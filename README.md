@@ -2,21 +2,38 @@
 
 **Python in, fab-ready KiCad out.** One AI-writable board file compiles to a KiCad 10 project and a JLCPCB zip.
 
-Zener is not used. There is no `SOURCE.json`, no `pcb.toml`, no pin lockfile. Pin **names** live on the `.kicad_sym`; pad **numbers** live on the `.kicad_mod`; `part.py` is MPN / LCSC / which CAD files.
+Zener is not used. There is no `SOURCE.json`, no `pcb.toml`, no pin lockfile.
 
 ```
-pcbc source search|import     LCSC + CAD → part.py + .kicad_mod + .kicad_sym
-      ↓
-board.py                      Net / Part / Place / NetReq
-      ↓
 pcbc build board.py           check → seed pcb → sch → place → route → fab
 ```
+
+## One fact, one file
+
+| Fact | Lives in |
+|---|---|
+| Nets, MPN, LCSC, Place, board size | `board.py` |
+| Pin **names** → pad numbers + artwork | `.kicad_sym` |
+| Land | `.kicad_mod` |
+| IC MPN / LCSC / which CAD files | `components/…/part.py` (no `pins=`) |
+
+Generics (`Resistor("R1", "1k", package="0402", …)`) use vendored KiCad chip lands. Footprint properties: `Value` = electrical, `Mpn` = reel, `LCSC` = JLC code.
+
+## Install
 
 ```bash
 pip install -e ".[dev]"
 pcbc check examples/blinky/blinky.py
+pcbc build examples/blinky/blinky.py --force
 ```
 
-KiCad 10 `kicad-cli` and KiCadRoutingTools (`KRT_HOME`) are required for place / route / fab. `pcb` (Zener) is not.
+KiCad 10 `kicad-cli` is required for DRC and Gerbers. `pcb` (Zener) is not.
+
+Blinky is a 40×25 mm 2-layer LED + resistor. `pcbc build` writes:
+
+- `layout/blinky/layout.kicad_pcb` — seed
+- `layout/blinky/schematic.kicad_sch`
+- `layout/blinky/placed/` / `routed/`
+- `layout/blinky/fab/` — Gerbers, `bom.csv`, `cpl.csv`, `FAB_NOTES.md`
 
 This is a sibling of [pcb-space](https://github.com/RileyMcCarthy/pcb-space), which stays the Zener-era tool.

@@ -1,0 +1,4 @@
+These chip footprints are excerpted from the KiCad official footprint
+library (https://gitlab.com/kicad/libraries/kicad-footprints) and are
+licensed under Creative Commons Attribution-ShareAlike 4.0 (CC-BY-SA 4.0).
+3D models were stripped; only the copper/courtyard/fab graphics are vendored.

@@ -29,7 +29,7 @@ def test_blinky_check_ok():
     d = load_board(BLINKY)
     assert {i.ref for i in d.instances} == {"R1", "D1"}
     assert d.board is not None
-    assert d.board.size_mm == (20.0, 10.0)
+    assert d.board.size_mm == (40.0, 25.0)
 
 
 def test_unbound_required_pin(tmp_path: Path):

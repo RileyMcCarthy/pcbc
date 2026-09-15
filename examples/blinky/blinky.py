@@ -25,11 +25,22 @@ Led(
     k=GND,
 )
 
-Board(width=20, height=10, layers=2, stackup="jlcpcb_2l_1oz")
+Board(width=40, height=25, layers=2, stackup="jlcpcb_2l_1oz")
+Place(
+    "R1",
+    position="absolute",
+    left=8,
+    top=0,
+    bottom=0,
+    margin_top="auto",
+    margin_bottom="auto",
+    locked=True,
+    reason="resistor west of LED",
+)
 Place(
     "D1",
     position="absolute",
-    right=2,
+    right=8,
     top=0,
     bottom=0,
     margin_top="auto",
@@ -38,3 +49,4 @@ Place(
     reason="LED at east edge",
 )
 NetReq("VCC", "GND", kind="power", volts=3.3, amps=0.05)
+NetReq("LED", kind="digital")

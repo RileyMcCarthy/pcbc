@@ -6,9 +6,8 @@ import sys
 from pathlib import Path
 
 from . import __version__
+from .build import STAGES, build_job
 from .language import check_board, load_board
-
-STAGES = ("check", "seed", "sch", "place", "route", "fab")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -16,13 +15,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--version", action="version", version=f"pcbc {__version__}")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    ck = sub.add_parser("check", help="Load board.py and fail on unbound pins / USB / missing LCSC")
+    ck = sub.add_parser("check", help="Load board.py; unbound pins / USB / LCSC")
     ck.add_argument("board")
     ck.set_defaults(func=cmd_check)
 
     bd = sub.add_parser("build", help="check → seed → sch → place → route → fab")
     bd.add_argument("board")
-    bd.add_argument("--upto", default="check", choices=STAGES)
+    bd.add_argument("--upto", default="fab", choices=STAGES)
     bd.add_argument("--force", action="store_true")
     bd.set_defaults(func=cmd_build)
 
@@ -46,13 +45,16 @@ def cmd_check(args: argparse.Namespace) -> int:
 
 
 def cmd_build(args: argparse.Namespace) -> int:
-    if args.upto != "check":
-        print(
-            f"pcbc build --upto {args.upto} is not implemented yet (check only in 0.1)",
-            file=sys.stderr,
-        )
+    path = Path(args.board)
+    if not path.exists():
+        print(f"no such file: {path}", file=sys.stderr)
         return 2
-    return cmd_check(args)
+    result = build_job(path, upto=args.upto, force=args.force)
+    print(json.dumps(result, indent=2, default=str))
+    if result.get("error"):
+        print(result["error"], file=sys.stderr)
+        return 1
+    return 0
 
 
 if __name__ == "__main__":

@@ -90,3 +90,11 @@ def has_edge_cuts_shape(text: str) -> bool:
 
 def new_uuid() -> str:
     return str(uuid.uuid4())
+
+
+_NS = uuid.UUID("7c9e6679-7425-40de-944b-e07fc1f90ae7")
+
+
+def stable_uuid(*parts: object) -> str:
+    """Deterministic UUIDv5 so rebuilds do not churn git."""
+    return str(uuid.uuid5(_NS, "|".join(str(p) for p in parts)))

@@ -13,6 +13,8 @@ venv/
 *.bak-*
 .DS_Store
 .easyeda_cache/
+# Generated boards (CI rebuilds with --force)
+examples/**/layout/
 
 **/review/index.html
 **/review/board.glb

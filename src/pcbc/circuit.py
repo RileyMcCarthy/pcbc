@@ -155,6 +155,14 @@ def load_part(path: Path) -> Part:
     else:
         raise ValueError(f"{src} must assign part = Component(...)")
     part.origin = pkg
+    if not part.symbol:
+        syms = [p for p in pkg.glob("*.kicad_sym")]
+        if len(syms) == 1:
+            part.symbol = syms[0].name
+    if not part.footprint:
+        mods = list(pkg.glob("*.kicad_mod"))
+        if len(mods) == 1:
+            part.footprint = mods[0].name
     if part.symbol:
         sym = pkg / part.symbol
         if not sym.exists():
@@ -163,7 +171,9 @@ def load_part(path: Path) -> Part:
 
         part.pins = parse_symbol_pins(sym)
     elif not part.pins:
-        raise ValueError(f"{part.name}: set symbol= to a .kicad_sym (that is the pin map)")
+        raise ValueError(
+            f"{part.name}: package needs one .kicad_sym (that is the pin map)"
+        )
     return part
 
 

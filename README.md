@@ -25,6 +25,7 @@ Generics (`Resistor("R1", "1k", package="0402", …)`) use vendored KiCad chip l
 pip install -e ".[dev]"
 pcbc check examples/blinky/blinky.py
 pcbc build examples/blinky/blinky.py --force
+pcbc review examples/blinky/blinky.py   # schematic, copper, 3D in one HTML page
 ```
 
 KiCad 10 `kicad-cli` is required for DRC and Gerbers. `pcb` (Zener) is not.

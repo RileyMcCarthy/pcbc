@@ -248,7 +248,7 @@ def silk_job(
         report["backup"] = str(bak)
     dest.parent.mkdir(parents=True, exist_ok=True)
     if dest != pcb:
-        from .place import copy_with_siblings
+        from .project import copy_with_siblings
 
         copy_with_siblings(pcb, dest)
     dest.write_text(new)

@@ -8,6 +8,7 @@ from pathlib import Path
 from . import __version__
 from .build import STAGES, build_job
 from .language import check_board, load_board
+from .review import review_job
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -24,6 +25,11 @@ def main(argv: list[str] | None = None) -> int:
     bd.add_argument("--upto", default="fab", choices=STAGES)
     bd.add_argument("--force", action="store_true")
     bd.set_defaults(func=cmd_build)
+
+    rv = sub.add_parser("review", help="HTML: schematic, copper, 3D")
+    rv.add_argument("board")
+    rv.add_argument("--no-open", action="store_true")
+    rv.set_defaults(func=cmd_review)
 
     args = parser.parse_args(argv)
     return int(args.func(args))
@@ -52,6 +58,19 @@ def cmd_build(args: argparse.Namespace) -> int:
     result = build_job(path, upto=args.upto, force=args.force)
     print(json.dumps(result, indent=2, default=str))
     if result.get("error"):
+        print(result["error"], file=sys.stderr)
+        return 1
+    return 0
+
+
+def cmd_review(args: argparse.Namespace) -> int:
+    path = Path(args.board)
+    if not path.exists():
+        print(f"no such file: {path}", file=sys.stderr)
+        return 2
+    result = review_job(path, open_html=not args.no_open)
+    print(json.dumps({k: result[k] for k in ("html", "pcb", "error") if k in result}, indent=2))
+    if result.get("error") and not (result.get("html") and Path(result["html"]).exists()):
         print(result["error"], file=sys.stderr)
         return 1
     return 0

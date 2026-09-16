@@ -360,16 +360,24 @@ def Led(
     cathode = k if k is not None else K
     if anode is None or cathode is None:
         raise ValueError(f"Led({ref!r}) needs a= and k=")
-    return _generic(
-        ref=ref,
+    # KiCad Device:LED / 0603 LED: pin 1 = K (cathode), pin 2 = A (anode).
+    part = Part(
+        name=mpn or f"D_{ref}",
         prefix="D",
-        value=color or "LED",
-        package=package,
         mpn=mpn,
-        lcsc=lcsc,
         manufacturer=manufacturer,
-        pin_nets={"1": anode, "2": cathode},
+        lcsc=lcsc,
+        footprint="",
+        package=package,
+        value=color or "LED",
+        kind="generic",
+        pins={
+            "K": Pin(name="K", pads=("1",)),
+            "A": Pin(name="A", pads=("2",)),
+        },
     )
+    part(ref, A=anode, K=cathode)
+    return part
 
 
 def Component(**kwargs) -> Part:

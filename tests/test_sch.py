@@ -22,9 +22,12 @@ def test_blinky_passives_sit_in_one_column():
     by = {p.ref: p for p in parts}
     assert abs(by["R1"].x - by["D1"].x) < 0.01
     assert abs(by["R1"].y - by["D1"].y) <= 15.0
+    assert by["D1"].lib_id == "LED"
+    assert by["R1"].y < by["D1"].y  # VCC/R at smaller Y = top of sheet
 
 
 def test_blinky_one_led_wire_not_two_stubs():
     sch = emit_from_design(load_board(BLINKY), title="blinky")
     assert sch.count('(label "LED"') == 1
-    assert sch.count("(wire") >= 3  # LED + VCC hat + GND hat
+    assert sch.count("(wire") >= 1  # LED net; VCC may add a stem wire
+    assert '(lib_id "LED")' in sch

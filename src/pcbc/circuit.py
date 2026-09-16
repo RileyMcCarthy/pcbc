@@ -26,9 +26,9 @@ def instantiate(part: Part, ref: str, pin_nets: dict[str, object]) -> Instance:
         elif key in ("p2", "P2"):
             key = "2" if "2" in part.pins else "P2"
         elif key in ("a", "A", "anode"):
-            key = "1" if "1" in part.pins else "A"
+            key = "A" if "A" in part.pins else ("2" if "2" in part.pins else "1")
         elif key in ("k", "K", "cathode"):
-            key = "2" if "2" in part.pins else "K"
+            key = "K" if "K" in part.pins else ("1" if "1" in part.pins else "2")
         if key not in part.pins:
             up = aliases.get(key.upper())
             if up:

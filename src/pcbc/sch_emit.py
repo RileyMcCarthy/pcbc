@@ -343,6 +343,53 @@ def _lib_l() -> str:
 """
 
 
+def _lib_led() -> str:
+    """Vertical LED: pin 2 A at top (−Y), pin 1 K at bottom (+Y). Current flows down."""
+    return """		(symbol "LED"
+			(pin_numbers (hide yes))
+			(pin_names (hide yes))
+			(exclude_from_sim no)
+			(in_bom yes)
+			(on_board yes)
+			(property "Reference" "D"
+				(at 3.81 0 0)
+				(effects (font (size 1.27 1.27)) (justify left))
+			)
+			(property "Value" "LED"
+				(at 3.81 2.54 0)
+				(effects (font (size 1.27 1.27)) (justify left))
+			)
+			(symbol "LED_0_1"
+				(polyline (pts (xy -1.016 0.762) (xy 1.016 0.762))
+					(stroke (width 0.254) (type default)) (fill (type none)))
+				(polyline (pts (xy -1.016 -0.762) (xy 1.016 -0.762) (xy 0 0.762) (xy -1.016 -0.762))
+					(stroke (width 0.254) (type default)) (fill (type none)))
+				(polyline (pts (xy 0 -2.54) (xy 0 2.54))
+					(stroke (width 0) (type default)) (fill (type none)))
+				(polyline (pts (xy 1.27 -0.254) (xy 2.286 -1.016) (xy 1.778 -1.016) (xy 2.286 -1.016) (xy 2.286 -0.508))
+					(stroke (width 0) (type default)) (fill (type none)))
+				(polyline (pts (xy 1.778 0.508) (xy 2.794 -0.254) (xy 2.286 -0.254) (xy 2.794 -0.254) (xy 2.794 0.254))
+					(stroke (width 0) (type default)) (fill (type none)))
+			)
+			(symbol "LED_1_1"
+				(pin passive line
+					(at 0 2.54 270)
+					(length 1.778)
+					(name "K" (effects (font (size 1.27 1.27))))
+					(number "1" (effects (font (size 1.27 1.27))))
+				)
+				(pin passive line
+					(at 0 -2.54 90)
+					(length 1.778)
+					(name "A" (effects (font (size 1.27 1.27))))
+					(number "2" (effects (font (size 1.27 1.27))))
+				)
+			)
+			(embedded_fonts no)
+		)
+"""
+
+
 def _lib_gnd() -> str:
     return """		(symbol "GND"
 			(power global)
@@ -590,7 +637,7 @@ def _seg_hits_part(x0: float, y0: float, x1: float, y1: float, part: Part) -> bo
 
 def _passive_chains(parts: list[Part]) -> list[list[Part]]:
     """Paths of 2-pin passives that share a signal net — place them in a column."""
-    passives = [p for p in parts if p.kind in ("r", "c", "l")]
+    passives = [p for p in parts if p.kind in ("r", "c", "l", "d")]
     by_ref = {p.ref: p for p in passives}
     adj: dict[str, list[tuple[str, str]]] = defaultdict(list)
     sites: dict[str, list[Part]] = defaultdict(list)
@@ -633,14 +680,17 @@ def _passive_chains(parts: list[Part]) -> list[list[Part]]:
                 break
             path.append(nxt[0])
             remaining.remove(nxt[0])
-        # Order so shared-net pins face: upper part's pin at −Y, lower at +Y.
-        if len(path) == 2:
-            a, b = by_ref[path[0]], by_ref[path[1]]
-            net = next((n for t, n in adj[a.ref] if t == b.ref), "")
-            pin_a = next((p for p in a.pins if p.net == net), None)
-            if pin_a is not None and pin_a.ly > 0:
-                path = list(reversed(path))
-        chains.append([by_ref[r] for r in path])
+        # Prefer VCC/power at the start so the column reads top → bottom.
+        ordered = [by_ref[r] for r in path]
+        if ordered and any(
+            is_power_net(pin.net or "") and "GND" not in (pin.net or "").upper()
+            for pin in ordered[-1].pins
+        ) and not any(
+            is_power_net(pin.net or "") and "GND" not in (pin.net or "").upper()
+            for pin in ordered[0].pins
+        ):
+            ordered.reverse()
+        chains.append(ordered)
     return chains
 
 
@@ -650,13 +700,14 @@ def _layout(parts: list[Part]) -> None:
         p.placed = False
         p.rot = 0.0
     x = 25.4
-    y_top = 50.8
+    y_top = 25.4
     for chain in _passive_chains(parts):
         y = y_top
         for p in chain:
             p.x, p.y = _snap(x), _snap(y)
+            p.rot = 0.0
             p.placed = True
-            y -= 5 * _GRID
+            y += 4 * _GRID
         x += 6 * _GRID
     rest = [p for p in parts if not p.placed]
     rest.sort(key=lambda p: (0 if p.ref[:1] in "UA" else 1 if p.ref[:1] == "J" else 2, p.ref))
@@ -708,11 +759,8 @@ def _label(name: str, x: float, y: float, rot: int, justify: str) -> str:
 def _hat(net: str, x: float, y: float, gnd: bool, rot: int = 0) -> str:
     lib = "GND" if gnd else "VCC"
     uid = new_uuid()
-    # Value sits past the symbol, away from the pin.
-    if gnd:
-        val_y = y - 3.81 if rot % 360 == 0 else y + 3.81
-    else:
-        val_y = y + 3.81 if rot % 360 == 0 else y - 3.81
+    # Sheet Y increases down: VCC name above the hat, GND name below.
+    val_y = y + 2.54 if gnd else y - 2.54
     return (
         f'\t(symbol\n'
         f'\t\t(lib_id "{lib}")\n'
@@ -784,7 +832,16 @@ def _parts_from_design(design: Design) -> list[Part]:
     for inst in design.instances:
         pnets = _pad_nets(inst)
         prefix = (inst.part.prefix or inst.ref[:1] or "U").upper()[:1]
-        if inst.part.kind == "generic" or prefix in "RCLD":
+        if prefix == "D" or inst.part.prefix == "D":
+            kind = "d"
+            lib_id = "LED"
+            pins = [
+                PinDef("1", "K", 0.0, 2.54, 270, pnets.get("1", pnets.get("K", ""))),
+                PinDef("2", "A", 0.0, -2.54, 90, pnets.get("2", pnets.get("A", ""))),
+            ]
+            hw, hh = 3.0, 3.0
+            lib_sexp = None
+        elif inst.part.kind == "generic" or prefix in "RCL":
             kind = {"R": "r", "C": "c", "L": "l"}.get(prefix, "r")
             pins = _passive_pins(kind, pnets)
             lib_id = kind.upper()
@@ -868,9 +925,9 @@ def _annotate(parts: list[Part], deg: dict[str, int]) -> list[str]:
         mx, my = (x0 + x1) / 2, (y0 + y1) / 2
         horizontal = abs(x1 - x0) >= abs(y1 - y0)
         if horizontal:
-            out.append(_label(net, mx, my, 0, "left"))
+            out.append(_label(net, mx, my - 1.27, 0, "left"))
         else:
-            out.append(_label(net, mx, my, 90, "left"))
+            out.append(_label(net, mx - 2.54, my, 0, "right"))
         wired.add(net)
 
     hats_done: set[tuple[str, str]] = set()
@@ -887,15 +944,16 @@ def _annotate(parts: list[Part], deg: dict[str, int]) -> list[str]:
                     continue
                 hats_done.add(key)
                 gnd = net.upper() in ("GND", "VSS") or "GND" in net.upper()
-                dx, dy = _stub_delta(pin.rot + p.rot, _HAT)
-                hx, hy = wx + dx, wy + dy
-                hat_rot = 0
-                if gnd and dy > 0:
-                    hat_rot = 180
-                if (not gnd) and dy < 0:
-                    hat_rot = 180
-                out.append(_wire(wx, wy, hx, hy))
-                out.append(_hat(net, hx, hy, gnd=gnd, rot=hat_rot))
+                # Sit on the pin. Rotate so the graphic points away from the body
+                # (KiCad schematic Y increases down).
+                # VCC graphic extends +Y (down the sheet) from its origin — sit
+                # the origin 2.54 mm above the pin so the V stays outside R.
+                # GND graphic extends −Y; rotate 180 so the triangle hangs below.
+                if gnd:
+                    out.append(_hat(net, wx, wy, gnd=True, rot=180))
+                else:
+                    out.append(_hat(net, wx, wy - 2.54, gnd=False, rot=0))
+                    out.append(_wire(wx, wy - 2.54, wx, wy))
                 continue
             if net in wired or deg.get(net, 0) < 2:
                 continue
@@ -918,8 +976,8 @@ def emit_from_design(design: Design, *, title: str = "") -> str:
     parts = _parts_from_design(design)
     _layout(parts)
     deg = _degree_parts(parts)
-    libs = [_lib_gnd(), _lib_vcc(), _lib_r(), _lib_c(), _lib_l()]
-    seen_lib: set[str] = {"GND", "VCC", "R", "C", "L"}
+    libs = [_lib_gnd(), _lib_vcc(), _lib_r(), _lib_c(), _lib_l(), _lib_led()]
+    seen_lib: set[str] = {"GND", "VCC", "R", "C", "L", "LED"}
     for p in parts:
         if p.lib_id in seen_lib:
             continue

@@ -391,20 +391,12 @@ def _lib_led() -> str:
 
 
 def _lib_gnd() -> str:
-    return """		(symbol "GND"
-			(power global)
-			(pin_numbers (hide yes))
-			(pin_names (offset 0) (hide yes))
-			(exclude_from_sim no)
-			(in_bom yes)
-			(on_board yes)
-			(property "Reference" "#PWR"
-				(at 0 -6.35 0)
-				(hide yes)
-				(effects (font (size 1.27 1.27)))
+    # Cached the way eeschema writes power:GND — body _0_1 + pin _1_1 stay one symbol.
+    return """		(symbol "power:GND" (power) (pin_names (offset 0)) (in_bom yes) (on_board yes)
+			(property "Reference" "#PWR" (at 0 -6.35 0)
+				(effects (font (size 1.27 1.27)) hide)
 			)
-			(property "Value" "GND"
-				(at 0 -3.81 0)
+			(property "Value" "GND" (at 0 -3.81 0)
 				(effects (font (size 1.27 1.27)))
 			)
 			(symbol "GND_0_1"
@@ -415,56 +407,46 @@ def _lib_gnd() -> str:
 				)
 			)
 			(symbol "GND_1_1"
-				(pin power_in line
-					(at 0 0 270)
-					(length 0)
-					(name "" (effects (font (size 1.27 1.27))))
+				(pin power_in line (at 0 0 270) (length 0) hide
+					(name "GND" (effects (font (size 1.27 1.27))))
 					(number "1" (effects (font (size 1.27 1.27))))
 				)
 			)
-			(embedded_fonts no)
 		)
 """
 
 
 def _lib_vcc() -> str:
-    return """		(symbol "VCC"
-			(power global)
-			(pin_numbers (hide yes))
-			(pin_names (offset 0) (hide yes))
-			(exclude_from_sim no)
-			(in_bom yes)
-			(on_board yes)
-			(property "Reference" "#PWR"
-				(at 0 6.35 0)
-				(hide yes)
-				(effects (font (size 1.27 1.27)))
+    return """		(symbol "power:VCC" (power) (pin_names (offset 0)) (in_bom yes) (on_board yes)
+			(property "Reference" "#PWR" (at 0 -3.81 0)
+				(effects (font (size 1.27 1.27)) hide)
 			)
-			(property "Value" "VCC"
-				(at 0 3.556 0)
+			(property "Value" "VCC" (at 0 3.556 0)
 				(effects (font (size 1.27 1.27)))
 			)
 			(symbol "VCC_0_1"
+				(polyline
+					(pts (xy -0.762 1.27) (xy 0 2.54))
+					(stroke (width 0) (type default))
+					(fill (type none))
+				)
+				(polyline
+					(pts (xy 0 2.54) (xy 0.762 1.27))
+					(stroke (width 0) (type default))
+					(fill (type none))
+				)
 				(polyline
 					(pts (xy 0 0) (xy 0 2.54))
 					(stroke (width 0) (type default))
 					(fill (type none))
 				)
-				(polyline
-					(pts (xy -0.762 1.27) (xy 0 2.54) (xy 0.762 1.27))
-					(stroke (width 0) (type default))
-					(fill (type none))
-				)
 			)
 			(symbol "VCC_1_1"
-				(pin power_in line
-					(at 0 0 90)
-					(length 0)
-					(name "" (effects (font (size 1.27 1.27))))
+				(pin power_in line (at 0 0 90) (length 0) hide
+					(name "VCC" (effects (font (size 1.27 1.27))))
 					(number "1" (effects (font (size 1.27 1.27))))
 				)
 			)
-			(embedded_fonts no)
 		)
 """
 
@@ -756,28 +738,50 @@ def _label(name: str, x: float, y: float, rot: int, justify: str) -> str:
     )
 
 
+def _rot_xy(x: float, y: float, rot: float) -> tuple[float, float]:
+    """Rotate a library-local offset with the parent symbol (CCW)."""
+    r = int(rot) % 360
+    if r == 90:
+        return -y, x
+    if r == 180:
+        return -x, -y
+    if r == 270:
+        return y, -x
+    return x, y
+
+
+# Library-local property offsets from KiCad power.kicad_sym — keep them
+# attached to the symbol so graphics + pin + name stay one group.
+_GND_REF, _GND_VAL = (0.0, -6.35), (0.0, -3.81)
+_VCC_REF, _VCC_VAL = (0.0, -3.81), (0.0, 3.556)
+
+
 def _hat(net: str, x: float, y: float, gnd: bool, rot: int = 0) -> str:
-    lib = "GND" if gnd else "VCC"
+    """Place the whole power symbol on the pin. Do not explode it into a wire + graphic."""
+    lib = "power:GND" if gnd else "power:VCC"
     uid = new_uuid()
-    # Sheet Y increases down: VCC name above the hat, GND name below.
-    val_y = y + 2.54 if gnd else y - 2.54
+    ref_l = _GND_REF if gnd else _VCC_REF
+    val_l = _GND_VAL if gnd else _VCC_VAL
+    rx, ry = _rot_xy(*ref_l, rot)
+    vx, vy = _rot_xy(*val_l, rot)
+    # Eeschema stores property Y as at_y − library_y (Y-up library, Y-down sheet).
+    rwx, rwy = x + rx, y - ry
+    vwx, vwy = x + vx, y - vy
     return (
-        f'\t(symbol\n'
-        f'\t\t(lib_id "{lib}")\n'
-        f'\t\t(at {_fmt(x)} {_fmt(y)} {rot})\n'
-        f'\t\t(unit 1)\n'
-        f'\t\t(in_bom no)\n'
-        f'\t\t(on_board no)\n'
-        f'\t\t(dnp no)\n'
+        f'\t(symbol (lib_id "{lib}") (at {_fmt(x)} {_fmt(y)} {rot}) (unit 1)\n'
+        f'\t\t(in_bom yes) (on_board yes) (dnp no)\n'
         f'\t\t(uuid "{uid}")\n'
-        f'\t\t(property "Reference" "#PWR{uid[:8]}"\n'
-        f'\t\t\t(at {_fmt(x)} {_fmt(y)} 0)\n'
-        f'\t\t\t(hide yes)\n'
+        f'\t\t(property "Reference" "#PWR{uid[:8]}" (at {_fmt(rwx)} {_fmt(rwy)} 0)\n'
+        f'\t\t\t(effects (font (size 1.27 1.27)) hide)\n'
+        f'\t\t)\n'
+        f'\t\t(property "Value" "{net}" (at {_fmt(vwx)} {_fmt(vwy)} 0)\n'
         f'\t\t\t(effects (font (size 1.27 1.27)))\n'
         f'\t\t)\n'
-        f'\t\t(property "Value" "{net}"\n'
-        f'\t\t\t(at {_fmt(x)} {_fmt(val_y)} 0)\n'
-        f'\t\t\t(effects (font (size 1.27 1.27)))\n'
+        f'\t\t(property "Footprint" "" (at {_fmt(x)} {_fmt(y)} 0)\n'
+        f'\t\t\t(effects (font (size 1.27 1.27)) hide)\n'
+        f'\t\t)\n'
+        f'\t\t(property "Datasheet" "" (at {_fmt(x)} {_fmt(y)} 0)\n'
+        f'\t\t\t(effects (font (size 1.27 1.27)) hide)\n'
         f'\t\t)\n'
         f'\t\t(pin "1" (uuid "{new_uuid()}"))\n'
         f'\t)\n'
@@ -944,16 +948,9 @@ def _annotate(parts: list[Part], deg: dict[str, int]) -> list[str]:
                     continue
                 hats_done.add(key)
                 gnd = net.upper() in ("GND", "VSS") or "GND" in net.upper()
-                # Sit on the pin. Rotate so the graphic points away from the body
-                # (KiCad schematic Y increases down).
-                # VCC graphic extends +Y (down the sheet) from its origin — sit
-                # the origin 2.54 mm above the pin so the V stays outside R.
-                # GND graphic extends −Y; rotate 180 so the triangle hangs below.
-                if gnd:
-                    out.append(_hat(net, wx, wy, gnd=True, rot=180))
-                else:
-                    out.append(_hat(net, wx, wy - 2.54, gnd=False, rot=0))
-                    out.append(_wire(wx, wy - 2.54, wx, wy))
+                # Whole library symbol on the pin (graphics + pin + name).
+                # Bodies are drawn VCC-up / GND-down; do not explode into wires.
+                out.append(_hat(net, wx, wy, gnd=gnd, rot=0))
                 continue
             if net in wired or deg.get(net, 0) < 2:
                 continue
@@ -977,7 +974,7 @@ def emit_from_design(design: Design, *, title: str = "") -> str:
     _layout(parts)
     deg = _degree_parts(parts)
     libs = [_lib_gnd(), _lib_vcc(), _lib_r(), _lib_c(), _lib_l(), _lib_led()]
-    seen_lib: set[str] = {"GND", "VCC", "R", "C", "L", "LED"}
+    seen_lib: set[str] = {"power:GND", "power:VCC", "GND", "VCC", "R", "C", "L", "LED"}
     for p in parts:
         if p.lib_id in seen_lib:
             continue

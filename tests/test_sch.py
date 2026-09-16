@@ -1,7 +1,7 @@
 from pathlib import Path
 
 from pcbc.language import load_board
-from pcbc.sch_emit import _layout, _parts_from_design, emit_from_design
+from pcbc.sch_emit import _fmt, _layout, _parts_from_design, _pin_world, emit_from_design
 
 BLINKY = Path(__file__).resolve().parent.parent / "examples" / "blinky" / "blinky.py"
 
@@ -29,5 +29,19 @@ def test_blinky_passives_sit_in_one_column():
 def test_blinky_one_led_wire_not_two_stubs():
     sch = emit_from_design(load_board(BLINKY), title="blinky")
     assert sch.count('(label "LED"') == 1
-    assert sch.count("(wire") >= 1  # LED net; VCC may add a stem wire
+    assert sch.count("(wire") == 1  # only the LED net; power symbols are not exploded
     assert '(lib_id "LED")' in sch
+
+
+def test_power_symbols_sit_on_pins_as_one_group():
+    design = load_board(BLINKY)
+    parts = _parts_from_design(design)
+    _layout(parts)
+    by = {p.ref: p for p in parts}
+    r_vcc = next(_pin_world(by["R1"], pin) for pin in by["R1"].pins if pin.net == "VCC")
+    d_gnd = next(_pin_world(by["D1"], pin) for pin in by["D1"].pins if pin.net == "GND")
+    sch = emit_from_design(design, title="blinky")
+    assert f'(at {_fmt(r_vcc[0])} {_fmt(r_vcc[1])} 0)' in sch
+    assert f'(at {_fmt(d_gnd[0])} {_fmt(d_gnd[1])} 0)' in sch
+    assert sch.count('(lib_id "power:VCC")') == 1
+    assert sch.count('(lib_id "power:GND")') == 1

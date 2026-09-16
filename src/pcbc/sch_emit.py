@@ -82,9 +82,11 @@ class Part:
     pins: list[PinDef]
     x: float = 0.0
     y: float = 0.0
+    rot: float = 0.0
     hw: float = 8.0
     hh: float = 6.0
     lib_sexp: str | None = None
+    placed: bool = False
 
 
 def _kind(ref: str) -> str:
@@ -98,12 +100,14 @@ def _kind(ref: str) -> str:
 
 
 def _passive_pins(kind: str, pin_nets: dict[str, str]) -> list[PinDef]:
-    # Pin 1 top (screen up = −Y), pin 2 bottom.
+    # Match Device-style libraries: pin 1 at −Y (KiCad sheet +Y is up, so pin 1
+    # is the lower end), pin 2 at +Y. Electrical ends, not the body edge.
     n1 = pin_nets.get("1", "")
     n2 = pin_nets.get("2", pin_nets.get("1", ""))
+    end = 3.81 if kind in ("r", "l") else 2.54
     return [
-        PinDef("1", "1", 0.0, -2.54, 90, n1),
-        PinDef("2", "2", 0.0, 2.54, 270, n2),
+        PinDef("1", "1", 0.0, -end, 90, n1),
+        PinDef("2", "2", 0.0, end, 270, n2),
     ]
 
 
@@ -549,29 +553,136 @@ def _build_parts(
     return parts
 
 
-def _layout(parts: list[Part]) -> None:
-    groups = [
-        [p for p in parts if p.ref[:1] in "UA"],
-        [p for p in parts if p.ref[:1] == "J"],
-        [p for p in parts if p.kind == "l"],
-        [p for p in parts if p.kind == "c"],
-        [p for p in parts if p.kind == "r"],
-        [p for p in parts if p.ref[:1] not in "UAJLRC"],
-    ]
-    y = 50.0
-    for group in groups:
-        if not group:
-            continue
-        group.sort(key=lambda p: p.ref)
-        row_hh = max(p.hh + (28.0 if p.kind == "box" else 12.0) for p in group)
-        y += row_hh
-        x = 50.0
+_GRID = 2.54
+
+
+def _snap(v: float) -> float:
+    return round(v / _GRID) * _GRID
+
+
+def _pin_world(part: Part, pin: PinDef) -> tuple[float, float]:
+    lx, ly = pin.lx, pin.ly
+    rot = part.rot % 360.0
+    if abs(rot - 180) < 1:
+        lx, ly = -lx, -ly
+    elif abs(rot - 90) < 1:
+        lx, ly = -ly, lx
+    elif abs(rot - 270) < 1:
+        lx, ly = ly, -lx
+    return part.x + lx, part.y + ly
+
+
+def _bbox(part: Part) -> tuple[float, float, float, float]:
+    return (
+        part.x - part.hw - 1.0,
+        part.y - part.hh - 1.0,
+        part.x + part.hw + 1.0,
+        part.y + part.hh + 1.0,
+    )
+
+
+def _seg_hits_part(x0: float, y0: float, x1: float, y1: float, part: Part) -> bool:
+    x_min, y_min, x_max, y_max = _bbox(part)
+    # Ignore the endpoints (they sit on this part's pins).
+    mx, my = (x0 + x1) / 2, (y0 + y1) / 2
+    return x_min <= mx <= x_max and y_min <= my <= y_max
+
+
+def _passive_chains(parts: list[Part]) -> list[list[Part]]:
+    """Paths of 2-pin passives that share a signal net — place them in a column."""
+    passives = [p for p in parts if p.kind in ("r", "c", "l")]
+    by_ref = {p.ref: p for p in passives}
+    adj: dict[str, list[tuple[str, str]]] = defaultdict(list)
+    sites: dict[str, list[Part]] = defaultdict(list)
+    for p in passives:
+        for pin in p.pins:
+            if pin.net and not is_power_net(pin.net):
+                sites[pin.net].append(p)
+    for net, group in sites.items():
+        uniq: list[Part] = []
         for p in group:
-            margin = 28.0 if p.kind == "box" else 12.0
-            x += p.hw + margin
-            p.x, p.y = x, y
-            x += p.hw + margin + 8.0
-        y += row_hh + 14.0
+            if p not in uniq:
+                uniq.append(p)
+        for i, a in enumerate(uniq):
+            for b in uniq[i + 1 :]:
+                adj[a.ref].append((b.ref, net))
+                adj[b.ref].append((a.ref, net))
+
+    remaining = {p.ref for p in passives}
+    chains: list[list[Part]] = []
+
+    def has_rail(ref: str, want: str) -> bool:
+        u = want.upper()
+        return any(
+            (pin.net or "").upper() == u or (u == "VCC" and is_power_net(pin.net or "") and "GND" not in (pin.net or "").upper())
+            for pin in by_ref[ref].pins
+        )
+
+    while remaining:
+        leaves = [r for r in remaining if len([n for n, _ in adj[r] if n in remaining]) <= 1]
+        start = next((r for r in leaves if has_rail(r, "VCC")), None)
+        if start is None:
+            start = next((r for r in leaves if not has_rail(r, "GND")), None)
+        if start is None:
+            start = next(iter(leaves or remaining))
+        path = [start]
+        remaining.remove(start)
+        while True:
+            nxt = [n for n, _ in adj[path[-1]] if n in remaining]
+            if not nxt:
+                break
+            path.append(nxt[0])
+            remaining.remove(nxt[0])
+        # Order so shared-net pins face: upper part's pin at −Y, lower at +Y.
+        if len(path) == 2:
+            a, b = by_ref[path[0]], by_ref[path[1]]
+            net = next((n for t, n in adj[a.ref] if t == b.ref), "")
+            pin_a = next((p for p in a.pins if p.net == net), None)
+            if pin_a is not None and pin_a.ly > 0:
+                path = list(reversed(path))
+        chains.append([by_ref[r] for r in path])
+    return chains
+
+
+def _layout(parts: list[Part]) -> None:
+    """Compact placement. Each part once. Connected passives share a column."""
+    for p in parts:
+        p.placed = False
+        p.rot = 0.0
+    x = 25.4
+    y_top = 50.8
+    for chain in _passive_chains(parts):
+        y = y_top
+        for p in chain:
+            p.x, p.y = _snap(x), _snap(y)
+            p.placed = True
+            y -= 5 * _GRID
+        x += 6 * _GRID
+    rest = [p for p in parts if not p.placed]
+    rest.sort(key=lambda p: (0 if p.ref[:1] in "UA" else 1 if p.ref[:1] == "J" else 2, p.ref))
+    col0 = x if any(p.placed for p in parts) else 25.4
+    x, y = col0, y_top
+    row_bottom = y
+    for p in rest:
+        gap = 12.7 if p.kind == "box" else 7.62
+        p.x = _snap(x + p.hw + gap)
+        p.y = _snap(y)
+        p.placed = True
+        x = p.x + p.hw + gap
+        row_bottom = min(row_bottom, y - p.hh * 2 - 15.0)
+        if x > 190:
+            x = col0
+            y = row_bottom
+    if not parts:
+        return
+    # Keep everything in the positive quadrant with a small margin.
+    min_x = min(p.x - p.hw for p in parts)
+    min_y = min(p.y - p.hh for p in parts)
+    dx = 0.0 if min_x >= 12.7 else _snap(12.7 - min_x)
+    dy = 0.0 if min_y >= 12.7 else _snap(12.7 - min_y)
+    for p in parts:
+        p.x = _snap(p.x + dx)
+        p.y = _snap(p.y + dy)
 
 
 def _wire(x0: float, y0: float, x1: float, y1: float) -> str:
@@ -594,14 +705,18 @@ def _label(name: str, x: float, y: float, rot: int, justify: str) -> str:
     )
 
 
-def _hat(net: str, x: float, y: float, gnd: bool) -> str:
+def _hat(net: str, x: float, y: float, gnd: bool, rot: int = 0) -> str:
     lib = "GND" if gnd else "VCC"
     uid = new_uuid()
-    val_y = y + 3.81 if gnd else y - 3.81
+    # Value sits past the symbol, away from the pin.
+    if gnd:
+        val_y = y - 3.81 if rot % 360 == 0 else y + 3.81
+    else:
+        val_y = y + 3.81 if rot % 360 == 0 else y - 3.81
     return (
         f'\t(symbol\n'
         f'\t\t(lib_id "{lib}")\n'
-        f'\t\t(at {_fmt(x)} {_fmt(y)} 0)\n'
+        f'\t\t(at {_fmt(x)} {_fmt(y)} {rot})\n'
         f'\t\t(unit 1)\n'
         f'\t\t(in_bom no)\n'
         f'\t\t(on_board no)\n'
@@ -625,10 +740,11 @@ def _instance(part: Part) -> str:
     pins = "".join(
         f'\t\t(pin "{p.number}" (uuid "{new_uuid()}"))\n' for p in part.pins
     )
+    rot = int(part.rot) % 360
     return (
         f'\t(symbol\n'
         f'\t\t(lib_id "{part.lib_id}")\n'
-        f'\t\t(at {_fmt(part.x)} {_fmt(part.y)} 0)\n'
+        f'\t\t(at {_fmt(part.x)} {_fmt(part.y)} {rot})\n'
         f'\t\t(unit 1)\n'
         f'\t\t(exclude_from_sim no)\n'
         f'\t\t(in_bom yes)\n'
@@ -636,12 +752,12 @@ def _instance(part: Part) -> str:
         f'\t\t(dnp no)\n'
         f'\t\t(uuid "{new_uuid()}")\n'
         f'\t\t(property "Reference" "{part.ref}"\n'
-        f'\t\t\t(at {_fmt(part.x)} {_fmt(part.y - part.hh - 2.0)} 0)\n'
-        f'\t\t\t(effects (font (size 1.27 1.27)))\n'
+        f'\t\t\t(at {_fmt(part.x + part.hw + 1.5)} {_fmt(part.y + 1.27)} 0)\n'
+        f'\t\t\t(effects (font (size 1.27 1.27)) (justify left))\n'
         f'\t\t)\n'
         f'\t\t(property "Value" "{part.display}"\n'
-        f'\t\t\t(at {_fmt(part.x)} {_fmt(part.y + part.hh + 2.0)} 0)\n'
-        f'\t\t\t(effects (font (size 1.27 1.27)))\n'
+        f'\t\t\t(at {_fmt(part.x + part.hw + 1.5)} {_fmt(part.y - 1.27)} 0)\n'
+        f'\t\t\t(effects (font (size 1.27 1.27)) (justify left))\n'
         f'\t\t)\n'
         f"{pins}"
         f'\t)\n'
@@ -726,6 +842,78 @@ def _degree_parts(parts: list[Part]) -> dict[str, int]:
     return deg
 
 
+def _annotate(parts: list[Part], deg: dict[str, int]) -> list[str]:
+    """Wires, one label per 2-pin net, power hats. KiCad sheet +Y is up."""
+    out: list[str] = []
+    sites: dict[str, list[tuple[Part, PinDef, float, float]]] = defaultdict(list)
+    for p in parts:
+        for pin in p.pins:
+            if not pin.net or pin.net.startswith("unconnected") or pin.net.endswith(".NC"):
+                continue
+            wx, wy = _pin_world(p, pin)
+            sites[pin.net].append((p, pin, wx, wy))
+
+    wired: set[str] = set()
+    for net, pts in sites.items():
+        if is_power_net(net) or len(pts) != 2:
+            continue
+        (_, _, x0, y0), (_, _, x1, y1) = pts
+        if any(
+            _seg_hits_part(x0, y0, x1, y1, p)
+            and p.ref not in {pts[0][0].ref, pts[1][0].ref}
+            for p in parts
+        ):
+            continue
+        out.append(_wire(x0, y0, x1, y1))
+        mx, my = (x0 + x1) / 2, (y0 + y1) / 2
+        horizontal = abs(x1 - x0) >= abs(y1 - y0)
+        if horizontal:
+            out.append(_label(net, mx, my, 0, "left"))
+        else:
+            out.append(_label(net, mx, my, 90, "left"))
+        wired.add(net)
+
+    hats_done: set[tuple[str, str]] = set()
+    labels_done: set[tuple[str, str]] = set()
+    for p in parts:
+        for pin in p.pins:
+            net = pin.net
+            if not net or net.startswith("unconnected") or net.endswith(".NC"):
+                continue
+            wx, wy = _pin_world(p, pin)
+            if is_power_net(net):
+                key = (p.ref, net)
+                if key in hats_done:
+                    continue
+                hats_done.add(key)
+                gnd = net.upper() in ("GND", "VSS") or "GND" in net.upper()
+                dx, dy = _stub_delta(pin.rot + p.rot, _HAT)
+                hx, hy = wx + dx, wy + dy
+                hat_rot = 0
+                if gnd and dy > 0:
+                    hat_rot = 180
+                if (not gnd) and dy < 0:
+                    hat_rot = 180
+                out.append(_wire(wx, wy, hx, hy))
+                out.append(_hat(net, hx, hy, gnd=gnd, rot=hat_rot))
+                continue
+            if net in wired or deg.get(net, 0) < 2:
+                continue
+            key = (p.ref, net)
+            if key in labels_done:
+                continue
+            length = min(max(2.54, _text_w(net) * 0.6), 5.08)
+            dx, dy = _stub_delta(pin.rot + p.rot, length)
+            sx, sy = wx + dx, wy + dy
+            if any(_seg_hits_part(wx, wy, sx, sy, o) and o.ref != p.ref for o in parts):
+                continue
+            labels_done.add(key)
+            rot, just = _underline_pose(dx, dy)
+            out.append(_wire(wx, wy, sx, sy))
+            out.append(_label(net, sx, sy, rot, just))
+    return out
+
+
 def emit_from_design(design: Design, *, title: str = "") -> str:
     parts = _parts_from_design(design)
     _layout(parts)
@@ -742,41 +930,10 @@ def emit_from_design(design: Design, *, title: str = "") -> str:
             libs.append(_lib_box(p.lib_id, p.pins, p.ref[:1] or "U"))
             seen_lib.add(p.lib_id)
     body: list[str] = [_instance(p) for p in parts]
-    hats_done: set[tuple[str, str]] = set()
-    labels_done: set[tuple[str, str]] = set()
-    for part in parts:
-        for pin in part.pins:
-            wx = part.x + pin.lx
-            wy = part.y + pin.ly
-            net = pin.net
-            if not net or net.startswith("unconnected") or net.endswith(".NC"):
-                continue
-            if is_power_net(net):
-                key = (part.ref, net)
-                if key in hats_done:
-                    continue
-                hats_done.add(key)
-                gnd = net.upper() in ("GND", "VSS")
-                hx, hy = wx, wy + (_HAT if gnd else -_HAT)
-                # Prefer vertical hat off the pin; if the pin is left/right, still drop/raise.
-                body.append(_wire(wx, wy, hx, hy))
-                body.append(_hat(net, hx, hy, gnd=gnd))
-                continue
-            if deg.get(net, 0) < 2:
-                continue
-            key = (part.ref, net)
-            if key in labels_done:
-                continue
-            labels_done.add(key)
-            length = max(5.08, _text_w(net))
-            dx, dy = _stub_delta(pin.rot, length)
-            sx, sy = wx + dx, wy + dy
-            rot, just = _underline_pose(dx, dy)
-            body.append(_wire(wx, wy, sx, sy))
-            body.append(_label(net, sx, sy, rot, just))
-    max_x = max((p.x + p.hw + 40 for p in parts), default=200)
-    max_y = max((p.y + p.hh + 40 for p in parts), default=150)
-    paper = "A2" if max_x < 420 and max_y < 300 else "A1" if max_x < 850 else "A0"
+    body.extend(_annotate(parts, deg))
+    max_x = max((p.x + p.hw + 20 for p in parts), default=100)
+    max_y = max((p.y + p.hh + 20 for p in parts), default=80)
+    paper = "A4" if max_x < 280 and max_y < 190 else "A3" if max_x < 400 else "A2"
     uid = new_uuid()
     title = title or "pcbc"
     return (

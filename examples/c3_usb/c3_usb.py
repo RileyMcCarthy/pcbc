@@ -14,6 +14,8 @@ from pcbc import (
     Place,
     Power,
     Resistor,
+    SchPlace,
+    SchRegion,
     load,
 )
 
@@ -241,6 +243,31 @@ Place("C_EN", position="absolute", right=12, bottom=16)
 Place("R_BOOT", position="absolute", left=18, top=12)
 Place("C_MCU", position="absolute", left=18, top=8)
 Place("C_MCU_HF", position="absolute", left=22, top=8)
+
+SchRegion("usb", left=15, top=15, width=55, height=55)
+SchPlace("J1", parent="usb", left=0, top=8)
+SchPlace("U3", pin="I/O1", to="J1.DP1", gap=7.62)
+SchPlace("R_CC1", pin="1", to="J1.CC1", gap=5.08)
+SchPlace("R_CC2", pin="1", to="J1.CC2", gap=5.08)
+
+SchRegion("pwr", left=80, top=15, width=45, height=45)
+SchPlace("U2", parent="pwr", left=0, top=12)
+SchPlace("C_VBUS", pin="1", to="U2.VIN", gap=5.08)
+SchPlace("C_VBUS_HF", pin="1", along="C_VBUS.1", gap=5.08)
+SchPlace("C_3V3", pin="1", to="U2.VOUT", gap=5.08)
+SchPlace("C_3V3_HF", pin="1", along="C_3V3.1", gap=5.08)
+
+SchRegion("mcu", left=15, top=85, width=110, height=90)
+SchPlace("U1", parent="mcu", left=45, top=5)
+SchPlace("C_MCU", pin="1", to="U1.3V3", gap=5.08)
+SchPlace("C_MCU_HF", pin="1", along="C_MCU.1", gap=5.08)
+SchPlace("R_EN", pin="2", to="U1.EN", gap=5.08)
+SchPlace("C_EN", pin="1", along="R_EN.2", gap=5.08)
+SchPlace("SW_RST", pin="1", along="C_EN.1", gap=7.62)
+SchPlace("R_BOOT", pin="2", to="U1.IO9", gap=5.08)
+SchPlace("SW_BOOT", pin="1", along="R_BOOT.2", gap=7.62)
+SchPlace("R_LED", pin="1", to="U1.IO10", gap=5.08)
+SchPlace("D1", pin="A", to="R_LED.2", gap=2.54)
 
 NetReq("USB_DP", "USB_DN", kind="usb_hs", z_diff_ohm=90, pair=True)
 NetReq("VBUS", "3V3", "GND", kind="power", volts=3.3, amps=0.5)

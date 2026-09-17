@@ -1,7 +1,8 @@
 """Board-file DSL. Ordinary Python that calls these constructors.
 
 Electrical: Net, Power, Ground, Resistor, Capacitor, Led, load(part).
-Spatial: Board, Place, Keepout, Region, NetReq (CSS names, millimetres).
+Spatial: Board, Place, Keepout, Region, NetReq (PCB CSS).
+Schematic: SchRegion, SchPlace (CSS body, or pin=/to=/gap= attach).
 """
 
 from __future__ import annotations
@@ -27,6 +28,7 @@ from .model import (
     Pin,
     PlaceSpec,
     RegionSpec,
+    SchPlaceSpec,
 )
 
 _current: Design | None = None
@@ -229,6 +231,84 @@ def Region(
     return spec
 
 
+def SchRegion(
+    name: str,
+    position: str | None = None,
+    style: str | None = None,
+    parent: str | None = None,
+    padding: object | None = None,
+    **css,
+) -> RegionSpec:
+    who = f"SchRegion({name!r})"
+    if padding is not None:
+        css = {**css, "padding": padding}
+    st = _style(who, style=style, position=position or "absolute", parent=parent, **css)
+    if not st.has_insets():
+        raise ValueError(
+            f"{who}: needs CSS left/top/right/bottom/width/height"
+        )
+    spec = RegionSpec(name=str(name))
+    spec = apply_style_to_spec(spec, st)
+    _doc().sch_regions.append(spec)
+    return spec
+
+
+def SchPlace(
+    ref: str,
+    *,
+    pin: str | None = None,
+    to: str | None = None,
+    along: str | None = None,
+    gap: float = 2.54,
+    align: str | None = None,
+    rotate: float | None = None,
+    parent: str | None = None,
+    position: str | None = None,
+    style: str | None = None,
+    reason: str = "",
+    **css,
+) -> SchPlaceSpec:
+    """Schematic pose. CSS parks a body; pin=/to=/gap= hangs a pin off another pin."""
+    who = f"SchPlace({ref!r})"
+    if "gap" in css:
+        raise ValueError(f"{who}: gap= is pin spacing (not CSS). Pass gap= as its own argument.")
+    attach = bool(to or along)
+    if attach and not pin:
+        pin = "1"
+    spec = SchPlaceSpec(
+        ref=str(ref),
+        pin=pin,
+        to=to,
+        along=along,
+        gap=float(gap),
+        align=align,
+        reason=reason,
+        parent=parent,
+    )
+    if rotate is not None:
+        spec.rot = float(rotate)
+        spec.rotate_set = True
+    if css or position or style or (parent and not attach):
+        st = _style(
+            who,
+            style=style,
+            position=position or ("absolute" if css else None),
+            rotate=rotate,
+            parent=parent,
+            **css,
+        )
+        spec = apply_style_to_spec(spec, st)
+        spec.rot = float(st.rotate)
+        if st.is_absolute():
+            spec.position = "absolute"
+        if parent:
+            spec.parent = parent
+    if not spec.has_css() and not spec.has_attach():
+        raise ValueError(f"{who}: needs CSS left/top/... or pin= and to=")
+    _doc().sch_places.append(spec)
+    return spec
+
+
 def NetReq(*nets: str, kind: str, **kwargs) -> NetReqSpec:
     if not nets:
         raise ValueError("NetReq needs at least one net or glob")
@@ -417,6 +497,8 @@ def load_board(path: str | Path) -> Design:
         "Capacitor": Capacitor,
         "Led": Led,
         "Component": Component,
+        "SchPlace": SchPlace,
+        "SchRegion": SchRegion,
         "load": load,
         "__file__": str(path),
         "__name__": "__pcbc__",

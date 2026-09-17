@@ -12,7 +12,7 @@ pcbc build board.py           check → seed pcb → sch → place → route →
 
 | Fact | Lives in |
 |---|---|
-| Nets, MPN, LCSC, Place, board size | `board.py` (every part needs `Place()` — CSS, not auto-place) |
+| Nets, MPN, LCSC, Place, board size | `board.py` — every part needs PCB `Place()` and schematic `SchPlace()` |
 | Pin **names** → pad numbers + artwork | `.kicad_sym` |
 | Land | `.kicad_mod` |
 | IC MPN / LCSC / which CAD files | `components/…/part.py` (no `pins=`) |

@@ -10,6 +10,7 @@ from pathlib import Path
 
 from .footprints import symbol_path
 from .model import Design
+from .sch_place import apply_sch_places
 from .sexp import matching_paren, new_uuid
 from .symbol import extract_main_symbol, parse_symbol_pins_geom
 
@@ -910,17 +911,17 @@ def _annotate(parts: list[Part], deg: dict[str, int], kinds: dict[str, str] | No
     for net, pts in sites.items():
         if is_power_net(net, kinds) or len(pts) != 2:
             continue
-        (_, _, x0, y0), (_, _, x1, y1) = pts
-        if any(
-            _seg_hits_part(x0, y0, x1, y1, p)
-            and p.ref not in {pts[0][0].ref, pts[1][0].ref}
-            for p in parts
-        ):
+        (pa, _, x0, y0), (pb, _, x1, y1) = pts
+        dist = math.hypot(x1 - x0, y1 - y0)
+        skip = {pa.ref, pb.ref}
+        if dist > 20.0:
             continue
-        out.append(_wire(x0, y0, x1, y1))
+        segs = _manhattan(x0, y0, x1, y1, parts, skip)
+        if segs is None:
+            continue
+        out.extend(segs)
         mx, my = (x0 + x1) / 2, (y0 + y1) / 2
-        horizontal = abs(x1 - x0) >= abs(y1 - y0)
-        if horizontal:
+        if abs(x1 - x0) >= abs(y1 - y0):
             out.append(_label(net, mx, my - 1.27, 0, "left"))
         else:
             out.append(_label(net, mx - 2.54, my, 0, "right"))
@@ -961,10 +962,31 @@ def _annotate(parts: list[Part], deg: dict[str, int], kinds: dict[str, str] | No
     return out
 
 
+def _manhattan(
+    x0: float,
+    y0: float,
+    x1: float,
+    y1: float,
+    parts: list[Part],
+    skip: set[str],
+) -> list[str] | None:
+    def hits(ax, ay, bx, by) -> bool:
+        return any(_seg_hits_part(ax, ay, bx, by, p) and p.ref not in skip for p in parts)
+
+    if abs(x0 - x1) < 0.4 or abs(y0 - y1) < 0.4:
+        if hits(x0, y0, x1, y1):
+            return None
+        return [_wire(x0, y0, x1, y1)]
+    for mx, my in ((x0, y1), (x1, y0)):
+        if not hits(x0, y0, mx, my) and not hits(mx, my, x1, y1):
+            return [_wire(x0, y0, mx, my), _wire(mx, my, x1, y1)]
+    return None
+
+
 def emit_from_design(design: Design, *, title: str = "") -> str:
     kinds = {n.name: n.kind for n in design.nets.values()}
     parts = _parts_from_design(design)
-    _layout(parts, kinds)
+    apply_sch_places(design, parts)
     deg = _degree_parts(parts)
     libs = [_lib_gnd(), _lib_vcc(), _lib_r(), _lib_c(), _lib_l(), _lib_led()]
     seen_lib: set[str] = {"power:GND", "power:VCC", "GND", "VCC", "R", "C", "L", "LED"}

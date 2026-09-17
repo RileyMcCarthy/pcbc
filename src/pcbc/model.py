@@ -92,6 +92,42 @@ class RegionSpec:
 
 
 @dataclass
+class SchPlaceSpec:
+    """Schematic pose. CSS is body-in-region; pin/to/gap attaches a pin to another."""
+
+    ref: str
+    pin: str | None = None
+    to: str | None = None
+    along: str | None = None
+    gap: float = 2.54
+    align: str | None = None
+    rot: float = 0.0
+    rotate_set: bool = False
+    reason: str = ""
+    position: str = "static"
+    top: object | None = None
+    right: object | None = None
+    bottom: object | None = None
+    left: object | None = None
+    width: object | None = None
+    height: object | None = None
+    margin_top: object = 0
+    margin_right: object = 0
+    margin_bottom: object = 0
+    margin_left: object = 0
+    parent: str | None = None
+
+    def has_css(self) -> bool:
+        return any(
+            getattr(self, k) is not None
+            for k in ("top", "right", "bottom", "left", "width", "height")
+        ) or self.position == "absolute"
+
+    def has_attach(self) -> bool:
+        return bool(self.to or self.along)
+
+
+@dataclass
 class NetReqSpec:
     nets: tuple[str, ...]
     kind: str
@@ -170,4 +206,6 @@ class Design:
     netreqs: list[NetReqSpec] = field(default_factory=list)
     nets: dict[str, Net] = field(default_factory=dict)
     instances: list[Instance] = field(default_factory=list)
+    sch_places: list[SchPlaceSpec] = field(default_factory=list)
+    sch_regions: list[RegionSpec] = field(default_factory=list)
     source: str | None = None

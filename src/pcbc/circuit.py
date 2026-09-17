@@ -67,9 +67,12 @@ def check_design(design: Design) -> list[str]:
             fails.append(f"{inst.ref} missing lcsc (JLC BOM needs it on SMT)")
 
     placed = {p.ref for p in design.places}
+    sch_placed = {p.ref for p in design.sch_places}
     for inst in design.instances:
         if inst.ref not in placed:
             fails.append(f"{inst.ref}: no Place() — every part is CSS-placed")
+        if inst.ref not in sch_placed:
+            fails.append(f"{inst.ref}: no SchPlace() — schematic pose is CSS, not auto-layout")
     return fails
 
 

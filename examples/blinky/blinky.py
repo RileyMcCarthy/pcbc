@@ -1,4 +1,4 @@
-from pcbc import Board, Ground, Led, Net, NetReq, Place, Power, Resistor
+from pcbc import Board, Ground, Led, Net, NetReq, Place, Power, Resistor, SchPlace
 
 VCC = Power("VCC")
 GND = Ground("GND")
@@ -48,5 +48,8 @@ Place(
     locked=True,
     reason="LED at east edge",
 )
+SchPlace("R1", left=20, top=20)
+SchPlace("D1", pin="A", to="R1.2", gap=2.54)
+
 NetReq("VCC", "GND", kind="power", volts=3.3, amps=0.05)
 NetReq("LED", kind="digital")

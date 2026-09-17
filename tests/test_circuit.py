@@ -71,13 +71,14 @@ def test_nc_may_float(tmp_path: Path):
     ldo = FIX / "ldo"
     board.write_text(
         f"""
-from pcbc import Board, Ground, Place, Power, load
+from pcbc import Board, Ground, Place, Power, SchPlace, load
 U = load({str(ldo)!r})
 VCC = Power("VCC")
 GND = Ground("GND")
 U("U1", VIN=VCC, VOUT=VCC, GND=GND, EN=VCC)
 Board(width=20, height=10, layers=2, stackup="jlcpcb_2l_1oz")
 Place("U1", at=(5, 5))
+SchPlace("U1", left=10, top=10)
 """
     )
     assert check_board(board) == []
@@ -111,16 +112,33 @@ Board(width=10, height=10, layers=2, stackup="jlcpcb_2l_1oz")
     assert any("R1: no Place()" in f for f in fails)
 
 
-def test_missing_lcsc(tmp_path: Path):
+def test_missing_schplace(tmp_path: Path):
     board = tmp_path / "board.py"
     board.write_text(
         """
 from pcbc import Board, Ground, Place, Power, Resistor
 VCC = Power("VCC")
 GND = Ground("GND")
+Resistor("R1", "1k", package="0402", mpn="X", lcsc="C1", p1=VCC, p2=GND)
+Board(width=10, height=10, layers=2, stackup="jlcpcb_2l_1oz")
+Place("R1", at=(5, 5))
+"""
+    )
+    fails = check_board(board)
+    assert any("R1: no SchPlace()" in f for f in fails)
+
+
+def test_missing_lcsc(tmp_path: Path):
+    board = tmp_path / "board.py"
+    board.write_text(
+        """
+from pcbc import Board, Ground, Place, Power, Resistor, SchPlace
+VCC = Power("VCC")
+GND = Ground("GND")
 Resistor("R1", "1k", package="0402", mpn="X", p1=VCC, p2=GND)
 Board(width=10, height=10, layers=2, stackup="jlcpcb_2l_1oz")
 Place("R1", at=(5, 5))
+SchPlace("R1", left=10, top=10)
 """
     )
     fails = check_board(board)

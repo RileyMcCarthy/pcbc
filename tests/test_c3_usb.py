@@ -1,7 +1,10 @@
 from pathlib import Path
 
+import pytest
+
 from pcbc.build import build_job
 from pcbc.language import check_board, load_board
+from pcbc.review import review_job
 
 BOARD = Path(__file__).resolve().parent.parent / "examples" / "c3_usb" / "c3_usb.py"
 
@@ -36,3 +39,21 @@ def test_c3_usb_upto_place(tmp_path: Path):
     sch = (layout / "schematic.kicad_sch").read_text()
     assert "USB_DP" in sch
     assert "power:GND" in sch
+
+
+@pytest.mark.kicad
+def test_c3_usb_review(tmp_path: Path):
+    import shutil
+
+    board = tmp_path / "c3_usb.py"
+    board.write_text(BOARD.read_text())
+    shutil.copytree(BOARD.parent / "components", tmp_path / "components")
+    built = build_job(board, upto="place", force=True)
+    assert built.get("error") is None, built
+    result = review_job(board, open_html=False)
+    html = Path(result["html"])
+    assert html.exists()
+    page = html.read_text()
+    assert 'data-tab="sch"' in page
+    assert 'data-tab="three"' in page
+    assert "USB_DP" in page or "J1" in page

@@ -144,7 +144,8 @@ def crop_svg_to_content(svg: str, *, pad_mm: float = 10.0, px_per_mm: float = 10
 
 
 def _best_pcb(layout: Path) -> Path | None:
-    for rel in ("routed/layout.kicad_pcb", "placed/layout.kicad_pcb", "layout.kicad_pcb"):
+    # CSS Place() is the layout. Segment-tree "route" is not a review surface.
+    for rel in ("placed/layout.kicad_pcb", "routed/layout.kicad_pcb", "layout.kicad_pcb"):
         p = layout / rel
         if p.exists():
             return p

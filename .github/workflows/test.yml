@@ -50,6 +50,8 @@ jobs:
           test -f examples/c3_usb/layout/c3_usb/schematic.kicad_sch
           test -f examples/c3_usb/layout/c3_usb/placed/layout.kicad_pcb
           grep -q USB_DP examples/c3_usb/layout/c3_usb/schematic.kicad_sch
+          pcbc review examples/c3_usb/c3_usb.py --no-open
+          test -f examples/c3_usb/layout/c3_usb/review/index.html
       - uses: actions/upload-artifact@v4
         with:
           name: blinky-fab
@@ -64,3 +66,12 @@ jobs:
             examples/blinky/layout/blinky/fab/cpl.csv
             examples/blinky/layout/blinky/fab/FAB_NOTES.md
             examples/blinky/layout/blinky/fab/*.drl
+      - uses: actions/upload-artifact@v4
+        with:
+          name: c3_usb-review
+          path: |
+            examples/c3_usb/layout/c3_usb/schematic.kicad_sch
+            examples/c3_usb/layout/c3_usb/placed/layout.kicad_pcb
+            examples/c3_usb/layout/c3_usb/review/index.html
+            examples/c3_usb/layout/c3_usb/review/board.glb
+            examples/c3_usb/layout/c3_usb/review/*.svg

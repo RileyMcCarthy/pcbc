@@ -28,6 +28,7 @@ pcbc build examples/blinky/blinky.py --force
 pcbc review examples/blinky/blinky.py   # schematic, copper, 3D in one HTML page
 pcbc check examples/c3_usb/c3_usb.py
 pcbc build examples/c3_usb/c3_usb.py --upto place --force
+pcbc review examples/c3_usb/c3_usb.py
 ```
 
 KiCad 10 `kicad-cli` is required for DRC and Gerbers. `pcb` (Zener) is not.

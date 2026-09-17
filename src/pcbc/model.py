@@ -145,6 +145,7 @@ class Part:
     kind: str = "ic"  # ic | generic | th
     origin: Path | None = None
     pins: dict[str, Pin] = field(default_factory=dict)
+    optional_pins: tuple[str, ...] = ()
 
     def __call__(self, ref: str, **pin_nets: object) -> Instance:
         from .circuit import instantiate

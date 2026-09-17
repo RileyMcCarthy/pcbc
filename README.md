@@ -12,7 +12,7 @@ pcbc build board.py           check → seed pcb → sch → place → route →
 
 | Fact | Lives in |
 |---|---|
-| Nets, MPN, LCSC, Place, board size | `board.py` |
+| Nets, MPN, LCSC, Place, board size | `board.py` (every part needs `Place()` — CSS, not auto-place) |
 | Pin **names** → pad numbers + artwork | `.kicad_sym` |
 | Land | `.kicad_mod` |
 | IC MPN / LCSC / which CAD files | `components/…/part.py` (no `pins=`) |
@@ -26,6 +26,8 @@ pip install -e ".[dev]"
 pcbc check examples/blinky/blinky.py
 pcbc build examples/blinky/blinky.py --force
 pcbc review examples/blinky/blinky.py   # schematic, copper, 3D in one HTML page
+pcbc check examples/c3_usb/c3_usb.py
+pcbc build examples/c3_usb/c3_usb.py --upto place --force
 ```
 
 KiCad 10 `kicad-cli` is required for DRC and Gerbers. `pcb` (Zener) is not.

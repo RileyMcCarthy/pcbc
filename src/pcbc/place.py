@@ -1,4 +1,4 @@
-"""Apply locked CSS poses. Unlocked parts need KRT (not in the blinky path)."""
+"""Every part is placed with CSS Place() — that pose is the layout."""
 
 from __future__ import annotations
 
@@ -15,7 +15,6 @@ def place_job(design: Design, seed: Path, *, out: Path) -> dict:
     job = compile_design(design)
     seed = Path(seed)
     out = Path(out)
-    unlocked = [p.ref for p in design.places if not p.locked]
     copy_with_siblings(seed, out)
     applied = apply_job(job, out, backup=False)
     fails = check_job(job, out)
@@ -25,12 +24,6 @@ def place_job(design: Design, seed: Path, *, out: Path) -> dict:
         "check": fails,
         "error": None,
     }
-    if unlocked:
-        result["error"] = (
-            "unlocked Place() needs KRT place_seed (not used for blinky). "
-            f"lock: {', '.join(unlocked)}"
-        )
-        return result
     if applied.get("missing"):
         result["error"] = "missing refs: " + ", ".join(applied["missing"])
     if fails:

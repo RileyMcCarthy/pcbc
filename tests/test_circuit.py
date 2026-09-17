@@ -71,12 +71,13 @@ def test_nc_may_float(tmp_path: Path):
     ldo = FIX / "ldo"
     board.write_text(
         f"""
-from pcbc import Board, Ground, Power, load
+from pcbc import Board, Ground, Place, Power, load
 U = load({str(ldo)!r})
 VCC = Power("VCC")
 GND = Ground("GND")
 U("U1", VIN=VCC, VOUT=VCC, GND=GND, EN=VCC)
 Board(width=20, height=10, layers=2, stackup="jlcpcb_2l_1oz")
+Place("U1", at=(5, 5))
 """
     )
     assert check_board(board) == []
@@ -95,15 +96,31 @@ def test_missing_board():
     assert any("no Board()" in f for f in fails)
 
 
-def test_missing_lcsc(tmp_path: Path):
+def test_missing_place(tmp_path: Path):
     board = tmp_path / "board.py"
     board.write_text(
         """
 from pcbc import Board, Ground, Power, Resistor
 VCC = Power("VCC")
 GND = Ground("GND")
+Resistor("R1", "1k", package="0402", mpn="X", lcsc="C1", p1=VCC, p2=GND)
+Board(width=10, height=10, layers=2, stackup="jlcpcb_2l_1oz")
+"""
+    )
+    fails = check_board(board)
+    assert any("R1: no Place()" in f for f in fails)
+
+
+def test_missing_lcsc(tmp_path: Path):
+    board = tmp_path / "board.py"
+    board.write_text(
+        """
+from pcbc import Board, Ground, Place, Power, Resistor
+VCC = Power("VCC")
+GND = Ground("GND")
 Resistor("R1", "1k", package="0402", mpn="X", p1=VCC, p2=GND)
 Board(width=10, height=10, layers=2, stackup="jlcpcb_2l_1oz")
+Place("R1", at=(5, 5))
 """
     )
     fails = check_board(board)
@@ -159,7 +176,7 @@ def test_usb_c_ok(tmp_path: Path):
     board = tmp_path / "board.py"
     board.write_text(
         f"""
-from pcbc import Board, Ground, Net, Power, Resistor, load
+from pcbc import Board, Ground, Net, Place, Power, Resistor, load
 J = load({str(usbc)!r})
 VBUS = Power("VBUS")
 GND = Ground("GND")
@@ -171,6 +188,9 @@ J("J1", VBUS=VBUS, GND=GND, DP1=DP, DP2=DP, DN1=DN, DN2=DN, CC1=CC1, CC2=CC2)
 Resistor("R1", "5.1k", package="0402", mpn="R", lcsc="C1", p1=CC1, p2=GND)
 Resistor("R2", "5.1k", package="0402", mpn="R", lcsc="C1", p1=CC2, p2=GND)
 Board(width=20, height=10, layers=2, stackup="jlcpcb_2l_1oz")
+Place("J1", at=(10, 8))
+Place("R1", at=(4, 4))
+Place("R2", at=(16, 4))
 """
     )
     assert check_board(board) == []

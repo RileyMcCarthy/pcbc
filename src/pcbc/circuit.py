@@ -71,6 +71,11 @@ def check_design(design: Design) -> list[str]:
             fails.append(f"{inst.ref} missing lcsc (JLC BOM needs it on SMT)")
         fails.extend(_usb_c_instance(inst))
 
+    placed = {p.ref for p in design.places}
+    for inst in design.instances:
+        if inst.ref not in placed:
+            fails.append(f"{inst.ref}: no Place() — every part is CSS-placed")
+
     if _has_usb_c(design) and not _has_cc_rd(design):
         fails.append("USB-C UFP needs 5.1 kΩ Rd on CC1 and CC2 to GND")
     return fails
@@ -170,6 +175,9 @@ def load_part(path: Path) -> Part:
         from .symbol import parse_symbol_pins
 
         part.pins = parse_symbol_pins(sym)
+        for name in part.optional_pins:
+            if name in part.pins:
+                part.pins[name].optional = True
     elif not part.pins:
         raise ValueError(
             f"{part.name}: package needs one .kicad_sym (that is the pin map)"
@@ -190,4 +198,5 @@ def _library_component(**kwargs) -> Part:
         package=str(kwargs.get("package") or ""),
         value=str(kwargs.get("value") or ""),
         kind=str(kwargs.get("kind") or "ic"),
+        optional_pins=tuple(str(n) for n in (kwargs.get("optional_pins") or ())),
     )

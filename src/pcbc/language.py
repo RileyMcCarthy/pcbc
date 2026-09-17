@@ -118,7 +118,7 @@ def Place(
     rot: float | None = None,
     rotate: float | None = None,
     side: str = "F",
-    locked: bool = False,
+    locked: bool = True,
     reason: str = "",
     position: str | None = None,
     style: str | None = None,

@@ -18,7 +18,7 @@ _PIN_AT = re.compile(r"\(at\s+([0-9.+-]+)\s+([0-9.+-]+)(?:\s+([0-9.+-]+))?\)")
 _PIN_LEN = re.compile(r"\(length\s+([0-9.+-]+)\)")
 _SYM_NAME = re.compile(r'\(symbol\s+"([^"]+)"')
 
-_OPTIONAL_NAMES = frozenset({"NC", "DNC", "EP", "PAD", "MP", "RSVD"})
+_OPTIONAL_NAMES = frozenset({"NC", "DNC"})
 _OPTIONAL_TYPES = frozenset({"no_connect"})
 
 

@@ -14,16 +14,13 @@ from .sexp import matching_paren, new_uuid
 from .symbol import extract_main_symbol, parse_symbol_pins_geom
 
 
-def is_power_net(name: str) -> bool:
-    n = (name or "").strip()
-    if not n or n.startswith("unconnected") or n.endswith(".NC"):
-        return False
-    u = n.upper()
-    if n.startswith("+") or n.startswith("-"):
-        return True
-    return u in {"GND", "VSS", "VBUS", "VIN", "VCC", "VDD", "3V3", "5V"} or u.startswith(
-        ("VCC", "VDD", "GND")
-    )
+def is_power_net(name: str, kinds: dict[str, str] | None = None) -> bool:
+    """True only if the board declared Power() or Ground() for this net."""
+    return (kinds or {}).get(name, "") in ("power", "ground")
+
+
+def is_ground_net(name: str, kinds: dict[str, str] | None = None) -> bool:
+    return (kinds or {}).get(name, "") == "ground"
 
 _FONT = 1.27
 _CHAR_W = 0.95
@@ -451,7 +448,7 @@ def _lib_vcc() -> str:
 """
 
 
-def _lib_box(lib_id: str, pins: list[PinDef], ref_prefix: str) -> str:
+def _lib_box(lib_id: str, pins: list[PinDef], ref_prefix: str, kinds: dict[str, str] | None = None) -> str:
     xs = [p.lx for p in pins] or [0.0]
     ys = [p.ly for p in pins] or [0.0]
     # Body inside pin tips.
@@ -463,7 +460,7 @@ def _lib_box(lib_id: str, pins: list[PinDef], ref_prefix: str) -> str:
             half_w = max(inward)
     pin_sexps = []
     for p in pins:
-        etype = "power_in" if is_power_net(p.net) else "unspecified"
+        etype = "power_in" if is_power_net(p.net, kinds) else "unspecified"
         pin_sexps.append(
             f"""				(pin {etype} line
 					(at {_fmt(p.lx)} {_fmt(p.ly)} {p.rot:g})
@@ -617,7 +614,7 @@ def _seg_hits_part(x0: float, y0: float, x1: float, y1: float, part: Part) -> bo
     return x_min <= mx <= x_max and y_min <= my <= y_max
 
 
-def _passive_chains(parts: list[Part]) -> list[list[Part]]:
+def _passive_chains(parts: list[Part], kinds: dict[str, str] | None = None) -> list[list[Part]]:
     """Paths of 2-pin passives that share a signal net — place them in a column."""
     passives = [p for p in parts if p.kind in ("r", "c", "l", "d")]
     by_ref = {p.ref: p for p in passives}
@@ -625,7 +622,7 @@ def _passive_chains(parts: list[Part]) -> list[list[Part]]:
     sites: dict[str, list[Part]] = defaultdict(list)
     for p in passives:
         for pin in p.pins:
-            if pin.net and not is_power_net(pin.net):
+            if pin.net and not is_power_net(pin.net, kinds):
                 sites[pin.net].append(p)
     for net, group in sites.items():
         uniq: list[Part] = []
@@ -640,18 +637,20 @@ def _passive_chains(parts: list[Part]) -> list[list[Part]]:
     remaining = {p.ref for p in passives}
     chains: list[list[Part]] = []
 
-    def has_rail(ref: str, want: str) -> bool:
-        u = want.upper()
+    def has_power(ref: str) -> bool:
         return any(
-            (pin.net or "").upper() == u or (u == "VCC" and is_power_net(pin.net or "") and "GND" not in (pin.net or "").upper())
+            is_power_net(pin.net or "", kinds) and not is_ground_net(pin.net or "", kinds)
             for pin in by_ref[ref].pins
         )
 
+    def has_ground(ref: str) -> bool:
+        return any(is_ground_net(pin.net or "", kinds) for pin in by_ref[ref].pins)
+
     while remaining:
         leaves = [r for r in remaining if len([n for n, _ in adj[r] if n in remaining]) <= 1]
-        start = next((r for r in leaves if has_rail(r, "VCC")), None)
+        start = next((r for r in leaves if has_power(r)), None)
         if start is None:
-            start = next((r for r in leaves if not has_rail(r, "GND")), None)
+            start = next((r for r in leaves if not has_ground(r)), None)
         if start is None:
             start = next(iter(leaves or remaining))
         path = [start]
@@ -662,28 +661,21 @@ def _passive_chains(parts: list[Part]) -> list[list[Part]]:
                 break
             path.append(nxt[0])
             remaining.remove(nxt[0])
-        # Prefer VCC/power at the start so the column reads top → bottom.
         ordered = [by_ref[r] for r in path]
-        if ordered and any(
-            is_power_net(pin.net or "") and "GND" not in (pin.net or "").upper()
-            for pin in ordered[-1].pins
-        ) and not any(
-            is_power_net(pin.net or "") and "GND" not in (pin.net or "").upper()
-            for pin in ordered[0].pins
-        ):
+        if ordered and has_power(ordered[-1].ref) and not has_power(ordered[0].ref):
             ordered.reverse()
         chains.append(ordered)
     return chains
 
 
-def _layout(parts: list[Part]) -> None:
+def _layout(parts: list[Part], kinds: dict[str, str] | None = None) -> None:
     """Compact placement. Each part once. Connected passives share a column."""
     for p in parts:
         p.placed = False
         p.rot = 0.0
     x = 25.4
     y_top = 25.4
-    for chain in _passive_chains(parts):
+    for chain in _passive_chains(parts, kinds):
         y = y_top
         for p in chain:
             p.x, p.y = _snap(x), _snap(y)
@@ -836,7 +828,7 @@ def _parts_from_design(design: Design) -> list[Part]:
     for inst in design.instances:
         pnets = _pad_nets(inst)
         prefix = (inst.part.prefix or inst.ref[:1] or "U").upper()[:1]
-        if prefix == "D" or inst.part.prefix == "D":
+        if inst.part.kind == "led":
             kind = "d"
             lib_id = "LED"
             pins = [
@@ -903,7 +895,7 @@ def _degree_parts(parts: list[Part]) -> dict[str, int]:
     return deg
 
 
-def _annotate(parts: list[Part], deg: dict[str, int]) -> list[str]:
+def _annotate(parts: list[Part], deg: dict[str, int], kinds: dict[str, str] | None = None) -> list[str]:
     """Wires, one label per 2-pin net, power hats. KiCad sheet +Y is up."""
     out: list[str] = []
     sites: dict[str, list[tuple[Part, PinDef, float, float]]] = defaultdict(list)
@@ -916,7 +908,7 @@ def _annotate(parts: list[Part], deg: dict[str, int]) -> list[str]:
 
     wired: set[str] = set()
     for net, pts in sites.items():
-        if is_power_net(net) or len(pts) != 2:
+        if is_power_net(net, kinds) or len(pts) != 2:
             continue
         (_, _, x0, y0), (_, _, x1, y1) = pts
         if any(
@@ -942,12 +934,12 @@ def _annotate(parts: list[Part], deg: dict[str, int]) -> list[str]:
             if not net or net.startswith("unconnected") or net.endswith(".NC"):
                 continue
             wx, wy = _pin_world(p, pin)
-            if is_power_net(net):
+            if is_power_net(net, kinds):
                 key = (p.ref, net)
                 if key in hats_done:
                     continue
                 hats_done.add(key)
-                gnd = net.upper() in ("GND", "VSS") or "GND" in net.upper()
+                gnd = is_ground_net(net, kinds)
                 # Whole library symbol on the pin (graphics + pin + name).
                 # Bodies are drawn VCC-up / GND-down; do not explode into wires.
                 out.append(_hat(net, wx, wy, gnd=gnd, rot=0))
@@ -970,8 +962,9 @@ def _annotate(parts: list[Part], deg: dict[str, int]) -> list[str]:
 
 
 def emit_from_design(design: Design, *, title: str = "") -> str:
+    kinds = {n.name: n.kind for n in design.nets.values()}
     parts = _parts_from_design(design)
-    _layout(parts)
+    _layout(parts, kinds)
     deg = _degree_parts(parts)
     libs = [_lib_gnd(), _lib_vcc(), _lib_r(), _lib_c(), _lib_l(), _lib_led()]
     seen_lib: set[str] = {"power:GND", "power:VCC", "GND", "VCC", "R", "C", "L", "LED"}
@@ -982,10 +975,10 @@ def emit_from_design(design: Design, *, title: str = "") -> str:
             libs.append(p.lib_sexp)
             seen_lib.add(p.lib_id)
         elif p.kind == "box":
-            libs.append(_lib_box(p.lib_id, p.pins, p.ref[:1] or "U"))
+            libs.append(_lib_box(p.lib_id, p.pins, p.ref[:1] or "U", kinds))
             seen_lib.add(p.lib_id)
     body: list[str] = [_instance(p) for p in parts]
-    body.extend(_annotate(parts, deg))
+    body.extend(_annotate(parts, deg, kinds))
     max_x = max((p.x + p.hw + 20 for p in parts), default=100)
     max_y = max((p.y + p.hh + 20 for p in parts), default=80)
     paper = "A4" if max_x < 280 and max_y < 190 else "A3" if max_x < 400 else "A2"

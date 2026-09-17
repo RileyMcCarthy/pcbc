@@ -370,7 +370,7 @@ def Led(
         footprint="",
         package=package,
         value=color or "LED",
-        kind="generic",
+        kind="led",
         pins={
             "K": Pin(name="K", pads=("1",)),
             "A": Pin(name="A", pads=("2",)),

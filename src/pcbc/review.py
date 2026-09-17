@@ -21,10 +21,24 @@ from .sch_emit import emit_schematic_file
 from .silk import silk_job
 
 
+def _kicad_3d_dir() -> Path | None:
+    for key in ("KICAD10_3DMODEL_DIR", "KICAD_3DMODEL_DIR"):
+        raw = os.environ.get(key)
+        if raw and Path(raw).is_dir():
+            return Path(raw)
+    for candidate in (
+        Path("/usr/share/kicad/3dmodels"),
+        Path("/Applications/KiCad/KiCad.app/Contents/SharedSupport/3dmodels"),
+    ):
+        if candidate.is_dir():
+            return candidate
+    return None
+
+
 def _kicad_env() -> dict[str, str]:
     env = os.environ.copy()
-    models = Path("/Applications/KiCad/KiCad.app/Contents/SharedSupport/3dmodels")
-    if models.is_dir():
+    models = _kicad_3d_dir()
+    if models is not None:
         env.setdefault("KICAD10_3DMODEL_DIR", str(models))
         env.setdefault("KICAD_3DMODEL_DIR", str(models))
     return env
@@ -62,31 +76,27 @@ def _export_svg(cli: Path, pcb: Path, out: Path, layers: str, *, mirror: bool = 
 
 
 def _export_glb(cli: Path, pcb: Path, out: Path) -> dict:
-    models = os.environ.get(
-        "KICAD10_3DMODEL_DIR",
-        "/Applications/KiCad/KiCad.app/Contents/SharedSupport/3dmodels",
-    )
-    return _run(
-        [
-            str(cli),
-            "pcb",
-            "export",
-            "glb",
-            "--force",
-            "--subst-models",
-            "--include-tracks",
-            "--include-pads",
-            "--include-zones",
-            "--include-silkscreen",
-            "--include-soldermask",
-            "--no-dnp",
-            "-D",
-            f"KICAD10_3DMODEL_DIR={models}",
-            "-o",
-            str(out),
-            str(pcb),
-        ]
-    )
+    cmd = [
+        str(cli),
+        "pcb",
+        "export",
+        "glb",
+        "--force",
+        "--subst-models",
+        "--include-tracks",
+        "--include-pads",
+        "--include-zones",
+        "--include-silkscreen",
+        "--include-soldermask",
+        "--no-dnp",
+        "-o",
+        str(out),
+        str(pcb),
+    ]
+    models = _kicad_3d_dir()
+    if models is not None:
+        cmd[cmd.index("-o"):0] = ["-D", f"KICAD10_3DMODEL_DIR={models}"]
+    return _run(cmd)
 
 
 def _export_sch_svg(cli: Path, sch: Path, out_dir: Path) -> dict:

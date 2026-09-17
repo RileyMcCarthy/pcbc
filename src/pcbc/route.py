@@ -1,4 +1,4 @@
-"""Straight F.Cu segments for 2-pin nets. Enough for blinky without KRT."""
+"""Straight F.Cu segments connecting pads of the same net."""
 
 from __future__ import annotations
 

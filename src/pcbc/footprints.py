@@ -35,7 +35,7 @@ def generic_mod(prefix: str, package: str) -> Path:
 
 
 def footprint_path(part: Part) -> Path:
-    if part.kind == "generic":
+    if part.kind in ("generic", "led"):
         return generic_mod(part.prefix, part.package)
     if part.origin and part.footprint:
         p = part.origin / part.footprint

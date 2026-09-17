@@ -27,11 +27,16 @@ from .sexp import (
 
 
 def kicad_cli() -> Path:
-    mac = Path("/Applications/KiCad/KiCad.app/Contents/MacOS/kicad-cli")
-    if mac.exists():
-        return mac
     found = shutil.which("kicad-cli")
-    return Path(found) if found else Path("kicad-cli")
+    if found:
+        return Path(found)
+    for candidate in (
+        Path("/usr/bin/kicad-cli"),
+        Path("/Applications/KiCad/KiCad.app/Contents/MacOS/kicad-cli"),
+    ):
+        if candidate.exists():
+            return candidate
+    return Path("kicad-cli")
 
 
 def _default_fab_dir(pcb: Path) -> Path:
@@ -376,10 +381,9 @@ def _run(cmd: list[str]) -> dict:
     }
 
 
-# Silk / dangling vias from unfilled zones. Same-footprint pad-pad shorts are
-# KiCad AABB on rotated modules (ESP32-C6-MINI-1 at 90°) — check_drc.py owns
-# those. diff_pair_gap is ignored as a leftover if KRT rewrote .kicad_dru;
-# fab restores the compiled 2-layer USB 0.10/0.10 rule before DRC.
+# Silk / dangling vias from unfilled zones. Same-footprint pad-pad is a KiCad
+# AABB false short on rotated modules — DRC owns those. diff_pair_gap is
+# ignored if a router rewrote .kicad_dru; fab restores compiled classes.
 _IGNORE_DRC = {
     "silk_overlap",
     "silk_over_copper",

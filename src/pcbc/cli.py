@@ -16,7 +16,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--version", action="version", version=f"pcbc {__version__}")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    ck = sub.add_parser("check", help="Load board.py; unbound pins / USB / LCSC")
+    ck = sub.add_parser("check", help="Load board.py; unbound pins, Place(), LCSC")
     ck.add_argument("board")
     ck.set_defaults(func=cmd_check)
 

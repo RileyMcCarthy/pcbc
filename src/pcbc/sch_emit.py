@@ -471,8 +471,7 @@ def _lib_box(lib_id: str, pins: list[PinDef], ref_prefix: str, kinds: dict[str, 
 				)
 """
         )
-    show_numbers = any(p.name != p.number for p in pins)
-    hide_nums = "no" if show_numbers else "yes"
+    hide_nums = "yes"
     hide_names = "no"
     return f"""		(symbol "{lib_id}"
 			(pin_names (offset 1.016) (hide {hide_names}))
@@ -824,7 +823,47 @@ def _pad_nets(inst) -> dict[str, str]:
     return out
 
 
-def _parts_from_design(design: Design) -> list[Part]:
+def _compact_connected_box(pins: list[PinDef]) -> tuple[list[PinDef], float, float]:
+    """One pin per connected name; NC/unbound dropped. Compact left/right box."""
+    uniq: list[PinDef] = []
+    seen: set[str] = set()
+    for p in pins:
+        if not p.net or p.net.startswith("unconnected"):
+            continue
+        if p.name.upper() in ("NC", "DNC"):
+            continue
+        if p.name in seen:
+            continue
+        seen.add(p.name)
+        uniq.append(PinDef(p.number, p.name, p.lx, p.ly, p.rot, p.net))
+    if not uniq:
+        uniq = [PinDef("1", "1", -15.24, 0.0, 0.0, "")]
+    left = [p for p in uniq if p.lx <= 0]
+    right = [p for p in uniq if p.lx > 0]
+    if not left:
+        mid = (len(right) + 1) // 2
+        left, right = right[:mid], right[mid:]
+    if not right:
+        mid = (len(left) + 1) // 2
+        left, right = left[:mid], left[mid:]
+    pitch = _PITCH
+    n = max(len(left), len(right), 1)
+    hw = 7.62 if len(uniq) <= 4 else 11.43
+    hh = max((n - 1) * pitch / 2 + 2.54, 5.08)
+    tip = hw + _PIN_LEN
+
+    def place(side: list[PinDef], x_tip: float, rot: float) -> None:
+        for i, p in enumerate(side):
+            p.lx = x_tip
+            p.ly = (len(side) - 1) * pitch / 2 - i * pitch
+            p.rot = rot
+
+    place(left, -tip, 0.0)
+    place(right, tip, 180.0)
+    return uniq, hw, hh
+
+
+def _parts_from_design(design: Design, kinds: dict[str, str] | None = None) -> list[Part]:
     parts: list[Part] = []
     for inst in design.instances:
         pnets = _pad_nets(inst)
@@ -848,11 +887,10 @@ def _parts_from_design(design: Design) -> list[Part]:
             kind = "box"
             lib_sexp = None
             lib_id = re.sub(r"[^A-Za-z0-9_.-]", "_", inst.part.name)[:40]
-            pins: list[PinDef] = []
+            pins = []
             sp = symbol_path(inst.part)
             if sp and sp.exists():
-                lib_id, raw = extract_main_symbol(sp.read_text())
-                lib_sexp = "\t\t" + raw.replace("\n", "\n\t\t") + "\n"
+                lib_id, _raw = extract_main_symbol(sp.read_text())
                 for gp in parse_symbol_pins_geom(sp):
                     pins.append(
                         PinDef(
@@ -866,10 +904,7 @@ def _parts_from_design(design: Design) -> list[Part]:
                     )
             if not pins:
                 pins = _box_pins(pnets, {})
-            xs = [abs(p.lx) for p in pins]
-            ys = [abs(p.ly) for p in pins]
-            hw = (max(xs) if xs else 16.0) + 2.0
-            hh = (max(ys) if ys else 8.0) + 2.0
+            pins, hw, hh = _compact_connected_box(pins)
         parts.append(
             Part(
                 ref=inst.ref,
@@ -947,14 +982,24 @@ def _annotate(parts: list[Part], deg: dict[str, int], kinds: dict[str, str] | No
                 continue
             if net in wired or deg.get(net, 0) < 2:
                 continue
+            if pin.name == net:
+                continue
             key = (p.ref, net)
             if key in labels_done:
                 continue
-            length = min(max(2.54, _text_w(net) * 0.6), 5.08)
-            dx, dy = _stub_delta(pin.rot + p.rot, length)
-            sx, sy = wx + dx, wy + dy
-            if any(_seg_hits_part(wx, wy, sx, sy, o) and o.ref != p.ref for o in parts):
-                continue
+            length = 5.08
+            dx, dy = _stub_delta(pin.rot + p.rot, 1.0)
+            n = math.hypot(dx, dy) or 1.0
+            sx, sy = wx + dx / n * length, wy + dy / n * length
+            if any(
+                o.kind == "box"
+                and o.ref != p.ref
+                and abs(sx - o.x) <= o.hw + 1
+                and abs(sy - o.y) <= o.hh + 1
+                for o in parts
+            ):
+                sx += dx / n * 5.08
+                sy += dy / n * 5.08
             labels_done.add(key)
             rot, just = _underline_pose(dx, dy)
             out.append(_wire(wx, wy, sx, sy))
@@ -985,7 +1030,7 @@ def _manhattan(
 
 def emit_from_design(design: Design, *, title: str = "") -> str:
     kinds = {n.name: n.kind for n in design.nets.values()}
-    parts = _parts_from_design(design)
+    parts = _parts_from_design(design, kinds)
     apply_sch_places(design, parts)
     deg = _degree_parts(parts)
     libs = [_lib_gnd(), _lib_vcc(), _lib_r(), _lib_c(), _lib_l(), _lib_led()]

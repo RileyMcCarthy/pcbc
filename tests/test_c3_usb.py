@@ -22,6 +22,19 @@ def test_c3_usb_check():
     assert u1.pins["IO19"] == "USB_DP"
 
 
+def test_c3_usb_schematic_hides_unbound_mcu_pins():
+    from pcbc.sch_emit import _parts_from_design
+
+    d = load_board(BOARD)
+    kinds = {n.name: n.kind for n in d.nets.values()}
+    parts = _parts_from_design(d, kinds)
+    u1 = next(p for p in parts if p.ref == "U1")
+    names = {p.name for p in u1.pins}
+    assert "IO0" not in names
+    assert "EN" in names and "IO19" in names
+    assert len(u1.pins) <= 12
+
+
 def test_c3_usb_upto_place(tmp_path: Path):
     board = tmp_path / "c3_usb.py"
     board.write_text(BOARD.read_text())

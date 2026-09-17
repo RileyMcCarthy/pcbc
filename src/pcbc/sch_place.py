@@ -89,56 +89,93 @@ def _apply_css(spec: SchPlaceSpec, part, regions: dict[str, Rect]) -> None:
     part.placed = True
 
 
+def _body(part) -> tuple[float, float, float, float]:
+    return (
+        part.x - part.hw,
+        part.y - part.hh,
+        part.x + part.hw,
+        part.y + part.hh,
+    )
+
+
+def _apply_along(spec: SchPlaceSpec, part, other, occupied: list) -> None:
+    gap = float(spec.gap)
+    if spec.rotate_set:
+        part.rot = float(spec.rot)
+    elif part.kind in ("r", "c", "l", "d"):
+        part.rot = other.rot
+    else:
+        part.rot = 0.0
+    step_x = other.hw + part.hw + gap
+    step_y = other.hh + part.hh + gap
+    for dx, dy in ((0.0, 1.0), (0.0, -1.0), (1.0, 0.0), (-1.0, 0.0)):
+        part.x = other.x + dx * step_x
+        part.y = other.y + dy * step_y
+        if not any(_overlap(part, o) for o in occupied):
+            part.placed = True
+            return
+    part.x = other.x
+    part.y = other.y + step_y
+    part.placed = True
+
+
 def _apply_attach(spec: SchPlaceSpec, part, other, other_pin_name: str, occupied: list) -> None:
+    if spec.along:
+        _apply_along(spec, part, other, occupied)
+        return
     op = _find_pin(other, other_pin_name)
     ox, oy = pin_world(other, op)
-    odx, ody = _outward(other, op)
     gap = float(spec.gap)
     our_name = spec.pin or ("1" if any(p.number == "1" for p in part.pins) else part.pins[0].number)
     our = _find_pin(part, our_name)
 
+    lx, ly = _rot_xy(op.lx, op.ly, other.rot)
+    bx0, by0, bx1, by1 = _body(other)
+    if abs(lx) >= abs(ly):
+        if lx < 0:
+            base_x, base_y, face, step = bx0 - gap, oy, (1.0, 0.0), (-1.0, 0.0)
+        else:
+            base_x, base_y, face, step = bx1 + gap, oy, (-1.0, 0.0), (1.0, 0.0)
+    else:
+        if ly < 0:
+            base_x, base_y, face, step = ox, by0 - gap, (0.0, 1.0), (0.0, -1.0)
+        else:
+            base_x, base_y, face, step = ox, by1 + gap, (0.0, -1.0), (0.0, 1.0)
+
     if spec.rotate_set:
         part.rot = float(spec.rot)
-    elif spec.along:
-        part.rot = other.rot
     elif part.kind in ("r", "c", "l", "d"):
-        part.rot = _best_rot(our, (-odx, -ody))
+        part.rot = _best_rot(our, face)
 
-    dirs = [(odx, ody), (-odx, -ody)]
-    if spec.along:
-        dirs = [(0.0, 1.0), (0.0, -1.0), (1.0, 0.0), (-1.0, 0.0)]
-    if spec.align == "x":
-        dirs = [(0.0, 1.0 if ody >= 0 else -1.0), (0.0, -1.0)]
-    elif spec.align == "y":
-        dirs = [(1.0 if odx >= 0 else -1.0, 0.0), (-1.0, 0.0)]
-
-    chosen = None
-    for dx, dy in dirs:
-        n = math.hypot(dx, dy) or 1.0
-        dx, dy = dx / n, dy / n
-        for step in range(0, 36):
-            g = gap + step * 1.27
-            tx, ty = ox + dx * g, oy + dy * g
-            lx, ly = _rot_xy(our.lx, our.ly, part.rot)
-            part.x, part.y = tx - lx, ty - ly
-            if not any(_overlap(part, o) for o in occupied):
-                chosen = True
-                break
-        if chosen:
+    chosen = False
+    for i in range(24):
+        tx = base_x + step[0] * i * 1.27
+        ty = base_y + step[1] * i * 1.27
+        plx, ply = _rot_xy(our.lx, our.ly, part.rot)
+        part.x, part.y = tx - plx, ty - ply
+        if not any(_overlap(part, o) for o in occupied):
+            chosen = True
             break
     if not chosen:
-        lx, ly = _rot_xy(our.lx, our.ly, part.rot)
-        part.x = ox + odx * (gap + 12.7) - lx
-        part.y = oy + ody * (gap + 12.7) - ly
+        plx, ply = _rot_xy(our.lx, our.ly, part.rot)
+        part.x = base_x + step[0] * 12.7 - plx
+        part.y = base_y + step[1] * 12.7 - ply
     part.placed = True
 
 
+def _reach(p) -> tuple[float, float]:
+    extra = 3.81 if p.kind == "box" else 0.0
+    return p.hw + extra, p.hh + extra
+
+
 def _overlap(a, b, pad: float = 1.27) -> bool:
+    aw, ah = _reach(a)
+    bw, bh = _reach(b)
     return not (
-        a.x + a.hw + pad < b.x - b.hw
-        or b.x + b.hw + pad < a.x - a.hw
-        or a.y + a.hh + pad < b.y - b.hh
-        or b.y + b.hh + pad < a.y - a.hh
+        a.x + aw + pad < b.x - bw
+        or b.x + bw + pad < a.x - aw
+        or a.y + ah + pad < b.y - bh
+        or b.y + bh + pad < a.y - ah
     )
 
 

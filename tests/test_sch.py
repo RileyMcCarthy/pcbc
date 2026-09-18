@@ -121,6 +121,20 @@ def test_along_with_side_turns_to_face_the_sibling():
     assert abs(top[0] - node[0]) < 0.01 and top[1] > node[1]
 
 
+def test_gap_defaults_to_room_for_the_label():
+    from pcbc.sch_place import _auto_gap
+
+    by = _placed(C3_USB)
+    r_boot, u1 = by["R_BOOT"], by["U1"]
+    boot = pin_world(r_boot, next(p for p in r_boot.pins if p.net == "BOOT"))
+    io9 = pin_world(u1, next(p for p in u1.pins if p.name == "IO9"))
+    boot_pin = next(p for p in r_boot.pins if p.net == "BOOT")
+    assert _auto_gap(r_boot, boot_pin, u1, {}) == 10.16  # off an IC: room to hang things
+    assert io9[0] - boot[0] > 10.16 - 1e-6
+    assert _auto_gap(r_boot, boot_pin, by["R_EN"], {}) == 7.62  # "BOOT" label on the wire
+    assert _auto_gap(r_boot, next(p for p in r_boot.pins if p.net == "3V3"), by["R_EN"], {"3V3": "power"}) == 5.08
+
+
 def test_ic_stays_upright_when_attached():
     assert _placed(C3_USB)["U3"].rot == 0.0
 

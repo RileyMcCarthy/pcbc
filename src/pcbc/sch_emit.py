@@ -1078,17 +1078,28 @@ class _Sheet:
         self.cores = [core_aabb(p) for p in parts]
         self.segs: list[tuple[float, float, float, float, str]] = []
         self.occupants: list[_Occupant] = []
+        # Label anchors and power-symbol pins: a wire through or onto one connects.
+        self.anchors: list[tuple[float, float, str]] = []
 
     # -- connectivity --------------------------------------------------------
     def on_pin_end(self, x: float, y: float) -> bool:
         return any(_near(x, y, px, py) for px, py in self.pin_ends)
 
+    def anchor(self, x: float, y: float, net: str) -> None:
+        self.anchors.append((x, y, net))
+
     def segment_ok(self, x0: float, y0: float, x1: float, y1: float, net: str = "") -> bool:
-        """Interior off every pin end and every symbol's graphics, and no contact
-        with another net's wire other than a plain crossing (KiCad joins
-        collinear wires that touch, and a T without a junction misleads)."""
+        """Interior off every pin end, every label anchor and every symbol's
+        graphics, and no contact with another net's wire other than a plain
+        crossing (KiCad joins collinear wires that touch, and a T without a
+        junction misleads)."""
         if any(_inside_segment(px, py, x0, y0, x1, y1) for px, py in self.pin_ends):
             return False
+        for ax, ay, anet in self.anchors:
+            if anet == net:
+                continue
+            if _inside_segment(ax, ay, x0, y0, x1, y1) or _near(ax, ay, x0, y0) or _near(ax, ay, x1, y1):
+                return False
         if any(_segment_crosses_box(x0, y0, x1, y1, box) for box in self.cores):
             return False
         for sx0, sy0, sx1, sy1, snet in self.segs:
@@ -1105,6 +1116,8 @@ class _Sheet:
     def point_free(self, x: float, y: float, net: str) -> bool:
         """A bend, stub end or label anchor may not touch another net."""
         if self.on_pin_end(x, y):
+            return False
+        if any(anet != net and _near(x, y, ax, ay) for ax, ay, anet in self.anchors):
             return False
         for sx0, sy0, sx1, sy1, snet in self.segs:
             if snet == net:
@@ -1325,6 +1338,7 @@ def _place_hat(sheet: _Sheet, members: list[_Site], net: str, gnd: bool) -> list
     out = sheet.add(pts, net) if len(pts) > 1 else []
     out.append(_hat(net, hx, hy, gnd=gnd, rot=rot))
     sheet.occupy(_hat_box(net, hx, hy, gnd, rot), "hat", s.part.ref, net)
+    sheet.anchor(hx, hy, net)
     return out
 
 
@@ -1346,12 +1360,14 @@ def _place_stub_label(sheet: _Sheet, s: _Site, net: str) -> list[str]:
     if best is None:
         box = _label_box(net, s.x, s.y, rot, just, "bottom")
         sheet.occupy(box, "label", f"{s.part.ref}.{s.pin.number}", net)
+        sheet.anchor(s.x, s.y, net)
         return [_label(net, s.x, s.y, rot, just)]
     length = best[1]
     ex, ey = s.x + ox * length, s.y + oy * length
     out = sheet.add([(s.x, s.y), (ex, ey)], net)
     out.append(_label(net, ex, ey, rot, just))
     sheet.occupy(_label_box(net, ex, ey, rot, just, "bottom"), "label", f"{s.part.ref}.{s.pin.number}", net)
+    sheet.anchor(ex, ey, net)
     return out
 
 
@@ -1381,6 +1397,7 @@ def _place_wire_label(sheet: _Sheet, segs: list[Box], net: str, owner: str) -> l
         return []
     _c, mx, my, rot, vjust = best
     sheet.occupy(_label_box(net, mx, my, rot, "left", vjust), "label", owner, net)
+    sheet.anchor(mx, my, net)
     return [_label(net, mx, my, rot, "left", vjust)]
 
 
@@ -1423,6 +1440,16 @@ def _lint(
 ) -> dict:
     """What still hurts readability, as things an AI can act on by moving parts."""
     issues: list[str] = []
+    for p in parts:
+        if p.kind != "box":
+            continue
+        wide = [pin.number for pin in p.pins if _text_w(pin.number) > pin.length + 0.5]
+        if wide:
+            shown = ", ".join(wide[:4]) + (", ..." if len(wide) > 4 else "")
+            issues.append(
+                f"{p.ref}: pin numbers {shown} are wider than their {p.pins[0].length:g} mm pins "
+                f"and print into the body - that is the .kicad_sym; lengthen the pins or hide numbers"
+            )
     for i, a in enumerate(parts):
         for b in parts[i + 1 :]:
             if _overlap_area(body_aabb(a), body_aabb(b)) > 0.0:

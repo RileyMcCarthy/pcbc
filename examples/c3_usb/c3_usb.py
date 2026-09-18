@@ -245,33 +245,34 @@ Place("C_MCU", position="absolute", left=18, top=8)
 Place("C_MCU_HF", position="absolute", left=22, top=8)
 
 # Schematic. CSS parks the multi-pin symbols; everything else hangs off a pin:
-# to="U1.EN" puts the pin that shares that net next to it, along= stacks beside
-# a sibling, side= says which way. Wires, labels and power symbols are drawn
-# from the netlist - nothing here can change what connects.
+# to="U1.EN" puts the pin that shares that net in line with it, along= stacks
+# beside a sibling, side= says which way. The tool picks the distance (room
+# for the net's label) and draws wires, labels and power symbols from the
+# netlist - nothing here can change what connects.
 SchRegion("usb", left=12, top=10, width=180, height=115)
 SchPlace("J1", parent="usb", left=90, top=12)
-SchPlace("R_CC1", to="J1.CC1", gap=7.62)
-SchPlace("R_CC2", to="J1.CC2", gap=7.62)
+SchPlace("R_CC1", to="J1.CC1")
+SchPlace("R_CC2", to="J1.CC2")
 SchPlace("U3", to="J1.DP1", side="bottom", gap=15.24)
 
 SchRegion("pwr", left=210, top=10, width=155, height=115)
 SchPlace("U2", parent="pwr", left=55, top=28)
-SchPlace("C_VBUS", to="U2.VIN", gap=10.16)
-SchPlace("C_VBUS_HF", along="C_VBUS.1", side="bottom", gap=5.08)
-SchPlace("C_3V3", to="U2.VOUT", gap=10.16)
-SchPlace("C_3V3_HF", along="C_3V3.1", side="bottom", gap=5.08)
+SchPlace("C_VBUS", to="U2.VIN")
+SchPlace("C_VBUS_HF", along="C_VBUS.1", side="bottom")
+SchPlace("C_3V3", to="U2.VOUT")
+SchPlace("C_3V3_HF", along="C_3V3.1", side="bottom")
 
 SchRegion("mcu", left=12, top=140, width=380, height=145)
 SchPlace("U1", parent="mcu", left=185, top=10)
-SchPlace("C_MCU", to="U1.3V3", gap=12.7)
-SchPlace("C_MCU_HF", along="C_MCU.1", side="bottom", gap=5.08)
-SchPlace("R_EN", to="U1.EN", gap=12.7)
-SchPlace("C_EN", along="R_EN.2", side="bottom", gap=5.08)
-SchPlace("SW_RST", along="C_EN.1", side="left", gap=7.62)
-SchPlace("R_BOOT", to="U1.IO9", gap=12.7)
-SchPlace("SW_BOOT", along="R_BOOT.2", side="bottom", gap=7.62)
-SchPlace("R_LED", to="U1.IO10", gap=12.7)
-SchPlace("D1", to="R_LED.2", gap=7.62)
+SchPlace("C_MCU", to="U1.3V3")
+SchPlace("C_MCU_HF", along="C_MCU.1", side="bottom")
+SchPlace("R_EN", to="U1.EN")
+SchPlace("C_EN", along="R_EN.2", side="bottom")
+SchPlace("SW_RST", along="C_EN.1", side="left")
+SchPlace("R_BOOT", to="U1.IO9")
+SchPlace("SW_BOOT", along="R_BOOT.2", side="bottom")
+SchPlace("R_LED", to="U1.IO10")
+SchPlace("D1", to="R_LED.2")
 
 NetReq("USB_DP", "USB_DN", kind="usb_hs", z_diff_ohm=90, pair=True)
 NetReq("VBUS", "3V3", "GND", kind="power", volts=3.3, amps=0.5)

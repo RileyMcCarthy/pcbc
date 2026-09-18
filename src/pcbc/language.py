@@ -259,7 +259,7 @@ def SchPlace(
     pin: str | None = None,
     to: str | None = None,
     along: str | None = None,
-    gap: float = 5.08,
+    gap: float | None = None,
     align: str | None = None,
     side: str | None = None,
     rotate: float | None = None,
@@ -271,10 +271,12 @@ def SchPlace(
 ) -> SchPlaceSpec:
     """Schematic pose. CSS parks a body; to=/along= hangs the part off another pin.
 
-    ``to="U1.EN"`` puts the pin of this part that shares U1.EN's net next to it;
-    ``pin=`` only when a different pin should go there. ``along="C1.1"`` stacks
-    beside that part instead. Library symbols are used as-is. ``side`` is
-    ``left``/``right``/``top``/``bottom`` (CSS sense: top is the smaller sheet Y).
+    ``to="U1.EN"`` puts the pin of this part that shares U1.EN's net in line with
+    it; ``pin=`` only when a different pin should go there. ``along="C1.1"``
+    stacks beside that part instead. ``side`` is ``left``/``right``/``top``/
+    ``bottom`` (CSS sense: top is the smaller sheet Y). ``gap`` (mm, pin to pin)
+    is chosen by the tool unless given: room for the net's label, else the grid
+    minimum. Library symbols are used as-is.
     """
     who = f"SchPlace({ref!r})"
     if "gap" in css:
@@ -287,7 +289,7 @@ def SchPlace(
         pin=pin,
         to=to,
         along=along,
-        gap=float(gap),
+        gap=float(gap) if gap is not None else None,
         align=align,
         side=side,
         reason=reason,

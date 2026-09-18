@@ -177,8 +177,27 @@ def core_aabb(part) -> tuple[float, float, float, float]:
     return _aabb_of(part, box)
 
 
-def _apply_along(spec: SchPlaceSpec, part, other, occupied: list) -> None:
-    gap = float(spec.gap)
+_GRID = 1.27
+
+
+def _auto_gap(part, our, other, kinds: dict[str, str] | None) -> float:
+    """Pin-to-pin distance when the board file gives none.
+
+    Off an IC pin: 10.16 mm, room for a label on the wire and for whatever
+    else hangs off that node (a second cap, its symbol, its text). Off another
+    2-pin part: just enough wire for the net's label, or the grid minimum for
+    a power net (its symbol goes on the far pin instead).
+    """
+    net = getattr(our, "net", "") or ""
+    power = (kinds or {}).get(net, "net") in ("power", "ground")
+    need = 2.54 if power else max(len(net), 1) * 1.27 * 0.95 + 2.54
+    need = max(5.08, math.ceil(need / _GRID) * _GRID)
+    if getattr(other, "kind", "") == "box" or part.kind not in ("r", "c", "l", "d"):
+        return max(10.16, need)
+    return need
+
+
+def _apply_along(spec: SchPlaceSpec, part, other, occupied: list, kinds=None) -> None:
     side = spec.side if spec.side in _SIDES else "bottom"
     sx, sy = _SIDES[side]
     ox0, oy0, ox1, oy1 = world_aabb(other)
@@ -194,6 +213,7 @@ def _apply_along(spec: SchPlaceSpec, part, other, occupied: list) -> None:
     else:
         part.rot = 0.0
     our = _attach_pin(spec, part, other, op)
+    gap = float(spec.gap) if spec.gap is not None else _auto_gap(part, our, other, kinds)
     plx, ply = lib_to_sheet(our.lx, our.ly, part.rot)
     facing = bool(spec.side) and part.kind in ("r", "c", "l", "d") and not spec.rotate_set
     for i in range(24):
@@ -230,13 +250,12 @@ def _apply_along(spec: SchPlaceSpec, part, other, occupied: list) -> None:
     part.placed = True
 
 
-def _apply_attach(spec: SchPlaceSpec, part, other, other_pin_name: str, occupied: list) -> None:
+def _apply_attach(spec: SchPlaceSpec, part, other, other_pin_name: str, occupied: list, kinds=None) -> None:
     if spec.along:
-        _apply_along(spec, part, other, occupied)
+        _apply_along(spec, part, other, occupied, kinds)
         return
     op = _find_pin(other, other_pin_name)
     ox, oy = pin_world(other, op)
-    gap = float(spec.gap)
 
     if spec.side and spec.side in _SIDES:
         step = _SIDES[spec.side]
@@ -247,6 +266,7 @@ def _apply_attach(spec: SchPlaceSpec, part, other, other_pin_name: str, occupied
     face = (-step[0], -step[1])
     part.rot = float(spec.rot) if spec.rotate_set else 0.0
     our = _attach_pin(spec, part, other, op, face)
+    gap = float(spec.gap) if spec.gap is not None else _auto_gap(part, our, other, kinds)
 
     if spec.rotate_set:
         part.rot = float(spec.rot)
@@ -314,6 +334,7 @@ def apply_sch_places(design: Design, parts: list) -> None:
         raise ValueError("SchPlace() for unknown ref " + ", ".join(extra))
 
     regions = resolve_regions(SHEET, design.sch_regions)
+    kinds = {n.name: n.kind for n in design.nets.values()}
     placed: set[str] = set()
 
     for spec in design.sch_places:
@@ -348,6 +369,7 @@ def apply_sch_places(design: Design, parts: list) -> None:
                 by_ref[tref],
                 tpin,
                 [by_ref[r] for r in placed],
+                kinds,
             )
             placed.add(spec.ref)
         if len(nxt) == len(pending) and nxt:

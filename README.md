@@ -23,13 +23,13 @@ Schematic symbols come from `.kicad_sym` **as-is** (no compact rewrite). `SchPla
 
 ```python
 SchPlace("U1", parent="mcu", left=150, top=20)   # CSS: ICs / connectors
-SchPlace("C1", to="U1.3V3", gap=10.16)           # the pin of C1 on U1.3V3's net goes next to it
+SchPlace("C1", to="U1.3V3")                      # the pin of C1 on U1.3V3's net, in line with it
 SchPlace("C2", along="C1.1", side="bottom")      # hang under that node, turned to face it
 SchPlace("SW1", along="C2.1", side="left")       # beside it, facing it
-SchPlace("U3", to="J1.DP1", side="left")         # an IC parks on a face, upright
+SchPlace("U3", to="J1.DP1", side="bottom")       # an IC parks on a face, upright
 ```
 
-`pin=` is only for hanging a pin that is *not* on the target's net; `rotate=` only to override the orientation the tool picks.
+The tool picks the distance (room for the net's label on the wire); `gap=` only to override it. `pin=` is only for hanging a pin that is *not* on the target's net; `rotate=` only to override the orientation the tool picks.
 
 Library `.kicad_sym` artwork is used as-is. Collision uses the real symbol (graphics, pin text, Reference/Value).
 

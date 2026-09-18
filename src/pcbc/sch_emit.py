@@ -10,9 +10,17 @@ from pathlib import Path
 
 from .footprints import symbol_path
 from .model import Design
-from .sch_place import apply_sch_places
+from .sch_place import (
+    apply_sch_places,
+    body_aabb,
+    core_aabb,
+    lib_to_sheet,
+    pin_outward,
+    pin_world,
+    world_aabb,
+)
 from .sexp import matching_paren, new_uuid
-from .symbol import extract_main_symbol, parse_symbol_pins_geom
+from .symbol import extract_main_symbol, parse_symbol_layout, parse_symbol_pins_geom
 
 
 def is_power_net(name: str, kinds: dict[str, str] | None = None) -> bool:
@@ -83,8 +91,13 @@ class Part:
     rot: float = 0.0
     hw: float = 8.0
     hh: float = 6.0
+    bbox: tuple[float, float, float, float] = (-8.0, -6.0, 8.0, 6.0)
+    body_bbox: tuple[float, float, float, float] = (-8.0, -6.0, 8.0, 6.0)
+    core_bbox: tuple[float, float, float, float] = (-6.0, -4.0, 6.0, 4.0)
     lib_sexp: str | None = None
     placed: bool = False
+    prop_ref: tuple[float, float] = (0.0, 0.0)
+    prop_val: tuple[float, float] = (0.0, 0.0)
 
 
 def _kind(ref: str) -> str:
@@ -98,14 +111,14 @@ def _kind(ref: str) -> str:
 
 
 def _passive_pins(kind: str, pin_nets: dict[str, str]) -> list[PinDef]:
-    # Match Device-style libraries: pin 1 at −Y (KiCad sheet +Y is up, so pin 1
-    # is the lower end), pin 2 at +Y. Electrical ends, not the body edge.
+    # KiCad Device convention: pin 1 at library +Y (top of the sheet), pin 2
+    # below. Coordinates are the electrical ends, not the body edge.
     n1 = pin_nets.get("1", "")
     n2 = pin_nets.get("2", pin_nets.get("1", ""))
     end = 3.81 if kind in ("r", "l") else 2.54
     return [
-        PinDef("1", "1", 0.0, -end, 90, n1),
-        PinDef("2", "2", 0.0, end, 270, n2),
+        PinDef("1", "1", 0.0, end, 270, n1),
+        PinDef("2", "2", 0.0, -end, 90, n2),
     ]
 
 
@@ -238,13 +251,13 @@ def _lib_r() -> str:
 			)
 			(symbol "R_1_1"
 				(pin passive line
-					(at 0 -3.81 90)
+					(at 0 3.81 270)
 					(length 1.27)
 					(name "1" (effects (font (size 1.27 1.27))))
 					(number "1" (effects (font (size 1.27 1.27))))
 				)
 				(pin passive line
-					(at 0 3.81 270)
+					(at 0 -3.81 90)
 					(length 1.27)
 					(name "2" (effects (font (size 1.27 1.27))))
 					(number "2" (effects (font (size 1.27 1.27))))
@@ -284,13 +297,13 @@ def _lib_c() -> str:
 			)
 			(symbol "C_1_1"
 				(pin passive line
-					(at 0 -2.54 90)
+					(at 0 2.54 270)
 					(length 2.032)
 					(name "1" (effects (font (size 1.27 1.27))))
 					(number "1" (effects (font (size 1.27 1.27))))
 				)
 				(pin passive line
-					(at 0 2.54 270)
+					(at 0 -2.54 90)
 					(length 2.032)
 					(name "2" (effects (font (size 1.27 1.27))))
 					(number "2" (effects (font (size 1.27 1.27))))
@@ -324,13 +337,13 @@ def _lib_l() -> str:
 			)
 			(symbol "L_1_1"
 				(pin passive line
-					(at 0 -3.81 90)
+					(at 0 3.81 270)
 					(length 1.778)
 					(name "1" (effects (font (size 1.27 1.27))))
 					(number "1" (effects (font (size 1.27 1.27))))
 				)
 				(pin passive line
-					(at 0 3.81 270)
+					(at 0 -3.81 90)
 					(length 1.778)
 					(name "2" (effects (font (size 1.27 1.27))))
 					(number "2" (effects (font (size 1.27 1.27))))
@@ -342,7 +355,7 @@ def _lib_l() -> str:
 
 
 def _lib_led() -> str:
-    """Vertical LED: pin 2 A at top (−Y), pin 1 K at bottom (+Y). Current flows down."""
+    """Vertical LED: pin 2 A at library +Y (sheet top), pin 1 K below. Current flows down."""
     return """		(symbol "LED"
 			(pin_numbers (hide yes))
 			(pin_names (hide yes))
@@ -358,9 +371,9 @@ def _lib_led() -> str:
 				(effects (font (size 1.27 1.27)) (justify left))
 			)
 			(symbol "LED_0_1"
-				(polyline (pts (xy -1.016 0.762) (xy 1.016 0.762))
+				(polyline (pts (xy -1.016 -0.762) (xy 1.016 -0.762))
 					(stroke (width 0.254) (type default)) (fill (type none)))
-				(polyline (pts (xy -1.016 -0.762) (xy 1.016 -0.762) (xy 0 0.762) (xy -1.016 -0.762))
+				(polyline (pts (xy -1.016 0.762) (xy 1.016 0.762) (xy 0 -0.762) (xy -1.016 0.762))
 					(stroke (width 0.254) (type default)) (fill (type none)))
 				(polyline (pts (xy 0 -2.54) (xy 0 2.54))
 					(stroke (width 0) (type default)) (fill (type none)))
@@ -371,13 +384,13 @@ def _lib_led() -> str:
 			)
 			(symbol "LED_1_1"
 				(pin passive line
-					(at 0 2.54 270)
+					(at 0 -2.54 90)
 					(length 1.778)
 					(name "K" (effects (font (size 1.27 1.27))))
 					(number "1" (effects (font (size 1.27 1.27))))
 				)
 				(pin passive line
-					(at 0 -2.54 90)
+					(at 0 2.54 270)
 					(length 1.778)
 					(name "A" (effects (font (size 1.27 1.27))))
 					(number "2" (effects (font (size 1.27 1.27))))
@@ -508,17 +521,6 @@ def _rotate(x: float, y: float, deg: float) -> tuple[float, float]:
     return x * c - y * s, x * s + y * c
 
 
-def _stub_delta(rot: float, length: float) -> tuple[float, float]:
-    rad = math.radians(rot)
-    return (-length * math.cos(rad), -length * math.sin(rad))
-
-
-def _underline_pose(dx: float, dy: float) -> tuple[int, str]:
-    if abs(dx) >= abs(dy):
-        return 0, "left" if dx < 0 else "right"
-    return 90, "left" if dy > 0 else "right"
-
-
 def _build_parts(
     net_text: str,
     pin_maps: list[tuple[str, dict[str, str]]] | None = None,
@@ -587,24 +589,11 @@ def _snap(v: float) -> float:
 
 
 def _pin_world(part: Part, pin: PinDef) -> tuple[float, float]:
-    lx, ly = pin.lx, pin.ly
-    rot = part.rot % 360.0
-    if abs(rot - 180) < 1:
-        lx, ly = -lx, -ly
-    elif abs(rot - 90) < 1:
-        lx, ly = -ly, lx
-    elif abs(rot - 270) < 1:
-        lx, ly = ly, -lx
-    return part.x + lx, part.y + ly
+    return pin_world(part, pin)
 
 
 def _bbox(part: Part) -> tuple[float, float, float, float]:
-    return (
-        part.x - part.hw - 1.0,
-        part.y - part.hh - 1.0,
-        part.x + part.hw + 1.0,
-        part.y + part.hh + 1.0,
-    )
+    return world_aabb(part)
 
 
 def _seg_hits_part(x0: float, y0: float, x1: float, y1: float, part: Part) -> bool:
@@ -780,11 +769,38 @@ def _hat(net: str, x: float, y: float, gnd: bool, rot: int = 0) -> str:
     )
 
 
+def _prop_world(part: Part, lib_xy: tuple[float, float]) -> tuple[float, float]:
+    """Instance property in sheet coords."""
+    dx, dy = lib_to_sheet(lib_xy[0], lib_xy[1], part.rot)
+    return part.x + dx, part.y + dy
+
+
+def _passive_label_xy(part: Part) -> tuple[tuple[float, float], tuple[float, float]]:
+    """Reference/Value off the body, perpendicular to the pins, away from hats."""
+    x0, y0, x1, y1 = body_aabb(part)
+    cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
+    if len(part.pins) >= 2:
+        ax, ay = _pin_world(part, part.pins[0])
+        bx, by = _pin_world(part, part.pins[1])
+        horiz = abs(bx - ax) >= abs(by - ay)
+    else:
+        horiz = False
+    if horiz:
+        # Pins left-right: text above (smaller Y) so GND hats below stay clear.
+        return (cx, y0 - 2.6), (cx, y0 - 5.4)
+    return (x1 + 2.8, cy - 1.2), (x1 + 2.8, cy + 1.4)
+
+
 def _instance(part: Part) -> str:
     pins = "".join(
         f'\t\t(pin "{p.number}" (uuid "{new_uuid()}"))\n' for p in part.pins
     )
     rot = int(part.rot) % 360
+    if part.kind in ("r", "c", "l", "d"):
+        (rwx, rwy), (vwx, vwy) = _passive_label_xy(part)
+    else:
+        rwx, rwy = _prop_world(part, part.prop_ref)
+        vwx, vwy = _prop_world(part, part.prop_val)
     return (
         f'\t(symbol\n'
         f'\t\t(lib_id "{part.lib_id}")\n'
@@ -796,12 +812,12 @@ def _instance(part: Part) -> str:
         f'\t\t(dnp no)\n'
         f'\t\t(uuid "{new_uuid()}")\n'
         f'\t\t(property "Reference" "{part.ref}"\n'
-        f'\t\t\t(at {_fmt(part.x + part.hw + 1.5)} {_fmt(part.y + 1.27)} 0)\n'
-        f'\t\t\t(effects (font (size 1.27 1.27)) (justify left))\n'
+        f'\t\t\t(at {_fmt(rwx)} {_fmt(rwy)} 0)\n'
+        f'\t\t\t(effects (font (size 1.27 1.27)))\n'
         f'\t\t)\n'
         f'\t\t(property "Value" "{part.display}"\n'
-        f'\t\t\t(at {_fmt(part.x + part.hw + 1.5)} {_fmt(part.y - 1.27)} 0)\n'
-        f'\t\t\t(effects (font (size 1.27 1.27)) (justify left))\n'
+        f'\t\t\t(at {_fmt(vwx)} {_fmt(vwy)} 0)\n'
+        f'\t\t\t(effects (font (size 1.27 1.27)))\n'
         f'\t\t)\n'
         f"{pins}"
         f'\t)\n'
@@ -823,44 +839,28 @@ def _pad_nets(inst) -> dict[str, str]:
     return out
 
 
-def _compact_connected_box(pins: list[PinDef]) -> tuple[list[PinDef], float, float]:
-    """One pin per connected name; NC/unbound dropped. Compact left/right box."""
-    uniq: list[PinDef] = []
-    seen: set[str] = set()
-    for p in pins:
-        if not p.net or p.net.startswith("unconnected"):
-            continue
-        if p.name.upper() in ("NC", "DNC"):
-            continue
-        if p.name in seen:
-            continue
-        seen.add(p.name)
-        uniq.append(PinDef(p.number, p.name, p.lx, p.ly, p.rot, p.net))
-    if not uniq:
-        uniq = [PinDef("1", "1", -15.24, 0.0, 0.0, "")]
-    left = [p for p in uniq if p.lx <= 0]
-    right = [p for p in uniq if p.lx > 0]
-    if not left:
-        mid = (len(right) + 1) // 2
-        left, right = right[:mid], right[mid:]
-    if not right:
-        mid = (len(left) + 1) // 2
-        left, right = left[:mid], left[mid:]
-    pitch = _PITCH
-    n = max(len(left), len(right), 1)
-    hw = 7.62 if len(uniq) <= 4 else 11.43
-    hh = max((n - 1) * pitch / 2 + 2.54, 5.08)
-    tip = hw + _PIN_LEN
+def _pin_bbox(pins: list[PinDef], hw: float, hh: float) -> tuple[float, float, float, float]:
+    if not pins:
+        return (-hw, -hh, hw, hh)
+    xs = [p.lx for p in pins]
+    ys = [p.ly for p in pins]
+    return (min(xs) - 1.0, min(ys) - 1.0, max(xs) + 1.0, max(ys) + 1.0)
 
-    def place(side: list[PinDef], x_tip: float, rot: float) -> None:
-        for i, p in enumerate(side):
-            p.lx = x_tip
-            p.ly = (len(side) - 1) * pitch / 2 - i * pitch
-            p.rot = rot
 
-    place(left, -tip, 0.0)
-    place(right, tip, 180.0)
-    return uniq, hw, hh
+_PASSIVE_PROP = {
+    "r": ((2.032, 0.0), (-2.032, 0.0), (-3.2, -4.6, 3.2, 4.6)),
+    "c": ((2.54, 0.0), (-2.54, 0.0), (-3.2, -3.4, 3.2, 3.4)),
+    "l": ((2.54, 0.0), (-2.54, 0.0), (-3.2, -4.6, 3.2, 4.6)),
+    "d": ((3.81, 0.0), (3.81, 2.54), (-3.5, -3.5, 6.5, 3.5)),
+}
+
+# Graphics only (between the pin ends): what a wire may not cross.
+_PASSIVE_CORE = {
+    "r": (-1.3, -2.8, 1.3, 2.8),
+    "c": (-1.8, -0.8, 1.8, 0.8),
+    "l": (-1.3, -2.3, 1.3, 2.3),
+    "d": (-1.3, -1.1, 3.1, 1.1),
+}
 
 
 def _parts_from_design(design: Design, kinds: dict[str, str] | None = None) -> list[Part]:
@@ -868,30 +868,43 @@ def _parts_from_design(design: Design, kinds: dict[str, str] | None = None) -> l
     for inst in design.instances:
         pnets = _pad_nets(inst)
         prefix = (inst.part.prefix or inst.ref[:1] or "U").upper()[:1]
+        prop_ref, prop_val = (0.0, 0.0), (0.0, 0.0)
         if inst.part.kind == "led":
             kind = "d"
             lib_id = "LED"
             pins = [
-                PinDef("1", "K", 0.0, 2.54, 270, pnets.get("1", pnets.get("K", ""))),
-                PinDef("2", "A", 0.0, -2.54, 90, pnets.get("2", pnets.get("A", ""))),
+                PinDef("1", "K", 0.0, -2.54, 90, pnets.get("1", pnets.get("K", ""))),
+                PinDef("2", "A", 0.0, 2.54, 270, pnets.get("2", pnets.get("A", ""))),
             ]
-            hw, hh = 3.0, 3.0
             lib_sexp = None
+            prop_ref, prop_val, bbox = _PASSIVE_PROP["d"]
+            body_bbox = bbox
+            core_bbox = _PASSIVE_CORE["d"]
+            hw = max(abs(bbox[0]), abs(bbox[2]))
+            hh = max(abs(bbox[1]), abs(bbox[3]))
         elif inst.part.kind == "generic" or prefix in "RCL":
             kind = {"R": "r", "C": "c", "L": "l"}.get(prefix, "r")
             pins = _passive_pins(kind, pnets)
             lib_id = kind.upper()
-            hw, hh = 2.0, 4.0
             lib_sexp = None
+            prop_ref, prop_val, bbox = _PASSIVE_PROP[kind]
+            body_bbox = bbox
+            core_bbox = _PASSIVE_CORE[kind]
+            hw = max(abs(bbox[0]), abs(bbox[2]))
+            hh = max(abs(bbox[1]), abs(bbox[3]))
         else:
             kind = "box"
             lib_sexp = None
             lib_id = re.sub(r"[^A-Za-z0-9_.-]", "_", inst.part.name)[:40]
             pins = []
             sp = symbol_path(inst.part)
+            layout = None
             if sp and sp.exists():
-                lib_id, _raw = extract_main_symbol(sp.read_text())
-                for gp in parse_symbol_pins_geom(sp):
+                raw_text = sp.read_text()
+                lib_id, raw = extract_main_symbol(raw_text)
+                lib_sexp = "\t\t" + raw.replace("\n", "\n\t\t") + "\n"
+                layout = parse_symbol_layout(raw_text)
+                for gp in layout["pins"] or parse_symbol_pins_geom(sp):
                     pins.append(
                         PinDef(
                             gp["number"],
@@ -904,7 +917,28 @@ def _parts_from_design(design: Design, kinds: dict[str, str] | None = None) -> l
                     )
             if not pins:
                 pins = _box_pins(pnets, {})
-            pins, hw, hh = _compact_connected_box(pins)
+            if layout:
+                bbox = layout["bbox"]
+                body_bbox = layout.get("body_bbox", bbox)
+                core_bbox = layout.get("core_bbox", body_bbox)
+                prop_ref = layout["prop_ref"]
+                prop_val = layout["prop_val"]
+            else:
+                xs = [abs(p.lx) for p in pins] or [12.0]
+                ys = [abs(p.ly) for p in pins] or [8.0]
+                bbox = _pin_bbox(pins, max(xs) + 2.0, max(ys) + 2.0)
+                body_bbox = bbox
+                # _lib_box draws the rectangle one pin length inside the pin ends.
+                core_bbox = (
+                    bbox[0] + _PIN_LEN + 1.0,
+                    bbox[1] + 1.0,
+                    bbox[2] - _PIN_LEN - 1.0,
+                    bbox[3] - 1.0,
+                )
+                prop_ref = (0.0, bbox[3] + 2.54)
+                prop_val = (0.0, bbox[1] - 2.54)
+            hw = max(abs(bbox[0]), abs(bbox[2]))
+            hh = max(abs(bbox[1]), abs(bbox[3]))
         parts.append(
             Part(
                 ref=inst.ref,
@@ -914,7 +948,12 @@ def _parts_from_design(design: Design, kinds: dict[str, str] | None = None) -> l
                 pins=pins,
                 hw=hw,
                 hh=hh,
+                bbox=bbox,
+                body_bbox=body_bbox,
+                core_bbox=core_bbox,
                 lib_sexp=lib_sexp,
+                prop_ref=prop_ref,
+                prop_val=prop_val,
             )
         )
     return parts
@@ -931,108 +970,295 @@ def _degree_parts(parts: list[Part]) -> dict[str, int]:
     return deg
 
 
-def _annotate(parts: list[Part], deg: dict[str, int], kinds: dict[str, str] | None = None) -> list[str]:
-    """Wires, one label per 2-pin net, power hats. KiCad sheet +Y is up."""
+@dataclass
+class _Site:
+    """One bound pin end on the sheet."""
+
+    part: Part
+    pin: PinDef
+    x: float
+    y: float
+
+
+_EPS = 0.05
+
+
+def _near(ax: float, ay: float, bx: float, by: float) -> bool:
+    return abs(ax - bx) < _EPS and abs(ay - by) < _EPS
+
+
+def _inside_segment(px: float, py: float, x0: float, y0: float, x1: float, y1: float) -> bool:
+    """Point on an axis-aligned segment, endpoints excluded."""
+    if abs(x0 - x1) < _EPS:
+        return abs(px - x0) < _EPS and min(y0, y1) + _EPS < py < max(y0, y1) - _EPS
+    if abs(y0 - y1) < _EPS:
+        return abs(py - y0) < _EPS and min(x0, x1) + _EPS < px < max(x0, x1) - _EPS
+    return False
+
+
+def _segment_crosses_box(
+    x0: float, y0: float, x1: float, y1: float, box: tuple[float, float, float, float], pad: float = 0.3
+) -> bool:
+    bx0, by0, bx1, by1 = box
+    return not (
+        max(x0, x1) < bx0 - pad
+        or min(x0, x1) > bx1 + pad
+        or max(y0, y1) < by0 - pad
+        or min(y0, y1) > by1 + pad
+    )
+
+
+def _point_in_aabb(
+    x: float, y: float, box: tuple[float, float, float, float], pad: float = 0.0
+) -> bool:
+    x0, y0, x1, y1 = box
+    return (x0 - pad) <= x <= (x1 + pad) and (y0 - pad) <= y <= (y1 + pad)
+
+
+class _Sheet:
+    """Geometry already on the sheet. KiCad connects wire endpoints to pin ends and
+    to other wire endpoints; it does not connect anything that merely crosses.
+    So every new segment must end on this net and its interior must stay off
+    every pin end and every symbol's graphics."""
+
+    def __init__(self, parts: list[Part]):
+        self.parts = parts
+        self.pin_ends = [pin_world(p, pin) for p in parts for pin in p.pins]
+        self.cores = [core_aabb(p) for p in parts]
+        self.segs: list[tuple[float, float, float, float, str]] = []
+
+    def on_pin_end(self, x: float, y: float) -> bool:
+        return any(_near(x, y, px, py) for px, py in self.pin_ends)
+
+    def segment_ok(self, x0: float, y0: float, x1: float, y1: float) -> bool:
+        if any(_inside_segment(px, py, x0, y0, x1, y1) for px, py in self.pin_ends):
+            return False
+        return not any(_segment_crosses_box(x0, y0, x1, y1, box) for box in self.cores)
+
+    def point_free(self, x: float, y: float, net: str) -> bool:
+        """A bend, stub end or label anchor may not touch another net."""
+        if self.on_pin_end(x, y):
+            return False
+        for sx0, sy0, sx1, sy1, snet in self.segs:
+            if snet == net:
+                continue
+            if (
+                _near(x, y, sx0, sy0)
+                or _near(x, y, sx1, sy1)
+                or _inside_segment(x, y, sx0, sy0, sx1, sy1)
+            ):
+                return False
+        return True
+
+    def path_ok(self, pts: list[tuple[float, float]], net: str) -> bool:
+        for (ax, ay), (bx, by) in zip(pts, pts[1:]):
+            if _near(ax, ay, bx, by):
+                continue
+            if abs(ax - bx) > _EPS and abs(ay - by) > _EPS:
+                return False
+            if not self.segment_ok(ax, ay, bx, by):
+                return False
+        return all(self.point_free(x, y, net) for x, y in pts[1:-1])
+
+    def add(self, pts: list[tuple[float, float]], net: str) -> list[str]:
+        out: list[str] = []
+        for (ax, ay), (bx, by) in zip(pts, pts[1:]):
+            if _near(ax, ay, bx, by):
+                continue
+            self.segs.append((ax, ay, bx, by, net))
+            out.append(_wire(ax, ay, bx, by))
+        return out
+
+
+class _Union:
+    def __init__(self, n: int):
+        self.parent = list(range(n))
+
+    def find(self, i: int) -> int:
+        while self.parent[i] != i:
+            self.parent[i] = self.parent[self.parent[i]]
+            i = self.parent[i]
+        return i
+
+    def join(self, i: int, j: int) -> None:
+        self.parent[self.find(i)] = self.find(j)
+
+    def groups(self) -> list[list[int]]:
+        by: dict[int, list[int]] = defaultdict(list)
+        for i in range(len(self.parent)):
+            by[self.find(i)].append(i)
+        return list(by.values())
+
+
+def _routes(a: _Site, b: _Site) -> list[list[tuple[float, float]]]:
+    """Candidate Manhattan paths from a to b, most natural first."""
+    ax, ay, bx, by = a.x, a.y, b.x, b.y
+    oa = pin_outward(a.part, a.pin)
+    out: list[list[tuple[float, float]]] = []
+    if abs(ax - bx) < _EPS or abs(ay - by) < _EPS:
+        out.append([(ax, ay), (bx, by)])
+    if abs(oa[0]) >= abs(oa[1]):
+        mx = (ax + bx) / 2.0
+        out.append([(ax, ay), (mx, ay), (mx, by), (bx, by)])
+        out.append([(ax, ay), (bx, ay), (bx, by)])
+        out.append([(ax, ay), (ax, by), (bx, by)])
+    else:
+        my = (ay + by) / 2.0
+        out.append([(ax, ay), (ax, my), (bx, my), (bx, by)])
+        out.append([(ax, ay), (ax, by), (bx, by)])
+        out.append([(ax, ay), (bx, ay), (bx, by)])
+    return out
+
+
+def _label_pose(ox: float, oy: float) -> tuple[int, str]:
+    """Text hangs away from the symbol along the outward direction."""
+    if abs(ox) >= abs(oy):
+        return 0, "right" if ox < 0 else "left"
+    return 90, "right" if oy > 0 else "left"
+
+
+def _hat_site(sites: list[_Site], gnd: bool, parts: list[Part]) -> _Site:
+    """The pin in a connected group whose power symbol collides least."""
+    best, best_score = sites[0], float("inf")
+    for s in sites:
+        box = (s.x - 2.2, s.y, s.x + 2.2, s.y + 5.2) if gnd else (s.x - 2.2, s.y - 5.2, s.x + 2.2, s.y)
+        hits = 0
+        for o in parts:
+            if o.ref == s.part.ref:
+                continue
+            ox0, oy0, ox1, oy1 = world_aabb(o)
+            if not (box[2] < ox0 or ox1 < box[0] or box[3] < oy0 or oy1 < box[1]):
+                hits += 1
+        # GND symbols want to hang down the sheet, supply symbols to point up.
+        score = hits * 1000.0 + (-s.y if gnd else s.y)
+        if score < best_score:
+            best, best_score = s, score
+    return best
+
+
+def _annotate(parts: list[Part], kinds: dict[str, str] | None = None) -> list[str]:
+    """Wires, labels and power symbols so KiCad reads exactly the board's netlist.
+
+    Per net: join same-symbol pins that sit in a line, then join nearby symbols
+    with Manhattan wires when a clean path exists. Whatever is still apart gets
+    named: every connected group of a signal net carries a label, every group of
+    a power net carries a power symbol. Nothing is skipped because a pin name
+    looks like the net — KiCad does not connect on names.
+    """
     out: list[str] = []
-    sites: dict[str, list[tuple[Part, PinDef, float, float]]] = defaultdict(list)
+    sites: dict[str, list[_Site]] = defaultdict(list)
     for p in parts:
         for pin in p.pins:
             if not pin.net or pin.net.startswith("unconnected") or pin.net.endswith(".NC"):
                 continue
-            wx, wy = _pin_world(p, pin)
-            sites[pin.net].append((p, pin, wx, wy))
+            wx, wy = pin_world(p, pin)
+            sites[pin.net].append(_Site(p, pin, wx, wy))
 
-    wired: set[str] = set()
-    for net, pts in sites.items():
-        if is_power_net(net, kinds) or len(pts) != 2:
-            continue
-        (pa, _, x0, y0), (pb, _, x1, y1) = pts
-        dist = math.hypot(x1 - x0, y1 - y0)
-        skip = {pa.ref, pb.ref}
-        if dist > 20.0:
-            continue
-        segs = _manhattan(x0, y0, x1, y1, parts, skip)
-        if segs is None:
-            continue
-        out.extend(segs)
-        mx, my = (x0 + x1) / 2, (y0 + y1) / 2
-        if abs(x1 - x0) >= abs(y1 - y0):
-            out.append(_label(net, mx, my - 1.27, 0, "left"))
-        else:
-            out.append(_label(net, mx - 2.54, my, 0, "right"))
-        wired.add(net)
+    sheet = _Sheet(parts)
+    unions: dict[str, _Union] = {}
+    net_segs: dict[str, list[tuple[int, list[tuple[float, float]]]]] = defaultdict(list)
 
-    hats_done: set[tuple[str, str]] = set()
-    labels_done: set[tuple[str, str]] = set()
-    for p in parts:
-        for pin in p.pins:
-            net = pin.net
-            if not net or net.startswith("unconnected") or net.endswith(".NC"):
-                continue
-            wx, wy = _pin_world(p, pin)
-            if is_power_net(net, kinds):
-                key = (p.ref, net)
-                if key in hats_done:
+    for net, sts in sites.items():
+        uf = _Union(len(sts))
+        unions[net] = uf
+        gnd = is_ground_net(net, kinds)
+
+        # Same symbol, pins in a line: a rail along the pin ends.
+        rails: list[tuple[float, int, int]] = []
+        for i, a in enumerate(sts):
+            for j in range(i + 1, len(sts)):
+                b = sts[j]
+                if a.part is not b.part:
                     continue
-                hats_done.add(key)
-                gnd = is_ground_net(net, kinds)
-                # Whole library symbol on the pin (graphics + pin + name).
-                # Bodies are drawn VCC-up / GND-down; do not explode into wires.
-                out.append(_hat(net, wx, wy, gnd=gnd, rot=0))
+                if abs(a.x - b.x) < _EPS or abs(a.y - b.y) < _EPS:
+                    rails.append((math.hypot(a.x - b.x, a.y - b.y), i, j))
+        for _d, i, j in sorted(rails):
+            if uf.find(i) == uf.find(j):
                 continue
-            if net in wired or deg.get(net, 0) < 2:
+            pts = [(sts[i].x, sts[i].y), (sts[j].x, sts[j].y)]
+            if sheet.path_ok(pts, net):
+                out.extend(sheet.add(pts, net))
+                net_segs[net].append((i, pts))
+                uf.join(i, j)
+
+        # Other symbols: shortest clean Manhattan paths first (ground is symbols only).
+        if gnd:
+            continue
+        limit = 80.0 if len(sts) == 2 else 45.0
+        edges: list[tuple[float, int, int]] = []
+        for i, a in enumerate(sts):
+            for j in range(i + 1, len(sts)):
+                b = sts[j]
+                if a.part is b.part:
+                    continue
+                d = math.hypot(a.x - b.x, a.y - b.y)
+                if d <= limit:
+                    edges.append((d, i, j))
+        for _d, i, j in sorted(edges):
+            if uf.find(i) == uf.find(j):
                 continue
-            if pin.name == net:
+            for pts in _routes(sts[i], sts[j]):
+                if sheet.path_ok(pts, net):
+                    out.extend(sheet.add(pts, net))
+                    net_segs[net].append((i, pts))
+                    uf.join(i, j)
+                    break
+
+    # Name every connected group.
+    for net, sts in sites.items():
+        uf = unions[net]
+        power = is_power_net(net, kinds)
+        gnd = is_ground_net(net, kinds)
+        for group in uf.groups():
+            members = [sts[i] for i in group]
+            if power:
+                s = _hat_site(members, gnd, parts)
+                out.append(_hat(net, s.x, s.y, gnd=gnd, rot=0))
                 continue
-            key = (p.ref, net)
-            if key in labels_done:
+            segs = [
+                (ax, ay, bx, by)
+                for i, pts in net_segs[net]
+                if uf.find(i) == uf.find(group[0])
+                for (ax, ay), (bx, by) in zip(pts, pts[1:])
+                if not _near(ax, ay, bx, by)
+            ]
+            if segs:
+                # Label on the longest run, horizontal preferred: readable, and
+                # a mid-wire anchor always connects.
+                segs.sort(key=lambda s: (abs(s[3] - s[1]) < _EPS, math.hypot(s[2] - s[0], s[3] - s[1])), reverse=True)
+                ax, ay, bx, by = segs[0]
+                mx, my = (ax + bx) / 2.0, (ay + by) / 2.0
+                rot = 0 if abs(by - ay) < _EPS else 90
+                out.append(_label(net, mx, my, rot, "left"))
                 continue
-            length = 5.08
-            dx, dy = _stub_delta(pin.rot + p.rot, 1.0)
-            n = math.hypot(dx, dy) or 1.0
-            sx, sy = wx + dx / n * length, wy + dy / n * length
-            if any(
-                o.kind == "box"
-                and o.ref != p.ref
-                and abs(sx - o.x) <= o.hw + 1
-                and abs(sy - o.y) <= o.hh + 1
-                for o in parts
-            ):
-                sx += dx / n * 5.08
-                sy += dy / n * 5.08
-            labels_done.add(key)
-            rot, just = _underline_pose(dx, dy)
-            out.append(_wire(wx, wy, sx, sy))
-            out.append(_label(net, sx, sy, rot, just))
+            s = members[0]
+            ox, oy = pin_outward(s.part, s.pin)
+            rot, just = _label_pose(ox, oy)
+            placed = False
+            for k in range(12):
+                length = 5.08 + 1.27 * k
+                ex, ey = s.x + ox * length, s.y + oy * length
+                if not sheet.segment_ok(s.x, s.y, ex, ey) or not sheet.point_free(ex, ey, net):
+                    continue
+                if any(
+                    o is not s.part and _point_in_aabb(ex, ey, world_aabb(o), pad=1.0)
+                    for o in parts
+                ):
+                    continue
+                out.extend(sheet.add([(s.x, s.y), (ex, ey)], net))
+                out.append(_label(net, ex, ey, rot, just))
+                placed = True
+                break
+            if not placed:
+                # No clean stub: the label sits on the pin end, which also connects.
+                out.append(_label(net, s.x, s.y, rot, just))
     return out
-
-
-def _manhattan(
-    x0: float,
-    y0: float,
-    x1: float,
-    y1: float,
-    parts: list[Part],
-    skip: set[str],
-) -> list[str] | None:
-    def hits(ax, ay, bx, by) -> bool:
-        return any(_seg_hits_part(ax, ay, bx, by, p) and p.ref not in skip for p in parts)
-
-    if abs(x0 - x1) < 0.4 or abs(y0 - y1) < 0.4:
-        if hits(x0, y0, x1, y1):
-            return None
-        return [_wire(x0, y0, x1, y1)]
-    for mx, my in ((x0, y1), (x1, y0)):
-        if not hits(x0, y0, mx, my) and not hits(mx, my, x1, y1):
-            return [_wire(x0, y0, mx, my), _wire(mx, my, x1, y1)]
-    return None
 
 
 def emit_from_design(design: Design, *, title: str = "") -> str:
     kinds = {n.name: n.kind for n in design.nets.values()}
     parts = _parts_from_design(design, kinds)
     apply_sch_places(design, parts)
-    deg = _degree_parts(parts)
     libs = [_lib_gnd(), _lib_vcc(), _lib_r(), _lib_c(), _lib_l(), _lib_led()]
     seen_lib: set[str] = {"power:GND", "power:VCC", "GND", "VCC", "R", "C", "L", "LED"}
     for p in parts:
@@ -1045,9 +1271,12 @@ def emit_from_design(design: Design, *, title: str = "") -> str:
             libs.append(_lib_box(p.lib_id, p.pins, p.ref[:1] or "U", kinds))
             seen_lib.add(p.lib_id)
     body: list[str] = [_instance(p) for p in parts]
-    body.extend(_annotate(parts, deg, kinds))
-    max_x = max((p.x + p.hw + 20 for p in parts), default=100)
-    max_y = max((p.y + p.hh + 20 for p in parts), default=80)
+    body.extend(_annotate(parts, kinds))
+    max_x, max_y = 100.0, 80.0
+    for p in parts:
+        x0, y0, x1, y1 = world_aabb(p)
+        max_x = max(max_x, x1 + 20)
+        max_y = max(max_y, y1 + 20)
     paper = "A4" if max_x < 280 and max_y < 190 else "A3" if max_x < 400 else "A2"
     uid = new_uuid()
     title = title or "pcbc"

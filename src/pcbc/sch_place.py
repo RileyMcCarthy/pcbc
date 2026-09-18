@@ -40,31 +40,57 @@ def _rot_xy(lx: float, ly: float, rot: float) -> tuple[float, float]:
     return lx, ly
 
 
+def lib_to_sheet(lx: float, ly: float, rot: float) -> tuple[float, float]:
+    """Library offset (Y up) → sheet offset (Y down) for a symbol placed at ``rot``.
+
+    KiCad rotates in the library frame first, then mirrors Y onto the sheet
+    (checked against kicad-cli for 0/90/180/270).
+    """
+    rx, ry = _rot_xy(lx, ly, rot)
+    return rx, -ry
+
+
 def pin_world(part, pin) -> tuple[float, float]:
-    lx, ly = _rot_xy(pin.lx, pin.ly, part.rot)
-    return part.x + lx, part.y + ly
+    """Electrical end of a pin in sheet coordinates."""
+    dx, dy = lib_to_sheet(pin.lx, pin.ly, part.rot)
+    return part.x + dx, part.y + dy
 
 
-def _stub_delta(rot: float, length: float) -> tuple[float, float]:
-    rad = math.radians(rot)
-    return (-length * math.cos(rad), -length * math.sin(rad))
-
-
-def _outward(part, pin) -> tuple[float, float]:
-    dx, dy = _stub_delta(pin.rot + part.rot, 1.0)
-    n = math.hypot(dx, dy) or 1.0
-    return dx / n, dy / n
+def pin_outward(part, pin) -> tuple[float, float]:
+    """Unit vector (sheet frame) from the pin end away from the body."""
+    rad = math.radians(pin.rot)  # pin rot points toward the body
+    ox, oy = lib_to_sheet(-math.cos(rad), -math.sin(rad), part.rot)
+    n = math.hypot(ox, oy) or 1.0
+    return ox / n, oy / n
 
 
 def _best_rot(pin, want: tuple[float, float]) -> float:
+    """Symbol rotation whose outward pin direction best matches ``want`` (sheet frame)."""
     best, best_dot = 0.0, -9.0
+    rad = math.radians(pin.rot)
     for r in (0.0, 90.0, 180.0, 270.0):
-        ox, oy = _rot_xy(*_stub_delta(pin.rot, 1.0), r)
+        ox, oy = lib_to_sheet(-math.cos(rad), -math.sin(rad), r)
         n = math.hypot(ox, oy) or 1.0
         d = (ox / n) * want[0] + (oy / n) * want[1]
         if d > best_dot:
             best, best_dot = r, d
     return best
+
+
+_SIDES = {
+    "left": (-1.0, 0.0),
+    "right": (1.0, 0.0),
+    "top": (0.0, -1.0),
+    "bottom": (0.0, 1.0),
+}
+
+# Full-box clearance (includes Reference/Value). Body-only attach can be tighter.
+_PAD = 5.08
+_BODY_PAD = 2.54
+
+
+def _local_box(part) -> tuple[float, float, float, float]:
+    return getattr(part, "bbox", (-part.hw, -part.hh, part.hw, part.hh))
 
 
 def _apply_css(spec: SchPlaceSpec, part, regions: dict[str, Rect]) -> None:
@@ -75,12 +101,12 @@ def _apply_css(spec: SchPlaceSpec, part, regions: dict[str, Rect]) -> None:
         cb = regions[spec.parent]
     else:
         cb = content_rect(SHEET)
-    local = (-part.hw, -part.hh, part.hw, part.hh)
+    local = _local_box(part)
     rect = resolve_rect(
         cb,
         st,
-        intrinsic_w=part.hw * 2,
-        intrinsic_h=part.hh * 2,
+        intrinsic_w=local[2] - local[0],
+        intrinsic_h=local[3] - local[1],
         who=f"SchPlace({part.ref!r})",
     )
     at = origin_from_border(rect, local, st.rotate)
@@ -89,13 +115,38 @@ def _apply_css(spec: SchPlaceSpec, part, regions: dict[str, Rect]) -> None:
     part.placed = True
 
 
-def _body(part) -> tuple[float, float, float, float]:
-    return (
-        part.x - part.hw,
-        part.y - part.hh,
-        part.x + part.hw,
-        part.y + part.hh,
+def _aabb_of(part, box: tuple[float, float, float, float]) -> tuple[float, float, float, float]:
+    x0, y0, x1, y1 = box
+    xs, ys = [], []
+    for cx, cy in ((x0, y0), (x1, y0), (x1, y1), (x0, y1)):
+        dx, dy = lib_to_sheet(cx, cy, part.rot)
+        xs.append(part.x + dx)
+        ys.append(part.y + dy)
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def world_aabb(part) -> tuple[float, float, float, float]:
+    """Graphics + pins + visible Reference/Value in sheet coordinates."""
+    return _aabb_of(part, getattr(part, "bbox", (-part.hw, -part.hh, part.hw, part.hh)))
+
+
+def body_aabb(part) -> tuple[float, float, float, float]:
+    """Graphics + pins + pin text, not Reference/Value. Used for pin-attach."""
+    box = getattr(part, "body_bbox", None) or getattr(
+        part, "bbox", (-part.hw, -part.hh, part.hw, part.hh)
     )
+    return _aabb_of(part, box)
+
+
+def core_aabb(part) -> tuple[float, float, float, float]:
+    """Graphics only (no pins, no text). Wires must not cross this."""
+    box = getattr(part, "core_bbox", None) or getattr(part, "body_bbox", None) or (
+        -part.hw,
+        -part.hh,
+        part.hw,
+        part.hh,
+    )
+    return _aabb_of(part, box)
 
 
 def _apply_along(spec: SchPlaceSpec, part, other, occupied: list) -> None:
@@ -106,16 +157,41 @@ def _apply_along(spec: SchPlaceSpec, part, other, occupied: list) -> None:
         part.rot = other.rot
     else:
         part.rot = 0.0
-    step_x = other.hw + part.hw + gap
-    step_y = other.hh + part.hh + gap
-    for dx, dy in ((0.0, 1.0), (0.0, -1.0), (1.0, 0.0), (-1.0, 0.0)):
-        part.x = other.x + dx * step_x
-        part.y = other.y + dy * step_y
+    side = spec.side if spec.side in _SIDES else "bottom"
+    sx, sy = _SIDES[side]
+    ox0, oy0, ox1, oy1 = world_aabb(other)
+    _, tpin = parse_refpin(spec.along or "?.1")
+    try:
+        op = _find_pin(other, tpin)
+        owx, owy = pin_world(other, op)
+    except ValueError:
+        owx, owy = other.x, other.y
+    our_name = spec.pin or ("1" if part.pins else "1")
+    try:
+        our = _find_pin(part, our_name)
+    except ValueError:
+        our = part.pins[0]
+    plx, ply = lib_to_sheet(our.lx, our.ly, part.rot)
+    for i in range(24):
+        d = gap + i * 1.27
+        part.x, part.y = other.x, other.y
+        a0, a1, a2, a3 = world_aabb(part)
+        if sy > 0:
+            part.x = owx - plx
+            part.y = oy1 + d + (part.y - a1)
+        elif sy < 0:
+            part.x = owx - plx
+            part.y = oy0 - d - (a3 - part.y)
+        elif sx > 0:
+            part.x = ox1 + d + (part.x - a0)
+            part.y = owy - ply
+        else:
+            part.x = ox0 - d - (a2 - part.x)
+            part.y = owy - ply
         if not any(_overlap(part, o) for o in occupied):
             part.placed = True
             return
-    part.x = other.x
-    part.y = other.y + step_y
+    part.x, part.y = owx - plx, oy1 + gap + part.hh
     part.placed = True
 
 
@@ -129,54 +205,63 @@ def _apply_attach(spec: SchPlaceSpec, part, other, other_pin_name: str, occupied
     our_name = spec.pin or ("1" if any(p.number == "1" for p in part.pins) else part.pins[0].number)
     our = _find_pin(part, our_name)
 
-    lx, ly = _rot_xy(op.lx, op.ly, other.rot)
-    bx0, by0, bx1, by1 = _body(other)
-    if abs(lx) >= abs(ly):
-        if lx < 0:
-            base_x, base_y, face, step = bx0 - gap, oy, (1.0, 0.0), (-1.0, 0.0)
-        else:
-            base_x, base_y, face, step = bx1 + gap, oy, (-1.0, 0.0), (1.0, 0.0)
+    if spec.side and spec.side in _SIDES:
+        step = _SIDES[spec.side]
+        face_park = True
     else:
-        if ly < 0:
-            base_x, base_y, face, step = ox, by0 - gap, (0.0, 1.0), (0.0, -1.0)
-        else:
-            base_x, base_y, face, step = ox, by1 + gap, (0.0, -1.0), (0.0, 1.0)
+        step = pin_outward(other, op)
+        face_park = False
+    face = (-step[0], -step[1])
 
     if spec.rotate_set:
         part.rot = float(spec.rot)
-    elif part.kind in ("r", "c", "l", "d"):
+    else:
         part.rot = _best_rot(our, face)
 
+    plx, ply = lib_to_sheet(our.lx, our.ly, part.rot)
+    bx0, by0, bx1, by1 = body_aabb(other)
     chosen = False
-    for i in range(24):
-        tx = base_x + step[0] * i * 1.27
-        ty = base_y + step[1] * i * 1.27
-        plx, ply = _rot_xy(our.lx, our.ly, part.rot)
+    for i in range(64):
+        dist = gap + i * 1.27
+        if face_park:
+            if spec.side == "left":
+                tx, ty = bx0 - dist, oy
+            elif spec.side == "right":
+                tx, ty = bx1 + dist, oy
+            elif spec.side == "top":
+                tx, ty = ox, by0 - dist
+            else:
+                tx, ty = ox, by1 + dist
+        else:
+            tx = ox + step[0] * dist
+            ty = oy + step[1] * dist
         part.x, part.y = tx - plx, ty - ply
-        if not any(_overlap(part, o) for o in occupied):
+        if not any(_overlap_body(part, o) for o in occupied):
             chosen = True
             break
     if not chosen:
-        plx, ply = _rot_xy(our.lx, our.ly, part.rot)
-        part.x = base_x + step[0] * 12.7 - plx
-        part.y = base_y + step[1] * 12.7 - ply
+        part.x = ox + step[0] * 50.8 - plx
+        part.y = oy + step[1] * 50.8 - ply
     part.placed = True
 
 
-def _reach(p) -> tuple[float, float]:
-    extra = 3.81 if p.kind == "box" else 0.0
-    return p.hw + extra, p.hh + extra
-
-
-def _overlap(a, b, pad: float = 1.27) -> bool:
-    aw, ah = _reach(a)
-    bw, bh = _reach(b)
+def _boxes_overlap(a, b, pad: float) -> bool:
+    ax0, ay0, ax1, ay1 = a
+    bx0, by0, bx1, by1 = b
     return not (
-        a.x + aw + pad < b.x - bw
-        or b.x + bw + pad < a.x - aw
-        or a.y + ah + pad < b.y - bh
-        or b.y + bh + pad < a.y - ah
+        ax1 + pad < bx0
+        or bx1 + pad < ax0
+        or ay1 + pad < by0
+        or by1 + pad < ay0
     )
+
+
+def _overlap(a, b, pad: float = _PAD) -> bool:
+    return _boxes_overlap(world_aabb(a), world_aabb(b), pad)
+
+
+def _overlap_body(a, b, pad: float = _BODY_PAD) -> bool:
+    return _boxes_overlap(body_aabb(a), body_aabb(b), pad)
 
 
 def apply_sch_places(design: Design, parts: list) -> None:
@@ -233,3 +318,26 @@ def apply_sch_places(design: Design, parts: list) -> None:
                 + ", ".join((s.to or s.along or s.ref) for s in nxt)
             )
         pending = nxt
+    _separate(parts, {s.ref for s in design.sch_places if not s.has_attach()})
+
+
+def _separate(parts: list, css_refs: set[str]) -> None:
+    """Nudge attached parts until visual boxes no longer overlap."""
+    for _ in range(48):
+        moved = False
+        for i, a in enumerate(parts):
+            for b in parts[i + 1 :]:
+                if not _overlap(a, b, pad=_PAD):
+                    continue
+                mover, hold = (b, a) if a.ref in css_refs and b.ref not in css_refs else (a, b)
+                if mover.ref in css_refs and hold.ref in css_refs:
+                    continue
+                mx, my = mover.x - hold.x, mover.y - hold.y
+                if abs(mx) < 0.1 and abs(my) < 0.1:
+                    mx = -1.0
+                n = math.hypot(mx, my) or 1.0
+                mover.x += 2.54 * mx / n
+                mover.y += 2.54 * my / n
+                moved = True
+        if not moved:
+            return

@@ -99,8 +99,9 @@ class SchPlaceSpec:
     pin: str | None = None
     to: str | None = None
     along: str | None = None
-    gap: float = 2.54
+    gap: float = 5.08
     align: str | None = None
+    side: str | None = None
     rot: float = 0.0
     rotate_set: bool = False
     reason: str = ""

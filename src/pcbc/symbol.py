@@ -5,6 +5,7 @@ The symbol is the name → pad map. Footprints only have pad numbers.
 
 from __future__ import annotations
 
+import math
 import re
 from pathlib import Path
 
@@ -20,6 +21,20 @@ _SYM_NAME = re.compile(r'\(symbol\s+"([^"]+)"')
 
 _OPTIONAL_NAMES = frozenset({"NC", "DNC"})
 _OPTIONAL_TYPES = frozenset({"no_connect"})
+
+_RECT = re.compile(
+    r"\(rectangle\s*\(\s*start\s+([0-9.+-]+)\s+([0-9.+-]+)\)\s*\(\s*end\s+([0-9.+-]+)\s+([0-9.+-]+)\)",
+    re.S,
+)
+_XY = re.compile(r"\(xy\s+([0-9.+-]+)\s+([0-9.+-]+)\)")
+_CENTER = re.compile(r"\(center\s+([0-9.+-]+)\s+([0-9.+-]+)\)")
+_RADIUS = re.compile(r"\(radius\s+([0-9.+-]+)\)")
+_ARC_PT = re.compile(r"\((?:start|mid|end)\s+([0-9.+-]+)\s+([0-9.+-]+)\)")
+_HIDE_NAMES = re.compile(r"\(pin_names\b[^)]*\bhide\s+yes", re.S)
+_HIDE_NUMS = re.compile(r"\(pin_numbers\b[^)]*\bhide\s+yes", re.S)
+_PROP_NAME = re.compile(r'\(property\s+"([^"]+)"')
+_CHAR_W = 1.27 * 0.8
+_FONT_H = 1.27
 
 
 def parse_symbol_pins(path: Path) -> dict[str, Pin]:
@@ -64,7 +79,10 @@ def extract_main_symbol(text: str) -> tuple[str, str]:
 
 
 def parse_symbol_pins_geom(path: Path) -> list[dict]:
-    text = Path(path).read_text()
+    return _pins_geom(Path(path).read_text())
+
+
+def _pins_geom(text: str) -> list[dict]:
     pins: list[dict] = []
     start = 0
     while True:
@@ -93,3 +111,99 @@ def parse_symbol_pins_geom(path: Path) -> list[dict]:
             }
         )
     return pins
+
+
+def _text_half_w(s: str) -> float:
+    return max(len(s), 1) * _CHAR_W / 2.0
+
+
+def parse_symbol_layout(text: str) -> dict:
+    """Visual AABB + visible Reference/Value offsets from a .kicad_sym.
+
+    Does not rewrite the symbol. Used so SchPlace collision matches what KiCad draws.
+    """
+    _name, block = extract_main_symbol(text)
+    xs: list[float] = []
+    ys: list[float] = []
+
+    def add(x: float, y: float, hx: float = 0.0, hy: float = 0.0) -> None:
+        xs.extend((x - hx, x + hx))
+        ys.extend((y - hy, y + hy))
+
+    for m in _RECT.finditer(block):
+        x0, y0, x1, y1 = (float(m.group(i)) for i in range(1, 5))
+        xs.extend((x0, x1))
+        ys.extend((y0, y1))
+    for m in _XY.finditer(block):
+        add(float(m.group(1)), float(m.group(2)))
+    for m in _CENTER.finditer(block):
+        cx, cy = float(m.group(1)), float(m.group(2))
+        rm = _RADIUS.search(block[m.start() : m.start() + 160])
+        r = float(rm.group(1)) if rm else 0.4
+        add(cx, cy, r, r)
+    for m in _ARC_PT.finditer(block):
+        add(float(m.group(1)), float(m.group(2)))
+
+    pad = 0.8
+    core_bbox = (
+        (min(xs) - pad, min(ys) - pad, max(xs) + pad, max(ys) + pad)
+        if xs
+        else None
+    )
+
+    hide_names = _HIDE_NAMES.search(block) is not None
+    hide_nums = _HIDE_NUMS.search(block) is not None
+    pins = _pins_geom(block)
+    for p in pins:
+        x, y, rot, length = p["x"], p["y"], p["rot"], p["length"]
+        add(x, y)
+        rad = math.radians(rot)
+        # Pin `at` is the electrical end; `rot` points toward the body.
+        bx = x + length * math.cos(rad)
+        by = y + length * math.sin(rad)
+        add(bx, by)
+        if not hide_names:
+            tw = _text_half_w(str(p["name"]))
+            add((x + bx) / 2.0, (y + by) / 2.0, tw, _FONT_H / 2.0)
+        if not hide_nums:
+            tw = _text_half_w(str(p["number"]))
+            ox, oy = -math.cos(rad), -math.sin(rad)
+            add(x + ox * tw, y + oy * (_FONT_H / 2.0), tw, _FONT_H / 2.0)
+
+    if not xs:
+        xs, ys = [-2.54, 2.54], [-2.54, 2.54]
+    body_bbox = (min(xs) - pad, min(ys) - pad, max(xs) + pad, max(ys) + pad)
+
+    props: dict[str, tuple[float, float]] = {}
+    start = 0
+    while True:
+        j = block.find("(property", start)
+        if j < 0:
+            break
+        k = matching_paren(block, j)
+        chunk = block[j : k + 1]
+        start = k + 1
+        nm = _PROP_NAME.search(chunk)
+        if not nm or nm.group(1) not in ("Reference", "Value"):
+            continue
+        if re.search(r"\bhide\b", chunk):
+            continue
+        at = _PIN_AT.search(chunk)
+        if not at:
+            continue
+        px, py = float(at.group(1)), float(at.group(2))
+        props[nm.group(1)] = (px, py)
+        vm = re.search(r'\(property\s+"[^"]+"\s+"([^"]*)"', chunk)
+        label = vm.group(1) if vm else nm.group(1)
+        tw = _text_half_w(label)
+        add(px, py, tw, _FONT_H / 2.0 + 0.4)
+
+    bbox = (min(xs) - pad, min(ys) - pad, max(xs) + pad, max(ys) + pad)
+    return {
+        "bbox": bbox,
+        "body_bbox": body_bbox,
+        "core_bbox": core_bbox or body_bbox,
+        "prop_ref": props.get("Reference", (bbox[2] + 1.5, 1.27)),
+        "prop_val": props.get("Value", (bbox[2] + 1.5, -1.27)),
+        "pins": pins,
+    }

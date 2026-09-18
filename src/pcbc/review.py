@@ -15,6 +15,7 @@ from pathlib import Path
 
 from .compile import compile_design
 from .fab import kicad_cli
+from .netcheck import KicadMissing, check_schematic
 from .language import load_board
 from .project import layout_dir
 from .sch_emit import emit_schematic_file
@@ -335,6 +336,12 @@ def review_job(board: Path, *, open_html: bool = True) -> dict:
     sch_path = layout / "schematic.kicad_sch"
     emit_schematic_file(design, sch_path, title=board.stem)
     result["schematic"] = str(sch_path)
+    try:
+        netlist_fails = check_schematic(design, sch_path)
+        result["netlist"] = "verified" if not netlist_fails else netlist_fails
+    except KicadMissing as exc:
+        netlist_fails = []
+        result["netlist"] = f"unchecked: {exc}"
 
     bom_path = layout / "fab" / "bom.csv"
     bom_rows: list[list[str]] = []
@@ -384,6 +391,13 @@ def review_job(board: Path, *, open_html: bool = True) -> dict:
     notes = [
         f"{len(design.instances)} parts, {len(design.nets)} nets",
         "Schematic is pcbc emit from board.py (no default.net).",
+        (
+            "kicad-cli reads the same netlist as board.py."
+            if result.get("netlist") == "verified"
+            else f"NETLIST MISMATCH: {'; '.join(netlist_fails)}"
+            if netlist_fails
+            else f"Netlist {result.get('netlist')}."
+        ),
         "3D is kicad-cli pcb export glb (tracks, pads, silk, mask).",
         "Vendored chip lands have no STEP — copper still shows.",
     ]

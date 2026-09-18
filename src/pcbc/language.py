@@ -259,8 +259,9 @@ def SchPlace(
     pin: str | None = None,
     to: str | None = None,
     along: str | None = None,
-    gap: float = 2.54,
+    gap: float = 5.08,
     align: str | None = None,
+    side: str | None = None,
     rotate: float | None = None,
     parent: str | None = None,
     position: str | None = None,
@@ -268,13 +269,19 @@ def SchPlace(
     reason: str = "",
     **css,
 ) -> SchPlaceSpec:
-    """Schematic pose. CSS parks a body; pin=/to=/gap= hangs a pin off another pin."""
+    """Schematic pose. CSS parks a body; pin=/to=/gap= hangs a pin off another pin.
+
+    Library symbols are used as-is. ``side`` is ``left``/``right``/``top``/``bottom``
+    (CSS sense: top is the smaller sheet Y).
+    """
     who = f"SchPlace({ref!r})"
     if "gap" in css:
         raise ValueError(f"{who}: gap= is pin spacing (not CSS). Pass gap= as its own argument.")
     attach = bool(to or along)
     if attach and not pin:
         pin = "1"
+    if side is not None and side not in ("left", "right", "top", "bottom"):
+        raise ValueError(f"{who}: side must be left/right/top/bottom, got {side!r}")
     spec = SchPlaceSpec(
         ref=str(ref),
         pin=pin,
@@ -282,6 +289,7 @@ def SchPlace(
         along=along,
         gap=float(gap),
         align=align,
+        side=side,
         reason=reason,
         parent=parent,
     )

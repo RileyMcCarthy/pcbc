@@ -8,6 +8,7 @@ from .circuit import check_design
 from .compile import compile_design
 from .fab import fab_job
 from .language import load_board
+from .netcheck import KicadMissing, check_schematic
 from .place import place_job
 from .project import layout_dir, packed_reason, seed_pcb
 from .route import route_job
@@ -90,7 +91,17 @@ def build_job(
     if "sch" in plan:
         sch = layout / "schematic.kicad_sch"
         emit_schematic_file(design, sch, title=name)
-        result["steps"].append({"stage": "sch", "sch": str(sch)})
+        step = {"stage": "sch", "sch": str(sch)}
+        try:
+            fails = check_schematic(design, sch)
+            step["netlist"] = "verified" if not fails else fails
+        except KicadMissing as exc:
+            fails = []
+            step["netlist"] = f"unchecked: {exc}"
+        result["steps"].append(step)
+        if fails:
+            result["error"] = "schematic netlist differs from board.py: " + "; ".join(fails)
+            return result
 
     placed = layout / "placed" / "layout.kicad_pcb"
     if "place" in plan:

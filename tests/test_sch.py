@@ -53,3 +53,37 @@ def test_power_symbols_sit_on_pins_as_one_group():
 
 def test_parse_refpin_slash_name():
     assert parse_refpin("U3.I/O1") == ("U3", "I/O1")
+
+
+def test_library_symbol_visual_bbox_includes_value():
+    from pcbc.symbol import parse_symbol_layout
+
+    path = (
+        Path(__file__).resolve().parent.parent
+        / "examples/c3_usb/components/Espressif/ESP32-C3-MINI-1-N4/ESP32-C3-MINI-1-N4.kicad_sym"
+    )
+    layout = parse_symbol_layout(path.read_text())
+    x0, y0, x1, y1 = layout["bbox"]
+    assert y1 > 35.0  # Reference above the body
+    assert y0 < -35.0  # Value below the body
+    assert layout["prop_ref"] == (0.0, 38.10) or abs(layout["prop_ref"][1] - 38.10) < 0.05
+
+
+def test_library_to_sheet_transform_matches_kicad():
+    # Pin 1 of a probe symbol at library (-10.16, 5.08); these sheet offsets are
+    # where kicad-cli 10 connected a wire for each instance rotation.
+    from pcbc.sch_place import lib_to_sheet
+
+    assert lib_to_sheet(-10.16, 5.08, 0) == (-10.16, -5.08)
+    assert lib_to_sheet(-10.16, 5.08, 90) == (-5.08, 10.16)
+    assert lib_to_sheet(-10.16, 5.08, 180) == (10.16, 5.08)
+    assert lib_to_sheet(-10.16, 5.08, 270) == (5.08, -10.16)
+
+
+def test_passives_follow_kicad_device_convention():
+    # Device:R has pin 1 at library +Y, i.e. the top of the sheet.
+    from pcbc.sch_emit import _passive_pins
+
+    p1, p2 = _passive_pins("r", {"1": "VCC", "2": "LED"})
+    assert (p1.number, p1.ly, p1.net) == ("1", 3.81, "VCC")
+    assert (p2.number, p2.ly, p2.net) == ("2", -3.81, "LED")

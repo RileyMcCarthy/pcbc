@@ -19,6 +19,19 @@ pcbc build board.py           check → seed pcb → sch → place → route →
 
 Generics (`Resistor("R1", "1k", package="0402", …)`) use vendored KiCad chip lands. Footprint properties: `Value` = electrical, `Mpn` = reel, `LCSC` = JLC code.
 
+Schematic symbols come from `.kicad_sym` **as-is** (no compact rewrite). `SchPlace` is how an AI lays them out:
+
+```python
+SchPlace("U1", parent="mcu", left=150, top=20)             # CSS: ICs / connectors
+SchPlace("C1", pin="1", to="U1.3V3", gap=10.16)            # hang a 2-pin part off a pin
+SchPlace("C2", pin="1", along="C1.1", side="left")          # stack, pin-aligned
+SchPlace("U3", pin="I/O1", to="J1.DP1", side="bottom")      # park on a face of the target
+```
+
+Library `.kicad_sym` artwork is used as-is. Collision uses the real symbol (graphics, pin text, Reference/Value).
+
+The AI never draws a wire. pcbc wires every net from `board.py`: pins of one symbol in a line share a rail, nearby symbols get Manhattan wires when a clean path exists, and every connected group is then named — a label on signal nets, a power symbol on `Power()`/`Ground()` nets. `pcbc build` then asks `kicad-cli sch export netlist` for what KiCad actually reads and fails the `sch` stage if it is not exactly the board's netlist (`tests/test_netcheck.py` does the same). Placement changes how it looks, never what it connects.
+
 ## Install
 
 ```bash

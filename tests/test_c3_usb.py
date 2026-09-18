@@ -22,17 +22,44 @@ def test_c3_usb_check():
     assert u1.pins["IO19"] == "USB_DP"
 
 
-def test_c3_usb_schematic_hides_unbound_mcu_pins():
-    from pcbc.sch_emit import _parts_from_design
+def test_c3_usb_uses_library_symbol_pins():
+    from pcbc.sch_emit import _parts_from_design, emit_from_design
 
     d = load_board(BOARD)
     kinds = {n.name: n.kind for n in d.nets.values()}
     parts = _parts_from_design(d, kinds)
     u1 = next(p for p in parts if p.ref == "U1")
-    names = {p.name for p in u1.pins}
-    assert "IO0" not in names
-    assert "EN" in names and "IO19" in names
-    assert len(u1.pins) <= 12
+    assert u1.lib_sexp  # EasyEDA .kicad_sym, not a rewritten box
+    assert "rectangle" in u1.lib_sexp
+    assert len(u1.pins) > 20
+    sch = emit_from_design(d, title="c3_usb")
+    assert "USB_DP" in sch
+    # Reference stays on the library offset, not dumped onto the right-side pins.
+    assert u1.prop_ref[1] > 20.0
+
+
+def test_c3_usb_sch_no_visual_overlap():
+    from pcbc.sch_emit import _parts_from_design
+    from pcbc.sch_place import _overlap, apply_sch_places
+
+    d = load_board(BOARD)
+    kinds = {n.name: n.kind for n in d.nets.values()}
+    parts = _parts_from_design(d, kinds)
+    apply_sch_places(d, parts)
+    hits = []
+    for i, a in enumerate(parts):
+        for b in parts[i + 1 :]:
+            if _overlap(a, b, pad=2.0):
+                hits.append(f"{a.ref}/{b.ref}")
+    assert hits == []
+
+
+def test_c3_usb_sch_wires_nearby_pins():
+    from pcbc.sch_emit import emit_from_design
+
+    sch = emit_from_design(load_board(BOARD), title="c3_usb")
+    assert sch.count("(wire") >= 12
+    assert sch.count('(lib_id "power:GND")') >= 4
 
 
 def test_c3_usb_upto_place(tmp_path: Path):

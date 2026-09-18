@@ -29,7 +29,7 @@ SchPlace("SW1", along="C2.1", side="left")       # beside it, facing it
 SchPlace("U3", to="J1.DP1", side="bottom")       # an IC parks on a face, upright
 ```
 
-The tool picks the distance (room for the net's label on the wire); `gap=` only to override it. `pin=` is only for hanging a pin that is *not* on the target's net; `rotate=` only to override the orientation the tool picks.
+The tool picks the distance (room for the net's label on the wire) and the pose — a 2-pin part turns or mirrors so the attached pin faces its target, a bigger symbol only mirrors, text stays readable either way. `gap=`, `rotate=`, `mirror="x"|"y"` override; `pin=` is only for hanging a pin that is *not* on the target's net.
 
 Library `.kicad_sym` artwork is used as-is. Collision uses the real symbol (graphics, pin text, Reference/Value).
 

@@ -263,6 +263,7 @@ def SchPlace(
     align: str | None = None,
     side: str | None = None,
     rotate: float | None = None,
+    mirror: str | None = None,
     parent: str | None = None,
     position: str | None = None,
     style: str | None = None,
@@ -276,7 +277,9 @@ def SchPlace(
     stacks beside that part instead. ``side`` is ``left``/``right``/``top``/
     ``bottom`` (CSS sense: top is the smaller sheet Y). ``gap`` (mm, pin to pin)
     is chosen by the tool unless given: room for the net's label, else the grid
-    minimum. Library symbols are used as-is.
+    minimum. The tool also turns or mirrors the part so the attached pin faces
+    its target (2-pin parts may rotate; bigger symbols only mirror); ``rotate=``
+    / ``mirror="x"|"y"`` override that. Library symbols are used as-is.
     """
     who = f"SchPlace({ref!r})"
     if "gap" in css:
@@ -284,6 +287,8 @@ def SchPlace(
     attach = bool(to or along)
     if side is not None and side not in ("left", "right", "top", "bottom"):
         raise ValueError(f"{who}: side must be left/right/top/bottom, got {side!r}")
+    if mirror is not None and mirror not in ("x", "y"):
+        raise ValueError(f"{who}: mirror must be 'x' (top/bottom) or 'y' (left/right), got {mirror!r}")
     spec = SchPlaceSpec(
         ref=str(ref),
         pin=pin,
@@ -292,6 +297,7 @@ def SchPlace(
         gap=float(gap) if gap is not None else None,
         align=align,
         side=side,
+        mirror=mirror,
         reason=reason,
         parent=parent,
     )

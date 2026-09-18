@@ -102,6 +102,7 @@ class SchPlaceSpec:
     gap: float | None = None  # None: the tool leaves room for the net's label
     align: str | None = None
     side: str | None = None
+    mirror: str | None = None  # "x" (top/bottom) or "y" (left/right), KiCad sense
     rot: float = 0.0
     rotate_set: bool = False
     reason: str = ""

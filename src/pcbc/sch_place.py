@@ -68,40 +68,55 @@ def _rot_xy(lx: float, ly: float, rot: float) -> tuple[float, float]:
     return lx, ly
 
 
-def lib_to_sheet(lx: float, ly: float, rot: float) -> tuple[float, float]:
-    """Library offset (Y up) → sheet offset (Y down) for a symbol placed at ``rot``.
+def lib_to_sheet(lx: float, ly: float, rot: float, mirror: str | None = None) -> tuple[float, float]:
+    """Library offset (Y up) → sheet offset (Y down) for a symbol placed at
+    ``rot`` with an optional ``(mirror x|y)``.
 
-    KiCad rotates in the library frame first, then mirrors Y onto the sheet
-    (checked against kicad-cli for 0/90/180/270).
+    KiCad rotates in the library frame, mirrors Y onto the sheet, then applies
+    the instance mirror in sheet coordinates: ``x`` flips top/bottom, ``y``
+    flips left/right (checked against kicad-cli for every combination).
     """
     rx, ry = _rot_xy(lx, ly, rot)
-    return rx, -ry
+    dx, dy = rx, -ry
+    if mirror == "x":
+        dy = -dy
+    elif mirror == "y":
+        dx = -dx
+    return dx, dy
 
 
 def pin_world(part, pin) -> tuple[float, float]:
     """Electrical end of a pin in sheet coordinates."""
-    dx, dy = lib_to_sheet(pin.lx, pin.ly, part.rot)
+    dx, dy = lib_to_sheet(pin.lx, pin.ly, part.rot, getattr(part, "mirror", None))
     return part.x + dx, part.y + dy
 
 
 def pin_outward(part, pin) -> tuple[float, float]:
     """Unit vector (sheet frame) from the pin end away from the body."""
     rad = math.radians(pin.rot)  # pin rot points toward the body
-    ox, oy = lib_to_sheet(-math.cos(rad), -math.sin(rad), part.rot)
+    ox, oy = lib_to_sheet(-math.cos(rad), -math.sin(rad), part.rot, getattr(part, "mirror", None))
     n = math.hypot(ox, oy) or 1.0
     return ox / n, oy / n
 
 
-def _best_rot(pin, want: tuple[float, float]) -> float:
-    """Symbol rotation whose outward pin direction best matches ``want`` (sheet frame)."""
-    best, best_dot = 0.0, -9.0
+# Poses in order of preference: as drawn, mirrored (text stays readable),
+# then turned. A 2-pin part may take any; a bigger symbol only mirrors.
+_POSES_2PIN = [(0.0, None), (0.0, "y"), (0.0, "x"), (180.0, None), (90.0, None), (270.0, None), (90.0, "y"), (270.0, "y")]
+_POSES_BOX = [(0.0, None), (0.0, "y"), (0.0, "x")]
+
+
+def _best_pose(pin, want: tuple[float, float], part) -> tuple[float, str | None]:
+    """Rotation and mirror whose outward direction for ``pin`` best matches
+    ``want`` (sheet frame). Ties keep the earlier, plainer pose."""
+    poses = _POSES_2PIN if len(part.pins) <= 2 else _POSES_BOX
+    best, best_dot = poses[0], -9.0
     rad = math.radians(pin.rot)
-    for r in (0.0, 90.0, 180.0, 270.0):
-        ox, oy = lib_to_sheet(-math.cos(rad), -math.sin(rad), r)
+    for r, m in poses:
+        ox, oy = lib_to_sheet(-math.cos(rad), -math.sin(rad), r, m)
         n = math.hypot(ox, oy) or 1.0
         d = (ox / n) * want[0] + (oy / n) * want[1]
-        if d > best_dot:
-            best, best_dot = r, d
+        if d > best_dot + 1e-9:
+            best, best_dot = (r, m), d
     return best
 
 
@@ -140,6 +155,7 @@ def _apply_css(spec: SchPlaceSpec, part, regions: dict[str, Rect]) -> None:
     at = origin_from_border(rect, local, st.rotate)
     part.x, part.y = at
     part.rot = float(st.rotate)
+    part.mirror = spec.mirror
     part.placed = True
 
 
@@ -147,7 +163,7 @@ def _aabb_of(part, box: tuple[float, float, float, float]) -> tuple[float, float
     x0, y0, x1, y1 = box
     xs, ys = [], []
     for cx, cy in ((x0, y0), (x1, y0), (x1, y1), (x0, y1)):
-        dx, dy = lib_to_sheet(cx, cy, part.rot)
+        dx, dy = lib_to_sheet(cx, cy, part.rot, getattr(part, "mirror", None))
         xs.append(part.x + dx)
         ys.append(part.y + dy)
     return min(xs), min(ys), max(xs), max(ys)
@@ -204,18 +220,20 @@ def _apply_along(spec: SchPlaceSpec, part, other, occupied: list, kinds=None) ->
     _, tpin = parse_refpin(spec.along or "?.1")
     op = _find_pin(other, tpin)
     owx, owy = pin_world(other, op)
-    if spec.rotate_set:
-        part.rot = float(spec.rot)
-    elif part.kind in ("r", "c", "l", "d"):
-        # Stack in the sibling's direction, or turn to face it when a side is named
-        # (a cap hanging under a wire node, a switch beside that cap).
-        part.rot = _best_rot(_attach_pin(spec, part, other, op), (-sx, -sy)) if spec.side else other.rot
+    two_pin = len(part.pins) <= 2
+    if spec.rotate_set or spec.mirror:
+        part.rot, part.mirror = float(spec.rot), spec.mirror
+    elif spec.side and two_pin:
+        # Turn to face the sibling (a cap under a wire node, a switch beside it).
+        part.rot, part.mirror = _best_pose(_attach_pin(spec, part, other, op), (-sx, -sy), part)
+    elif two_pin:
+        part.rot, part.mirror = other.rot, getattr(other, "mirror", None)
     else:
-        part.rot = 0.0
+        part.rot, part.mirror = 0.0, None
     our = _attach_pin(spec, part, other, op)
     gap = float(spec.gap) if spec.gap is not None else _auto_gap(part, our, other, kinds)
-    plx, ply = lib_to_sheet(our.lx, our.ly, part.rot)
-    facing = bool(spec.side) and part.kind in ("r", "c", "l", "d") and not spec.rotate_set
+    plx, ply = lib_to_sheet(our.lx, our.ly, part.rot, part.mirror)
+    facing = bool(spec.side) and two_pin and not spec.rotate_set
     for i in range(24):
         d = gap + i * 1.27
         if facing:
@@ -264,18 +282,17 @@ def _apply_attach(spec: SchPlaceSpec, part, other, other_pin_name: str, occupied
         step = pin_outward(other, op)
         face_park = False
     face = (-step[0], -step[1])
-    part.rot = float(spec.rot) if spec.rotate_set else 0.0
+    part.rot, part.mirror = 0.0, None
     our = _attach_pin(spec, part, other, op, face)
     gap = float(spec.gap) if spec.gap is not None else _auto_gap(part, our, other, kinds)
 
-    if spec.rotate_set:
-        part.rot = float(spec.rot)
-    elif part.kind in ("r", "c", "l", "d"):
-        part.rot = _best_rot(our, face)
+    if spec.rotate_set or spec.mirror:
+        part.rot, part.mirror = float(spec.rot), spec.mirror
     else:
-        part.rot = 0.0  # ICs stay upright unless rotate= says otherwise
+        # A 2-pin part turns or mirrors to face the target; an IC only mirrors.
+        part.rot, part.mirror = _best_pose(our, face, part)
 
-    plx, ply = lib_to_sheet(our.lx, our.ly, part.rot)
+    plx, ply = lib_to_sheet(our.lx, our.ly, part.rot, part.mirror)
     bx0, by0, bx1, by1 = body_aabb(other)
     chosen = False
     for i in range(64):

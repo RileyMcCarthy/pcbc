@@ -90,6 +90,7 @@ class Part:
     x: float = 0.0
     y: float = 0.0
     rot: float = 0.0
+    mirror: str | None = None
     hw: float = 8.0
     hh: float = 6.0
     bbox: tuple[float, float, float, float] = (-8.0, -6.0, 8.0, 6.0)
@@ -774,7 +775,7 @@ def _hat(net: str, x: float, y: float, gnd: bool, rot: int = 0) -> str:
 
 def _prop_world(part: Part, lib_xy: tuple[float, float]) -> tuple[float, float]:
     """Instance property in sheet coords."""
-    dx, dy = lib_to_sheet(lib_xy[0], lib_xy[1], part.rot)
+    dx, dy = lib_to_sheet(lib_xy[0], lib_xy[1], part.rot, part.mirror)
     return part.x + dx, part.y + dy
 
 
@@ -799,6 +800,7 @@ def _instance(part: Part) -> str:
         f'\t\t(pin "{p.number}" (uuid "{new_uuid()}"))\n' for p in part.pins
     )
     rot = int(part.rot) % 360
+    mirror = f"\n\t\t(mirror {part.mirror})" if part.mirror in ("x", "y") else ""
     # KiCad turns field text with a 90/270 symbol; a 90 field angle undoes that.
     ang = 90 if rot in (90, 270) else 0
     rjust = vjust = None
@@ -815,7 +817,7 @@ def _instance(part: Part) -> str:
     return (
         f'\t(symbol\n'
         f'\t\t(lib_id "{part.lib_id}")\n'
-        f'\t\t(at {_fmt(part.x)} {_fmt(part.y)} {rot})\n'
+        f'\t\t(at {_fmt(part.x)} {_fmt(part.y)} {rot}){mirror}\n'
         f'\t\t(unit 1)\n'
         f'\t\t(exclude_from_sim no)\n'
         f'\t\t(in_bom yes)\n'
@@ -1269,6 +1271,12 @@ def _hat_box(net: str, x: float, y: float, gnd: bool, rot: int) -> Box:
 
 
 # -- placements ---------------------------------------------------------------
+def _two_pin(part: Part) -> bool:
+    """Passives and 2-pin library symbols (a switch, a crystal): text is placed
+    around them, and they may turn or mirror to face what they hang off."""
+    return bool(part.pins) and (part.kind in ("r", "c", "l", "d") or len(part.pins) <= 2)
+
+
 def _reserve(sheet: _Sheet, parts: list[Part], sites: dict[str, list[_Site]], kinds: dict[str, str] | None) -> None:
     """Before routing: pencil in where power symbols and passive text will want
     to be, so wires steer around those spots instead of through them."""
@@ -1282,7 +1290,7 @@ def _reserve(sheet: _Sheet, parts: list[Part], sites: dict[str, list[_Site]], ki
             hx, hy = (s.x, s.y) if natural else (s.x + ox * 2.54, s.y + oy * 2.54)
             sheet.occupy(_hat_box(net, hx, hy, gnd, 0), "reserve", s.part.ref, net)
     for part in parts:
-        if part.kind not in ("r", "c", "l", "d") or not part.pins:
+        if not _two_pin(part):
             continue
         x0, y0, x1, y1 = body_aabb(part)
         cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
@@ -1548,10 +1556,11 @@ def _annotate(parts: list[Part], kinds: dict[str, str] | None = None) -> tuple[l
                 else:
                     box = (mx - _TEXT_H, my - half, mx, my + half)
                 sheet.occupy(box, "pintext", f"{p.ref}.{pin.number}")
-            rx, ry = _prop_world(p, p.prop_ref)
-            vx, vy = _prop_world(p, p.prop_val)
-            sheet.occupy(_prop_box(p.ref, rx, ry, None), "ref", p.ref)
-            sheet.occupy(_prop_box(p.display, vx, vy, None), "value", p.ref)
+            if not _two_pin(p):
+                rx, ry = _prop_world(p, p.prop_ref)
+                vx, vy = _prop_world(p, p.prop_val)
+                sheet.occupy(_prop_box(p.ref, rx, ry, None), "ref", p.ref)
+                sheet.occupy(_prop_box(p.display, vx, vy, None), "value", p.ref)
         else:
             sheet.occupy(body_aabb(p), "symbol", p.ref)
 
@@ -1670,7 +1679,7 @@ def _annotate(parts: list[Part], kinds: dict[str, str] | None = None) -> tuple[l
         for group in unions[net].groups():
             out.extend(_place_hat(sheet, [sts[i] for i in group], net, gnd))
     for p in parts:
-        if p.kind in ("r", "c", "l", "d"):
+        if _two_pin(p):
             _place_passive_text(sheet, p)
     power_nets = {n for n in sites if is_power_net(n, kinds)}
     return out, _lint(sheet, parts, sites, unions, power_nets)

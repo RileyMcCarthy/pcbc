@@ -135,6 +135,26 @@ def test_gap_defaults_to_room_for_the_label():
     assert _auto_gap(r_boot, next(p for p in r_boot.pins if p.net == "3V3"), by["R_EN"], {"3V3": "power"}) == 5.08
 
 
+def test_switch_mirrors_to_face_its_node():
+    # B3U pin 1 is drawn on the left; beside C_EN it must face right, and a
+    # mirror keeps the text readable where a 180 turn would not.
+    by = _placed(C3_USB)
+    sw = by["SW_RST"]
+    assert (sw.rot, sw.mirror) == (0.0, "y")
+    sch = emit_from_design(load_board(C3_USB), title="c3_usb")
+    i = sch.index('(property "Reference" "SW_RST"')
+    assert "(mirror y)" in sch[i - 200 : i]
+
+
+def test_library_to_sheet_mirror_matches_kicad():
+    from pcbc.sch_place import lib_to_sheet
+
+    # Verified with kicad-cli 10: mirror applies in sheet coordinates after the rotation.
+    assert lib_to_sheet(-10.16, 5.08, 0, "y") == (10.16, -5.08)
+    assert lib_to_sheet(-10.16, 5.08, 0, "x") == (-10.16, 5.08)
+    assert lib_to_sheet(-10.16, 5.08, 90, "y") == (5.08, 10.16)
+
+
 def test_ic_stays_upright_when_attached():
     assert _placed(C3_USB)["U3"].rot == 0.0
 

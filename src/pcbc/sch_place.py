@@ -29,6 +29,34 @@ def _find_pin(part, name: str):
     )
 
 
+def _attach_pin(spec: SchPlaceSpec, part, other, other_pin, face: tuple[float, float] | None = None):
+    """Which of our pins goes next to the target pin: the one on the same net,
+    and of several (an ESD array's pass-through pair) the one facing the target."""
+    if spec.pin:
+        return _find_pin(part, spec.pin)
+    net = getattr(other_pin, "net", "")
+    shared = [p for p in part.pins if net and getattr(p, "net", "") == net]
+    if shared:
+        if face and len(shared) > 1 and part.kind == "box":
+            def facing(p) -> float:
+                ox, oy = pin_outward(part, p)
+                return ox * face[0] + oy * face[1]
+
+            return max(shared, key=facing)
+        return shared[0]
+    if spec.along:
+        try:
+            return _find_pin(part, other_pin.number)
+        except ValueError:
+            return part.pins[0]
+    have = ", ".join(f"{p.name}={p.net}" for p in part.pins if getattr(p, "net", ""))
+    raise ValueError(
+        f"SchPlace({part.ref!r}): no pin of {part.ref} is on net {net!r} like "
+        f"{other.ref}.{other_pin.name} (have {have}). Pass pin= to hang an "
+        f"unconnected pin there on purpose."
+    )
+
+
 def _rot_xy(lx: float, ly: float, rot: float) -> tuple[float, float]:
     r = rot % 360.0
     if abs(r - 180) < 1:
@@ -151,29 +179,34 @@ def core_aabb(part) -> tuple[float, float, float, float]:
 
 def _apply_along(spec: SchPlaceSpec, part, other, occupied: list) -> None:
     gap = float(spec.gap)
-    if spec.rotate_set:
-        part.rot = float(spec.rot)
-    elif part.kind in ("r", "c", "l", "d"):
-        part.rot = other.rot
-    else:
-        part.rot = 0.0
     side = spec.side if spec.side in _SIDES else "bottom"
     sx, sy = _SIDES[side]
     ox0, oy0, ox1, oy1 = world_aabb(other)
     _, tpin = parse_refpin(spec.along or "?.1")
-    try:
-        op = _find_pin(other, tpin)
-        owx, owy = pin_world(other, op)
-    except ValueError:
-        owx, owy = other.x, other.y
-    our_name = spec.pin or ("1" if part.pins else "1")
-    try:
-        our = _find_pin(part, our_name)
-    except ValueError:
-        our = part.pins[0]
+    op = _find_pin(other, tpin)
+    owx, owy = pin_world(other, op)
+    if spec.rotate_set:
+        part.rot = float(spec.rot)
+    elif part.kind in ("r", "c", "l", "d"):
+        # Stack in the sibling's direction, or turn to face it when a side is named
+        # (a cap hanging under a wire node, a switch beside that cap).
+        part.rot = _best_rot(_attach_pin(spec, part, other, op), (-sx, -sy)) if spec.side else other.rot
+    else:
+        part.rot = 0.0
+    our = _attach_pin(spec, part, other, op)
     plx, ply = lib_to_sheet(our.lx, our.ly, part.rot)
+    facing = bool(spec.side) and part.kind in ("r", "c", "l", "d") and not spec.rotate_set
     for i in range(24):
         d = gap + i * 1.27
+        if facing:
+            # Turned toward the sibling's pin: gap is pin to pin, i.e. the wire.
+            part.x = owx + sx * d - plx
+            part.y = owy + sy * d - ply
+            if not any(_overlap_body(part, o, pad=1.0) for o in occupied):
+                part.attach_dir = (sx, sy)
+                part.placed = True
+                return
+            continue
         part.x, part.y = other.x, other.y
         a0, a1, a2, a3 = world_aabb(part)
         if sy > 0:
@@ -189,9 +222,11 @@ def _apply_along(spec: SchPlaceSpec, part, other, occupied: list) -> None:
             part.x = ox0 - d - (a2 - part.x)
             part.y = owy - ply
         if not any(_overlap(part, o) for o in occupied):
+            part.attach_dir = (sx, sy)
             part.placed = True
             return
     part.x, part.y = owx - plx, oy1 + gap + part.hh
+    part.attach_dir = (sx, sy)
     part.placed = True
 
 
@@ -202,8 +237,6 @@ def _apply_attach(spec: SchPlaceSpec, part, other, other_pin_name: str, occupied
     op = _find_pin(other, other_pin_name)
     ox, oy = pin_world(other, op)
     gap = float(spec.gap)
-    our_name = spec.pin or ("1" if any(p.number == "1" for p in part.pins) else part.pins[0].number)
-    our = _find_pin(part, our_name)
 
     if spec.side and spec.side in _SIDES:
         step = _SIDES[spec.side]
@@ -212,11 +245,15 @@ def _apply_attach(spec: SchPlaceSpec, part, other, other_pin_name: str, occupied
         step = pin_outward(other, op)
         face_park = False
     face = (-step[0], -step[1])
+    part.rot = float(spec.rot) if spec.rotate_set else 0.0
+    our = _attach_pin(spec, part, other, op, face)
 
     if spec.rotate_set:
         part.rot = float(spec.rot)
-    else:
+    elif part.kind in ("r", "c", "l", "d"):
         part.rot = _best_rot(our, face)
+    else:
+        part.rot = 0.0  # ICs stay upright unless rotate= says otherwise
 
     plx, ply = lib_to_sheet(our.lx, our.ly, part.rot)
     bx0, by0, bx1, by1 = body_aabb(other)
@@ -242,6 +279,7 @@ def _apply_attach(spec: SchPlaceSpec, part, other, other_pin_name: str, occupied
     if not chosen:
         part.x = ox + step[0] * 50.8 - plx
         part.y = oy + step[1] * 50.8 - ply
+    part.attach_dir = step
     part.placed = True
 
 
@@ -322,22 +360,30 @@ def apply_sch_places(design: Design, parts: list) -> None:
 
 
 def _separate(parts: list, css_refs: set[str]) -> None:
-    """Nudge attached parts until visual boxes no longer overlap."""
+    """Nudge attached parts whose graphics or pins overlap another symbol.
+
+    Moves go along the part's own attach axis, so the pin alignment that
+    to=/along= just made survives (the wire only gets longer). Text is placed
+    later around whatever is here, so it does not count as overlap.
+    """
     for _ in range(48):
         moved = False
         for i, a in enumerate(parts):
             for b in parts[i + 1 :]:
-                if not _overlap(a, b, pad=_PAD):
+                if not _overlap_body(a, b, pad=1.0):
                     continue
                 mover, hold = (b, a) if a.ref in css_refs and b.ref not in css_refs else (a, b)
                 if mover.ref in css_refs and hold.ref in css_refs:
                     continue
-                mx, my = mover.x - hold.x, mover.y - hold.y
-                if abs(mx) < 0.1 and abs(my) < 0.1:
-                    mx = -1.0
-                n = math.hypot(mx, my) or 1.0
-                mover.x += 2.54 * mx / n
-                mover.y += 2.54 * my / n
+                dx, dy = getattr(mover, "attach_dir", None) or (0.0, 0.0)
+                if abs(dx) < 0.1 and abs(dy) < 0.1:
+                    dx, dy = mover.x - hold.x, mover.y - hold.y
+                    if abs(dx) >= abs(dy):
+                        dx, dy = (1.0 if dx >= 0 else -1.0), 0.0
+                    else:
+                        dx, dy = 0.0, (1.0 if dy >= 0 else -1.0)
+                mover.x += 1.27 * dx
+                mover.y += 1.27 * dy
                 moved = True
         if not moved:
             return

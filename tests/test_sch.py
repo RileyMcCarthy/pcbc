@@ -87,3 +87,52 @@ def test_passives_follow_kicad_device_convention():
     p1, p2 = _passive_pins("r", {"1": "VCC", "2": "LED"})
     assert (p1.number, p1.ly, p1.net) == ("1", 3.81, "VCC")
     assert (p2.number, p2.ly, p2.net) == ("2", -3.81, "LED")
+
+
+C3_USB = Path(__file__).resolve().parent.parent / "examples" / "c3_usb" / "c3_usb.py"
+
+
+def _placed(board):
+    design = load_board(board)
+    parts = _parts_from_design(design, {n.name: n.kind for n in design.nets.values()})
+    apply_sch_places(design, parts)
+    return {p.ref: p for p in parts}
+
+
+def test_attach_picks_the_pin_on_the_target_net():
+    by = _placed(C3_USB)
+    r_en, u1 = by["R_EN"], by["U1"]
+    en_pin = next(p for p in u1.pins if p.name == "EN")
+    ours = next(p for p in r_en.pins if p.net == "EN")  # pin 2, not the default pin 1
+    ex, ey = pin_world(u1, en_pin)
+    ox, oy = pin_world(r_en, ours)
+    # Same row (the wire is straight); the tool may slide it further out to make room.
+    assert abs(ey - oy) < 0.01 and 12.0 < ex - ox < 30.0
+
+
+def test_along_with_side_turns_to_face_the_sibling():
+    by = _placed(C3_USB)
+    c_en, r_en = by["C_EN"], by["R_EN"]
+    assert r_en.rot in (90.0, 270.0)  # horizontal resistor on U1.EN
+    assert c_en.rot in (0.0, 180.0)  # cap hangs under the EN node, pin 1 up
+    en_pin = next(p for p in c_en.pins if p.net == "EN")
+    node = pin_world(r_en, next(p for p in r_en.pins if p.net == "EN"))
+    top = pin_world(c_en, en_pin)
+    assert abs(top[0] - node[0]) < 0.01 and top[1] > node[1]
+
+
+def test_ic_stays_upright_when_attached():
+    assert _placed(C3_USB)["U3"].rot == 0.0
+
+
+def test_rotated_symbol_fields_stay_horizontal():
+    sch = emit_from_design(load_board(C3_USB), title="c3_usb")
+    # R_EN is a 90/270 symbol; KiCad turns its fields, so the file compensates.
+    i = sch.index('(property "Reference" "R_EN"')
+    assert " 90)" in sch[i : i + 80]
+
+
+def test_readability_report_is_empty_for_blinky():
+    report: dict = {}
+    emit_from_design(load_board(BLINKY), title="blinky", report=report)
+    assert report["issues"] == [] and report["count"] == 0

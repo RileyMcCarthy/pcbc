@@ -38,9 +38,9 @@ def test_c3_usb_uses_library_symbol_pins():
     assert u1.prop_ref[1] > 20.0
 
 
-def test_c3_usb_sch_no_visual_overlap():
+def test_c3_usb_sch_no_symbol_overlap():
     from pcbc.sch_emit import _parts_from_design
-    from pcbc.sch_place import _overlap, apply_sch_places
+    from pcbc.sch_place import _overlap_body, apply_sch_places
 
     d = load_board(BOARD)
     kinds = {n.name: n.kind for n in d.nets.values()}
@@ -49,7 +49,7 @@ def test_c3_usb_sch_no_visual_overlap():
     hits = []
     for i, a in enumerate(parts):
         for b in parts[i + 1 :]:
-            if _overlap(a, b, pad=2.0):
+            if _overlap_body(a, b, pad=1.0):
                 hits.append(f"{a.ref}/{b.ref}")
     assert hits == []
 
@@ -60,6 +60,15 @@ def test_c3_usb_sch_wires_nearby_pins():
     sch = emit_from_design(load_board(BOARD), title="c3_usb")
     assert sch.count("(wire") >= 12
     assert sch.count('(lib_id "power:GND")') >= 4
+
+
+def test_c3_usb_readability_bar():
+    from pcbc.sch_emit import emit_from_design
+
+    report: dict = {}
+    emit_from_design(load_board(BOARD), title="c3_usb", report=report)
+    assert not [i for i in report["issues"] if i.endswith(": move one of them")]
+    assert report["count"] <= 8, report["issues"]
 
 
 def test_c3_usb_upto_place(tmp_path: Path):

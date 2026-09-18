@@ -166,9 +166,9 @@ def parse_symbol_layout(text: str) -> dict:
             tw = _text_half_w(str(p["name"]))
             add((x + bx) / 2.0, (y + by) / 2.0, tw, _FONT_H / 2.0)
         if not hide_nums:
+            # KiCad draws the number along the pin, between its end and the body.
             tw = _text_half_w(str(p["number"]))
-            ox, oy = -math.cos(rad), -math.sin(rad)
-            add(x + ox * tw, y + oy * (_FONT_H / 2.0), tw, _FONT_H / 2.0)
+            add((x + bx) / 2.0, (y + by) / 2.0, tw, _FONT_H / 2.0)
 
     if not xs:
         xs, ys = [-2.54, 2.54], [-2.54, 2.54]

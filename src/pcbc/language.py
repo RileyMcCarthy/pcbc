@@ -269,17 +269,17 @@ def SchPlace(
     reason: str = "",
     **css,
 ) -> SchPlaceSpec:
-    """Schematic pose. CSS parks a body; pin=/to=/gap= hangs a pin off another pin.
+    """Schematic pose. CSS parks a body; to=/along= hangs the part off another pin.
 
-    Library symbols are used as-is. ``side`` is ``left``/``right``/``top``/``bottom``
-    (CSS sense: top is the smaller sheet Y).
+    ``to="U1.EN"`` puts the pin of this part that shares U1.EN's net next to it;
+    ``pin=`` only when a different pin should go there. ``along="C1.1"`` stacks
+    beside that part instead. Library symbols are used as-is. ``side`` is
+    ``left``/``right``/``top``/``bottom`` (CSS sense: top is the smaller sheet Y).
     """
     who = f"SchPlace({ref!r})"
     if "gap" in css:
         raise ValueError(f"{who}: gap= is pin spacing (not CSS). Pass gap= as its own argument.")
     attach = bool(to or along)
-    if attach and not pin:
-        pin = "1"
     if side is not None and side not in ("left", "right", "top", "bottom"):
         raise ValueError(f"{who}: side must be left/right/top/bottom, got {side!r}")
     spec = SchPlaceSpec(

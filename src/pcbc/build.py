@@ -90,8 +90,9 @@ def build_job(
 
     if "sch" in plan:
         sch = layout / "schematic.kicad_sch"
-        emit_schematic_file(design, sch, title=name)
-        step = {"stage": "sch", "sch": str(sch)}
+        report: dict = {}
+        emit_schematic_file(design, sch, title=name, report=report)
+        step = {"stage": "sch", "sch": str(sch), "readability": report.get("issues", [])}
         try:
             fails = check_schematic(design, sch)
             step["netlist"] = "verified" if not fails else fails

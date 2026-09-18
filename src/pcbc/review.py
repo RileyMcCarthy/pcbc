@@ -334,8 +334,10 @@ def review_job(board: Path, *, open_html: bool = True) -> dict:
         return result
 
     sch_path = layout / "schematic.kicad_sch"
-    emit_schematic_file(design, sch_path, title=board.stem)
+    sch_report: dict = {}
+    emit_schematic_file(design, sch_path, title=board.stem, report=sch_report)
     result["schematic"] = str(sch_path)
+    result["readability"] = sch_report.get("issues", [])
     try:
         netlist_fails = check_schematic(design, sch_path)
         result["netlist"] = "verified" if not netlist_fails else netlist_fails
@@ -397,6 +399,12 @@ def review_job(board: Path, *, open_html: bool = True) -> dict:
             else f"NETLIST MISMATCH: {'; '.join(netlist_fails)}"
             if netlist_fails
             else f"Netlist {result.get('netlist')}."
+        ),
+        (
+            "Schematic readability: nothing overlaps."
+            if not result["readability"]
+            else f"Schematic readability, {len(result['readability'])} to fix by moving parts: "
+            + "; ".join(result["readability"])
         ),
         "3D is kicad-cli pcb export glb (tracks, pads, silk, mask).",
         "Vendored chip lands have no STEP — copper still shows.",

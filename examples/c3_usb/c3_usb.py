@@ -265,7 +265,7 @@ SchPlace("C_3V3_HF", along="C_3V3.1", side="bottom")
 SchRegion("mcu", left=12, top=140, width=380, height=145)
 SchPlace("U1", parent="mcu", left=185, top=10)
 SchPlace("C_MCU", to="U1.3V3")
-SchPlace("C_MCU_HF", along="C_MCU.1", side="bottom")
+SchPlace("C_MCU_HF", along="C_MCU.1", side="bottom")  # under the 3V3 node: no extra symbol
 SchPlace("R_EN", to="U1.EN")
 SchPlace("C_EN", along="R_EN.2", side="bottom")
 SchPlace("SW_RST", along="C_EN.1", side="left")

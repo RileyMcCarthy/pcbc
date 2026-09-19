@@ -130,6 +130,98 @@ _SIDES = {
 # Full-box clearance (includes Reference/Value). Body-only attach can be tighter.
 _PAD = 5.08
 _BODY_PAD = 2.54
+_HAT_H = 4.8
+
+
+def text_w(s: str) -> float:
+    """Width of KiCad 1.27 mm text, roughly."""
+    return max(len(s), 1) * 1.27 * 0.95 + 0.4
+
+
+def hat_zone(part, pin, net: str, gnd: bool) -> tuple[float, float, float, float]:
+    """Where this pin's power symbol will want to be: on the pin end when the
+    pin already points the symbol's way, else 2.54 mm out along the pin."""
+    ex, ey = pin_world(part, pin)
+    ox, oy = pin_outward(part, pin)
+    vertical = abs(oy) > abs(ox)
+    natural = vertical and ((gnd and oy > 0) or (not gnd and oy < 0))
+    hx, hy = (ex, ey) if natural else (ex + ox * 2.54, ey + oy * 2.54)
+    hw = max(1.5, text_w(net) / 2.0)
+    return (hx - hw, hy, hx + hw, hy + _HAT_H) if gnd else (hx - hw, hy - _HAT_H, hx + hw, hy)
+
+
+def two_pin(part) -> bool:
+    return bool(part.pins) and (getattr(part, "kind", "") in ("r", "c", "l", "d") or len(part.pins) <= 2)
+
+
+def text_zone(part) -> tuple[float, float, float, float]:
+    """Where a 2-pin part's Reference/Value will want to be: right of a vertical
+    part, above a horizontal one."""
+    x0, y0, x1, y1 = body_aabb(part)
+    cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
+    w = max(text_w(part.ref), text_w(getattr(part, "display", "") or ""))
+    vertical = abs(pin_outward(part, part.pins[0])[1]) > 0.5
+    if vertical:
+        return (x1 + 0.8, cy - 1.8, x1 + 0.8 + w, cy + 1.8)
+    return (cx - w / 2.0, y0 - 3.5, cx + w / 2.0, y0 - 0.2)
+
+
+def keepout_boxes(part, kinds: dict[str, str] | None) -> list[tuple[float, float, float, float]]:
+    """Body plus the room each power symbol will take, as separate boxes (one
+    box around all of them would claim the space under the whole part). Parts
+    are kept out of each other's boxes, so what is drawn later has somewhere
+    to go. A pin that an attach already wires needs no symbol; text is soft
+    and finds its own side."""
+    boxes = [body_aabb(part)]
+    wired = getattr(part, "wired_pins", set())
+    for pin in part.pins:
+        if pin.number in wired:
+            continue
+        net = getattr(pin, "net", "") or ""
+        kind = (kinds or {}).get(net, "")
+        if kind in ("power", "ground"):
+            boxes.append(hat_zone(part, pin, net, kind == "ground"))
+    return boxes
+
+
+def keepout_aabb(part, kinds: dict[str, str] | None) -> tuple[float, float, float, float]:
+    boxes = keepout_boxes(part, kinds)
+    return (
+        min(b[0] for b in boxes),
+        min(b[1] for b in boxes),
+        max(b[2] for b in boxes),
+        max(b[3] for b in boxes),
+    )
+
+
+_keepout_memo: dict = {}
+
+
+def _keepout(part, kinds) -> list[tuple[float, float, float, float]]:
+    key = (id(part), part.x, part.y, part.rot, getattr(part, "mirror", None), len(getattr(part, "wired_pins", ())))
+    boxes = _keepout_memo.get(key)
+    if boxes is None:
+        if len(_keepout_memo) > 4096:
+            _keepout_memo.clear()
+        boxes = _keepout_memo[key] = keepout_boxes(part, kinds)
+    return boxes
+
+
+def _clash(a, b, kinds, pad: float = 0.25) -> bool:
+    """Any keepout box of one touching any of the other. Bodies may sit close -
+    a cap right under its node - so the pad is small; the symbols each part
+    will need are already among the boxes."""
+    return any(_boxes_overlap(x, y, pad) for x in _keepout(a, kinds) for y in _keepout(b, kinds))
+
+
+def _mark_wired(part, our, other, op) -> None:
+    """An attach draws a wire between these two pins: neither needs a symbol."""
+    for p, pin in ((part, our), (other, op)):
+        wired = getattr(p, "wired_pins", None)
+        if wired is None:
+            wired = set()
+            p.wired_pins = wired
+        wired.add(pin.number)
 
 
 def _local_box(part) -> tuple[float, float, float, float]:
@@ -231,16 +323,39 @@ def _apply_along(spec: SchPlaceSpec, part, other, occupied: list, kinds=None) ->
     else:
         part.rot, part.mirror = 0.0, None
     our = _attach_pin(spec, part, other, op)
-    gap = float(spec.gap) if spec.gap is not None else _auto_gap(part, our, other, kinds)
-    plx, ply = lib_to_sheet(our.lx, our.ly, part.rot, part.mirror)
+    _mark_wired(part, our, other, op)
     facing = bool(spec.side) and two_pin and not spec.rotate_set
+    node_named = (kinds or {}).get(getattr(our, "net", ""), "net") in ("power", "ground") or (
+        op.number in getattr(other, "wired_pins", set()) and our.number in getattr(part, "wired_pins", set())
+    )
+    if spec.align:
+        # Land our pin on that pin's row (stacking up/down) or column (sideways):
+        # a straight wire can then join the two, no label or symbol needed.
+        aref, apin = parse_refpin(spec.align)
+        target = next((o for o in occupied if o.ref == aref), other if other.ref == aref else None)
+        if target is None:
+            raise ValueError(f"SchPlace({part.ref!r}): align={spec.align!r} names a part that is not placed yet")
+        ax, ay = pin_world(target, _find_pin(target, apin))
+        gap = abs(ay - owy) if sy else abs(ax - owx)
+        if gap < 2.54:
+            raise ValueError(f"SchPlace({part.ref!r}): align={spec.align!r} is on the same row as {other.ref}.{op.name}")
+        facing = two_pin and not spec.rotate_set
+    elif spec.gap is not None:
+        gap = float(spec.gap)
+    elif facing and node_named:
+        # Hangs off a node that already carries the symbol or the label
+        # (it is wired on to something else): nothing to fit on this wire.
+        gap = 2.54
+    else:
+        gap = _auto_gap(part, our, other, kinds)
+    plx, ply = lib_to_sheet(our.lx, our.ly, part.rot, part.mirror)
     for i in range(24):
         d = gap + i * 1.27
         if facing:
             # Turned toward the sibling's pin: gap is pin to pin, i.e. the wire.
             part.x = owx + sx * d - plx
             part.y = owy + sy * d - ply
-            if not any(_overlap_body(part, o, pad=1.0) for o in occupied):
+            if not any(_clash(part, o, kinds) for o in occupied):
                 part.attach_dir = (sx, sy)
                 part.placed = True
                 return
@@ -259,7 +374,7 @@ def _apply_along(spec: SchPlaceSpec, part, other, occupied: list, kinds=None) ->
         else:
             part.x = ox0 - d - (a2 - part.x)
             part.y = owy - ply
-        if not any(_overlap(part, o) for o in occupied):
+        if not any(_clash(part, o, kinds) for o in occupied):
             part.attach_dir = (sx, sy)
             part.placed = True
             return
@@ -284,6 +399,7 @@ def _apply_attach(spec: SchPlaceSpec, part, other, other_pin_name: str, occupied
     face = (-step[0], -step[1])
     part.rot, part.mirror = 0.0, None
     our = _attach_pin(spec, part, other, op, face)
+    _mark_wired(part, our, other, op)
     gap = float(spec.gap) if spec.gap is not None else _auto_gap(part, our, other, kinds)
 
     if spec.rotate_set or spec.mirror:
@@ -310,7 +426,7 @@ def _apply_attach(spec: SchPlaceSpec, part, other, other_pin_name: str, occupied
             tx = ox + step[0] * dist
             ty = oy + step[1] * dist
         part.x, part.y = tx - plx, ty - ply
-        if not any(_overlap_body(part, o) for o in occupied):
+        if not any(_clash(part, o, kinds) for o in occupied):
             chosen = True
             break
     if not chosen:
@@ -375,7 +491,8 @@ def apply_sch_places(design: Design, parts: list) -> None:
         for spec in pending:
             target = spec.to or spec.along or ""
             tref, tpin = parse_refpin(target)
-            if tref not in placed:
+            aref = parse_refpin(spec.align)[0] if spec.align else None
+            if tref not in placed or (aref and aref not in placed and aref in by_ref):
                 nxt.append(spec)
                 continue
             if tref not in by_ref:
@@ -395,34 +512,60 @@ def apply_sch_places(design: Design, parts: list) -> None:
                 + ", ".join((s.to or s.along or s.ref) for s in nxt)
             )
         pending = nxt
-    _separate(parts, {s.ref for s in design.sch_places if not s.has_attach()})
+    _separate(parts, {s.ref for s in design.sch_places if not s.has_attach()}, kinds)
 
 
-def _separate(parts: list, css_refs: set[str]) -> None:
-    """Nudge attached parts whose graphics or pins overlap another symbol.
+def _axis(part, other) -> tuple[float, float]:
+    dx, dy = getattr(part, "attach_dir", None) or (0.0, 0.0)
+    if abs(dx) < 0.1 and abs(dy) < 0.1:
+        dx, dy = part.x - other.x, part.y - other.y
+        if abs(dx) >= abs(dy):
+            return (1.0 if dx >= 0 else -1.0), 0.0
+        return 0.0, (1.0 if dy >= 0 else -1.0)
+    return dx, dy
 
-    Moves go along the part's own attach axis, so the pin alignment that
-    to=/along= just made survives (the wire only gets longer). Text is placed
-    later around whatever is here, so it does not count as overlap.
-    """
+
+def _steps_to_clear(mover, hold, others: list, kinds, limit: int = 24) -> int | None:
+    """How many 1.27 mm steps along its attach axis until mover's keepout
+    clears hold's and everyone else's. None if that never happens within the
+    limit - then it stays put and the report says so."""
+    dx, dy = _axis(mover, hold)
+    x0, y0 = mover.x, mover.y
+    try:
+        for k in range(1, limit + 1):
+            mover.x, mover.y = x0 + 1.27 * dx * k, y0 + 1.27 * dy * k
+            if not any(_clash(mover, o, kinds) for o in others if o is not mover):
+                return k
+        return None
+    finally:
+        mover.x, mover.y = x0, y0
+
+
+def _separate(parts: list, css_refs: set[str], kinds: dict[str, str] | None = None) -> None:
+    """Push attached parts apart until their keepouts (body plus the power
+    symbols they will need) no longer overlap. Of the two, the one that clears
+    everything with the smaller shove along its own attach axis moves, so pin
+    alignment survives and the wire only gets longer. A part that cannot clear
+    within 30 mm is left where it is rather than marched across the sheet."""
     for _ in range(48):
         moved = False
         for i, a in enumerate(parts):
             for b in parts[i + 1 :]:
-                if not _overlap_body(a, b, pad=1.0):
+                if not _clash(a, b, kinds):
                     continue
-                mover, hold = (b, a) if a.ref in css_refs and b.ref not in css_refs else (a, b)
-                if mover.ref in css_refs and hold.ref in css_refs:
+                options = []
+                for mover, hold in ((a, b), (b, a)):
+                    if mover.ref in css_refs:
+                        continue
+                    k = _steps_to_clear(mover, hold, parts, kinds)
+                    if k is not None:
+                        options.append((k, mover, hold))
+                if not options:
                     continue
-                dx, dy = getattr(mover, "attach_dir", None) or (0.0, 0.0)
-                if abs(dx) < 0.1 and abs(dy) < 0.1:
-                    dx, dy = mover.x - hold.x, mover.y - hold.y
-                    if abs(dx) >= abs(dy):
-                        dx, dy = (1.0 if dx >= 0 else -1.0), 0.0
-                    else:
-                        dx, dy = 0.0, (1.0 if dy >= 0 else -1.0)
-                mover.x += 1.27 * dx
-                mover.y += 1.27 * dy
+                k, mover, hold = min(options, key=lambda t: t[0])
+                dx, dy = _axis(mover, hold)
+                mover.x += 1.27 * dx * k
+                mover.y += 1.27 * dy * k
                 moved = True
         if not moved:
             return

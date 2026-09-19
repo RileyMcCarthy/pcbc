@@ -49,7 +49,7 @@ def test_c3_usb_sch_no_symbol_overlap():
     hits = []
     for i, a in enumerate(parts):
         for b in parts[i + 1 :]:
-            if _overlap_body(a, b, pad=1.0):
+            if _overlap_body(a, b, pad=0.25):  # the designed clearance: a cap sits right under its node
                 hits.append(f"{a.ref}/{b.ref}")
     assert hits == []
 

@@ -56,6 +56,8 @@ def _register_net(net: Net) -> Net:
         return net
     if existing.kind == "net" and net.kind != "net":
         existing.kind = net.kind
+    if net.wire_mm is not None:
+        existing.wire_mm = net.wire_mm
     return existing
 
 
@@ -67,8 +69,17 @@ def Ground(name: str = "GND") -> Net:
     return _register_net(Net(str(name), kind="ground"))
 
 
-def Net_(name: str) -> Net:  # noqa: N802 — exported as Net
-    return _register_net(Net(str(name), kind="net"))
+def Net_(name: str, *, wire_mm: float | None = None) -> Net:  # noqa: N802 — exported as Net
+    """A signal net. ``wire_mm`` caps the wire the schematic may draw for it
+    (0 = labels only); the default is ``SchStyle(wire_mm=...)``, 25.4."""
+    return _register_net(Net(str(name), kind="net", wire_mm=wire_mm))
+
+
+def SchStyle(*, wire_mm: float | None = None) -> None:
+    """Sheet-wide schematic defaults. ``wire_mm``: longest wire drawn between
+    two symbols before the net is joined by labels instead."""
+    if wire_mm is not None:
+        _doc().sch_wire_mm = float(wire_mm)
 
 
 def _padding4(padding) -> tuple[float, float, float, float]:
@@ -277,7 +288,8 @@ def SchPlace(
     stacks beside that part instead. ``side`` is ``left``/``right``/``top``/
     ``bottom`` (CSS sense: top is the smaller sheet Y). ``gap`` (mm, pin to pin)
     is chosen by the tool unless given: room for the net's label, else the grid
-    minimum. The tool also turns or mirrors the part so the attached pin faces
+    minimum. ``align="U2.EN"`` (with ``along=``) picks the gap that lands the
+    hanging pin on that pin's row or column, so one straight wire joins them. The tool also turns or mirrors the part so the attached pin faces
     its target (2-pin parts may rotate; bigger symbols only mirror); ``rotate=``
     / ``mirror="x"|"y"`` override that. Library symbols are used as-is.
     """
@@ -515,6 +527,7 @@ def load_board(path: str | Path) -> Design:
         "Component": Component,
         "SchPlace": SchPlace,
         "SchRegion": SchRegion,
+        "SchStyle": SchStyle,
         "load": load,
         "__file__": str(path),
         "__name__": "__pcbc__",

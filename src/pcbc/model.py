@@ -153,6 +153,7 @@ class NetReqSpec:
 class Net:
     name: str
     kind: str = "net"  # net | power | ground
+    wire_mm: float | None = None  # longest schematic wire before a label; None: SchStyle default
 
     def __str__(self) -> str:
         return self.name
@@ -210,4 +211,5 @@ class Design:
     instances: list[Instance] = field(default_factory=list)
     sch_places: list[SchPlaceSpec] = field(default_factory=list)
     sch_regions: list[RegionSpec] = field(default_factory=list)
+    sch_wire_mm: float = 25.4
     source: str | None = None

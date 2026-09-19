@@ -14,9 +14,11 @@ from .sch_place import (
     apply_sch_places,
     body_aabb,
     core_aabb,
+    hat_zone,
     lib_to_sheet,
     pin_outward,
     pin_world,
+    text_zone,
     world_aabb,
 )
 from .sexp import matching_paren, new_uuid
@@ -1003,6 +1005,7 @@ class _Site:
 
 
 _EPS = 0.05
+_CLEAN = 0.6  # mm² of overlap below which a placement counts as touching nothing
 Box = tuple[float, float, float, float]
 
 
@@ -1045,6 +1048,22 @@ def _collinear_touch(
     return False
 
 
+def _crosses(
+    x0: float, y0: float, x1: float, y1: float, sx0: float, sy0: float, sx1: float, sy1: float
+) -> bool:
+    """Two axis-aligned segments crossing each other's interior. KiCad does not
+    connect them, but a reader cannot tell - so it is never drawn."""
+    a_vert = abs(x0 - x1) < _EPS
+    s_vert = abs(sx0 - sx1) < _EPS
+    if a_vert == s_vert:
+        return False
+    if a_vert:
+        vx, vy0, vy1, hy, hx0, hx1 = x0, min(y0, y1), max(y0, y1), sy0, min(sx0, sx1), max(sx0, sx1)
+    else:
+        vx, vy0, vy1, hy, hx0, hx1 = sx0, min(sy0, sy1), max(sy0, sy1), y0, min(x0, x1), max(x0, x1)
+    return hx0 + _EPS < vx < hx1 - _EPS and vy0 + _EPS < hy < vy1 - _EPS
+
+
 def _overlap_area(a: Box, b: Box) -> float:
     w = min(a[2], b[2]) - max(a[0], b[0])
     h = min(a[3], b[3]) - max(a[1], b[1])
@@ -1061,6 +1080,7 @@ class _Occupant:
     kind: str  # symbol | pintext | ref | value | label | hat
     owner: str
     net: str = ""
+    tag: str = ""  # placement this belongs to, so it can be taken back
 
 
 class _Sheet:
@@ -1079,25 +1099,44 @@ class _Sheet:
         self.pin_ends = [pin_world(p, pin) for p in parts for pin in p.pins]
         self.cores = [core_aabb(p) for p in parts]
         self.segs: list[tuple[float, float, float, float, str]] = []
+        self.seg_tags: list[str] = []
+        self.seg_boxes: list[Box] = []
         self.occupants: list[_Occupant] = []
         # Label anchors and power-symbol pins: a wire through or onto one connects.
-        self.anchors: list[tuple[float, float, str]] = []
+        self.anchors: list[tuple[float, float, str, str]] = []
 
     # -- connectivity --------------------------------------------------------
     def on_pin_end(self, x: float, y: float) -> bool:
         return any(_near(x, y, px, py) for px, py in self.pin_ends)
 
-    def anchor(self, x: float, y: float, net: str) -> None:
-        self.anchors.append((x, y, net))
+    def anchor(self, x: float, y: float, net: str, tag: str = "") -> None:
+        self.anchors.append((x, y, net, tag))
+
+    def remove(self, tag: str) -> None:
+        """Take one placement (its wires, box and anchor) back off the sheet."""
+        keep = [i for i, t in enumerate(self.seg_tags) if t != tag]
+        self.segs = [self.segs[i] for i in keep]
+        self.seg_tags = [self.seg_tags[i] for i in keep]
+        self.seg_boxes = [self.seg_boxes[i] for i in keep]
+        self.occupants = [o for o in self.occupants if o.tag != tag]
+        self.anchors = [a for a in self.anchors if a[3] != tag]
 
     def segment_ok(self, x0: float, y0: float, x1: float, y1: float, net: str = "") -> bool:
         """Interior off every pin end, every label anchor and every symbol's
         graphics, and no contact with another net's wire other than a plain
         crossing (KiCad joins collinear wires that touch, and a T without a
         junction misleads)."""
-        if any(_inside_segment(px, py, x0, y0, x1, y1) for px, py in self.pin_ends):
-            return False
-        for ax, ay, anet in self.anchors:
+        if abs(x0 - x1) < _EPS:
+            lo, hi = min(y0, y1) + _EPS, max(y0, y1) - _EPS
+            for px, py in self.pin_ends:
+                if abs(px - x0) < _EPS and lo < py < hi:
+                    return False
+        else:
+            lo, hi = min(x0, x1) + _EPS, max(x0, x1) - _EPS
+            for px, py in self.pin_ends:
+                if abs(py - y0) < _EPS and lo < px < hi:
+                    return False
+        for ax, ay, anet, _tag in self.anchors:
             if anet == net:
                 continue
             if _inside_segment(ax, ay, x0, y0, x1, y1) or _near(ax, ay, x0, y0) or _near(ax, ay, x1, y1):
@@ -1113,13 +1152,15 @@ class _Sheet:
                 return False
             if _inside_segment(x0, y0, sx0, sy0, sx1, sy1) or _inside_segment(x1, y1, sx0, sy0, sx1, sy1):
                 return False
+            if _crosses(x0, y0, x1, y1, sx0, sy0, sx1, sy1):
+                return False
         return True
 
     def point_free(self, x: float, y: float, net: str) -> bool:
         """A bend, stub end or label anchor may not touch another net."""
         if self.on_pin_end(x, y):
             return False
-        if any(anet != net and _near(x, y, ax, ay) for ax, ay, anet in self.anchors):
+        if any(anet != net and _near(x, y, ax, ay) for ax, ay, anet, _t in self.anchors):
             return False
         for sx0, sy0, sx1, sy1, snet in self.segs:
             if snet == net:
@@ -1142,33 +1183,62 @@ class _Sheet:
                 return False
         return all(self.point_free(x, y, net) for x, y in pts[1:-1])
 
-    def add(self, pts: list[tuple[float, float]], net: str) -> list[str]:
+    def add(self, pts: list[tuple[float, float]], net: str, tag: str = "") -> list[str]:
         out: list[str] = []
         for (ax, ay), (bx, by) in zip(pts, pts[1:]):
             if _near(ax, ay, bx, by):
                 continue
             self.segs.append((ax, ay, bx, by, net))
+            self.seg_tags.append(tag)
+            self.seg_boxes.append(_seg_box(ax, ay, bx, by))
             out.append(_wire(ax, ay, bx, by))
         return out
 
     # -- readability ----------------------------------------------------------
-    def occupy(self, box: Box, kind: str, owner: str, net: str = "") -> None:
-        self.occupants.append(_Occupant(box, kind, owner, net))
+    def occupy(self, box: Box, kind: str, owner: str, net: str = "", tag: str = "") -> None:
+        self.occupants.append(_Occupant(box, kind, owner, net, tag))
+
+    def hard_cost(self, box: Box, net: str = "") -> float:
+        """Overlap with what is really drawn: symbols, pins, text, other nets'
+        wires. Reservations and the net's own wires do not count. Zero means
+        the box is clean."""
+        bx0, by0, bx1, by1 = box
+        total = 0.0
+        for o in self.occupants:
+            if o.kind == "reserve":
+                continue
+            ox0, oy0, ox1, oy1 = o.box
+            if ox1 <= bx0 or ox0 >= bx1 or oy1 <= by0 or oy0 >= by1:
+                continue
+            total += (min(bx1, ox1) - max(bx0, ox0)) * (min(by1, oy1) - max(by0, oy0))
+        for (sx0, sy0, sx1, sy1), seg in zip(self.seg_boxes, self.segs):
+            if seg[4] == net or sx1 <= bx0 or sx0 >= bx1 or sy1 <= by0 or sy0 >= by1:
+                continue
+            total += (min(bx1, sx1) - max(bx0, sx0)) * (min(by1, sy1) - max(by0, sy0))
+        return total
 
     def cost(self, box: Box, net: str = "") -> float:
         """Overlap area with what is drawn. Own-net wires count less: a label
         sits on its wire by design. Reservations (where a power symbol or a
         part's text will probably go) count half, and not for their own net."""
+        bx0, by0, bx1, by1 = box
         total = 0.0
         for o in self.occupants:
+            ox0, oy0, ox1, oy1 = o.box
+            if ox1 <= bx0 or ox0 >= bx1 or oy1 <= by0 or oy0 >= by1:
+                continue
+            area = (min(bx1, ox1) - max(bx0, ox0)) * (min(by1, oy1) - max(by0, oy0))
             if o.kind == "reserve":
                 if o.net and o.net == net:
                     continue
-                total += _overlap_area(box, o.box) * 0.5
+                total += area * 0.5
+            else:
+                total += area
+        for (sx0, sy0, sx1, sy1), seg in zip(self.seg_boxes, self.segs):
+            if sx1 <= bx0 or sx0 >= bx1 or sy1 <= by0 or sy0 >= by1:
                 continue
-            total += _overlap_area(box, o.box)
-        for x0, y0, x1, y1, snet in self.segs:
-            total += _overlap_area(box, _seg_box(x0, y0, x1, y1)) * (0.3 if snet == net else 1.0)
+            area = (min(bx1, sx1) - max(bx0, sx0)) * (min(by1, sy1) - max(by0, sy0))
+            total += area * (0.3 if seg[4] == net else 1.0)
         return total
 
 
@@ -1285,29 +1355,29 @@ def _reserve(sheet: _Sheet, parts: list[Part], sites: dict[str, list[_Site]], ki
             continue
         gnd = is_ground_net(net, kinds)
         for s in sts:
-            ox, oy = pin_outward(s.part, s.pin)
-            natural = abs(oy) > abs(ox) and ((gnd and oy > 0) or (not gnd and oy < 0))
-            hx, hy = (s.x, s.y) if natural else (s.x + ox * 2.54, s.y + oy * 2.54)
-            sheet.occupy(_hat_box(net, hx, hy, gnd, 0), "reserve", s.part.ref, net)
+            sheet.occupy(hat_zone(s.part, s.pin, net, gnd), "reserve", s.part.ref, net)
     for part in parts:
-        if not _two_pin(part):
-            continue
-        x0, y0, x1, y1 = body_aabb(part)
-        cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
-        vertical = abs(pin_outward(part, part.pins[0])[1]) > 0.5
-        if vertical:
-            boxes = [_prop_box(part.ref, x1 + 0.8, cy - 1.0, "left"), _prop_box(part.display, x1 + 0.8, cy + 1.0, "left")]
-        else:
-            boxes = [_prop_box(part.ref, cx, y0 - 2.7, None), _prop_box(part.display, cx, y0 - 1.0, None)]
-        for b in boxes:
-            sheet.occupy(b, "reserve", part.ref)
+        if _two_pin(part):
+            sheet.occupy(text_zone(part), "reserve", part.ref)
 
 
-def _place_hat(sheet: _Sheet, members: list[_Site], net: str, gnd: bool) -> list[str]:
-    """Power symbol for one connected group: on the pin end when the pin already
-    points the symbol's way, else on a stub — straight, or with a jog the
-    symbol's way — wherever symbol and wires overlap least."""
-    best: tuple[float, _Site, list[tuple[float, float]], int] | None = None
+_HatCand = tuple[tuple[int, float], _Site, list[tuple[float, float]], int]
+
+
+def _hat_candidates(sheet: _Sheet, members: list[_Site], net: str, gnd: bool) -> list[_HatCand]:
+    """Every legal spot for one group's power symbol, best first: on the pin end
+    when the pin already points the symbol's way, else on a stub — straight, or
+    with a jog either way. A spot that touches nothing drawn beats every spot
+    that does; among those, the least overlap."""
+    found: list[_HatCand] = []
+    if len(members) > 4:
+        # A big group (an IC's GND rail) only needs its few least crowded pins tried.
+        def _room(s: _Site) -> float:
+            ox, oy = pin_outward(s.part, s.pin)
+            cx, cy = s.x + ox * 3.0, s.y + oy * 3.0
+            return sheet.hard_cost((cx - 4.0, cy - 4.0, cx + 4.0, cy + 4.0), net)
+
+        members = sorted(members, key=_room)[:4]
     for s in members:
         ox, oy = pin_outward(s.part, s.pin)
         vertical = abs(oy) > abs(ox)
@@ -1321,68 +1391,107 @@ def _place_hat(sheet: _Sheet, members: list[_Site], net: str, gnd: bool) -> list
             for length in (2.54, 5.08, 7.62):
                 cands.append(([(s.x, s.y), (s.x + ox * length, s.y + oy * length)], 180))
         else:
-            for length in (2.54, 3.81, 5.08, 7.62, 10.16, 12.7, 15.24):
+            for length in (2.54, 5.08, 7.62, 10.16):
                 ex, ey = s.x + ox * length, s.y + oy * length
                 cands.append(([(s.x, s.y), (ex, ey)], 0))
+                # A jog the symbol's way, or the other way (a supply that
+                # first drops below its pin, then points up - the clean answer
+                # when the pin above is busy).
                 for jog in (2.54, 5.08):
                     cands.append(([(s.x, s.y), (ex, ey), (ex, ey + jog_y * jog)], 0))
+                    cands.append(([(s.x, s.y), (ex, ey), (ex, ey - jog_y * jog)], 0))
+                # Upside down (a supply pointing down, GND pointing up): only
+                # when every upright spot collides - it still beats a crossing.
+                cands.append(([(s.x, s.y), (ex, ey)], 180))
+                for jog in (2.54, 5.08):
+                    cands.append(([(s.x, s.y), (ex, ey), (ex, ey - jog_y * jog)], 180))
         for pts, rot in cands:
             hx, hy = pts[-1]
             moving = [p for p in pts[1:]]
             if moving and not _near(pts[0][0], pts[0][1], hx, hy):
                 if not sheet.path_ok(pts, net) or not sheet.point_free(hx, hy, net):
                     continue
-            c = sheet.cost(_hat_box(net, hx, hy, gnd, rot), net)
+                # kicad-cli: a symbol pin on a wire's interior does not connect.
+                if any(_inside_segment(hx, hy, *seg[:4]) for seg in sheet.segs):
+                    continue
+            box = _hat_box(net, hx, hy, gnd, rot)
+            hard = sheet.hard_cost(box, net)
+            c = sheet.cost(box, net)
+            if rot == 180 and not vertical:
+                c += 3.0
             for (ax, ay), (bx, by) in zip(pts, pts[1:]):
                 if not _near(ax, ay, bx, by):
-                    c += sheet.cost(_seg_box(ax, ay, bx, by), net) + 0.02 * math.hypot(bx - ax, by - ay)
-            if best is None or c < best[0]:
-                best = (c, s, pts, rot)
-    if best is None:
-        s = members[0]
-        best = (0.0, s, [(s.x, s.y)], 0)
-    _c, s, pts, rot = best
+                    sb = _seg_box(ax, ay, bx, by)
+                    hard += sheet.hard_cost(sb, net)
+                    c += sheet.cost(sb, net) + 0.02 * math.hypot(bx - ax, by - ay)
+            if len(pts) == 3 and not natural and not vertical:
+                # The jog away from the symbol's direction reads a little worse.
+                away = (pts[2][1] - pts[1][1]) * jog_y < 0
+                c += 0.5 if away else 0.0
+            found.append(((0 if hard < _CLEAN else 1, c), s, pts, rot))
+    found.sort(key=lambda t: t[0])
+    return found
+
+
+def _place_hat(sheet: _Sheet, members: list[_Site], net: str, gnd: bool, tag: str = "") -> list[str]:
+    cands = _hat_candidates(sheet, members, net, gnd)
+    if cands:
+        return _commit_hat(sheet, cands[0], net, gnd, tag)
+    s = members[0]
+    return _commit_hat(sheet, ((1, 0.0), s, [(s.x, s.y)], 0), net, gnd, tag)
+
+
+def _commit_hat(sheet: _Sheet, cand: _HatCand, net: str, gnd: bool, tag: str) -> list[str]:
+    _k, s, pts, rot = cand
     hx, hy = pts[-1]
-    out = sheet.add(pts, net) if len(pts) > 1 else []
+    out = sheet.add(pts, net, tag) if len(pts) > 1 else []
     out.append(_hat(net, hx, hy, gnd=gnd, rot=rot))
-    sheet.occupy(_hat_box(net, hx, hy, gnd, rot), "hat", s.part.ref, net)
-    sheet.anchor(hx, hy, net)
+    sheet.occupy(_hat_box(net, hx, hy, gnd, rot), "hat", s.part.ref, net, tag)
+    sheet.anchor(hx, hy, net, tag)
     return out
 
 
-def _place_stub_label(sheet: _Sheet, s: _Site, net: str) -> list[str]:
-    """Label on a stub off a lone pin; the stub length that overlaps least wins.
-    With no clean stub at all the label sits on the pin end, which also connects."""
+def _place_stub_label(sheet: _Sheet, s: _Site, net: str, tag: str = "") -> list[str]:
+    """Label on a stub off a lone pin, text on either side of the wire; a spot
+    that touches nothing drawn wins, else the least overlap. With no clean stub
+    at all the label sits on the pin end, which also connects."""
     ox, oy = pin_outward(s.part, s.pin)
     rot, just = _label_pose(ox, oy)
-    best: tuple[float, float] | None = None
-    for k in range(9):
-        length = 5.08 + 1.27 * k
+    owner = f"{s.part.ref}.{s.pin.number}"
+    best: tuple[tuple[int, float], float, str] | None = None
+    for length in (0.0, 2.54, 5.08, 6.35, 7.62, 8.89, 10.16, 12.7, 15.24):
         ex, ey = s.x + ox * length, s.y + oy * length
-        if not sheet.segment_ok(s.x, s.y, ex, ey, net) or not sheet.point_free(ex, ey, net):
+        if length and (not sheet.segment_ok(s.x, s.y, ex, ey, net) or not sheet.point_free(ex, ey, net)):
             continue
-        c = sheet.cost(_label_box(net, ex, ey, rot, just, "bottom"), net)
-        c += sheet.cost(_seg_box(s.x, s.y, ex, ey), net) + 0.02 * length
-        if best is None or c < best[0]:
-            best = (c, length)
+        stub = _seg_box(s.x, s.y, ex, ey) if length else None
+        for vjust in ("bottom", "top"):
+            box = _label_box(net, ex, ey, rot, just, vjust)
+            hard = sheet.hard_cost(box, net) + (sheet.hard_cost(stub, net) if stub else 0.0)
+            c = sheet.cost(box, net) + (sheet.cost(stub, net) if stub else 0.0) + 0.02 * length
+            c += 0.0 if vjust == "bottom" else 0.05  # above the wire when nothing else decides
+            c += 0.3 if not length else 0.0  # a little wire between symbol and name reads better
+            key = (0 if hard < _CLEAN else 1, c)
+            if best is None or key < best[0]:
+                best = (key, length, vjust)
     if best is None:
         box = _label_box(net, s.x, s.y, rot, just, "bottom")
-        sheet.occupy(box, "label", f"{s.part.ref}.{s.pin.number}", net)
-        sheet.anchor(s.x, s.y, net)
+        sheet.occupy(box, "label", owner, net, tag)
+        sheet.anchor(s.x, s.y, net, tag)
         return [_label(net, s.x, s.y, rot, just)]
-    length = best[1]
+    _k, length, vjust = best
     ex, ey = s.x + ox * length, s.y + oy * length
-    out = sheet.add([(s.x, s.y), (ex, ey)], net)
-    out.append(_label(net, ex, ey, rot, just))
-    sheet.occupy(_label_box(net, ex, ey, rot, just, "bottom"), "label", f"{s.part.ref}.{s.pin.number}", net)
-    sheet.anchor(ex, ey, net)
+    out = sheet.add([(s.x, s.y), (ex, ey)], net, tag) if length else []
+    out.append(_label(net, ex, ey, rot, just, vjust))
+    sheet.occupy(_label_box(net, ex, ey, rot, just, vjust), "label", owner, net, tag)
+    sheet.anchor(ex, ey, net, tag)
     return out
 
 
-def _place_wire_label(sheet: _Sheet, segs: list[Box], net: str, owner: str) -> list[str]:
+def _place_wire_label(sheet: _Sheet, segs: list[Box], net: str, owner: str, tag: str = "") -> list[str]:
     """Label on one of the group's own wires: any midpoint connects, so pick the
-    side and segment whose text overlaps least (horizontal runs preferred)."""
-    best: tuple[float, float, float, int, str] | None = None
+    side and segment where the text touches nothing, else overlaps least
+    (horizontal runs preferred)."""
+    best: tuple[tuple[int, float], float, float, int, str] | None = None
     for ax, ay, bx, by in segs:
         horiz = abs(by - ay) < _EPS
         length = math.hypot(bx - ax, by - ay)
@@ -1393,24 +1502,85 @@ def _place_wire_label(sheet: _Sheet, segs: list[Box], net: str, owner: str) -> l
             for rot in (0, 90):
                 along = (rot == 0) == horiz
                 for vjust in ("bottom", "top"):
-                    c = sheet.cost(_label_box(net, mx, my, rot, "left", vjust), net)
+                    box = _label_box(net, mx, my, rot, "left", vjust)
+                    hard = sheet.hard_cost(box, net)
+                    c = sheet.cost(box, net)
                     c += 0.0 if rot == 0 else 0.3  # upright text reads better
                     if along:
                         c += max(0.0, _text_w(net) - length) * 0.2  # text longer than its wire
                     else:
                         c += 0.5
-                    if best is None or c < best[0]:
-                        best = (c, mx, my, rot, vjust)
+                    key = (0 if hard < _CLEAN else 1, c)
+                    if best is None or key < best[0]:
+                        best = (key, mx, my, rot, vjust)
     if best is None:
         return []
-    _c, mx, my, rot, vjust = best
-    sheet.occupy(_label_box(net, mx, my, rot, "left", vjust), "label", owner, net)
-    sheet.anchor(mx, my, net)
+    _k, mx, my, rot, vjust = best
+    sheet.occupy(_label_box(net, mx, my, rot, "left", vjust), "label", owner, net, tag)
+    sheet.anchor(mx, my, net, tag)
     return [_label(net, mx, my, rot, "left", vjust)]
+
+
+def _joint_hats(sheet: _Sheet, a: tuple, b: tuple, drawn: dict[str, list[str]]) -> None:
+    """Place two power symbols together: the pair whose spots are cleanest, and
+    among clean pairs the least overlap. Only better than what each had alone
+    is kept."""
+    tag_a, mem_a, net_a, gnd_a = a
+    tag_b, mem_b, net_b, gnd_b = b
+    before = _pair_key(sheet, a, b)
+    sheet.remove(tag_a)
+    sheet.remove(tag_b)
+    best = None
+    for ca in _hat_candidates(sheet, mem_a, net_a, gnd_a)[:6]:
+        _commit_hat(sheet, ca, net_a, gnd_a, tag_a)
+        cbs = _hat_candidates(sheet, mem_b, net_b, gnd_b)
+        sheet.remove(tag_a)
+        if not cbs:
+            continue
+        cb = cbs[0]
+        joint = (ca[0][0] + cb[0][0], ca[0][1] + cb[0][1])
+        if best is None or joint < best[0]:
+            best = (joint, ca)
+    if best is not None and (before is None or best[0] < before):
+        drawn[tag_a] = _commit_hat(sheet, best[1], net_a, gnd_a, tag_a)
+        drawn[tag_b] = _place_hat(sheet, mem_b, net_b, gnd_b, tag_b)
+    else:
+        drawn[tag_a] = _place_hat(sheet, mem_a, net_a, gnd_a, tag_a)
+        drawn[tag_b] = _place_hat(sheet, mem_b, net_b, gnd_b, tag_b)
+
+
+def _pair_key(sheet: _Sheet, a: tuple, b: tuple) -> tuple[int, float] | None:
+    """How the two symbols score where they are now (each judged with the other in place)."""
+    total = [0, 0.0]
+    for tag, _m, net, _g in (a, b):
+        occ = [o for o in sheet.occupants if o.tag == tag]
+        if not occ:
+            return None
+        box = occ[0].box
+        mine = [(sheet.segs[i], sheet.seg_boxes[i]) for i, t in enumerate(sheet.seg_tags) if t == tag]
+        # Measure with this one lifted off the sheet, so it does not count itself.
+        saved = (sheet.occupants, sheet.segs, sheet.seg_tags, sheet.seg_boxes)
+        sheet.occupants = [o for o in sheet.occupants if o.tag != tag]
+        keep = [i for i, t in enumerate(sheet.seg_tags) if t != tag]
+        sheet.segs = [sheet.segs[i] for i in keep]
+        sheet.seg_tags = [sheet.seg_tags[i] for i in keep]
+        sheet.seg_boxes = [sheet.seg_boxes[i] for i in keep]
+        try:
+            hard = sheet.hard_cost(box, net)
+            c = sheet.cost(box, net)
+            for _seg, sb in mine:
+                hard += sheet.hard_cost(sb, net)
+                c += sheet.cost(sb, net)
+        finally:
+            sheet.occupants, sheet.segs, sheet.seg_tags, sheet.seg_boxes = saved
+        total[0] += 0 if hard < _CLEAN else 1
+        total[1] += c
+    return (total[0], total[1])
 
 
 def _place_passive_text(sheet: _Sheet, part: Part) -> None:
     """Reference and Value beside a 2-pin part on the side that overlaps least."""
+    sheet.occupants = [o for o in sheet.occupants if not (o.owner == part.ref and o.kind in ("ref", "value"))]
     x0, y0, x1, y1 = body_aabb(part)
     cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
     ref, val = part.ref, part.display
@@ -1423,6 +1593,11 @@ def _place_passive_text(sheet: _Sheet, part: Part) -> None:
         ("above-right", (x0, y0 - 2.7, "left"), (x0, y0 - 1.0, "left")),
         ("below-left", (x1, y1 + 1.0, "right"), (x1, y1 + 2.7, "right")),
         ("below-right", (x0, y1 + 1.0, "left"), (x0, y1 + 2.7, "left")),
+        # Slid along a side: the two lines sit toward one end of the part.
+        ("right-high", (x1 + 0.8, cy - 2.7, "left"), (x1 + 0.8, cy - 1.0, "left")),
+        ("right-low", (x1 + 0.8, cy + 1.0, "left"), (x1 + 0.8, cy + 2.7, "left")),
+        ("left-high", (x0 - 0.8, cy - 2.7, "right"), (x0 - 0.8, cy - 1.0, "right")),
+        ("left-low", (x0 - 0.8, cy + 1.0, "right"), (x0 - 0.8, cy + 2.7, "right")),
     ]
     vertical = abs(pin_outward(part, part.pins[0])[1]) > 0.5 if part.pins else True
     order = cands if vertical else cands[2:4] + cands[:2] + cands[4:]
@@ -1496,12 +1671,11 @@ def _lint(
                 if not pairs:
                     continue
                 d, i, j = min(pairs)
-                if d < 30.0:
-                    a, b = sts[i], sts[j]
+                a, b = sts[i], sts[j]
+                if d < 20.0 and (abs(a.x - b.x) < _EPS or abs(a.y - b.y) < _EPS):
                     issues.append(
-                        f"{net}: {a.part.ref}.{a.pin.name} and {b.part.ref}.{b.pin.name} are "
-                        f"{d:.0f} mm apart but joined by labels, no clean wire path; "
-                        f"line them up or move them apart"
+                        f"{net}: {a.part.ref}.{a.pin.name} and {b.part.ref}.{b.pin.name} are in line "
+                        f"{d:.0f} mm apart but joined by labels: something sits between them"
                     )
     return {"issues": issues, "count": len(issues)}
 
@@ -1520,7 +1694,12 @@ def _describe(o: _Occupant) -> str:
     return f"{o.owner} {o.kind}"
 
 
-def _annotate(parts: list[Part], kinds: dict[str, str] | None = None) -> tuple[list[str], dict]:
+def _annotate(
+    parts: list[Part],
+    kinds: dict[str, str] | None = None,
+    wire_limits: dict[str, float] | None = None,
+    wire_default: float = 25.4,
+) -> tuple[list[str], dict]:
     """Wires, labels and power symbols so KiCad reads exactly the board's netlist.
 
     Per net: join same-symbol pins that sit in a line, then join nearby symbols
@@ -1547,7 +1726,12 @@ def _annotate(parts: list[Part], kinds: dict[str, str] | None = None) -> tuple[l
                 ex, ey = pin_world(p, pin)
                 ox, oy = pin_outward(p, pin)
                 bx, by = ex - ox * pin.length, ey - oy * pin.length
-                sheet.occupy(_seg_box(ex, ey, bx, by, pad=0.3), "pin", f"{p.ref}.{pin.number}")
+                # Sideways slack only: a stub leaving the pin end is not a hit.
+                if abs(ox) > abs(oy):
+                    pin_box = (min(ex, bx), ey - 0.3, max(ex, bx), ey + 0.3)
+                else:
+                    pin_box = (ex - 0.3, min(ey, by), ex + 0.3, max(ey, by))
+                sheet.occupy(pin_box, "pin", f"{p.ref}.{pin.number}")
                 # The number sits along the pin; a long number is clipped to it.
                 half = min(_text_w(pin.number) / 2.0, pin.length / 2.0)
                 mx, my = (ex + bx) / 2.0, (ey + by) / 2.0
@@ -1568,7 +1752,17 @@ def _annotate(parts: list[Part], kinds: dict[str, str] | None = None) -> tuple[l
     unions: dict[str, _Union] = {}
     net_segs: dict[str, list[tuple[int, list[tuple[float, float]]]]] = defaultdict(list)
 
-    for net, sts in sites.items():
+    def _span(sts: list[_Site]) -> float:
+        return min(
+            (math.hypot(a.x - b.x, a.y - b.y) for i, a in enumerate(sts) for b in sts[i + 1 :] if a.part is not b.part),
+            default=0.0,
+        )
+
+    # Two-pin nets first, closest first: a short straight wire claims its lane
+    # before a big net has to bend around it.
+    order = sorted(sites, key=lambda n: (is_power_net(n, kinds), len(sites[n]) > 2, _span(sites[n])))
+    for net in order:
+        sts = sites[net]
         uf = _Union(len(sts))
         unions[net] = uf
         gnd = is_ground_net(net, kinds)
@@ -1590,8 +1784,9 @@ def _annotate(parts: list[Part], kinds: dict[str, str] | None = None) -> tuple[l
                 out.extend(sheet.add(pts, net))
                 net_segs[net].append((i, pts))
                 uf.join(i, j)
-        # Same side but other pins in between (a USB-C's DP1/DP2): a bus bar
-        # just outside the pin ends, one step further out per crowded net.
+        # Same side with unconnected pins in between (a USB-C's DP1/DP2): a bus
+        # bar just outside the pin ends. Never around a pin of another net -
+        # that would wall its wire in.
         jogs: list[tuple[float, int, int]] = []
         for i, a in enumerate(sts):
             for j in range(i + 1, len(sts)):
@@ -1602,7 +1797,13 @@ def _annotate(parts: list[Part], kinds: dict[str, str] | None = None) -> tuple[l
                 if oa[0] * ob[0] + oa[1] * ob[1] < 0.9:
                     continue
                 span = math.hypot(a.x - b.x, a.y - b.y)
-                if span <= 10.16:  # a short bar; far-apart pins get their own symbol or label
+                if span > 10.16:  # a short bar; far-apart pins get their own symbol or label
+                    continue
+                walled = any(
+                    pin.net and pin.net != net and _inside_segment(*pin_world(a.part, pin), a.x, a.y, b.x, b.y)
+                    for pin in a.part.pins
+                )
+                if not walled:
                     jogs.append((span, i, j))
         for _d, i, j in sorted(jogs):
             if uf.find(i) == uf.find(j):
@@ -1622,10 +1823,18 @@ def _annotate(parts: list[Part], kinds: dict[str, str] | None = None) -> tuple[l
                 net_segs[net].append((i, best_jog[1]))
                 uf.join(i, j)
 
-        # Other symbols: shortest clean Manhattan paths first (ground is symbols only).
+        # Other symbols: shortest clean Manhattan paths first. Ground is symbols
+        # only; a supply net gets a wire only when it is one short straight
+        # segment, else each site gets its own symbol - never a rail that
+        # crosses the sheet.
         if gnd:
             continue
-        limit = 80.0 if len(sts) == 2 else 45.0
+        power = is_power_net(net, kinds)
+        limit = (wire_limits or {}).get(net, wire_default)
+        if power:
+            limit = min(limit, 15.24)
+        if limit <= 0:
+            continue
         edges: list[tuple[float, int, int]] = []
         for i, a in enumerate(sts):
             for j in range(i + 1, len(sts)):
@@ -1640,6 +1849,10 @@ def _annotate(parts: list[Part], kinds: dict[str, str] | None = None) -> tuple[l
                 continue
             best_route = None
             for k, pts in enumerate(_routes(sts[i], sts[j])):
+                if power and len(pts) > 2:
+                    continue
+                if sum(math.hypot(bx - ax, by - ay) for (ax, ay), (bx, by) in zip(pts, pts[1:])) > limit + _EPS:
+                    continue
                 if not sheet.path_ok(pts, net):
                     continue
                 c = _route_cost(sheet, pts, net) + 0.001 * k
@@ -1651,10 +1864,14 @@ def _annotate(parts: list[Part], kinds: dict[str, str] | None = None) -> tuple[l
                 net_segs[net].append((i, pts))
                 uf.join(i, j)
 
-    sheet.occupants = [o for o in sheet.occupants if o.kind != "reserve"]
-
     # Name every connected group. Labels first: a label can only slide along
     # its stub, a power symbol can also jog, so it is the one that gives way.
+    # The symbol reservations stay up until the symbols themselves are placed,
+    # so a label does not sit where a symbol has to go. Three passes: each
+    # re-places every name with all the others in sight, so the order they
+    # were drawn in does not decide who got the clean spot.
+    jobs: list[tuple[str, object]] = []
+    hats: list[tuple] = []
     for net, sts in sites.items():
         if is_power_net(net, kinds):
             continue
@@ -1668,18 +1885,62 @@ def _annotate(parts: list[Part], kinds: dict[str, str] | None = None) -> tuple[l
                 if not _near(ax, ay, bx, by)
             ]
             s = sts[group[0]]
+            tag = f"label:{net}:{s.part.ref}.{s.pin.number}"
             if segs:
-                out.extend(_place_wire_label(sheet, segs, net, f"{s.part.ref}.{s.pin.number}"))
+                jobs.append((tag, lambda t=tag, sg=segs, n=net, o=f"{s.part.ref}.{s.pin.number}": _place_wire_label(sheet, sg, n, o, t)))
             else:
-                out.extend(_place_stub_label(sheet, s, net))
+                jobs.append((tag, lambda t=tag, st=s, n=net: _place_stub_label(sheet, st, n, t)))
     for net, sts in sites.items():
         if not is_power_net(net, kinds):
             continue
         gnd = is_ground_net(net, kinds)
         for group in unions[net].groups():
-            out.extend(_place_hat(sheet, [sts[i] for i in group], net, gnd))
-    for p in parts:
-        if _two_pin(p):
+            members = [sts[i] for i in group]
+            tag = f"hat:{net}:{members[0].part.ref}.{members[0].pin.number}"
+            jobs.append((tag, lambda t=tag, m=members, n=net, g=gnd: _place_hat(sheet, m, n, g, t)))
+            hats.append((tag, members, net, gnd))
+    drawn: dict[str, list[str]] = {}
+
+    def one_pass() -> None:
+        for tag, job in jobs:
+            sheet.remove(tag)
+            drawn[tag] = job()
+            if tag.startswith("hat:"):
+                # Its symbol is real now; the pencilled-in zones for that net's pins go.
+                net_of = tag.split(":")[1]
+                sheet.occupants = [o for o in sheet.occupants if not (o.kind == "reserve" and o.net == net_of)]
+
+    one_pass()
+    one_pass()
+    # Two symbols on one part (an LDO's GND between VIN and EN) can each block
+    # the other's only clean spot; one at a time never gets out of that. Try
+    # them as a pair: for each good spot of one, the best of the other.
+    by_part: dict[str, list[tuple]] = defaultdict(list)
+    for h in hats:
+        for m in h[1]:
+            if h not in by_part[m.part.ref]:
+                by_part[m.part.ref].append(h)
+    seen_pairs: set[tuple[str, str]] = set()
+
+    def near(a: tuple, b: tuple) -> bool:
+        return any(
+            math.hypot(x.x - y.x, x.y - y.y) <= 10.16 for x in a[1] for y in b[1]
+        )
+
+    for group in by_part.values():
+        for i, a in enumerate(group):
+            for b in group[i + 1 :]:
+                if (a[0], b[0]) in seen_pairs or not near(a, b):
+                    continue
+                seen_pairs.add((a[0], b[0]))
+                _joint_hats(sheet, a, b, drawn)
+    one_pass()
+    sheet.occupants = [o for o in sheet.occupants if o.kind != "reserve"]
+    for tag, _job in jobs:
+        out.extend(drawn[tag])
+    two_pin = [p for p in parts if _two_pin(p)]
+    for _round in range(2):
+        for p in two_pin:
             _place_passive_text(sheet, p)
     power_nets = {n for n in sites if is_power_net(n, kinds)}
     return out, _lint(sheet, parts, sites, unions, power_nets)
@@ -1701,7 +1962,8 @@ def emit_from_design(design: Design, *, title: str = "", report: dict | None = N
         elif p.kind == "box":
             libs.append(_lib_box(p.lib_id, p.pins, p.ref[:1] or "U", kinds))
             seen_lib.add(p.lib_id)
-    annotations, lint = _annotate(parts, kinds)
+    limits = {n.name: float(n.wire_mm) for n in design.nets.values() if n.wire_mm is not None}
+    annotations, lint = _annotate(parts, kinds, limits, design.sch_wire_mm)
     if report is not None:
         report.update(lint)
     body: list[str] = [_instance(p) for p in parts]

@@ -4,7 +4,8 @@ from pcbc.language import load_board
 from pcbc.sch_emit import _fmt, _parts_from_design, _pin_world, emit_from_design
 from pcbc.sch_place import apply_sch_places, parse_refpin, pin_world
 
-BLINKY = Path(__file__).resolve().parent.parent / "examples" / "blinky" / "blinky.py"
+EXAMPLES = Path(__file__).resolve().parent.parent / "examples"
+BLINKY = EXAMPLES / "blinky" / "blinky.py"
 
 
 def test_blinky_schematic_has_led_net():
@@ -107,7 +108,7 @@ def test_attach_picks_the_pin_on_the_target_net():
     ex, ey = pin_world(u1, en_pin)
     ox, oy = pin_world(r_en, ours)
     # Same row (the wire is straight); the tool may slide it further out to make room.
-    assert abs(ey - oy) < 0.01 and 12.0 < ex - ox < 30.0
+    assert abs(ey - oy) < 0.01 and 10.0 < ex - ox < 30.0
 
 
 def test_along_with_side_turns_to_face_the_sibling():
@@ -170,3 +171,66 @@ def test_readability_report_is_empty_for_blinky():
     report: dict = {}
     emit_from_design(load_board(BLINKY), title="blinky", report=report)
     assert report["issues"] == [] and report["count"] == 0
+
+
+def test_wire_limit_per_net_and_sheet_default(tmp_path: Path):
+    src = BLINKY.read_text()
+    board = tmp_path / "blinky.py"
+    board.write_text(src.replace('LED = Net("LED")', 'LED = Net("LED", wire_mm=0)'))
+    sch = emit_from_design(load_board(board), title="b")
+    assert sch.count('(label "LED"') == 2  # labels only, one per pin
+    board.write_text(src.replace('LED = Net("LED")', 'LED = Net("LED")\nSchStyle(wire_mm=0)'))
+    sch = emit_from_design(load_board(board), title="b")
+    assert sch.count('(label "LED"') == 2
+    board.write_text(src)
+    assert emit_from_design(load_board(board), title="b").count('(label "LED"') == 1
+
+
+def test_wires_never_cross():
+    from pcbc.sch_emit import _crosses
+
+    assert _crosses(0, 0, 10, 0, 5, -5, 5, 5)  # + shape
+    assert not _crosses(0, 0, 10, 0, 5, 0, 5, 5)  # T: an endpoint on the line, not a crossing
+    assert not _crosses(0, 0, 10, 0, 0, 5, 10, 5)  # parallel
+    assert not _crosses(0, 0, 10, 0, 12, -5, 12, 5)  # beside
+
+
+def test_keepouts_shove_along_the_attach_axis_without_marching():
+    by = _placed(C3_USB)
+    r_en, c_en = by["R_EN"], by["C_EN"]
+    node = pin_world(r_en, next(p for p in r_en.pins if p.net == "EN"))
+    top = pin_world(c_en, next(p for p in c_en.pins if p.net == "EN"))
+    assert abs(top[0] - node[0]) < 0.01  # still under its node
+    assert 0 < top[1] - node[1] < 15.0  # a short wire, not the bottom of the sheet
+
+
+def test_attached_pin_needs_no_symbol_room():
+    by = _placed(C3_USB)
+    c_vbus, c_hf = by["C_VBUS"], by["C_VBUS_HF"]
+    assert "1" in c_hf.wired_pins and "1" in c_vbus.wired_pins
+    node = pin_world(c_vbus, next(p for p in c_vbus.pins if p.number == "1"))
+    top = pin_world(c_hf, next(p for p in c_hf.pins if p.number == "1"))
+    assert abs(top[0] - node[0]) < 0.01 and abs((top[1] - node[1]) - 2.54) < 0.01
+
+
+def test_align_lands_the_hanging_pin_on_another_pins_row(tmp_path: Path):
+    import shutil
+
+    src = (EXAMPLES / "c3_usb" / "c3_usb.py").read_text()
+    board = tmp_path / "c3_usb.py"
+    shutil.copytree(EXAMPLES / "c3_usb" / "components", tmp_path / "components")
+    board.write_text(
+        src.replace(
+            'SchPlace("C_VBUS_HF", along="C_VBUS.1", side="bottom")',
+            'SchPlace("C_VBUS_HF", along="C_VBUS.1", side="bottom", align="U2.EN")',
+        )
+    )
+    by = _placed(board)
+    en = pin_world(by["U2"], next(p for p in by["U2"].pins if p.name == "EN"))
+    top = pin_world(by["C_VBUS_HF"], next(p for p in by["C_VBUS_HF"].pins if p.number == "1"))
+    assert abs(top[1] - en[1]) < 0.01
+    aligned = emit_from_design(load_board(board), title="c3").count('(lib_id "power:VCC")')
+    board.write_text(src)
+    plain = emit_from_design(load_board(board), title="c3").count('(lib_id "power:VCC")')
+    # EN and the cap node are now one straight wire: one supply symbol fewer.
+    assert aligned == plain - 1

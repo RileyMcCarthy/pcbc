@@ -59,6 +59,7 @@ def instantiate(
         raise ValueError(f"{inst.ref}: not a kicad_mod")
     end = matching_paren(mod, j)
     body = mod[j : end + 1]
+    body = _absolute_models(body, footprint_path(inst.part).parent)
     stem = Path(footprint_path(inst.part)).stem
     lib_id = f"pcbc:{stem}"
     body = re.sub(r'^\(footprint "[^"]*"', f'(footprint "{lib_id}"', body, count=1)
@@ -88,6 +89,21 @@ def instantiate(
     nets = pad_nets(inst)
     block = _bind_pads(block, nets, board=board, ref=inst.ref)
     return "\t" + block.replace("\n", "\n\t") + "\n"
+
+
+_MODEL = re.compile(r'\(model\s+"([^"$]+)"')
+
+
+def _absolute_models(block: str, pkg: Path) -> str:
+    """A `(model "x.step")` fetched beside the footprint lives in the part dir; KiCad wants a path."""
+
+    def fix(m: re.Match) -> str:
+        raw = m.group(1)
+        if Path(raw).is_absolute():
+            return m.group(0)
+        return f'(model "{(pkg / raw).resolve()}"'
+
+    return _MODEL.sub(fix, block)
 
 
 def _bind_pads(block: str, nets: dict[str, str], *, board: str, ref: str) -> str:

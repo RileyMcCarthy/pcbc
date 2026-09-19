@@ -25,7 +25,8 @@ def _pin(part, key):
 
 
 def test_node_checks():
-    assert check_board(BOARD) == []
+    assert check_board(BOARD, pcb=False) == []  # schematic-first: no Place() yet
+    assert any("no Place()" in f for f in check_board(BOARD))  # a build would want them
     d = load_board(BOARD)
     assert len(d.instances) == 31 and len(d.nets) == 18
 

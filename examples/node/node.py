@@ -57,19 +57,8 @@ Capacitor("C_BME", "100nF", mpn="CL05B104KO5NNNC", lcsc="C1525", p1=V33, p2=GND,
 Capacitor("C_OPA", "100nF", mpn="CL05B104KO5NNNC", lcsc="C1525", p1=V33, p2=GND, **c)
 Led("D1", "red", package="0603", mpn="KT-0603R", lcsc="C72043", manufacturer="Kento", a=LED_A, k=GND)
 
-# PCB: 60 x 45 mm, 4 layers. Coarse CSS grid; copper is a later stage.
+# PCB: 60 x 45 mm, 4 layers. Copper is a later stage; `pcbc sch` needs no Place().
 Board(width=60, height=45, layers=4, stackup="jlcpcb_4l_1oz", planes=[("GND", "In1.Cu"), ("3V3", "In2.Cu")])
-_grid = [
-    ("J1", 2, 12), ("U3", 12, 6), ("R_CC1", 12, 14), ("R_CC2", 12, 18),
-    ("U2", 24, 4), ("C_VBUS", 20, 4), ("C_VBUS_HF", 20, 8), ("C_3V3", 30, 4), ("C_3V3_HF", 30, 8),
-    ("U1", 22, 16), ("C_MCU", 18, 24), ("C_MCU_HF", 18, 28), ("R_EN", 40, 14), ("C_EN", 40, 18), ("SW_RST", 46, 14),
-    ("R_BOOT", 40, 22), ("SW_BOOT", 46, 22), ("R_LED", 40, 28), ("D1", 46, 28),
-    ("U4", 6, 34), ("C_BME", 6, 40), ("R_SDA", 12, 34), ("R_SCL", 12, 38),
-    ("U5", 24, 36), ("C_OPA", 30, 36), ("R_NTC", 20, 40), ("R_TDIV", 24, 40),
-    ("Q1", 44, 36), ("R_G", 38, 36), ("R_PD", 38, 40), ("J_LOAD", 52, 34),
-]
-for _ref, _x, _y in _grid:
-    Place(_ref, position="absolute", left=_x, top=_y, locked=True, reason="coarse grid; copper later")
 
 # Schematic: six groups, one SchPlace() per part. Attached parts pose themselves.
 SchRegion("usb", left=12, top=12, width=170, height=110)

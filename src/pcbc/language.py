@@ -538,12 +538,13 @@ def load_board(path: str | Path) -> Design:
     return design
 
 
-def check_board(path: str | Path) -> list[str]:
+def check_board(path: str | Path, pcb: bool = True) -> list[str]:
     """Everything that can be wrong before a build: unbound pins, missing
     Place()/SchPlace(), and a SchPlace that names a pin or part that is not
-    there or hangs a part off a pin it does not share a net with."""
+    there or hangs a part off a pin it does not share a net with. The
+    schematic loop passes ``pcb=False``: no Place() needed to draw a sheet."""
     design = load_board(path)
-    fails = check_design(design)
+    fails = check_design(design, pcb=pcb)
     if fails:
         return fails
     from .sch_emit import _parts_from_design

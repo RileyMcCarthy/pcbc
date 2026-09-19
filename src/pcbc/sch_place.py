@@ -140,7 +140,9 @@ def text_w(s: str) -> float:
 
 def hat_zone(part, pin, net: str, gnd: bool) -> tuple[float, float, float, float]:
     """Where this pin's power symbol will want to be: on the pin end when the
-    pin already points the symbol's way, else 2.54 mm out along the pin."""
+    pin already points the symbol's way, else 2.54 mm out along the pin.
+    (A longer lane was tried and pushed connectors 17 mm away: when a symbol
+    is boxed in, the report names the hanger to move instead.)"""
     ex, ey = pin_world(part, pin)
     ox, oy = pin_outward(part, pin)
     vertical = abs(oy) > abs(ox)

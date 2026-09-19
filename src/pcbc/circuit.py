@@ -40,7 +40,9 @@ def instantiate(part: Part, ref: str, pin_nets: dict[str, object]) -> Instance:
     return inst
 
 
-def check_design(design: Design) -> list[str]:
+def check_design(design: Design, pcb: bool = True) -> list[str]:
+    """What is wrong before a build. ``pcb=False`` is the schematic loop:
+    Place() is not needed to draw the sheet."""
     fails: list[str] = []
     if design.board is None:
         fails.append("no Board() — need width/height and stackup")
@@ -65,11 +67,21 @@ def check_design(design: Design) -> list[str]:
                 )
         if inst.part.kind != "th" and not inst.part.lcsc:
             fails.append(f"{inst.ref} missing lcsc (JLC BOM needs it on SMT)")
+        if inst.part.symbol and inst.part.origin:
+            from .symbol import symbol_units
+
+            sym = Path(inst.part.origin) / inst.part.symbol
+            units = symbol_units(sym.read_text()) if sym.exists() else 1
+            if units > 1:
+                fails.append(
+                    f"{inst.ref}: symbol {inst.part.symbol} has {units} units (A, B, ...); pcbc draws one "
+                    f"unit per symbol - use a single-unit symbol (easyeda2kicad makes them) or split the part"
+                )
 
     placed = {p.ref for p in design.places}
     sch_placed = {p.ref for p in design.sch_places}
     for inst in design.instances:
-        if inst.ref not in placed:
+        if pcb and inst.ref not in placed:
             fails.append(f"{inst.ref}: no Place() — every part is CSS-placed")
         if inst.ref not in sch_placed:
             fails.append(f"{inst.ref}: no SchPlace() — schematic pose is CSS, not auto-layout")

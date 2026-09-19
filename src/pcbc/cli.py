@@ -39,6 +39,24 @@ def main(argv: list[str] | None = None) -> int:
     rv.add_argument("--no-open", action="store_true")
     rv.set_defaults(func=cmd_review)
 
+    se = sub.add_parser("search", help="LCSC / JLC parts for a query (stock, price, basic/extended)")
+    se.add_argument("query")
+    se.add_argument("--limit", type=int, default=10)
+    se.add_argument("--json", action="store_true")
+    se.set_defaults(func=cmd_search)
+
+    fe = sub.add_parser("fetch", help="LCSC id → components/<Mfr>/<MPN>/{part.py, .kicad_sym, .kicad_mod, .step}, scored")
+    fe.add_argument("lcsc", nargs="+", help="C-numbers, e.g. C191884")
+    fe.add_argument("--into", default="components", help="components dir (default: ./components)")
+    fe.add_argument("--force", action="store_true", help="rewrite an existing part.py")
+    fe.add_argument("--json", action="store_true")
+    fe.set_defaults(func=cmd_fetch)
+
+    so = sub.add_parser("score", help="Library quality of a part dir, a .kicad_sym, or every part a board.py loads")
+    so.add_argument("path", nargs="+")
+    so.add_argument("--json", action="store_true")
+    so.set_defaults(func=cmd_score)
+
     args = parser.parse_args(argv)
     return int(args.func(args))
 
@@ -77,7 +95,7 @@ def cmd_sch(args: argparse.Namespace) -> int:
     if not path.exists():
         print(f"no such file: {path}", file=sys.stderr)
         return 2
-    fails = check_board(path)
+    fails = check_board(path, pcb=False)
     if fails:
         for f in fails:
             print(f, file=sys.stderr)
@@ -125,6 +143,11 @@ def cmd_sch(args: argparse.Namespace) -> int:
             print(f"  {i}. {m}")
     else:
         print("readability: nothing overlaps")
+    notes = report.get("notes", [])
+    if notes:
+        print(f"style: {len(notes)} note{'s' if len(notes) > 1 else ''} (legal, not counted)")
+        for m in notes:
+            print(f"  - {m}")
     return 1 if (mismatch or erc["errors"]) else 0
 
 
@@ -139,6 +162,66 @@ def cmd_review(args: argparse.Namespace) -> int:
         print(result["error"], file=sys.stderr)
         return 1
     return 0
+
+
+def cmd_search(args: argparse.Namespace) -> int:
+    from .source import format_hits, search_lcsc
+
+    try:
+        hits = search_lcsc(args.query, limit=args.limit)
+    except RuntimeError as e:
+        print(str(e), file=sys.stderr)
+        return 1
+    print(json.dumps(hits, indent=2) if args.json else format_hits(hits))
+    return 0
+
+
+def cmd_fetch(args: argparse.Namespace) -> int:
+    from .source import fetch_lcsc, format_score
+
+    results = []
+    worst = 0
+    for lcsc in args.lcsc:
+        try:
+            r = fetch_lcsc(lcsc, Path(args.into), force=args.force)
+        except RuntimeError as e:
+            print(f"{lcsc}: {e}", file=sys.stderr)
+            worst = 1
+            continue
+        results.append(r)
+        if not args.json:
+            print(f"{r['lcsc']} -> {r['dir']}  ({'wrote' if r['wrote_part_py'] else 'kept'} part.py)")
+            print(format_score(r["score"]))
+    if args.json:
+        print(json.dumps(results, indent=2))
+    return worst
+
+
+def cmd_score(args: argparse.Namespace) -> int:
+    from .source import format_score, score_part
+
+    dirs: list[Path] = []
+    for raw in args.path:
+        p = Path(raw)
+        if not p.exists():
+            print(f"no such path: {p}", file=sys.stderr)
+            return 2
+        if p.is_file() and p.suffix == ".py" and p.name != "part.py":
+            design = load_board(p)
+            seen: set[Path] = set()
+            for inst in design.instances:
+                if inst.part.origin and inst.part.origin not in seen:
+                    seen.add(inst.part.origin)
+                    dirs.append(inst.part.origin)
+        else:
+            dirs.append(p)
+    reports = [score_part(d) for d in dirs]
+    if args.json:
+        print(json.dumps(reports, indent=2))
+    else:
+        for r in reports:
+            print(format_score(r))
+    return 0 if all(r["grade"] != "bad" for r in reports) else 1
 
 
 if __name__ == "__main__":

@@ -1512,13 +1512,17 @@ def _hat_candidates(sheet: _Sheet, members: list[_Site], net: str, gnd: bool, te
     that does; among those, the least overlap."""
     found: list[_HatCand] = []
     if len(members) > 4:
-        # A big group (an IC's GND rail) only needs its few least crowded pins tried.
+        # A big group (an IC's GND rail) only needs its few least crowded pins
+        # tried - plus the end the symbol naturally hangs from: the bottom pin
+        # for ground, the top one for a supply, where pointing the right way
+        # is free.
         def _room(s: _Site) -> float:
             ox, oy = pin_outward(s.part, s.pin)
             cx, cy = s.x + ox * 3.0, s.y + oy * 3.0
             return sheet.hard_cost((cx - 4.0, cy - 4.0, cx + 4.0, cy + 4.0), net)
 
-        members = sorted(members, key=_room)[:4]
+        natural_end = max(members, key=lambda s: s.y) if gnd else min(members, key=lambda s: s.y)
+        members = sorted(members, key=_room)[:3] + [natural_end]
     for s in members:
         ox, oy = pin_outward(s.part, s.pin)
         vertical = abs(oy) > abs(ox)
@@ -1952,6 +1956,9 @@ def _lint(
                 issues.append(f"{a.ref} overlaps {b.ref}: move one of them")
     text_kinds = {"label", "hat", "ref", "value"}
     occ = sheet.occupants
+    # One line per placement that lost, listing everything it hit: the AI
+    # acts on the cause, not on five symptoms of it.
+    lost: dict[tuple[str, str, str], tuple[_Occupant, _Occupant, list[str]]] = {}
     for i, a in enumerate(occ):
         for b in occ[i + 1 :]:
             if a.kind not in text_kinds and b.kind not in text_kinds:
@@ -1961,7 +1968,20 @@ def _lint(
             area = _overlap_area(a.box, b.box)
             if area < 0.6:
                 continue
-            issues.append(f"{_describe(a)} overlaps {_describe(b)}{_move_hint(a, b)}")
+            loser, partner = _loser(a, b)
+            key = (loser.kind, loser.owner, loser.net)
+            entry = lost.setdefault(key, (loser, partner, []))
+            what = _describe(partner)
+            if what not in entry[2]:
+                entry[2].append(what)
+    for loser, partner, hits in lost.values():
+        issues.append(f"{_describe(loser)} overlaps {', '.join(hits)}{_move_hint(loser, partner)}")
+    # Style notes: legal drawings a person might still tidy. Not counted.
+    notes: list[str] = []
+    for o in occ:
+        if o.kind == "hat" and getattr(o, "rot", 0) == 180 and not (o.tag or "").startswith("flag:"):
+            way = "up" if o.net in ground_nets else "down"
+            notes.append(f"the {o.net} symbol at {o.owner} points {way}: nothing was clear the right way up")
     # A 2-pin part with its own power symbol next to a same-net pin: hang it off
     # that pin instead and the wire carries the net - one symbol fewer, no clash.
     by_ref = {p.ref: p for p in parts}
@@ -1997,10 +2017,15 @@ def _lint(
                     f"{d:.0f} mm away and not wired to it; {how} shares that node instead"
                 )
                 break
+    through: dict[tuple[str, str, str], tuple[_Occupant, list[str]]] = {}
     for x0, y0, x1, y1, net in sheet.segs:
         for o in occ:
             if o.kind in text_kinds | {"pin"} and o.net != net and _overlap_area(_seg_box(x0, y0, x1, y1), o.box) > 0.6:
-                issues.append(f"wire {net} runs through {_describe(o)}")
+                entry = through.setdefault((o.kind, o.owner, o.net), (o, []))
+                if net not in entry[1]:
+                    entry[1].append(net)
+    for o, nets in through.values():
+        issues.append(f"wire{'s' if len(nets) > 1 else ''} {', '.join(nets)} run{'' if len(nets) > 1 else 's'} through {_describe(o)}")
     for net, sts in sites.items():
         if net in power_nets:
             continue  # power nets are joined by symbols on purpose
@@ -2025,10 +2050,18 @@ def _lint(
                         f"{net}: {a.part.ref}.{a.pin.name} and {b.part.ref}.{b.pin.name} are in line "
                         f"{d:.0f} mm apart but joined by labels: something sits between them"
                     )
-    return {"issues": issues, "count": len(issues)}
+    return {"issues": issues, "count": len(issues), "notes": notes}
 
 
 _HANGERS: dict[str, list[str]] = {}
+_LOSES = {"ref": 0, "value": 0, "label": 1, "hat": 2}
+
+
+def _loser(a: _Occupant, b: _Occupant) -> tuple[_Occupant, _Occupant]:
+    """Of two things that overlap, the one that was placed and lost: text
+    before a label before a power symbol, before anything fixed."""
+    ra, rb = _LOSES.get(a.kind, 9), _LOSES.get(b.kind, 9)
+    return (a, b) if ra <= rb else (b, a)
 
 
 def _move_hint(a: _Occupant, b: _Occupant) -> str:

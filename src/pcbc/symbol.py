@@ -68,6 +68,17 @@ def parse_symbol_pins(path: Path) -> dict[str, Pin]:
     return pins
 
 
+_UNIT_NAME = re.compile(r'\(symbol\s+"[^"]+_(\d+)_\d+"')
+
+
+def symbol_units(text: str) -> int:
+    """How many units the main symbol has (sub-symbols NAME_<unit>_<style>;
+    unit 0 is shared graphics). easyeda2kicad makes single-unit symbols."""
+    _name, block = extract_main_symbol(text)
+    units = {int(m.group(1)) for m in _UNIT_NAME.finditer(block)} - {0}
+    return max(len(units), 1)
+
+
 def extract_main_symbol(text: str) -> tuple[str, str]:
     j = text.find("(symbol ")
     if j < 0:

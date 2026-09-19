@@ -332,3 +332,28 @@ def test_report_says_how_to_share_a_node(tmp_path: Path):
     report = {}
     emit_from_design(load_board(EXAMPLES / "c3_usb" / "c3_usb.py"), title="c3", report=report)
     assert not [i for i in report["issues"] if "carries its own" in i], report["issues"]
+
+
+def test_multi_unit_symbols_are_refused(tmp_path: Path):
+    import shutil
+
+    from pcbc.language import check_board
+
+    src = EXAMPLES / "node"
+    shutil.copytree(src / "components", tmp_path / "components")
+    sym = tmp_path / "components" / "TI" / "LMV321IDBVR" / "LMV321IDBVR.kicad_sym"
+    text = sym.read_text()
+    # Give the op-amp a second unit the way a KiCad library dual op-amp has:
+    # the one sub-symbol becomes unit 1 and a copy of it unit 2.
+    from pcbc.sexp import matching_paren
+
+    i = text.index('(symbol "LMV321IDBVR_0_1"')
+    block = text[i : matching_paren(text, i) + 1]
+    unit1 = block.replace('"LMV321IDBVR_0_1"', '"LMV321IDBVR_1_1"', 1)
+    unit2 = block.replace('"LMV321IDBVR_0_1"', '"LMV321IDBVR_2_1"', 1)
+    text = text[:i] + unit1 + "\n    " + unit2 + text[i + len(block) :]
+    sym.write_text(text)
+    board = tmp_path / "node.py"
+    board.write_text((src / "node.py").read_text())
+    fails = [f for f in check_board(board, pcb=False) if "units" in f]
+    assert fails and fails[0].startswith("U5:") and "2 units" in fails[0], fails

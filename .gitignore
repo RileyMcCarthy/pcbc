@@ -31,3 +31,7 @@ examples/**/layout/
 **/fab/drc.json
 **/fab/pos_kicad.csv
 **/fab/report.json
+
+# Example parts keep their STEP models out of git (megabytes each); pcbc fetch restores them
+examples/**/*.step
+examples/**/*.wrl

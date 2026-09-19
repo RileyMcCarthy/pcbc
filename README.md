@@ -66,7 +66,33 @@ What the sheet is held to, and the test that pins each one (`tests/`):
 | The same `board.py` gives the same file, byte for byte | `test_sch.py::test_the_same_board_gives_the_same_file` |
 | Everything left is reported as a move; the examples stay under the bar | `test_rules.py::test_readability_bar` |
 
-What still collides comes back as a list — in the `sch` step of `pcbc build` (`"readability"`), from `pcbc sch`, and on the review page — phrased as moves: `wire 3V3 runs through C_MCU_HF value`, `EN: R_EN.2 and C_EN.1 are 19 mm apart but joined by labels`. The AI iterates on that list, not on a picture.
+What still collides comes back as a list — in the `sch` step of `pcbc build` (`"readability"`), from `pcbc sch`, and on the review page — phrased as moves: `wire 3V3 runs through C_MCU_HF value`, `EN: R_EN.2 and C_EN.1 are 19 mm apart but joined by labels`. The AI iterates on that list, not on a picture. Legal drawings a person might still tidy (a supply symbol that had to point down because nothing was clear above it) come back separately as `style:` notes and are not counted.
+
+## Parts
+
+Library files are the one thing the AI cannot write. `pcbc fetch` gets them and says how good they are:
+
+```bash
+pcbc search "TPS54202"                 # LCSC / JLC hits: id, package, stock, price, basic / extended
+pcbc fetch C191884 C158012             # → components/<Mfr>/<MPN>/{part.py, .kicad_sym, .kicad_mod, .step}
+pcbc score examples/node/node.py       # every part a board loads, or a part dir, or a .kicad_sym
+```
+
+`fetch` runs `easyeda2kicad` (`pip install easyeda2kicad`), upgrades the files to the current KiCad format with `kicad-cli`, drops the random ids so a second fetch is byte-identical, keeps the STEP model beside the footprint (`pcbc build` points the board at it), and writes a `part.py` whose comment lists the pin **names** — what `board.py` binds — so the AI never opens the `.kicad_sym`. A `part.py` you edited is kept unless `--force`.
+
+The score is what pcbc needs from a library, not taste. `fail` items break the netlist or the drawing; `warn` items cost readability or ERC coverage:
+
+| Check | Why it matters |
+|---|---|
+| every symbol pin number is a footprint pad (and the other way round) | a pin with no pad is silently dropped from the copper netlist |
+| one unit, no repeated pin numbers, no two pins drawn on one spot | pcbc draws one unit per symbol; a pad carries one pin |
+| pin ends on the 1.27 mm grid | wires can only meet pins on the grid |
+| pin numbers narrower than their pins; pins ≥ 2.54 mm apart | numbers print into the body; names collide and labels have no room |
+| pins named and typed | `board.py` binds by name; ERC skips `unspecified` pins |
+| courtyard, body outline, 3D model, current file format | placement keeps parts apart; `pcbc build` cannot place a KiCad 5 `(module` |
+| `part.py` `body_mm` matches the footprint's outline | the wrong land, or the wrong datasheet |
+
+`good` ≥ 90, `usable` ≥ 70, else `bad` (and `pcbc score` exits 1). Anything scores — SnapEDA, the KiCad library, a hand-drawn symbol — so two candidates for one chip can be compared before `load()`-ing one. The examples' USB-C receptacle scores `bad`: its symbol numbers the joined pins `A1B12` while the footprint has `A1` and `B12`; the schematic is right, the copper would not be.
 
 ## Install
 

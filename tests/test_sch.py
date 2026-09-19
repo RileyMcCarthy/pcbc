@@ -234,3 +234,22 @@ def test_align_lands_the_hanging_pin_on_another_pins_row(tmp_path: Path):
     plain = emit_from_design(load_board(board), title="c3").count('(lib_id "power:VCC")')
     # EN and the cap node are now one straight wire: one supply symbol fewer.
     assert aligned == plain - 1
+
+
+def test_wire_label_sits_mid_wire_not_at_the_pin():
+    import re
+
+    from pcbc.sch_emit import _text_w
+
+    sch = emit_from_design(load_board(C3_USB), title="c3_usb")
+    m = re.search(r'\(label "CC1"\n\t\t\(at ([0-9.]+) ([0-9.]+) 0\)\n\t\t\(effects \(font \(size 1.27 1.27\)\) \(justify (left|right) (bottom|top)\)', sch)
+    assert m, "CC1 is a wire label"
+    x, y, just, vjust = float(m.group(1)), float(m.group(2)), m.group(3), m.group(4)
+    w = _text_w("CC1") + 0.4
+    x0, x1 = (x, x + w) if just == "left" else (x - w, x)
+    # R_CC1.1 sits 10.16 mm left of J1.CC1: the name lies along that wire, on
+    # top of it, and stays clear of the pin end where the number is.
+    by = _placed(C3_USB)
+    cc1 = pin_world(by["J1"], next(p for p in by["J1"].pins if p.name == "CC1"))
+    assert abs(y - cc1[1]) < 0.01 and vjust == "bottom"
+    assert cc1[0] - 10.16 - 0.6 <= x0 and x1 <= cc1[0] - 1.0

@@ -1476,11 +1476,10 @@ def _place_stub_label(sheet: _Sheet, s: _Site, net: str, tag: str = "") -> list[
         if length and (not sheet.segment_ok(s.x, s.y, ex, ey, net) or not sheet.point_free(ex, ey, net)):
             continue
         stub = _seg_box(s.x, s.y, ex, ey) if length else None
-        for vjust in ("bottom", "top"):
+        for vjust in ("bottom",):  # on the wire, never hung beneath it
             box = _label_box(net, ex, ey, rot, just, vjust)
             hard = sheet.hard_cost(box, net) + (sheet.hard_cost(stub, net) if stub else 0.0)
             c = sheet.cost(box, net) + (sheet.cost(stub, net) if stub else 0.0) + 0.02 * length
-            c += 0.0 if vjust == "bottom" else 0.05  # above the wire when nothing else decides
             c += 0.3 if not length else 0.0  # a little wire between symbol and name reads better
             key = (0 if hard < _CLEAN else 1, c)
             if best is None or key < best[0]:
@@ -1500,37 +1499,57 @@ def _place_stub_label(sheet: _Sheet, s: _Site, net: str, tag: str = "") -> list[
 
 
 def _place_wire_label(sheet: _Sheet, segs: list[Box], net: str, owner: str, tag: str = "") -> list[str]:
-    """Label on one of the group's own wires: any midpoint connects, so pick the
-    side and segment where the text touches nothing, else overlaps least
-    (horizontal runs preferred)."""
-    best: tuple[tuple[int, float], float, float, int, str] | None = None
+    """Label on one of the group's own wires: any point on it connects. The
+    text lies along the run - centred when it fits, else flush with an end or
+    overhanging - on the side where it touches nothing. Near the middle and
+    away from pin ends reads best; text across the wire is a last resort."""
+    w = _text_w(net) + 0.4
+    best: tuple[tuple[int, float], float, float, int, str, str] | None = None
     for ax, ay, bx, by in segs:
         horiz = abs(by - ay) < _EPS
         length = math.hypot(bx - ax, by - ay)
-        for t in (0.5, 0.35, 0.65):
-            mx, my = ax + (bx - ax) * t, ay + (by - ay) * t
-            if not sheet.point_free(mx, my, net):
+        lo, hi = (min(ax, bx), max(ax, bx)) if horiz else (min(ay, by), max(ay, by))
+        mid = (lo + hi) / 2.0
+        rot_along = 0 if horiz else 90
+        # (anchor along the run, justify): where the text starts. A rot-0 "left"
+        # label runs right from its anchor; a rot-90 "left" label runs up.
+        opts: list[tuple[float, str]] = []
+        if horiz:
+            if length >= w + 1.0:
+                opts += [(mid - w / 2.0, "left"), (lo + 0.5, "left"), (hi - w - 0.5, "left")]
+            else:
+                opts += [(lo + 0.5, "left"), (hi - 0.5, "right")]
+        elif length >= w + 1.0:
+            opts += [(mid + w / 2.0, "left"), (hi - 0.5, "left"), (lo + w + 0.5, "left")]
+        else:
+            opts += [(hi - 0.5, "left"), (lo + 0.5, "right")]
+        cands = [(a, rot_along, j) for a, j in opts]
+        cands.append((mid, 90 - rot_along, "left"))
+        for a, rot, just in cands:
+            mx, my = (a, ay) if horiz else (ax, a)
+            if not (lo + _EPS < a < hi - _EPS) or not sheet.point_free(mx, my, net):
                 continue
-            for rot in (0, 90):
-                along = (rot == 0) == horiz
-                for vjust in ("bottom", "top"):
-                    box = _label_box(net, mx, my, rot, "left", vjust)
-                    hard = sheet.hard_cost(box, net)
-                    c = sheet.cost(box, net)
-                    c += 0.0 if rot == 0 else 0.3  # upright text reads better
-                    if along:
-                        c += max(0.0, _text_w(net) - length) * 0.2  # text longer than its wire
-                    else:
-                        c += 0.5
-                    key = (0 if hard < _CLEAN else 1, c)
-                    if best is None or key < best[0]:
-                        best = (key, mx, my, rot, vjust)
+            # The text sits on the wire (KiCad's "bottom": its base on the line),
+            # never hung beneath it - that reads as the row below.
+            for vjust in ("bottom",):
+                box = _label_box(net, mx, my, rot, just, vjust)
+                hard = sheet.hard_cost(box, net)
+                c = sheet.cost(box, net)
+                c += 0.0 if rot == 0 else 0.3  # upright text reads better
+                c += 0.5 if rot != rot_along else 0.0
+                centre = (box[0] + box[2]) / 2.0 if horiz else (box[1] + box[3]) / 2.0
+                c += 0.05 * abs(centre - mid)
+                if any(_point_in_aabb(px, py, box, pad=1.0) for px, py in sheet.pin_ends):
+                    c += 0.4  # crowding a pin end is what makes a name hard to read
+                key = (0 if hard < _CLEAN else 1, c)
+                if best is None or key < best[0]:
+                    best = (key, mx, my, rot, just, vjust)
     if best is None:
         return []
-    _k, mx, my, rot, vjust = best
-    sheet.occupy(_label_box(net, mx, my, rot, "left", vjust), "label", owner, net, tag)
+    _k, mx, my, rot, just, vjust = best
+    sheet.occupy(_label_box(net, mx, my, rot, just, vjust), "label", owner, net, tag)
     sheet.anchor(mx, my, net, tag)
-    return [_label(net, mx, my, rot, "left", vjust)]
+    return [_label(net, mx, my, rot, just, vjust)]
 
 
 def _joint_hats(sheet: _Sheet, a: tuple, b: tuple, drawn: dict[str, list[str]]) -> None:

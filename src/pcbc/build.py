@@ -8,7 +8,7 @@ from .circuit import check_design
 from .compile import compile_design
 from .fab import fab_job
 from .language import load_board
-from .netcheck import KicadMissing, check_erc, check_schematic
+from .netcheck import KicadMissing, check_copper, check_erc, check_schematic
 from .place import place_job
 from .project import layout_dir, packed_reason, seed_pcb
 from .route import route_job
@@ -128,9 +128,21 @@ def build_job(
     if "route" in plan:
         src = placed if placed.exists() else seed
         step = route_job(design, src, out=routed, name=name)
-        result["steps"].append({"stage": "route", **step})
+        entry = {"stage": "route", **step}
         if step.get("error"):
+            result["steps"].append(entry)
             result["error"] = step["error"]
+            return result
+        try:
+            gate = check_copper(design, routed)
+            entry["copper"] = "verified" if gate["ok"] else gate["fails"]
+            entry["drc_warnings"] = gate["drc_warnings"]
+        except KicadMissing as exc:
+            gate = {"ok": True, "fails": []}
+            entry["copper"] = f"unchecked: {exc}"
+        result["steps"].append(entry)
+        if not gate["ok"]:
+            result["error"] = "copper is not board.py's netlist, or fails KiCad DRC: " + "; ".join(gate["fails"])
             return result
 
     if "fab" in plan:

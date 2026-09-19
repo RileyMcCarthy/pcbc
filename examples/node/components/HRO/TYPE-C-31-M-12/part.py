@@ -6,7 +6,7 @@ part = Component(
     mpn="TYPE-C-31-M-12",
     manufacturer="HRO",
     lcsc="C165948",
-    footprint="USB_C_Receptacle_HRO_TYPE-C-31-M-12.kicad_mod",
+    footprint="USB-C_SMD-TYPE-C-31-M-12_1.kicad_mod",
     symbol="TYPE-C-31-M-12.kicad_sym",
     optional_pins=("SBU1", "SBU2"),
 )

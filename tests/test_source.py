@@ -254,7 +254,29 @@ def test_cli_score_and_fetch(tmp_path: Path, capsys):
 def test_the_example_parts_report_their_known_faults():
     root = Path(__file__).resolve().parent.parent / "examples"
     usb = score_part(root / "c3_usb" / "components" / "HRO" / "TYPE-C-31-M-12")
-    assert usb["grade"] == "bad"
-    assert any("A1B12" in m and "no pad" in m for _s, m in usb["findings"]), usb
+    # EasyEDA's own footprint carries the joined pads (A1B12); the KiCad one pcb-space paired it with did not.
+    assert usb["grade"] != "bad", usb
+    assert not any("no pad" in m for _s, m in usb["findings"]), usb
+    assert any("A1B12" in m and "wider than" in m for _s, m in usb["findings"]), usb  # the library item the bar allows
     ldo = score_part(root / "c3_usb" / "components" / "Diodes_Inc" / "AP2112K-3.3TRG1")
     assert ldo["grade"] != "bad"
+
+
+def test_check_refuses_a_fail_grade_part(tmp_path: Path):
+    from pcbc.language import check_board
+
+    bad = _write_part(tmp_path / "components" / "Acme" / "PART", _symbol(GOOD_PINS), _footprint(["1", "2", "3"]))
+    (bad / "part.py").write_text('from pcbc import Component\npart = Component(name="PART", prefix="U", lcsc="C1")\n')
+    good = _write_part(tmp_path / "components" / "Acme" / "OK", _symbol(GOOD_PINS), _footprint(["1", "2", "3", "4"]))
+    (good / "part.py").write_text('from pcbc import Component\npart = Component(name="OK", prefix="U", lcsc="C2")\n')
+    board = tmp_path / "b.py"
+    board.write_text(
+        "from pcbc import *\n"
+        'VIN = Power("VIN"); GND = Ground("GND"); EN = Net("EN"); SW = Net("SW")\n'
+        'U1 = load("components/Acme/PART"); U1("U1", VIN=VIN, GND=GND, EN=EN, SW=SW)\n'
+        'U2 = load("components/Acme/OK"); U2("U2", VIN=VIN, GND=GND, EN=EN, SW=SW)\n'
+        'SchPlace("U1", left=20, top=20); SchPlace("U2", left=80, top=20)\n'
+        'Board(width=20, height=20, layers=2, stackup="jlcpcb_2l_1oz")\n'
+    )
+    fails = check_board(board, pcb=False)
+    assert fails == ["U1: library symbol pins with no pad in the footprint: 4; the netlist would drop them"], fails

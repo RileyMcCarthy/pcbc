@@ -108,6 +108,27 @@ pcbc review examples/c3_usb/c3_usb.py
 
 KiCad 10 `kicad-cli` is required for DRC and Gerbers. `pcb` (Zener) is not.
 
+Copper is routed by [KiCadRoutingTools](https://github.com/drandyhaas/KiCadRoutingTools) (KRT), pinned to `pcbc.route.KRT_SHA`; `pcbc build` names the clone command when it is missing. Install it once (`KRT_HOME` if not in `~/Downloads`):
+
+```bash
+git clone https://github.com/drandyhaas/KiCadRoutingTools.git ~/Downloads/KiCadRoutingTools
+cd ~/Downloads/KiCadRoutingTools && git checkout 3244726b2c15668fb109a0bb24384750a054af40
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt && .venv/bin/python build_router.py
+```
+
+### Copper rules
+
+The AI never draws a track. KRT routes the placed board; the gate is KiCad's own verdict plus the netlist:
+
+| Rule | Test |
+|---|---|
+| A `fail`-grade library part (a symbol pin with no pad, several units, a KiCad 5 footprint) is refused by `pcbc check` before anything is drawn | `test_source.py::test_check_refuses_a_fail_grade_part` |
+| The routed board passes `kicad-cli pcb drc` with nothing unconnected, and its pads are bound exactly as `board.py` says | `test_route.py::test_blinky_routes_clean_and_the_same_twice`, `test_placed_board_fails_the_copper_gate_as_unconnected` |
+| The same `board.py` gives the same copper, byte for byte (KRT's ids are re-keyed by order) | `test_route.py::test_blinky_routes_clean_and_the_same_twice` |
+| Without KRT the route stage stops and says how to get it | `test_route.py::test_route_without_krt_says_how_to_get_it` |
+
+Placement language and the routing plan compiled from `NetReq` are the next phases: see `docs/copper-plan.md`.
+
 Blinky is a 40×25 mm 2-layer LED + resistor. `pcbc build` writes:
 
 - `layout/blinky/layout.kicad_pcb` — seed

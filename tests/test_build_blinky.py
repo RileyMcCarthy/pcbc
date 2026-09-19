@@ -7,6 +7,8 @@ from pcbc.build import build_job
 BLINKY = Path(__file__).resolve().parent.parent / "examples" / "blinky" / "blinky.py"
 
 
+@pytest.mark.kicad
+@pytest.mark.krt
 def test_blinky_upto_route(tmp_path: Path, monkeypatch):
     # Copy board into tmp so layout/ does not dirty the example until --force CI.
     board = tmp_path / "blinky.py"
@@ -17,12 +19,14 @@ def test_blinky_upto_route(tmp_path: Path, monkeypatch):
     pcb = (layout / "routed" / "layout.kicad_pcb").read_text()
     assert '(net "LED")' in pcb
     assert "(segment" in pcb
+    assert result["steps"][-1]["router"] == "krt" and result["steps"][-1]["copper"] == "verified"
     sch = (layout / "schematic.kicad_sch").read_text()
     assert "(kicad_sch" in sch
     assert '(property "LCSC" "C72043"' in (layout / "placed" / "layout.kicad_pcb").read_text()
 
 
 @pytest.mark.kicad
+@pytest.mark.krt
 def test_blinky_fab(tmp_path: Path):
     board = tmp_path / "blinky.py"
     board.write_text(BLINKY.read_text())

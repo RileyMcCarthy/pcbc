@@ -40,4 +40,5 @@ pythonpath = ["src"]
 addopts = "--strict-markers"
 markers = [
   "kicad: needs kicad-cli (Gerbers / DRC / POS)",
+  "krt: needs KiCadRoutingTools (KRT_HOME; set PCBC_REQUIRE_KRT=1)",
 ]

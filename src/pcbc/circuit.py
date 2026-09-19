@@ -67,16 +67,9 @@ def check_design(design: Design, pcb: bool = True) -> list[str]:
                 )
         if inst.part.kind != "th" and not inst.part.lcsc:
             fails.append(f"{inst.ref} missing lcsc (JLC BOM needs it on SMT)")
-        if inst.part.symbol and inst.part.origin:
-            from .symbol import symbol_units
-
-            sym = Path(inst.part.origin) / inst.part.symbol
-            units = symbol_units(sym.read_text()) if sym.exists() else 1
-            if units > 1:
-                fails.append(
-                    f"{inst.ref}: symbol {inst.part.symbol} has {units} units (A, B, ...); pcbc draws one "
-                    f"unit per symbol - use a single-unit symbol (easyeda2kicad makes them) or split the part"
-                )
+        if inst.part.origin:
+            for msg in _library_fails(inst.part):
+                fails.append(f"{inst.ref}: library {msg}")
 
     placed = {p.ref for p in design.places}
     sch_placed = {p.ref for p in design.sch_places}
@@ -86,6 +79,23 @@ def check_design(design: Design, pcb: bool = True) -> list[str]:
         if inst.ref not in sch_placed:
             fails.append(f"{inst.ref}: no SchPlace() — schematic pose is CSS, not auto-layout")
     return fails
+
+
+_LIBRARY_FAILS: dict[tuple[str, str | None, str], list[str]] = {}
+
+
+def _library_fails(part: Part) -> list[str]:
+    """`fail`-grade findings from pcbc score: what would break the netlist or the drawing."""
+    key = (str(part.origin), part.symbol, part.footprint)
+    if key not in _LIBRARY_FAILS:
+        from .source import score_part
+
+        report = score_part(Path(part.origin), symbol=part.symbol or None, footprint=part.footprint or None)
+        # A missing file is reported by seed (footprint) or the pin check (symbol); here only what both files say.
+        _LIBRARY_FAILS[key] = [
+            msg for sev, msg in report["findings"] if sev == "fail" and not msg.startswith(("no .kicad_mod", "no .kicad_sym"))
+        ]
+    return _LIBRARY_FAILS[key]
 
 
 def load_part(path: Path) -> Part:

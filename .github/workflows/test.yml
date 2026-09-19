@@ -12,7 +12,7 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install -e ".[dev]"
-      - run: pytest -q -m "not kicad"
+      - run: pytest -q -m "not kicad and not krt"
 
   blinky-fab:
     runs-on: ubuntu-latest
@@ -31,10 +31,19 @@ jobs:
           kicad-cli version
           kicad-cli version | grep -q '^10\.' || { echo "need KiCad 10.x"; exit 1; }
       - run: pip install -e ".[dev]"
-      - name: Unit tests including kicad
+      - name: Install KiCadRoutingTools (pinned; pcbc.route.KRT_SHA)
+        run: |
+          KRT_SHA=$(python -c "from pcbc.route import KRT_SHA; print(KRT_SHA)")
+          git clone https://github.com/drandyhaas/KiCadRoutingTools.git "$HOME/KiCadRoutingTools"
+          cd "$HOME/KiCadRoutingTools" && git checkout "$KRT_SHA"
+          python -m venv .venv && .venv/bin/pip install -q -r requirements.txt
+          .venv/bin/python build_router.py
+          echo "KRT_HOME=$HOME/KiCadRoutingTools" >> "$GITHUB_ENV"
+      - name: Unit tests including kicad and krt
         run: pytest -q --tb=short
         env:
           PCBC_REQUIRE_KICAD: "1"
+          PCBC_REQUIRE_KRT: "1"
       - name: Produce blinky KiCad project + JLC package
         run: |
           pcbc build examples/blinky/blinky.py --force

@@ -49,8 +49,24 @@ def test_compare_flags_schematic_only_nets():
 
 
 @pytest.mark.kicad
-@pytest.mark.parametrize("board", [BLINKY, C3_USB], ids=["blinky", "c3_usb"])
+@pytest.mark.parametrize("board", [BLINKY, C3_USB, EXAMPLES / "buck" / "buck.py"], ids=["blinky", "c3_usb", "buck"])
 def test_kicad_reads_the_board_netlist(tmp_path: Path, board: Path):
     design = load_board(board)
     sch = emit_schematic_file(design, tmp_path / "schematic.kicad_sch", title=board.stem)
     assert check_schematic(design, sch) == []
+
+
+BUCK = EXAMPLES / "buck" / "buck.py"
+
+
+@pytest.mark.kicad
+@pytest.mark.parametrize("board", [BLINKY, C3_USB, BUCK], ids=["blinky", "c3_usb", "buck"])
+def test_erc_is_clean_and_on_grid(tmp_path: Path, board: Path):
+    from pcbc.netcheck import check_erc
+
+    design = load_board(board)
+    sch = emit_schematic_file(design, tmp_path / "schematic.kicad_sch", title=board.stem)
+    erc = check_erc(sch)
+    assert erc["errors"] == []
+    assert erc["warnings"].get("endpoint_off_grid", 0) == 0
+    assert erc["warnings"].get("pin_not_connected", 0) == 0

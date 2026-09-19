@@ -52,6 +52,10 @@ jobs:
           grep -q USB_DP examples/c3_usb/layout/c3_usb/schematic.kicad_sch
           pcbc review examples/c3_usb/c3_usb.py --no-open
           test -f examples/c3_usb/layout/c3_usb/review/index.html
+      - name: buck schematic (netlist proof, ERC, readability)
+        run: |
+          pcbc check examples/buck/buck.py
+          pcbc sch examples/buck/buck.py
       - uses: actions/upload-artifact@v4
         with:
           name: blinky-fab

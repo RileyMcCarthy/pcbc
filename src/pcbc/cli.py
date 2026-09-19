@@ -8,7 +8,7 @@ from pathlib import Path
 from . import __version__
 from .build import STAGES, build_job
 from .language import check_board, load_board
-from .netcheck import KicadMissing, check_schematic
+from .netcheck import KicadMissing, check_erc, check_schematic
 from .project import layout_dir
 from .review import review_job
 from .sch_emit import emit_schematic_file
@@ -90,12 +90,16 @@ def cmd_sch(args: argparse.Namespace) -> int:
     try:
         mismatch = check_schematic(design, sch)
         report["netlist"] = "verified" if not mismatch else mismatch
+        erc = check_erc(sch)
+        report["erc"] = "clean" if not erc["errors"] else erc["errors"]
+        report["erc_warnings"] = erc["warnings"]
     except KicadMissing as exc:
         mismatch = []
-        report["netlist"] = f"unchecked: {exc}"
+        erc = {"errors": [], "warnings": {}}
+        report["netlist"] = report["erc"] = f"unchecked: {exc}"
     if args.json:
         print(json.dumps(report, indent=2, default=str))
-        return 1 if mismatch else 0
+        return 1 if (mismatch or erc["errors"]) else 0
     print(f"schematic: {sch}")
     if report["netlist"] == "verified":
         print("netlist: kicad-cli reads exactly board.py's netlist")
@@ -105,6 +109,15 @@ def cmd_sch(args: argparse.Namespace) -> int:
             print(f"  ! {m}")
     else:
         print(f"netlist: {report['netlist']}")
+    if report["erc"] == "clean":
+        w = erc["warnings"]
+        print(f"erc: clean ({sum(w.values())} warnings: " + ", ".join(f"{k} {v}" for k, v in sorted(w.items())) + ")" if w else "erc: clean")
+    elif erc["errors"]:
+        print(f"erc: {len(erc['errors'])} error(s)")
+        for e in erc["errors"]:
+            print(f"  ! {e}")
+    else:
+        print(f"erc: {report['erc']}")
     issues = report.get("issues", [])
     if issues:
         print(f"readability: {len(issues)} to fix by editing SchPlace() lines")
@@ -112,7 +125,7 @@ def cmd_sch(args: argparse.Namespace) -> int:
             print(f"  {i}. {m}")
     else:
         print("readability: nothing overlaps")
-    return 1 if mismatch else 0
+    return 1 if (mismatch or erc["errors"]) else 0
 
 
 def cmd_review(args: argparse.Namespace) -> int:

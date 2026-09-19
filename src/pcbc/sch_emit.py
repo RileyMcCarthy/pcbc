@@ -102,8 +102,8 @@ class Part:
     placed: bool = False
     prop_ref: tuple[float, float] = (0.0, 0.0)
     prop_val: tuple[float, float] = (0.0, 0.0)
-    text_ref: tuple[float, float, str | None] | None = None
-    text_val: tuple[float, float, str | None] | None = None
+    text_ref: tuple[float, float, str | None, int] | None = None
+    text_val: tuple[float, float, str | None, int] | None = None
 
 
 def _kind(ref: str) -> str:
@@ -409,22 +409,24 @@ def _lib_led() -> str:
 
 def _lib_gnd() -> str:
     # Cached the way eeschema writes power:GND — body _0_1 + pin _1_1 stay one symbol.
-    return """		(symbol "power:GND" (power) (pin_names (offset 0)) (in_bom yes) (on_board yes)
+    name = "power:GND"
+    etype, vis = "power_in", " hide"
+    return f"""		(symbol "{name}" (power) (pin_names (offset 0)) (in_bom yes) (on_board yes)
 			(property "Reference" "#PWR" (at 0 -6.35 0)
 				(effects (font (size 1.27 1.27)) hide)
 			)
 			(property "Value" "GND" (at 0 -3.81 0)
 				(effects (font (size 1.27 1.27)))
 			)
-			(symbol "GND_0_1"
+			(symbol "{name.split(':')[1]}_0_1"
 				(polyline
 					(pts (xy 0 0) (xy 0 -1.27) (xy 1.27 -1.27) (xy 0 -2.54) (xy -1.27 -1.27) (xy 0 -1.27))
 					(stroke (width 0) (type default))
 					(fill (type none))
 				)
 			)
-			(symbol "GND_1_1"
-				(pin power_in line (at 0 0 270) (length 0) hide
+			(symbol "{name.split(':')[1]}_1_1"
+				(pin {etype} line (at 0 0 270) (length 0){vis}
 					(name "GND" (effects (font (size 1.27 1.27))))
 					(number "1" (effects (font (size 1.27 1.27))))
 				)
@@ -434,14 +436,16 @@ def _lib_gnd() -> str:
 
 
 def _lib_vcc() -> str:
-    return """		(symbol "power:VCC" (power) (pin_names (offset 0)) (in_bom yes) (on_board yes)
+    name = "power:VCC"
+    etype, vis = "power_in", " hide"
+    return f"""		(symbol "{name}" (power) (pin_names (offset 0)) (in_bom yes) (on_board yes)
 			(property "Reference" "#PWR" (at 0 -3.81 0)
 				(effects (font (size 1.27 1.27)) hide)
 			)
 			(property "Value" "VCC" (at 0 3.556 0)
 				(effects (font (size 1.27 1.27)))
 			)
-			(symbol "VCC_0_1"
+			(symbol "{name.split(':')[1]}_0_1"
 				(polyline
 					(pts (xy -0.762 1.27) (xy 0 2.54))
 					(stroke (width 0) (type default))
@@ -458,9 +462,36 @@ def _lib_vcc() -> str:
 					(fill (type none))
 				)
 			)
-			(symbol "VCC_1_1"
-				(pin power_in line (at 0 0 90) (length 0) hide
+			(symbol "{name.split(':')[1]}_1_1"
+				(pin {etype} line (at 0 0 90) (length 0){vis}
 					(name "VCC" (effects (font (size 1.27 1.27))))
+					(number "1" (effects (font (size 1.27 1.27))))
+				)
+			)
+		)
+"""
+
+
+def _lib_pwr_flag() -> str:
+    # KiCad's power:PWR_FLAG: a power-output pin, visible and zero length, that
+    # names no net and drives whatever it sits on.
+    return """		(symbol "power:PWR_FLAG" (power) (pin_numbers (hide yes)) (pin_names (offset 0) (hide yes)) (in_bom yes) (on_board yes)
+			(property "Reference" "#FLG" (at 0 1.905 0)
+				(effects (font (size 1.27 1.27)) hide)
+			)
+			(property "Value" "PWR_FLAG" (at 0 3.81 0)
+				(effects (font (size 1.27 1.27)))
+			)
+			(symbol "PWR_FLAG_0_1"
+				(polyline
+					(pts (xy 0 0) (xy 0 1.27) (xy -1.016 1.905) (xy 0 2.54) (xy 1.016 1.905) (xy 0 1.27))
+					(stroke (width 0) (type default))
+					(fill (type none))
+				)
+			)
+			(symbol "PWR_FLAG_1_1"
+				(pin power_out line (at 0 0 90) (length 0)
+					(name "pwr" (effects (font (size 1.27 1.27))))
 					(number "1" (effects (font (size 1.27 1.27))))
 				)
 			)
@@ -764,13 +795,18 @@ _GND_REF, _GND_VAL = (0.0, -6.35), (0.0, -3.81)
 _VCC_REF, _VCC_VAL = (0.0, -3.81), (0.0, 3.556)
 
 
-def _hat(net: str, x: float, y: float, gnd: bool, rot: int = 0) -> str:
+_FLAG_REF, _FLAG_VAL = (0.0, 1.905), (0.0, 3.81)
+
+
+def _hat(net: str, x: float, y: float, gnd: bool, rot: int = 0, lib: str | None = None, value: str | None = None) -> str:
     """Place the whole power symbol on the pin. Do not explode it into a wire + graphic."""
-    lib = "power:GND" if gnd else "power:VCC"
-    uid = _uid(f"hat:{net}:{_fmt(x)},{_fmt(y)}")
-    pwr = "#PWR?"  # numbered in one pass over the finished sheet
-    ref_l = _GND_REF if gnd else _VCC_REF
-    val_l = _GND_VAL if gnd else _VCC_VAL
+    flag = lib == "power:PWR_FLAG"
+    lib = lib or ("power:GND" if gnd else "power:VCC")
+    uid = _uid(f"hat:{lib}:{net}:{_fmt(x)},{_fmt(y)}")
+    pwr = "#FLG?" if flag else "#PWR?"  # numbered in one pass over the finished sheet
+    ref_l = _FLAG_REF if flag else (_GND_REF if gnd else _VCC_REF)
+    val_l = _FLAG_VAL if flag else (_GND_VAL if gnd else _VCC_VAL)
+    net = value or net
     rx, ry = _rot_xy(*ref_l, rot)
     vx, vy = _rot_xy(*val_l, rot)
     # Eeschema stores property Y as at_y − library_y (Y-up library, Y-down sheet).
@@ -828,9 +864,10 @@ def _instance(part: Part) -> str:
     # KiCad turns field text with a 90/270 symbol; a 90 field angle undoes that.
     ang = 90 if rot in (90, 270) else 0
     rjust = vjust = None
+    rvis = vvis = 0
     if part.text_ref and part.text_val:
-        rwx, rwy, rjust = part.text_ref
-        vwx, vwy, vjust = part.text_val
+        rwx, rwy, rjust, rvis = part.text_ref
+        vwx, vwy, vjust, vvis = part.text_val
     elif part.kind in ("r", "c", "l", "d"):
         (rwx, rwy), (vwx, vwy) = _passive_label_xy(part)
     else:
@@ -838,6 +875,10 @@ def _instance(part: Part) -> str:
         vwx, vwy = _prop_world(part, part.prop_val)
     rj = f" (justify {rjust})" if rjust else ""
     vj = f" (justify {vjust})" if vjust else ""
+    # A field's angle adds to the symbol's; KiCad never draws text upside
+    # down, so the visual angle is (field + symbol) mod 180.
+    rang = (rvis - rot) % 180
+    vang = (vvis - rot) % 180
     return (
         f'\t(symbol\n'
         f'\t\t(lib_id "{part.lib_id}")\n'
@@ -849,11 +890,11 @@ def _instance(part: Part) -> str:
         f'\t\t(dnp no)\n'
         f'\t\t(uuid "{_uid(f"sym:{part.ref}")}")\n'
         f'\t\t(property "Reference" "{part.ref}"\n'
-        f'\t\t\t(at {_fmt(rwx)} {_fmt(rwy)} {ang})\n'
+        f'\t\t\t(at {_fmt(rwx)} {_fmt(rwy)} {rang if part.text_ref else ang})\n'
         f'\t\t\t(effects (font (size 1.27 1.27)){rj})\n'
         f'\t\t)\n'
         f'\t\t(property "Value" "{part.display}"\n'
-        f'\t\t\t(at {_fmt(vwx)} {_fmt(vwy)} {ang})\n'
+        f'\t\t\t(at {_fmt(vwx)} {_fmt(vwy)} {vang if part.text_val else ang})\n'
         f'\t\t\t(effects (font (size 1.27 1.27)){vj})\n'
         f'\t\t)\n'
         f"{pins}"
@@ -1211,9 +1252,9 @@ class _Sheet:
                 if abs(py - y0) < _EPS and lo + _EPS < px < hi - _EPS:
                     return False
         for ax, ay, anet, _tag in self.anchors:
-            if anet == net:
-                continue
-            if _inside_segment(ax, ay, x0, y0, x1, y1) or _near(ax, ay, x0, y0) or _near(ax, ay, x1, y1):
+            if _inside_segment(ax, ay, x0, y0, x1, y1):
+                return False  # a symbol pin or label on a wire's interior, any net: never drawn
+            if anet != net and (_near(ax, ay, x0, y0) or _near(ax, ay, x1, y1)):
                 return False
         if any(_segment_crosses_box(x0, y0, x1, y1, box) for box in self.cores):
             return False
@@ -1429,8 +1470,8 @@ def _prop_box(text: str, x: float, y: float, just: str | None) -> Box:
     return (x0, y - _TEXT_H / 2.0, x1, y + _TEXT_H / 2.0)
 
 
-def _hat_box(net: str, x: float, y: float, gnd: bool, rot: int) -> Box:
-    hw = max(1.5, _text_w(net) / 2.0 + 0.2)
+def _hat_box(net: str, x: float, y: float, gnd: bool, rot: int, text: str | None = None) -> Box:
+    hw = max(1.5, _text_w(text or net) / 2.0 + 0.2)
     down = gnd if rot == 0 else not gnd  # GND hangs down; a supply points up
     return (x - hw, y, x + hw, y + 4.8) if down else (x - hw, y - 4.8, x + hw, y)
 
@@ -1459,7 +1500,7 @@ def _reserve(sheet: _Sheet, parts: list[Part], sites: dict[str, list[_Site]], ki
 _HatCand = tuple[tuple[int, float], _Site, list[tuple[float, float]], int]
 
 
-def _hat_candidates(sheet: _Sheet, members: list[_Site], net: str, gnd: bool) -> list[_HatCand]:
+def _hat_candidates(sheet: _Sheet, members: list[_Site], net: str, gnd: bool, text: str | None = None) -> list[_HatCand]:
     """Every legal spot for one group's power symbol, best first: on the pin end
     when the pin already points the symbol's way, else on a stub — straight, or
     with a jog either way. A spot that touches nothing drawn beats every spot
@@ -1509,7 +1550,7 @@ def _hat_candidates(sheet: _Sheet, members: list[_Site], net: str, gnd: bool) ->
                 # kicad-cli: a symbol pin on a wire's interior does not connect.
                 if sheet.on_wire_interior(hx, hy):
                     continue
-            box = _hat_box(net, hx, hy, gnd, rot)
+            box = _hat_box(net, hx, hy, gnd, rot, text)
             # The symbol may not sit on its own wire: a GND jogged up and
             # pointing back down through the jog is legal and looks broken.
             if any(
@@ -1538,20 +1579,24 @@ def _hat_candidates(sheet: _Sheet, members: list[_Site], net: str, gnd: bool) ->
     return found
 
 
-def _place_hat(sheet: _Sheet, members: list[_Site], net: str, gnd: bool, tag: str = "") -> list[str]:
-    cands = _hat_candidates(sheet, members, net, gnd)
+def _place_hat(
+    sheet: _Sheet, members: list[_Site], net: str, gnd: bool, tag: str = "", lib: str | None = None, value: str | None = None
+) -> list[str]:
+    cands = _hat_candidates(sheet, members, net, gnd, value)
     if cands:
-        return _commit_hat(sheet, cands[0], net, gnd, tag)
+        return _commit_hat(sheet, cands[0], net, gnd, tag, lib, value)
     s = members[0]
-    return _commit_hat(sheet, ((1, 0.0), s, [(s.x, s.y)], 0), net, gnd, tag)
+    return _commit_hat(sheet, ((1, 0.0), s, [(s.x, s.y)], 0), net, gnd, tag, lib, value)
 
 
-def _commit_hat(sheet: _Sheet, cand: _HatCand, net: str, gnd: bool, tag: str) -> list[str]:
+def _commit_hat(
+    sheet: _Sheet, cand: _HatCand, net: str, gnd: bool, tag: str, lib: str | None = None, value: str | None = None
+) -> list[str]:
     _k, s, pts, rot = cand
     hx, hy = pts[-1]
     out = sheet.add(pts, net, tag) if len(pts) > 1 else []
-    out.append(_hat(net, hx, hy, gnd=gnd, rot=rot))
-    sheet.occupy(_hat_box(net, hx, hy, gnd, rot), "hat", s.part.ref, net, tag)
+    out.append(_hat(net, hx, hy, gnd=gnd, rot=rot, lib=lib, value=value))
+    sheet.occupy(_hat_box(net, hx, hy, gnd, rot, value), "hat", s.part.ref, net, tag)
     sheet.occupants[-1].rot = rot
     sheet.anchor(hx, hy, net, tag)
     return out
@@ -1741,40 +1786,59 @@ def _pair_key(sheet: _Sheet, a: tuple, b: tuple) -> tuple[int, float] | None:
     return (total[0], total[1])
 
 
+def _text_box(text: str, x: float, y: float, just: str | None, vis: int) -> Box:
+    """Where a field's text lands: horizontal from its anchor, or running up
+    from it when drawn at 90 degrees (KiCad's rotated field, justify left)."""
+    if vis == 90:
+        w = _text_w(text) + 0.4
+        return (x - _TEXT_H / 2.0, y - w, x + _TEXT_H / 2.0, y)
+    return _prop_box(text, x, y, just)
+
+
 def _place_passive_text(sheet: _Sheet, part: Part) -> None:
-    """Reference and Value beside a 2-pin part on the side that overlaps least."""
+    """Reference and Value beside a 2-pin part on the side that overlaps least.
+    Beside a part that stands vertically they may also stand vertically -
+    how an engineer labels a hanging resistor when the row beside it is busy."""
     sheet.occupants = [o for o in sheet.occupants if not (o.owner == part.ref and o.kind in ("ref", "value"))]
     x0, y0, x1, y1 = body_aabb(part)
     cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
     ref, val = part.ref, part.display
-    cands: list[tuple[str, tuple[float, float, str | None], tuple[float, float, str | None]]] = [
-        ("right", (x1 + 0.8, cy - 1.0, "left"), (x1 + 0.8, cy + 1.0, "left")),
-        ("left", (x0 - 0.8, cy - 1.0, "right"), (x0 - 0.8, cy + 1.0, "right")),
-        ("above", (cx, y0 - 2.7, None), (cx, y0 - 1.0, None)),
-        ("below", (cx, y1 + 1.0, None), (cx, y1 + 2.7, None)),
-        ("above-left", (x1, y0 - 2.7, "right"), (x1, y0 - 1.0, "right")),
-        ("above-right", (x0, y0 - 2.7, "left"), (x0, y0 - 1.0, "left")),
-        ("below-left", (x1, y1 + 1.0, "right"), (x1, y1 + 2.7, "right")),
-        ("below-right", (x0, y1 + 1.0, "left"), (x0, y1 + 2.7, "left")),
+    Spot = tuple[float, float, str | None, int]
+    cands: list[tuple[str, Spot, Spot]] = [
+        ("right", (x1 + 0.8, cy - 1.0, "left", 0), (x1 + 0.8, cy + 1.0, "left", 0)),
+        ("left", (x0 - 0.8, cy - 1.0, "right", 0), (x0 - 0.8, cy + 1.0, "right", 0)),
+        ("above", (cx, y0 - 2.7, None, 0), (cx, y0 - 1.0, None, 0)),
+        ("below", (cx, y1 + 1.0, None, 0), (cx, y1 + 2.7, None, 0)),
+        ("above-left", (x1, y0 - 2.7, "right", 0), (x1, y0 - 1.0, "right", 0)),
+        ("above-right", (x0, y0 - 2.7, "left", 0), (x0, y0 - 1.0, "left", 0)),
+        ("below-left", (x1, y1 + 1.0, "right", 0), (x1, y1 + 2.7, "right", 0)),
+        ("below-right", (x0, y1 + 1.0, "left", 0), (x0, y1 + 2.7, "left", 0)),
         # Slid along a side: the two lines sit toward one end of the part.
-        ("right-high", (x1 + 0.8, cy - 2.7, "left"), (x1 + 0.8, cy - 1.0, "left")),
-        ("right-low", (x1 + 0.8, cy + 1.0, "left"), (x1 + 0.8, cy + 2.7, "left")),
-        ("left-high", (x0 - 0.8, cy - 2.7, "right"), (x0 - 0.8, cy - 1.0, "right")),
-        ("left-low", (x0 - 0.8, cy + 1.0, "right"), (x0 - 0.8, cy + 2.7, "right")),
+        ("right-high", (x1 + 0.8, cy - 2.7, "left", 0), (x1 + 0.8, cy - 1.0, "left", 0)),
+        ("right-low", (x1 + 0.8, cy + 1.0, "left", 0), (x1 + 0.8, cy + 2.7, "left", 0)),
+        ("left-high", (x0 - 0.8, cy - 2.7, "right", 0), (x0 - 0.8, cy - 1.0, "right", 0)),
+        ("left-low", (x0 - 0.8, cy + 1.0, "right", 0), (x0 - 0.8, cy + 2.7, "right", 0)),
     ]
     vertical = abs(pin_outward(part, part.pins[0])[1]) > 0.5 if part.pins else True
+    if vertical:
+        wr, wv = _text_w(ref) + 0.4, _text_w(val) + 0.4
+        cands += [
+            ("right-rot", (x1 + 1.2, cy + wr / 2.0, "left", 90), (x1 + 3.0, cy + wv / 2.0, "left", 90)),
+            ("left-rot", (x0 - 3.0, cy + wr / 2.0, "left", 90), (x0 - 1.2, cy + wv / 2.0, "left", 90)),
+        ]
     order = cands if vertical else cands[2:4] + cands[:2] + cands[4:]
     best = None
-    for i, (_side, r, v) in enumerate(order):
-        c = sheet.cost(_prop_box(ref, *r)) + sheet.cost(_prop_box(val, *v)) + 0.01 * i
+    for i, (side, r, v) in enumerate(order):
+        c = sheet.cost(_text_box(ref, *r)) + sheet.cost(_text_box(val, *v)) + 0.01 * i
+        c += 0.4 if side.endswith("-rot") else 0.0  # upright reads better when it fits
         if best is None or c < best[0]:
             best = (c, r, v)
     assert best is not None
     _c, r, v = best
     part.text_ref = r
     part.text_val = v
-    sheet.occupy(_prop_box(ref, *r), "ref", part.ref)
-    sheet.occupy(_prop_box(val, *v), "value", part.ref)
+    sheet.occupy(_text_box(ref, *r), "ref", part.ref)
+    sheet.occupy(_text_box(val, *v), "value", part.ref)
 
 
 def _lint(
@@ -1787,6 +1851,24 @@ def _lint(
 ) -> dict:
     """What still hurts readability, as things an AI can act on by moving parts."""
     issues: list[str] = []
+    for p in parts:
+        shoved = getattr(p, "shoved_mm", 0.0)
+        if shoved > 8 * 1.27:  # a stagger of a few grid steps is normal; more is a lane taken
+            issues.append(
+                f"{p.ref} was pushed {shoved:.0f} mm along its attach to clear {getattr(p, 'shoved_by', '?')}: "
+                f"they want the same side of the same part - hang one of them off a different pin, "
+                f"or down from its row (SchPlace(..., rotate=0)), or give it its own SchPlace() spot"
+            )
+        for other in sorted(getattr(p, "stuck_on", set())):
+            issues.append(
+                f"{p.ref} overlaps {other} at every distance along its attach: hang {p.ref} off a different pin or side"
+            )
+        wire = getattr(p, "stuck_wire", None)
+        if wire and wire[1]:
+            issues.append(
+                f"{p.ref}: its wire from {wire[0]} would run through {', '.join(wire[1])} at every distance - "
+                f"that pin's free side is the other way; attach {p.ref} to a pin on this side, or to the far end of the run"
+            )
     for p in parts:
         if p.kind != "box":
             continue
@@ -2151,7 +2233,25 @@ def _annotate(
     sheet.occupants = [o for o in sheet.occupants if o.kind != "reserve"]
     for tag, _job in jobs:
         out.extend(drawn[tag])
+    # One PWR_FLAG per power net, placed like any symbol where it touches
+    # nothing: ERC then sees every power net driven (the connector's VBUS and
+    # the regulator's output have no power-output pin in their library symbols).
+    for net, sts in sites.items():
+        if is_power_net(net, kinds):
+            out.extend(_place_hat(sheet, sts, net, False, f"flag:{net}", lib="power:PWR_FLAG", value="PWR_FLAG"))
     out.extend(_junctions(sheet))
+    # A pin the board leaves unbound is marked so: ERC's "pin not connected"
+    # is for pins someone forgot, not for the ones the board file left open.
+    for p in parts:
+        for pin in p.pins:
+            if not pin.net or pin.net.startswith("unconnected") or pin.net.endswith(".NC"):
+                x, y = pin_world(p, pin)
+                out.append(
+                    f'\t(no_connect\n'
+                    f'\t\t(at {_fmt(x)} {_fmt(y)})\n'
+                    f'\t\t(uuid "{_uid(f"nc:{p.ref}:{pin.number}")}")\n'
+                    f'\t)\n'
+                )
     two_pin = [p for p in parts if _two_pin(p)]
     for _round in range(2):
         for p in two_pin:
@@ -2181,8 +2281,8 @@ def _emit(design: Design, *, title: str, report: dict | None) -> str:
             {"ref": p.ref, "x": round(p.x, 3), "y": round(p.y, 3), "rot": p.rot, "mirror": p.mirror}
             for p in parts
         ]
-    libs = [_lib_gnd(), _lib_vcc(), _lib_r(), _lib_c(), _lib_l(), _lib_led()]
-    seen_lib: set[str] = {"power:GND", "power:VCC", "GND", "VCC", "R", "C", "L", "LED"}
+    libs = [_lib_gnd(), _lib_vcc(), _lib_pwr_flag(), _lib_r(), _lib_c(), _lib_l(), _lib_led()]
+    seen_lib: set[str] = {"power:GND", "power:VCC", "power:PWR_FLAG", "GND", "VCC", "R", "C", "L", "LED"}
     for p in parts:
         if p.lib_id in seen_lib:
             continue
@@ -2215,6 +2315,8 @@ def _emit(design: Design, *, title: str, report: dict | None) -> str:
         return f'"#PWR{n:03d}"'
 
     body_text = re.sub(r'"#PWR\?"', _number, body_text)
+    n = 0
+    body_text = re.sub(r'"#FLG\?"', lambda m: _number(m).replace("#PWR", "#FLG"), body_text)
     return (
         f'(kicad_sch\n'
         f'\t(version 20260306)\n'

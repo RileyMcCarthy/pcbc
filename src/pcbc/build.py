@@ -8,7 +8,7 @@ from .circuit import check_design
 from .compile import compile_design
 from .fab import fab_job
 from .language import load_board
-from .netcheck import KicadMissing, check_schematic
+from .netcheck import KicadMissing, check_erc, check_schematic
 from .place import place_job
 from .project import layout_dir, packed_reason, seed_pcb
 from .route import route_job
@@ -101,12 +101,19 @@ def build_job(
         try:
             fails = check_schematic(design, sch)
             step["netlist"] = "verified" if not fails else fails
+            erc = check_erc(sch)
+            step["erc"] = "clean" if not erc["errors"] else erc["errors"]
+            step["erc_warnings"] = erc["warnings"]
         except KicadMissing as exc:
             fails = []
-            step["netlist"] = f"unchecked: {exc}"
+            erc = {"errors": []}
+            step["netlist"] = step["erc"] = f"unchecked: {exc}"
         result["steps"].append(step)
         if fails:
             result["error"] = "schematic netlist differs from board.py: " + "; ".join(fails)
+            return result
+        if erc["errors"]:
+            result["error"] = "schematic fails KiCad ERC: " + "; ".join(erc["errors"])
             return result
 
     placed = layout / "placed" / "layout.kicad_pcb"

@@ -13,7 +13,11 @@ from pcbc.language import load_board
 from pcbc.sch_emit import emit_from_design
 
 EXAMPLES = Path(__file__).resolve().parent.parent / "examples"
-BOARDS = {"blinky": EXAMPLES / "blinky" / "blinky.py", "c3_usb": EXAMPLES / "c3_usb" / "c3_usb.py"}
+BOARDS = {
+    "blinky": EXAMPLES / "blinky" / "blinky.py",
+    "c3_usb": EXAMPLES / "c3_usb" / "c3_usb.py",
+    "buck": EXAMPLES / "buck" / "buck.py",
+}
 EPS = 0.05
 
 _WIRE = re.compile(r"\(wire\n\t\t\(pts \(xy ([0-9.]+) ([0-9.]+)\) \(xy ([0-9.]+) ([0-9.]+)\)\)")
@@ -121,3 +125,20 @@ def test_emit_stays_fast():
     t = time.perf_counter()
     emit_from_design(load_board(BOARDS["c3_usb"]), title="c3_usb")
     assert time.perf_counter() - t < 30.0  # was 31 s once; the bar catches a cliff, not a wobble
+
+
+@pytest.mark.parametrize("name", list(BOARDS))
+def test_everything_on_the_grid_and_open_pins_marked(sheets, name):
+    text = sheets[name][0]
+    for x0, y0, x1, y1 in _wires(text):
+        for v in (x0, y0, x1, y1):
+            assert abs(v / 1.27 - round(v / 1.27)) < 0.01, (x0, y0, x1, y1)
+    design = load_board(BOARDS[name])
+    open_pads = sum(
+        len(pin.pads) for inst in design.instances for nm, pin in inst.part.pins.items() if nm not in inst.pins
+    )
+    assert text.count("(no_connect") == open_pads
+    # exactly one PWR_FLAG per power net, numbered
+    power = [n.name for n in design.nets.values() if n.kind in ("power", "ground")]
+    assert text.count('(lib_id "power:PWR_FLAG")') == len(power)
+    assert len(re.findall(r'"#FLG\d{3}"', text)) == len(power)

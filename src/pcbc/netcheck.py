@@ -113,3 +113,36 @@ def compare(expected: dict[str, set[Pad]], actual: dict[str, set[Pad]]) -> list[
 def check_schematic(design: Design, sch: Path, cli: Path | None = None) -> list[str]:
     """Run kicad-cli on the emitted sheet and diff. Empty list means identical."""
     return compare(expected_nets(design), kicad_nets(Path(sch), cli))
+
+
+def check_erc(sch: Path, cli: Path | None = None) -> dict:
+    """KiCad's own ERC on the sheet. ``errors`` is a list of strings (empty is
+    clean); ``warnings`` counts each warning type. Errors are what a person
+    opening the project would see first: an unbound pin with no mark, a
+    power net nothing drives."""
+    import json
+    from collections import Counter
+
+    cli = cli or kicad_cli()
+    if not cli.exists() and shutil.which(str(cli)) is None:
+        raise KicadMissing(f"kicad-cli not found ({cli})")
+    with tempfile.TemporaryDirectory() as td:
+        rep = Path(td) / "erc.json"
+        run = subprocess.run(
+            [str(cli), "sch", "erc", "--format", "json", "--severity-all", "-o", str(rep), str(sch)],
+            capture_output=True,
+            text=True,
+        )
+        if not rep.exists():
+            raise RuntimeError(f"kicad-cli sch erc failed: {run.stderr.strip() or run.stdout.strip()}")
+        data = json.loads(rep.read_text())
+    errors: list[str] = []
+    warnings: Counter = Counter()
+    for sheet in data.get("sheets", []):
+        for v in sheet.get("violations", []):
+            if v.get("severity") == "error":
+                what = "; ".join(i.get("description", "") for i in v.get("items", []))
+                errors.append(f"{v.get('type')}: {what}")
+            else:
+                warnings[v.get("type", "?")] += 1
+    return {"errors": errors, "warnings": dict(warnings)}

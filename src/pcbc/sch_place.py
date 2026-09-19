@@ -245,7 +245,8 @@ def _apply_css(spec: SchPlaceSpec, part, regions: dict[str, Rect]) -> None:
         who=f"SchPlace({part.ref!r})",
     )
     at = origin_from_border(rect, local, st.rotate)
-    part.x, part.y = at
+    # KiCad connects on a 1.27 mm grid; library pins sit on it, so the origin must too.
+    part.x, part.y = round(at[0] / 1.27) * 1.27, round(at[1] / 1.27) * 1.27
     part.rot = float(st.rotate)
     part.mirror = spec.mirror
     part.placed = True
@@ -307,14 +308,30 @@ def _auto_gap(part, our, other, kinds: dict[str, str] | None) -> float:
 
 def _apply_along(spec: SchPlaceSpec, part, other, occupied: list, kinds=None) -> None:
     side = spec.side if spec.side in _SIDES else "bottom"
-    sx, sy = _SIDES[side]
-    ox0, oy0, ox1, oy1 = world_aabb(other)
     _, tpin = parse_refpin(spec.along or "?.1")
     op = _find_pin(other, tpin)
+    # side= is relative to the parent as drawn. "bottom" off the TOP pin of a
+    # part that hangs from its row (a second cap on the same node) cannot
+    # share that node from below, so it means beside it, away from whatever
+    # the parent is attached to - and the sibling then hangs the same way.
+    # "bottom" off the BOTTOM pin (the tap of a divider) stays below.
+    parallel = False
+    p_dir = getattr(other, "attach_dir", None)
+    if side in ("top", "bottom") and other.pins and abs(pin_outward(other, other.pins[0])[1]) > 0.5:
+        opx, opy = pin_world(other, op)
+        ys = [pin_world(other, pn)[1] for pn in other.pins]
+        far_end = (side == "bottom" and opy <= min(ys) + 0.05) or (side == "top" and opy >= max(ys) - 0.05)
+        if far_end and p_dir and abs(p_dir[0]) > 0.5:
+            side = "left" if p_dir[0] < 0 else "right"
+            parallel = True
+    sx, sy = _SIDES[side]
+    ox0, oy0, ox1, oy1 = world_aabb(other)
     owx, owy = pin_world(other, op)
     two_pin = len(part.pins) <= 2
     if spec.rotate_set or spec.mirror:
         part.rot, part.mirror = float(spec.rot), spec.mirror
+    elif parallel and two_pin:
+        part.rot, part.mirror = other.rot, getattr(other, "mirror", None)
     elif spec.side and two_pin:
         # Turn to face the sibling (a cap under a wire node, a switch beside it).
         part.rot, part.mirror = _best_pose(_attach_pin(spec, part, other, op), (-sx, -sy), part)
@@ -324,7 +341,8 @@ def _apply_along(spec: SchPlaceSpec, part, other, occupied: list, kinds=None) ->
         part.rot, part.mirror = 0.0, None
     our = _attach_pin(spec, part, other, op)
     _mark_wired(part, our, other, op)
-    facing = bool(spec.side) and two_pin and not spec.rotate_set
+    facing = bool(spec.side) and two_pin and not spec.rotate_set and not parallel
+    blockers: list[str] = []
     node_named = (kinds or {}).get(getattr(our, "net", ""), "net") in ("power", "ground") or (
         op.number in getattr(other, "wired_pins", set()) and our.number in getattr(part, "wired_pins", set())
     )
@@ -355,30 +373,47 @@ def _apply_along(spec: SchPlaceSpec, part, other, occupied: list, kinds=None) ->
             # Turned toward the sibling's pin: gap is pin to pin, i.e. the wire.
             part.x = owx + sx * d - plx
             part.y = owy + sy * d - ply
-            if not any(_clash(part, o, kinds) for o in occupied):
+            hits = [o.ref for o in occupied if _clash(part, o, kinds)]
+            if i == 0:
+                blockers = hits
+            if not hits:
+                if i >= 8:
+                    part.shoved_mm = getattr(part, "shoved_mm", 0.0) + i * 1.27
+                    part.shoved_by = blockers[0] if blockers else "?"
                 part.attach_dir = (sx, sy)
+                part.attach_wire = ((owx, owy), pin_world(part, our))
                 part.placed = True
                 return
             continue
         part.x, part.y = other.x, other.y
         a0, a1, a2, a3 = world_aabb(part)
+        # Beside or below the parent's box, then the pin snapped outward onto
+        # the 1.27 mm grid (the box edge is wherever the graphics end).
         if sy > 0:
             part.x = owx - plx
-            part.y = oy1 + d + (part.y - a1)
+            part.y = math.ceil((oy1 + d + (part.y - a1) + ply) / 1.27) * 1.27 - ply
         elif sy < 0:
             part.x = owx - plx
-            part.y = oy0 - d - (a3 - part.y)
+            part.y = math.floor((oy0 - d - (a3 - part.y) + ply) / 1.27) * 1.27 - ply
         elif sx > 0:
-            part.x = ox1 + d + (part.x - a0)
+            part.x = math.ceil((ox1 + d + (part.x - a0) + plx) / 1.27) * 1.27 - plx
             part.y = owy - ply
         else:
-            part.x = ox0 - d - (a2 - part.x)
+            part.x = math.floor((ox0 - d - (a2 - part.x) + plx) / 1.27) * 1.27 - plx
             part.y = owy - ply
-        if not any(_clash(part, o, kinds) for o in occupied):
+        hits = [o.ref for o in occupied if _clash(part, o, kinds)]
+        if i == 0:
+            blockers = hits
+        if not hits:
+            if i >= 8:
+                part.shoved_mm = getattr(part, "shoved_mm", 0.0) + i * 1.27
+                part.shoved_by = blockers[0] if blockers else "?"
             part.attach_dir = (sx, sy)
+            part.attach_wire = ((owx, owy), pin_world(part, our))
             part.placed = True
             return
     part.x, part.y = owx - plx, oy1 + gap + part.hh
+    part.stuck_on = set(blockers)
     part.attach_dir = (sx, sy)
     part.placed = True
 
@@ -402,38 +437,120 @@ def _apply_attach(spec: SchPlaceSpec, part, other, other_pin_name: str, occupied
     _mark_wired(part, our, other, op)
     gap = float(spec.gap) if spec.gap is not None else _auto_gap(part, our, other, kinds)
 
+    # Poses to try at each distance, best first. A 2-pin part on a horizontal
+    # pin lies along it (a series element) or hangs from the row: down when
+    # its far end is ground, up when its far end is a supply - what an
+    # engineer draws for a decoupling cap or a pull-up. An IC only mirrors.
+    facing = _best_pose(our, face, part)
     if spec.rotate_set or spec.mirror:
-        part.rot, part.mirror = float(spec.rot), spec.mirror
+        poses = [(float(spec.rot), spec.mirror)]
+    elif part.kind in ("r", "c", "d") and abs(step[1]) < 0.5 and not face_park:
+        far = next((getattr(pn, "net", "") for pn in part.pins if pn is not our), "")
+        far_kind = (kinds or {}).get(far, "net")
+        down = _best_pose(our, (0.0, -1.0), part)  # our pin on top, body below the row
+        up = _best_pose(our, (0.0, 1.0), part)  # our pin underneath, body above
+        # What an engineer draws: a cap to ground hangs down from the row, a
+        # pull-up stands up to its supply; a signal part takes the free side -
+        # up off the top pin of a side, down off the bottom one - and only
+        # lies along the pin when neither is called for.
+        same_side = [
+            pin_world(other, pn)[1]
+            for pn in other.pins
+            if abs(pin_outward(other, pn)[0] - step[0]) < 0.5 and abs(pin_outward(other, pn)[1] - step[1]) < 0.5
+        ]
+        top = oy <= min(same_side) + 0.05
+        bottom = oy >= max(same_side) - 0.05
+        if far_kind == "ground":
+            poses = [down, up, facing]
+        elif far_kind == "power":
+            poses = [up, down, facing]
+        elif top and not bottom:
+            poses = [up, facing, down]
+        elif bottom and not top:
+            poses = [down, facing, up]
+        else:
+            poses = [facing, down, up]
     else:
-        # A 2-pin part turns or mirrors to face the target; an IC only mirrors.
-        part.rot, part.mirror = _best_pose(our, face, part)
+        poses = [facing]
+    # The first pose at the asked gap, then a stagger of a few grid steps,
+    # then the other poses, then longer slides.
+    _STAGGER = 8  # grid steps a part may step out before it changes pose or is reported
+    tries = [(i, pose) for pose in poses[:1] for i in range(_STAGGER)]
+    tries += [(i, pose) for pose in poses[1:] for i in range(_STAGGER)]
+    tries += [(i, pose) for i in range(_STAGGER, 64) for pose in poses]
 
-    plx, ply = lib_to_sheet(our.lx, our.ly, part.rot, part.mirror)
     bx0, by0, bx1, by1 = body_aabb(other)
     chosen = False
-    for i in range(64):
+    blockers: list[str] = []
+    wire_blockers: list[str] = []
+    tx = ty = 0.0
+    for i, (rot, mirror) in tries:
         dist = gap + i * 1.27
         if face_park:
+            # Parked off a face: that edge is wherever the graphics end, so the
+            # parked coordinate is snapped outward to the 1.27 mm grid (the
+            # pin's own coordinate is already on it).
             if spec.side == "left":
-                tx, ty = bx0 - dist, oy
+                tx, ty = math.floor((bx0 - dist) / 1.27) * 1.27, oy
             elif spec.side == "right":
-                tx, ty = bx1 + dist, oy
+                tx, ty = math.ceil((bx1 + dist) / 1.27) * 1.27, oy
             elif spec.side == "top":
-                tx, ty = ox, by0 - dist
+                tx, ty = ox, math.floor((by0 - dist) / 1.27) * 1.27
             else:
-                tx, ty = ox, by1 + dist
+                tx, ty = ox, math.ceil((by1 + dist) / 1.27) * 1.27
         else:
             tx = ox + step[0] * dist
             ty = oy + step[1] * dist
+        part.rot, part.mirror = rot, mirror
+        plx, ply = lib_to_sheet(our.lx, our.ly, rot, mirror)
         part.x, part.y = tx - plx, ty - ply
-        if not any(_clash(part, o, kinds) for o in occupied):
+        body_hits = [o.ref for o in occupied if _clash(part, o, kinds)]
+        wire_hits = _wire_conflicts(part, ((ox, oy), (tx, ty)), occupied)
+        if not blockers and not wire_blockers:
+            blockers, wire_blockers = body_hits, wire_hits
+        if not body_hits and not wire_hits:
             chosen = True
+            if i >= _STAGGER:
+                # Slid well past the asked gap to clear a neighbour: say so, a
+                # long slide is a placement to change, not a fix.
+                part.shoved_mm = getattr(part, "shoved_mm", 0.0) + i * 1.27
+                part.shoved_by = (blockers or wire_blockers or ["?"])[0]
             break
     if not chosen:
-        part.x = ox + step[0] * 50.8 - plx
-        part.y = oy + step[1] * 50.8 - ply
+        # Nowhere along this attach is clear: stay where it was asked, so the
+        # collision is visible where it is, and say what is in the way.
+        part.rot, part.mirror = poses[0]
+        plx, ply = lib_to_sheet(our.lx, our.ly, part.rot, part.mirror)
+        tx, ty = ox + step[0] * gap, oy + step[1] * gap
+        part.x, part.y = tx - plx, ty - ply
+        part.stuck_on = set(blockers)
+        part.stuck_wire = (f"{other.ref}.{op.name}", sorted(set(wire_blockers)))
+    part.attach_wire = ((ox, oy), (tx, ty))
     part.attach_dir = step
     part.placed = True
+
+
+def _seg_hits_box(x0: float, y0: float, x1: float, y1: float, box, pad: float = 0.3) -> bool:
+    bx0, by0, bx1, by1 = box
+    return not (
+        max(x0, x1) < bx0 - pad or min(x0, x1) > bx1 + pad or max(y0, y1) < by0 - pad or min(y0, y1) > by1 + pad
+    )
+
+
+def _wire_conflicts(part, wire, others: list) -> list[str]:
+    """Placed hangers' attach wires through our graphics, or ours through
+    theirs: a body across a neighbour's wire is as bad as a body on a body."""
+    (ax, ay), (bx, by) = wire
+    core = core_aabb(part)
+    out: list[str] = []
+    for o in others:
+        w = getattr(o, "attach_wire", None)
+        if w and _seg_hits_box(w[0][0], w[0][1], w[1][0], w[1][1], core):
+            out.append(o.ref)
+            continue
+        if _seg_hits_box(ax, ay, bx, by, core_aabb(o)):
+            out.append(o.ref)
+    return out
 
 
 def _boxes_overlap(a, b, pad: float) -> bool:
@@ -481,7 +598,13 @@ def apply_sch_places(design: Design, parts: list) -> None:
         _apply_css(spec, part, regions)
         placed.add(spec.ref)
 
-    pending = [s for s in design.sch_places if s.has_attach()]
+    def _rigidity(spec: SchPlaceSpec) -> int:
+        part = by_ref[spec.ref]
+        return 0 if part.kind not in ("r", "c", "d") else 1
+
+    # Parts with one pose (an IC, an inductor, a connector) go first, so a
+    # part that can hang from its row is the one that yields.
+    pending = sorted((s for s in design.sch_places if s.has_attach()), key=_rigidity)
     guard = 0
     while pending:
         guard += 1
@@ -561,11 +684,23 @@ def _separate(parts: list, css_refs: set[str], kinds: dict[str, str] | None = No
                     if k is not None:
                         options.append((k, mover, hold))
                 if not options:
+                    # Neither can clear along its attach: left as is, reported.
+                    for m in (a, b):
+                        if m.ref not in css_refs:
+                            stuck = getattr(m, "stuck_on", set())
+                            stuck.add(b.ref if m is a else a.ref)
+                            m.stuck_on = stuck
                     continue
                 k, mover, hold = min(options, key=lambda t: t[0])
                 dx, dy = _axis(mover, hold)
                 mover.x += 1.27 * dx * k
                 mover.y += 1.27 * dy * k
+                # Remember how far and because of whom: a long shove is a
+                # placement the board file should change, not a fix.
+                mover.shoved_mm = getattr(mover, "shoved_mm", 0.0) + 1.27 * k
+                mover.shoved_by = hold.ref
+                mover.stuck_on = set()
+                mover.stuck_wire = None
                 moved = True
         if not moved:
             return

@@ -112,14 +112,18 @@ def test_attach_picks_the_pin_on_the_target_net():
 
 
 def test_along_with_side_turns_to_face_the_sibling():
+    # R_EN (a pull-up to 3V3) stands up from the EN row; C_EN continues below
+    # its EN pin in the same column; SW_RST, beside C_EN's node, turns to face it.
     by = _placed(C3_USB)
-    c_en, r_en = by["C_EN"], by["R_EN"]
-    assert r_en.rot in (90.0, 270.0)  # horizontal resistor on U1.EN
-    assert c_en.rot in (0.0, 180.0)  # cap hangs under the EN node, pin 1 up
-    en_pin = next(p for p in c_en.pins if p.net == "EN")
+    c_en, r_en, sw = by["C_EN"], by["R_EN"], by["SW_RST"]
+    r_top = pin_world(r_en, next(p for p in r_en.pins if p.net == "3V3"))
     node = pin_world(r_en, next(p for p in r_en.pins if p.net == "EN"))
-    top = pin_world(c_en, en_pin)
-    assert abs(top[0] - node[0]) < 0.01 and top[1] > node[1]
+    assert abs(r_top[0] - node[0]) < 0.01 and r_top[1] < node[1]
+    top = pin_world(c_en, next(p for p in c_en.pins if p.net == "EN"))
+    assert abs(top[0] - node[0]) < 0.01 and abs((top[1] - node[1]) - 2.54) < 0.01
+    sw_en = pin_world(sw, next(p for p in sw.pins if p.net == "EN"))
+    assert abs(sw_en[1] - top[1]) < 0.01 and sw_en[0] < top[0]
+    assert (sw.rot, sw.mirror) == (0.0, "y")  # pin 1 is drawn on the left; mirrored to face right
 
 
 def test_gap_defaults_to_room_for_the_label():
@@ -205,12 +209,15 @@ def test_keepouts_shove_along_the_attach_axis_without_marching():
 
 
 def test_attached_pin_needs_no_symbol_room():
+    # Both input caps hang from the VIN row side by side: the second one's
+    # keepout has no symbol zone on its wired pin, so it sits one stagger
+    # away, not a symbol's width.
     by = _placed(C3_USB)
     c_vbus, c_hf = by["C_VBUS"], by["C_VBUS_HF"]
     assert "1" in c_hf.wired_pins and "1" in c_vbus.wired_pins
     node = pin_world(c_vbus, next(p for p in c_vbus.pins if p.number == "1"))
     top = pin_world(c_hf, next(p for p in c_hf.pins if p.number == "1"))
-    assert abs(top[0] - node[0]) < 0.01 and abs((top[1] - node[1]) - 2.54) < 0.01
+    assert abs(top[1] - node[1]) < 0.01 and 2.54 <= abs(top[0] - node[0]) <= 12.7
 
 
 def test_align_lands_the_hanging_pin_on_another_pins_row(tmp_path: Path):
@@ -219,21 +226,17 @@ def test_align_lands_the_hanging_pin_on_another_pins_row(tmp_path: Path):
     src = (EXAMPLES / "c3_usb" / "c3_usb.py").read_text()
     board = tmp_path / "c3_usb.py"
     shutil.copytree(EXAMPLES / "c3_usb" / "components", tmp_path / "components")
-    board.write_text(
-        src.replace(
-            'SchPlace("C_VBUS_HF", along="C_VBUS.1", side="bottom")',
-            'SchPlace("C_VBUS_HF", along="C_VBUS.1", side="bottom", align="U2.EN")',
-        )
-    )
+    # C_EN continues below R_EN's EN pin; align= picks the gap so C_EN's own
+    # EN pin lands on the row of U1.IO1, five pins further down.
+    old = 'SchPlace("C_EN", along="R_EN.2", side="bottom")'
+    assert old in src
+    board.write_text(src.replace(old, 'SchPlace("C_EN", along="R_EN.2", side="bottom", align="U1.IO1")'))
     by = _placed(board)
-    en = pin_world(by["U2"], next(p for p in by["U2"].pins if p.name == "EN"))
-    top = pin_world(by["C_VBUS_HF"], next(p for p in by["C_VBUS_HF"].pins if p.number == "1"))
-    assert abs(top[1] - en[1]) < 0.01
-    aligned = emit_from_design(load_board(board), title="c3").count('(lib_id "power:VCC")')
-    board.write_text(src)
-    plain = emit_from_design(load_board(board), title="c3").count('(lib_id "power:VCC")')
-    # EN and the cap node are now one straight wire: one supply symbol fewer.
-    assert aligned == plain - 1
+    io1 = pin_world(by["U1"], next(p for p in by["U1"].pins if p.name == "IO1"))
+    top = pin_world(by["C_EN"], next(p for p in by["C_EN"].pins if p.net == "EN"))
+    assert abs(top[1] - io1[1]) < 0.01
+    node = pin_world(by["R_EN"], next(p for p in by["R_EN"].pins if p.net == "EN"))
+    assert abs(top[0] - node[0]) < 0.01 and top[1] > node[1]
 
 
 def test_wire_label_sits_mid_wire_not_at_the_pin():
@@ -318,11 +321,14 @@ def test_report_says_how_to_share_a_node(tmp_path: Path):
     board.write_text(src.replace(old, 'SchPlace("C_MCU_HF", to="U1.3V3")'))
     report: dict = {}
     emit_from_design(load_board(board), title="c3", report=report)
-    # Hung off U1.3V3 it slides out past C_MCU, cannot be wired through it, and
-    # gets a 3V3 symbol of its own; the report names the fix.
-    hint = [i for i in report["issues"] if i.startswith("3V3: C_MCU_HF carries its own 3V3 symbol")]
-    assert hint and "along='C_MCU.1'" in hint[0], report["issues"]
-    # And the shipped example, which does that, gets no such line.
+    # Hung off U1.3V3 as well, it hangs from the same row one stagger out and
+    # is wired along it: no symbol of its own, nothing to report.
+    assert not [i for i in report["issues"] if "carries its own" in i], report["issues"]
+    by = _placed(board)
+    rail = pin_world(by["C_MCU"], next(p for p in by["C_MCU"].pins if p.net == "3V3"))
+    top = pin_world(by["C_MCU_HF"], next(p for p in by["C_MCU_HF"].pins if p.net == "3V3"))
+    assert abs(top[1] - rail[1]) < 0.01 and "1" in by["C_MCU_HF"].wired_pins
+    # And the shipped example gets no such line either.
     report = {}
     emit_from_design(load_board(EXAMPLES / "c3_usb" / "c3_usb.py"), title="c3", report=report)
     assert not [i for i in report["issues"] if "carries its own" in i], report["issues"]

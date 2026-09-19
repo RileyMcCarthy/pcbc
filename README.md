@@ -60,6 +60,8 @@ What the sheet is held to, and the test that pins each one (`tests/`):
 | 2-pin parts turn or mirror to face their node; ICs stay upright; field text stays horizontal | `test_sch.py::test_switch_mirrors_to_face_its_node`, `test_ic_stays_upright_when_attached`, `test_rotated_symbol_fields_stay_horizontal` |
 | A hanger takes the engineer's pose: down to ground, up to a supply, along for a series part; a divider's tap continues below | `test_buck.py::test_hangers_take_the_engineers_pose` |
 | A part that had to slide far, or could not be placed at all, is reported as a move, and stays where the collision is | `test_buck.py::test_a_taken_lane_is_reported` |
+| Off a pin that points up or down, a cap lies sideways from a short stub; a pull-up stands with its supply up, a part to ground with its ground down, or the report says so | `test_node.py::test_cap_lies_sideways_off_a_vertical_supply_pin`, `test_divider_and_pullups_stand_the_right_way_up` |
+| A supply may be wired as one short straight run, or a short U tying two of one part's pins; anything longer is a symbol per pin | `test_rules.py::test_power_is_symbols_or_one_short_wire` |
 | The sheet passes KiCad ERC: a pin the board leaves open carries a no-connect mark, each power net carries one `PWR_FLAG`, everything sits on the 1.27 mm grid | `test_netcheck.py::test_erc_is_clean_and_on_grid`, `test_rules.py::test_everything_on_the_grid_and_open_pins_marked` |
 | The same `board.py` gives the same file, byte for byte | `test_sch.py::test_the_same_board_gives_the_same_file` |
 | Everything left is reported as a move; the examples stay under the bar | `test_rules.py::test_readability_bar` |

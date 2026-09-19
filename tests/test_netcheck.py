@@ -49,7 +49,11 @@ def test_compare_flags_schematic_only_nets():
 
 
 @pytest.mark.kicad
-@pytest.mark.parametrize("board", [BLINKY, C3_USB, EXAMPLES / "buck" / "buck.py"], ids=["blinky", "c3_usb", "buck"])
+@pytest.mark.parametrize(
+    "board",
+    [BLINKY, C3_USB, EXAMPLES / "buck" / "buck.py", EXAMPLES / "node" / "node.py"],
+    ids=["blinky", "c3_usb", "buck", "node"],
+)
 def test_kicad_reads_the_board_netlist(tmp_path: Path, board: Path):
     design = load_board(board)
     sch = emit_schematic_file(design, tmp_path / "schematic.kicad_sch", title=board.stem)
@@ -59,8 +63,11 @@ def test_kicad_reads_the_board_netlist(tmp_path: Path, board: Path):
 BUCK = EXAMPLES / "buck" / "buck.py"
 
 
+NODE = EXAMPLES / "node" / "node.py"
+
+
 @pytest.mark.kicad
-@pytest.mark.parametrize("board", [BLINKY, C3_USB, BUCK], ids=["blinky", "c3_usb", "buck"])
+@pytest.mark.parametrize("board", [BLINKY, C3_USB, BUCK, NODE], ids=["blinky", "c3_usb", "buck", "node"])
 def test_erc_is_clean_and_on_grid(tmp_path: Path, board: Path):
     from pcbc.netcheck import check_erc
 

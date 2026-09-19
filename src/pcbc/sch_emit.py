@@ -1323,6 +1323,11 @@ class _Sheet:
         for (ax, ay), (bx, by) in zip(pts, pts[1:]):
             if _near(ax, ay, bx, by):
                 continue
+            if any(
+                (_near(ax, ay, sx0, sy0) and _near(bx, by, sx1, sy1)) or (_near(ax, ay, sx1, sy1) and _near(bx, by, sx0, sy0))
+                for sx0, sy0, sx1, sy1, _n in self.segs
+            ):
+                continue  # already drawn (a flag's stub over a symbol's)
             self.segs.append((ax, ay, bx, by, net))
             self.seg_tags.append(tag)
             self.seg_boxes.append(_seg_box(ax, ay, bx, by))
@@ -1795,6 +1800,38 @@ def _text_box(text: str, x: float, y: float, just: str | None, vis: int) -> Box:
     return _prop_box(text, x, y, just)
 
 
+def _place_box_text(sheet: _Sheet, part: Part) -> None:
+    """An IC's Reference and Value: where the library puts them when that is
+    clear, else the least crowded of a few spots around the body."""
+    sheet.occupants = [o for o in sheet.occupants if not (o.owner == part.ref and o.kind in ("ref", "value"))]
+    rx, ry = _prop_world(part, part.prop_ref)
+    vx, vy = _prop_world(part, part.prop_val)
+    x0, y0, x1, y1 = core_aabb(part)
+    cx = (x0 + x1) / 2.0
+    ref, val = part.ref, part.display
+    Spot = tuple[float, float, str | None, int]
+    cands: list[tuple[str, Spot, Spot]] = [
+        ("library", (rx, ry, None, 0), (vx, vy, None, 0)),
+        ("above-left", (x0, y0 - 2.7, "right", 0), (x0, y0 - 1.0, "right", 0)),
+        ("above-right", (x1, y0 - 2.7, "left", 0), (x1, y0 - 1.0, "left", 0)),
+        ("below-left", (x0, y1 + 1.0, "right", 0), (x0, y1 + 2.7, "right", 0)),
+        ("below-right", (x1, y1 + 1.0, "left", 0), (x1, y1 + 2.7, "left", 0)),
+        ("above", (cx, y0 - 2.7, None, 0), (cx, y0 - 1.0, None, 0)),
+        ("below", (cx, y1 + 1.0, None, 0), (cx, y1 + 2.7, None, 0)),
+    ]
+    best = None
+    for i, (_name, r, v) in enumerate(cands):
+        c = sheet.cost(_text_box(ref, *r)) + sheet.cost(_text_box(val, *v)) + 0.05 * i
+        if best is None or c < best[0]:
+            best = (c, r, v)
+    assert best is not None
+    _c, r, v = best
+    part.text_ref = r
+    part.text_val = v
+    sheet.occupy(_text_box(ref, *r), "ref", part.ref)
+    sheet.occupy(_text_box(val, *v), "value", part.ref)
+
+
 def _place_passive_text(sheet: _Sheet, part: Part) -> None:
     """Reference and Value beside a 2-pin part on the side that overlaps least.
     Beside a part that stands vertically they may also stand vertically -
@@ -1821,10 +1858,13 @@ def _place_passive_text(sheet: _Sheet, part: Part) -> None:
     ]
     vertical = abs(pin_outward(part, part.pins[0])[1]) > 0.5 if part.pins else True
     if vertical:
+        # Rotated text runs up from its anchor; anchored at body-top + width it
+        # spans the body and spills below it, never above the top pin, where
+        # the part's node and rail are.
         wr, wv = _text_w(ref) + 0.4, _text_w(val) + 0.4
         cands += [
-            ("right-rot", (x1 + 1.2, cy + wr / 2.0, "left", 90), (x1 + 3.0, cy + wv / 2.0, "left", 90)),
-            ("left-rot", (x0 - 3.0, cy + wr / 2.0, "left", 90), (x0 - 1.2, cy + wv / 2.0, "left", 90)),
+            ("right-rot", (x1 + 1.2, y0 + wr, "left", 90), (x1 + 3.0, y0 + wv, "left", 90)),
+            ("left-rot", (x0 - 3.0, y0 + wr, "left", 90), (x0 - 1.2, y0 + wv, "left", 90)),
         ]
     order = cands if vertical else cands[2:4] + cands[:2] + cands[4:]
     best = None
@@ -1848,12 +1888,39 @@ def _lint(
     unions: dict[str, _Union],
     power_nets: set[str],
     ground_nets: set[str] = frozenset(),
+    kinds: dict[str, str] | None = None,
 ) -> dict:
     """What still hurts readability, as things an AI can act on by moving parts."""
     issues: list[str] = []
+    _HANGERS.clear()
+    for p in parts:
+        ref = getattr(p, "attach_ref", None)
+        if ref:
+            _HANGERS.setdefault(ref, []).append(p.ref)
+    # A pull-up ends up, a part to ground ends down: a standing 2-pin part
+    # with its supply end below or its ground end above was pushed the wrong
+    # way by whatever took the right spot.
+    for p in parts:
+        if not _two_pin(p) or len(p.pins) != 2:
+            continue
+        (ax, ay), (bx, by) = pin_world(p, p.pins[0]), pin_world(p, p.pins[1])
+        if abs(ax - bx) > _EPS:
+            continue  # lying: no up or down to get wrong
+        for pin, y_self, y_other in ((p.pins[0], ay, by), (p.pins[1], by, ay)):
+            kind = (kinds or {}).get(pin.net or "", "net")
+            if kind == "power" and y_self > y_other + _EPS:
+                issues.append(
+                    f"{p.ref} stands the wrong way up: its {pin.net} end is at the bottom - "
+                    f"nothing was clear above it; give the parts beside it more gap"
+                )
+            if kind == "ground" and y_self < y_other - _EPS:
+                issues.append(
+                    f"{p.ref} stands the wrong way up: its {pin.net} end is at the top - "
+                    f"nothing was clear below it; give the parts beside it more gap"
+                )
     for p in parts:
         shoved = getattr(p, "shoved_mm", 0.0)
-        if shoved > 8 * 1.27:  # a stagger of a few grid steps is normal; more is a lane taken
+        if shoved > 10 * 1.27:  # a stagger of a few grid steps is normal; more is a lane taken
             issues.append(
                 f"{p.ref} was pushed {shoved:.0f} mm along its attach to clear {getattr(p, 'shoved_by', '?')}: "
                 f"they want the same side of the same part - hang one of them off a different pin, "
@@ -1961,6 +2028,9 @@ def _lint(
     return {"issues": issues, "count": len(issues)}
 
 
+_HANGERS: dict[str, list[str]] = {}
+
+
 def _move_hint(a: _Occupant, b: _Occupant) -> str:
     """What to change in board.py for this pair."""
     for t, other in ((a, b), (b, a)):
@@ -1968,6 +2038,12 @@ def _move_hint(a: _Occupant, b: _Occupant) -> str:
             return f" - no clear spot for {t.owner}'s name; give SchPlace({t.owner!r}) more gap or move it"
     for t, other in ((a, b), (b, a)):
         if t.kind == "hat":
+            hangers = _HANGERS.get(t.owner, [])
+            if hangers:
+                return (
+                    f" - no clear spot for the {t.net} symbol at {t.owner}: {', '.join(hangers)} hang off {t.owner} "
+                    f"at the default gap and box it in; give them gap=15.24 or hang them off another node"
+                )
             return f" - no clear spot for the {t.net} symbol at {t.owner}; give {t.owner} more room"
     for t, other in ((a, b), (b, a)):
         if t.kind == "label":
@@ -2036,10 +2112,12 @@ def _annotate(
                     box = (mx - _TEXT_H, my - half, mx, my + half)
                 sheet.occupy(box, "pintext", f"{p.ref}.{pin.number}")
             if not _two_pin(p):
+                # Pencilled in where the library puts them; placed for real
+                # after the symbols, and moved if that spot is taken.
                 rx, ry = _prop_world(p, p.prop_ref)
                 vx, vy = _prop_world(p, p.prop_val)
-                sheet.occupy(_prop_box(p.ref, rx, ry, None), "ref", p.ref)
-                sheet.occupy(_prop_box(p.display, vx, vy, None), "value", p.ref)
+                sheet.occupy(_prop_box(p.ref, rx, ry, None), "reserve", p.ref)
+                sheet.occupy(_prop_box(p.display, vx, vy, None), "reserve", p.ref)
         else:
             sheet.occupy(body_aabb(p), "symbol", p.ref)
 
@@ -2145,7 +2223,11 @@ def _annotate(
             best_route = None
             for k, pts in enumerate(_routes(sts[i], sts[j])):
                 if power and len(pts) > 2:
-                    continue
+                    # A supply is symbols, not rails - except a short L that
+                    # ties two of one part's pins (VDDIO to VDD two pins up).
+                    run = sum(math.hypot(bx - ax, by - ay) for (ax, ay), (bx, by) in zip(pts, pts[1:]))
+                    if len(pts) > 4 or run > 10.16 or sts[i].part is not sts[j].part:
+                        continue
                 if sum(math.hypot(bx - ax, by - ay) for (ax, ay), (bx, by) in zip(pts, pts[1:])) > limit + _EPS:
                     continue
                 if not sheet.path_ok(pts, net):
@@ -2253,12 +2335,15 @@ def _annotate(
                     f'\t)\n'
                 )
     two_pin = [p for p in parts if _two_pin(p)]
+    boxes = [p for p in parts if not _two_pin(p)]
     for _round in range(2):
+        for p in boxes:
+            _place_box_text(sheet, p)
         for p in two_pin:
             _place_passive_text(sheet, p)
     power_nets = {n for n in sites if is_power_net(n, kinds)}
     ground_nets = {n for n in sites if is_ground_net(n, kinds)}
-    return out, _lint(sheet, parts, sites, unions, power_nets, ground_nets)
+    return out, _lint(sheet, parts, sites, unions, power_nets, ground_nets, kinds)
 
 
 def emit_from_design(design: Design, *, title: str = "", report: dict | None = None) -> str:

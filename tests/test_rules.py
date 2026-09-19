@@ -17,6 +17,7 @@ BOARDS = {
     "blinky": EXAMPLES / "blinky" / "blinky.py",
     "c3_usb": EXAMPLES / "c3_usb" / "c3_usb.py",
     "buck": EXAMPLES / "buck" / "buck.py",
+    "node": EXAMPLES / "node" / "node.py",
 }
 EPS = 0.05
 

@@ -173,6 +173,15 @@ def keepout_boxes(part, kinds: dict[str, str] | None) -> list[tuple[float, float
     to go. A pin that an attach already wires needs no symbol; text is soft
     and finds its own side."""
     boxes = [body_aabb(part)]
+    if two_pin(part):
+        # Half a name's lane on each side of a standing part (above and below
+        # a lying one): two neighbours then leave a lane between them, and a
+        # part still fits a slot the width of its body plus one lane.
+        bx0, by0, bx1, by1 = boxes[0]
+        if abs(pin_outward(part, part.pins[0])[1]) > 0.5:
+            boxes.append((bx0 - 0.8, by0, bx1 + 0.8, by1))
+        else:
+            boxes.append((bx0, by0 - 0.8, bx1, by1 + 0.8))
     wired = getattr(part, "wired_pins", set())
     for pin in part.pins:
         if pin.number in wired:
@@ -377,7 +386,7 @@ def _apply_along(spec: SchPlaceSpec, part, other, occupied: list, kinds=None) ->
             if i == 0:
                 blockers = hits
             if not hits:
-                if i >= 8:
+                if i >= 10:
                     part.shoved_mm = getattr(part, "shoved_mm", 0.0) + i * 1.27
                     part.shoved_by = blockers[0] if blockers else "?"
                 part.attach_dir = (sx, sy)
@@ -405,7 +414,7 @@ def _apply_along(spec: SchPlaceSpec, part, other, occupied: list, kinds=None) ->
         if i == 0:
             blockers = hits
         if not hits:
-            if i >= 8:
+            if i >= 10:
                 part.shoved_mm = getattr(part, "shoved_mm", 0.0) + i * 1.27
                 part.shoved_by = blockers[0] if blockers else "?"
             part.attach_dir = (sx, sy)
@@ -470,11 +479,28 @@ def _apply_attach(spec: SchPlaceSpec, part, other, other_pin_name: str, occupied
             poses = [down, facing, up]
         else:
             poses = [facing, down, up]
+    elif part.kind in ("r", "c", "d") and abs(step[1]) >= 0.5 and not face_park:
+        # Off a pin that points up or down (an op-amp's supply), the part lies
+        # sideways from a short stub - the decoupling cap beside the pin - on
+        # the side away from the target's other pins.
+        right = _best_pose(our, (-1.0, 0.0), part)  # our pin points at the node, body to the right
+        left = _best_pose(our, (1.0, 0.0), part)
+        others_x = [pin_world(other, pn)[0] for pn in other.pins if pn is not op]
+        prefer_right = not others_x or (sum(others_x) / len(others_x)) <= ox
+        sideways = [right, left] if prefer_right else [left, right]
+        far = next((getattr(pn, "net", "") for pn in part.pins if pn is not our), "")
+        far_kind = (kinds or {}).get(far, "net")
+        # A chain continues in line - an LED below a resistor on to ground, a
+        # part above a pin on to its supply; anything else steps aside.
+        in_line = (step[1] > 0 and far_kind == "ground") or (step[1] < 0 and far_kind == "power")
+        poses = [facing] + sideways if in_line else sideways + [facing]
+        if not in_line and (kinds or {}).get(getattr(our, "net", ""), "net") in ("power", "ground") and spec.gap is None:
+            gap = min(gap, 5.08)  # a symbol, not a label, goes on this stub
     else:
         poses = [facing]
     # The first pose at the asked gap, then a stagger of a few grid steps,
     # then the other poses, then longer slides.
-    _STAGGER = 8  # grid steps a part may step out before it changes pose or is reported
+    _STAGGER = 10  # grid steps a part may step out before it changes pose or is reported (12.7 mm: a three-part staircase)
     tries = [(i, pose) for pose in poses[:1] for i in range(_STAGGER)]
     tries += [(i, pose) for pose in poses[1:] for i in range(_STAGGER)]
     tries += [(i, pose) for i in range(_STAGGER, 64) for pose in poses]
@@ -527,6 +553,7 @@ def _apply_attach(spec: SchPlaceSpec, part, other, other_pin_name: str, occupied
         part.stuck_wire = (f"{other.ref}.{op.name}", sorted(set(wire_blockers)))
     part.attach_wire = ((ox, oy), (tx, ty))
     part.attach_dir = step
+    part.attach_ref = other.ref
     part.placed = True
 
 

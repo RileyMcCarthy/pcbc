@@ -1,0 +1,122 @@
+# Sensor node: USB-C in, 3.3 V LDO, ESP32-C3, BME280 on I2C, a thermistor
+# buffered by an op-amp into an ADC pin, and a MOSFET switching a load.
+# 33 parts, six groups - the hardest sheet so far. The AI writes the netlist
+# and one SchPlace() per part; the tool draws everything else.
+from pcbc import Board, Capacitor, Ground, Led, Net, NetReq, Place, Power, Resistor, SchPlace, SchRegion, load
+
+VBUS, V33, GND = Power("VBUS"), Power("3V3"), Ground("GND")
+USB_DP, USB_DN, CC1, CC2 = Net("USB_DP"), Net("USB_DN"), Net("CC1"), Net("CC2")
+EN, BOOT, LED, LED_A = Net("EN"), Net("BOOT"), Net("LED"), Net("LED_A")
+SDA, SCL = Net("SDA"), Net("SCL")
+T_DIV, T_OUT = Net("T_DIV"), Net("T_OUT")
+GATE, DRV, LOAD = Net("GATE"), Net("DRV"), Net("LOAD")
+
+USBC = load("components/HRO/TYPE-C-31-M-12")
+ESD = load("components/ST/USBLC6-2SC6")
+LDO = load("components/Diodes_Inc/AP2112K-3.3TRG1")
+MCU = load("components/Espressif/ESP32-C3-MINI-1-N4")
+SW = load("components/Omron/B3U-1000P")
+BME = load("components/Bosch/BME280")
+OPA = load("components/TI/LMV321IDBVR")
+FET = load("components/AOS/AO3400A")
+JST = load("components/JST/B2B-XH-A")
+
+USBC("J1", GND=GND, VBUS=VBUS, CC1=CC1, CC2=CC2, DP1=USB_DP, DP2=USB_DP, DN1=USB_DN, DN2=USB_DN, EH=GND)
+ESD("U3", GND=GND, VBUS=VBUS, **{"I/O1": USB_DP, "I/O2": USB_DN})
+LDO("U2", VIN=VBUS, GND=GND, EN=VBUS, VOUT=V33)
+MCU("U1", **{"3V3": V33}, GND=GND, EN=EN, IO9=BOOT, IO10=LED, IO18=USB_DN, IO19=USB_DP, IO0=T_OUT, IO1=DRV, IO4=SDA, IO5=SCL)
+SW("SW_RST", **{"1": EN, "2": GND})
+SW("SW_BOOT", **{"1": BOOT, "2": GND})
+BME("U4", VDD=V33, VDDIO=V33, GND=GND, CSB=V33, SDO=GND, SDI=SDA, SCK=SCL)
+OPA("U5", **{"+": T_DIV, "-": T_OUT, "OUT": T_OUT, "V+": V33, "GND": GND})
+FET("Q1", G=GATE, D=LOAD, S=GND)
+JST("J_LOAD", p1=V33, p2=LOAD)
+
+r = dict(package="0402", manufacturer="UniOhm")
+Resistor("R_CC1", "5.1k", mpn="0402WGF5101TCE", lcsc="C25905", p1=CC1, p2=GND, **r)
+Resistor("R_CC2", "5.1k", mpn="0402WGF5101TCE", lcsc="C25905", p1=CC2, p2=GND, **r)
+Resistor("R_EN", "10k", mpn="0402WGF1002TCE", lcsc="C25744", p1=V33, p2=EN, **r)
+Resistor("R_BOOT", "10k", mpn="0402WGF1002TCE", lcsc="C25744", p1=V33, p2=BOOT, **r)
+Resistor("R_LED", "1k", mpn="0402WGF1001TCE", lcsc="C11702", p1=LED, p2=LED_A, **r)
+Resistor("R_SDA", "4.7k", mpn="0402WGF4701TCE", lcsc="C25900", p1=V33, p2=SDA, **r)
+Resistor("R_SCL", "4.7k", mpn="0402WGF4701TCE", lcsc="C25900", p1=V33, p2=SCL, **r)
+Resistor("R_NTC", "10k NTC", mpn="NCP15XH103F03RC", lcsc="C13564", manufacturer="Murata", package="0402", p1=V33, p2=T_DIV)
+Resistor("R_TDIV", "10k", mpn="0402WGF1002TCE", lcsc="C25744", p1=T_DIV, p2=GND, **r)
+Resistor("R_G", "100R", mpn="0402WGF1000TCE", lcsc="C25076", p1=DRV, p2=GATE, **r)
+Resistor("R_PD", "100k", mpn="0402WGF1003TCE", lcsc="C25741", p1=GATE, p2=GND, **r)
+
+c = dict(package="0402", manufacturer="Samsung")
+Capacitor("C_VBUS", "10uF", package="0603", mpn="CL10A106KO8NQNC", lcsc="C962136", manufacturer="Samsung", p1=VBUS, p2=GND)
+Capacitor("C_VBUS_HF", "100nF", mpn="CL05B104KO5NNNC", lcsc="C1525", p1=VBUS, p2=GND, **c)
+Capacitor("C_3V3", "10uF", package="0603", mpn="CL10A106KO8NQNC", lcsc="C962136", manufacturer="Samsung", p1=V33, p2=GND)
+Capacitor("C_3V3_HF", "100nF", mpn="CL05B104KO5NNNC", lcsc="C1525", p1=V33, p2=GND, **c)
+Capacitor("C_MCU", "10uF", package="0603", mpn="CL10A106KO8NQNC", lcsc="C962136", manufacturer="Samsung", p1=V33, p2=GND)
+Capacitor("C_MCU_HF", "100nF", mpn="CL05B104KO5NNNC", lcsc="C1525", p1=V33, p2=GND, **c)
+Capacitor("C_EN", "1uF", mpn="CL05A105KA5NQNC", lcsc="C52923", p1=EN, p2=GND, **c)
+Capacitor("C_BME", "100nF", mpn="CL05B104KO5NNNC", lcsc="C1525", p1=V33, p2=GND, **c)
+Capacitor("C_OPA", "100nF", mpn="CL05B104KO5NNNC", lcsc="C1525", p1=V33, p2=GND, **c)
+Led("D1", "red", package="0603", mpn="KT-0603R", lcsc="C72043", manufacturer="Kento", a=LED_A, k=GND)
+
+# PCB: 60 x 45 mm, 4 layers. Coarse CSS grid; copper is a later stage.
+Board(width=60, height=45, layers=4, stackup="jlcpcb_4l_1oz", planes=[("GND", "In1.Cu"), ("3V3", "In2.Cu")])
+_grid = [
+    ("J1", 2, 12), ("U3", 12, 6), ("R_CC1", 12, 14), ("R_CC2", 12, 18),
+    ("U2", 24, 4), ("C_VBUS", 20, 4), ("C_VBUS_HF", 20, 8), ("C_3V3", 30, 4), ("C_3V3_HF", 30, 8),
+    ("U1", 22, 16), ("C_MCU", 18, 24), ("C_MCU_HF", 18, 28), ("R_EN", 40, 14), ("C_EN", 40, 18), ("SW_RST", 46, 14),
+    ("R_BOOT", 40, 22), ("SW_BOOT", 46, 22), ("R_LED", 40, 28), ("D1", 46, 28),
+    ("U4", 6, 34), ("C_BME", 6, 40), ("R_SDA", 12, 34), ("R_SCL", 12, 38),
+    ("U5", 24, 36), ("C_OPA", 30, 36), ("R_NTC", 20, 40), ("R_TDIV", 24, 40),
+    ("Q1", 44, 36), ("R_G", 38, 36), ("R_PD", 38, 40), ("J_LOAD", 52, 34),
+]
+for _ref, _x, _y in _grid:
+    Place(_ref, position="absolute", left=_x, top=_y, locked=True, reason="coarse grid; copper later")
+
+# Schematic: six groups, one SchPlace() per part. Attached parts pose themselves.
+SchRegion("usb", left=12, top=12, width=170, height=110)
+SchPlace("J1", parent="usb", left=90, top=12)
+SchPlace("R_CC1", to="J1.CC1")
+SchPlace("R_CC2", to="J1.CC2")
+SchPlace("U3", to="J1.DP1", side="bottom", gap=15.24)
+
+SchRegion("pwr", left=200, top=12, width=170, height=60)
+SchPlace("U2", parent="pwr", left=60, top=20)
+SchPlace("C_VBUS", to="U2.VIN")
+SchPlace("C_VBUS_HF", along="C_VBUS.1", side="bottom")
+SchPlace("C_3V3", to="U2.VOUT")
+SchPlace("C_3V3_HF", along="C_3V3.1", side="bottom")
+
+SchRegion("mcu", left=200, top=90, width=190, height=150)
+SchPlace("U1", parent="mcu", left=90, top=10)
+SchPlace("C_MCU", to="U1.3V3")
+SchPlace("C_MCU_HF", along="C_MCU.1", side="bottom")
+SchPlace("R_EN", to="U1.EN")
+SchPlace("C_EN", along="R_EN.2", side="bottom")
+SchPlace("SW_RST", along="C_EN.1", side="left")
+SchPlace("R_BOOT", to="U1.IO9")
+SchPlace("SW_BOOT", along="R_BOOT.2", side="bottom")
+SchPlace("R_LED", to="U1.IO10")
+SchPlace("D1", to="R_LED.2")
+
+SchRegion("sensor", left=12, top=140, width=170, height=60)
+SchPlace("U4", parent="sensor", left=70, top=10)
+# Four pins on the left need three symbols and this cap: hangers sit out at 15.24 so the symbols have room.
+SchPlace("C_BME", to="U4.VDD", gap=15.24)
+SchPlace("R_SDA", to="U4.SDI", gap=15.24)
+SchPlace("R_SCL", to="U4.SCK", gap=15.24)
+
+SchRegion("analog", left=12, top=215, width=170, height=70)
+SchPlace("U5", parent="analog", left=70, top=15)
+SchPlace("C_OPA", to="U5.V+")
+SchPlace("R_NTC", to="U5.+")
+SchPlace("R_TDIV", along="R_NTC.2", side="bottom")
+
+SchRegion("load", left=200, top=250, width=190, height=45)
+SchPlace("R_G", parent="load", left=20, top=15, rotate=90)  # the group's anchor, lying left to right
+SchPlace("R_PD", along="R_G.2", side="bottom")
+SchPlace("Q1", to="R_G.2")
+SchPlace("J_LOAD", to="Q1.D")
+
+NetReq("USB_DP", "USB_DN", kind="usb_hs", z_diff_ohm=90, pair=True)
+NetReq("VBUS", "3V3", "GND", kind="power", volts=5, amps=1)
+NetReq("T_DIV", "T_OUT", kind="analog")
+NetReq("LOAD", kind="power", volts=3.3, amps=1)

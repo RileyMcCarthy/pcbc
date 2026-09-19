@@ -253,3 +253,76 @@ def test_wire_label_sits_mid_wire_not_at_the_pin():
     cc1 = pin_world(by["J1"], next(p for p in by["J1"].pins if p.name == "CC1"))
     assert abs(y - cc1[1]) < 0.01 and vjust == "bottom"
     assert cc1[0] - 10.16 - 0.6 <= x0 and x1 <= cc1[0] - 1.0
+
+
+def test_the_same_board_gives_the_same_file():
+    import hashlib
+    import os
+    import subprocess
+    import sys
+
+    d = load_board(BLINKY)
+    assert emit_from_design(d, title="blinky") == emit_from_design(d, title="blinky")
+    code = (
+        "import hashlib, sys; from pathlib import Path; from pcbc.language import load_board; "
+        "from pcbc.sch_emit import emit_from_design; "
+        "print(hashlib.sha1(emit_from_design(load_board(Path(sys.argv[1])), title='blinky').encode()).hexdigest())"
+    )
+    digests = {
+        subprocess.run(
+            [sys.executable, "-c", code, str(BLINKY)],
+            env={**os.environ, "PYTHONHASHSEED": seed},
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        for seed in ("1", "2", "random")
+    }
+    assert len(digests) == 1
+    sch = emit_from_design(d, title="blinky")
+    assert "#PWR001" in sch and "#PWR002" in sch  # power symbols numbered, not random
+
+
+def test_check_catches_a_schplace_on_a_missing_pin(tmp_path: Path):
+    from pcbc.language import check_board
+
+    src = BLINKY.read_text()
+    assert 'to="R1.2"' in src
+    board = tmp_path / "blinky.py"
+    board.write_text(src.replace('to="R1.2"', 'to="R1.7"'))
+    fails = check_board(board)
+    assert len(fails) == 1 and fails[0].startswith("schematic:") and "R1" in fails[0] and "'7'" in fails[0]
+    assert check_board(BLINKY) == []
+
+
+def test_pcbc_sch_prints_the_list(tmp_path: Path, capsys):
+    from pcbc.cli import main
+
+    board = tmp_path / "blinky.py"
+    board.write_text(BLINKY.read_text())
+    rc = main(["sch", str(board)])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "schematic: " in out and "netlist: " in out and "readability: nothing overlaps" in out
+    assert (tmp_path / "layout" / "blinky" / "schematic.kicad_sch").exists()
+
+
+def test_report_says_how_to_share_a_node(tmp_path: Path):
+    import shutil
+
+    src = (EXAMPLES / "c3_usb" / "c3_usb.py").read_text()
+    old = 'SchPlace("C_MCU_HF", along="C_MCU.1", side="bottom")'
+    assert old in src
+    shutil.copytree(EXAMPLES / "c3_usb" / "components", tmp_path / "components")
+    board = tmp_path / "c3_usb.py"
+    board.write_text(src.replace(old, 'SchPlace("C_MCU_HF", to="U1.3V3")'))
+    report: dict = {}
+    emit_from_design(load_board(board), title="c3", report=report)
+    # Hung off U1.3V3 it slides out past C_MCU, cannot be wired through it, and
+    # gets a 3V3 symbol of its own; the report names the fix.
+    hint = [i for i in report["issues"] if i.startswith("3V3: C_MCU_HF carries its own 3V3 symbol")]
+    assert hint and "along='C_MCU.1'" in hint[0], report["issues"]
+    # And the shipped example, which does that, gets no such line.
+    report = {}
+    emit_from_design(load_board(EXAMPLES / "c3_usb" / "c3_usb.py"), title="c3", report=report)
+    assert not [i for i in report["issues"] if "carries its own" in i], report["issues"]

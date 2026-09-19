@@ -21,7 +21,7 @@ from .sch_place import (
     text_zone,
     world_aabb,
 )
-from .sexp import matching_paren, new_uuid
+from .sexp import matching_paren, new_uuid, stable_uuid
 from .symbol import extract_main_symbol, parse_symbol_layout, parse_symbol_pins_geom
 
 
@@ -705,12 +705,33 @@ def _layout(parts: list[Part], kinds: dict[str, str] | None = None) -> None:
         p.y = _snap(p.y + dy)
 
 
+class _Ids:
+    """Ids keyed by what they name, so the same board gives the same file byte
+    for byte: no churn in git, and a report that does not move between runs."""
+
+    def __init__(self, title: str):
+        self.title = title
+        self.seen: dict[str, int] = {}
+
+    def __call__(self, key: str) -> str:
+        n = self.seen.get(key, 0)
+        self.seen[key] = n + 1
+        return stable_uuid(self.title, key, n)
+
+
+_ids: _Ids | None = None
+
+
+def _uid(key: str) -> str:
+    return _ids(key) if _ids is not None else new_uuid()
+
+
 def _wire(x0: float, y0: float, x1: float, y1: float) -> str:
     return (
         f'\t(wire\n'
         f'\t\t(pts (xy {_fmt(x0)} {_fmt(y0)}) (xy {_fmt(x1)} {_fmt(y1)}))\n'
         f'\t\t(stroke (width 0) (type default))\n'
-        f'\t\t(uuid "{new_uuid()}")\n'
+        f'\t\t(uuid "{_uid(f"wire:{_fmt(x0)},{_fmt(y0)},{_fmt(x1)},{_fmt(y1)}")}")\n'
         f'\t)\n'
     )
 
@@ -720,7 +741,7 @@ def _label(name: str, x: float, y: float, rot: int, justify: str, vjust: str = "
         f'\t(label "{name}"\n'
         f'\t\t(at {_fmt(x)} {_fmt(y)} {rot})\n'
         f'\t\t(effects (font (size {_FONT} {_FONT})) (justify {justify} {vjust}))\n'
-        f'\t\t(uuid "{new_uuid()}")\n'
+        f'\t\t(uuid "{_uid(f"label:{name}:{_fmt(x)},{_fmt(y)}")}")\n'
         f'\t)\n'
     )
 
@@ -746,7 +767,8 @@ _VCC_REF, _VCC_VAL = (0.0, -3.81), (0.0, 3.556)
 def _hat(net: str, x: float, y: float, gnd: bool, rot: int = 0) -> str:
     """Place the whole power symbol on the pin. Do not explode it into a wire + graphic."""
     lib = "power:GND" if gnd else "power:VCC"
-    uid = new_uuid()
+    uid = _uid(f"hat:{net}:{_fmt(x)},{_fmt(y)}")
+    pwr = "#PWR?"  # numbered in one pass over the finished sheet
     ref_l = _GND_REF if gnd else _VCC_REF
     val_l = _GND_VAL if gnd else _VCC_VAL
     rx, ry = _rot_xy(*ref_l, rot)
@@ -758,7 +780,7 @@ def _hat(net: str, x: float, y: float, gnd: bool, rot: int = 0) -> str:
         f'\t(symbol (lib_id "{lib}") (at {_fmt(x)} {_fmt(y)} {rot}) (unit 1)\n'
         f'\t\t(in_bom yes) (on_board yes) (dnp no)\n'
         f'\t\t(uuid "{uid}")\n'
-        f'\t\t(property "Reference" "#PWR{uid[:8]}" (at {_fmt(rwx)} {_fmt(rwy)} 0)\n'
+        f'\t\t(property "Reference" "{pwr}" (at {_fmt(rwx)} {_fmt(rwy)} 0)\n'
         f'\t\t\t(effects (font (size 1.27 1.27)) hide)\n'
         f'\t\t)\n'
         f'\t\t(property "Value" "{net}" (at {_fmt(vwx)} {_fmt(vwy)} 0)\n'
@@ -770,7 +792,7 @@ def _hat(net: str, x: float, y: float, gnd: bool, rot: int = 0) -> str:
         f'\t\t(property "Datasheet" "" (at {_fmt(x)} {_fmt(y)} 0)\n'
         f'\t\t\t(effects (font (size 1.27 1.27)) hide)\n'
         f'\t\t)\n'
-        f'\t\t(pin "1" (uuid "{new_uuid()}"))\n'
+        f'\t\t(pin "1" (uuid "{_uid(f"hatpin:{net}:{_fmt(x)},{_fmt(y)}")}"))\n'
         f'\t)\n'
     )
 
@@ -799,7 +821,7 @@ def _passive_label_xy(part: Part) -> tuple[tuple[float, float], tuple[float, flo
 
 def _instance(part: Part) -> str:
     pins = "".join(
-        f'\t\t(pin "{p.number}" (uuid "{new_uuid()}"))\n' for p in part.pins
+        f'\t\t(pin "{p.number}" (uuid "{_uid(f"pin:{part.ref}:{p.number}")}"))\n' for p in part.pins
     )
     rot = int(part.rot) % 360
     mirror = f"\n\t\t(mirror {part.mirror})" if part.mirror in ("x", "y") else ""
@@ -825,7 +847,7 @@ def _instance(part: Part) -> str:
         f'\t\t(in_bom yes)\n'
         f'\t\t(on_board yes)\n'
         f'\t\t(dnp no)\n'
-        f'\t\t(uuid "{new_uuid()}")\n'
+        f'\t\t(uuid "{_uid(f"sym:{part.ref}")}")\n'
         f'\t\t(property "Reference" "{part.ref}"\n'
         f'\t\t\t(at {_fmt(rwx)} {_fmt(rwy)} {ang})\n'
         f'\t\t\t(effects (font (size 1.27 1.27)){rj})\n'
@@ -1659,6 +1681,7 @@ def _lint(
     sites: dict[str, list[_Site]],
     unions: dict[str, _Union],
     power_nets: set[str],
+    ground_nets: set[str] = frozenset(),
 ) -> dict:
     """What still hurts readability, as things an AI can act on by moving parts."""
     issues: list[str] = []
@@ -1687,7 +1710,42 @@ def _lint(
             area = _overlap_area(a.box, b.box)
             if area < 0.6:
                 continue
-            issues.append(f"{_describe(a)} overlaps {_describe(b)}")
+            issues.append(f"{_describe(a)} overlaps {_describe(b)}{_move_hint(a, b)}")
+    # A 2-pin part with its own power symbol next to a same-net pin: hang it off
+    # that pin instead and the wire carries the net - one symbol fewer, no clash.
+    by_ref = {p.ref: p for p in parts}
+    for o in occ:
+        if o.kind != "hat" or not o.tag or o.net in ground_nets:
+            continue  # ground is always symbols; only a supply can share a node by wire
+        ref = o.owner
+        part = by_ref.get(ref)
+        if part is None or not _two_pin(part):
+            continue
+        sts = sites.get(o.net, [])
+        uf = unions[o.net]
+        idx = {id(s): i for i, s in enumerate(sts)}
+        mine = [s for s in sts if s.part is part]
+        for m in mine:
+            near = [
+                (math.hypot(m.x - s.x, m.y - s.y), s)
+                for s in sts
+                if s.part is not part
+                and uf.find(idx[id(s)]) != uf.find(idx[id(m)])  # not already wired together
+                and math.hypot(m.x - s.x, m.y - s.y) <= 15.24
+                and (abs(m.x - s.x) < _EPS or abs(m.y - s.y) < _EPS)
+            ]
+            if near:
+                d, s = min(near, key=lambda t: t[0])
+                how = (
+                    f"SchPlace({ref!r}, to={s.part.ref + '.' + s.pin.name!r})"
+                    if not _two_pin(s.part)
+                    else f"SchPlace({ref!r}, along={s.part.ref + '.' + s.pin.number!r}, side=...)"
+                )
+                issues.append(
+                    f"{o.net}: {ref} carries its own {o.net} symbol though {s.part.ref}.{s.pin.name} is in line "
+                    f"{d:.0f} mm away and not wired to it; {how} shares that node instead"
+                )
+                break
     for x0, y0, x1, y1, net in sheet.segs:
         for o in occ:
             if o.kind in text_kinds | {"pin"} and o.net != net and _overlap_area(_seg_box(x0, y0, x1, y1), o.box) > 0.6:
@@ -1717,6 +1775,20 @@ def _lint(
                         f"{d:.0f} mm apart but joined by labels: something sits between them"
                     )
     return {"issues": issues, "count": len(issues)}
+
+
+def _move_hint(a: _Occupant, b: _Occupant) -> str:
+    """What to change in board.py for this pair."""
+    for t, other in ((a, b), (b, a)):
+        if t.kind in ("ref", "value"):
+            return f" - no clear spot for {t.owner}'s name; give SchPlace({t.owner!r}) more gap or move it"
+    for t, other in ((a, b), (b, a)):
+        if t.kind == "hat":
+            return f" - no clear spot for the {t.net} symbol at {t.owner}; give {t.owner} more room"
+    for t, other in ((a, b), (b, a)):
+        if t.kind == "label":
+            return f" - move the parts on {t.net} apart"
+    return ""
 
 
 def _describe(o: _Occupant) -> str:
@@ -1982,14 +2054,30 @@ def _annotate(
         for p in two_pin:
             _place_passive_text(sheet, p)
     power_nets = {n for n in sites if is_power_net(n, kinds)}
-    return out, _lint(sheet, parts, sites, unions, power_nets)
+    ground_nets = {n for n in sites if is_ground_net(n, kinds)}
+    return out, _lint(sheet, parts, sites, unions, power_nets, ground_nets)
 
 
 def emit_from_design(design: Design, *, title: str = "", report: dict | None = None) -> str:
-    """The sheet text. ``report`` (if given) receives the readability issues."""
+    """The sheet text. ``report`` (if given) receives the readability issues
+    and every part's pose. The same design gives the same text, byte for byte."""
+    global _ids
+    _ids = _Ids(title or "pcbc")
+    try:
+        return _emit(design, title=title, report=report)
+    finally:
+        _ids = None
+
+
+def _emit(design: Design, *, title: str, report: dict | None) -> str:
     kinds = {n.name: n.kind for n in design.nets.values()}
     parts = _parts_from_design(design, kinds)
     apply_sch_places(design, parts)
+    if report is not None:
+        report["parts"] = [
+            {"ref": p.ref, "x": round(p.x, 3), "y": round(p.y, 3), "rot": p.rot, "mirror": p.mirror}
+            for p in parts
+        ]
     libs = [_lib_gnd(), _lib_vcc(), _lib_r(), _lib_c(), _lib_l(), _lib_led()]
     seen_lib: set[str] = {"power:GND", "power:VCC", "GND", "VCC", "R", "C", "L", "LED"}
     for p in parts:
@@ -2013,8 +2101,17 @@ def emit_from_design(design: Design, *, title: str = "", report: dict | None = N
         max_x = max(max_x, x1 + 20)
         max_y = max(max_y, y1 + 20)
     paper = "A4" if max_x < 280 and max_y < 190 else "A3" if max_x < 400 else "A2"
-    uid = new_uuid()
+    uid = _uid("sheet")
     title = title or "pcbc"
+    body_text = "".join(body)
+    n = 0
+
+    def _number(_m: re.Match) -> str:
+        nonlocal n
+        n += 1
+        return f'"#PWR{n:03d}"'
+
+    body_text = re.sub(r'"#PWR\?"', _number, body_text)
     return (
         f'(kicad_sch\n'
         f'\t(version 20260306)\n'
@@ -2028,7 +2125,7 @@ def emit_from_design(design: Design, *, title: str = "", report: dict | None = N
         f'\t(lib_symbols\n'
         + "".join(libs)
         + "\t)\n"
-        + "".join(body)
+        + body_text
         + f'\t(sheet_instances\n'
         f'\t\t(path "/" (page "1"))\n'
         f'\t)\n'

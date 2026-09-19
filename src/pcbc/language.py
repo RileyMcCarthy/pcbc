@@ -539,5 +539,19 @@ def load_board(path: str | Path) -> Design:
 
 
 def check_board(path: str | Path) -> list[str]:
+    """Everything that can be wrong before a build: unbound pins, missing
+    Place()/SchPlace(), and a SchPlace that names a pin or part that is not
+    there or hangs a part off a pin it does not share a net with."""
     design = load_board(path)
-    return check_design(design)
+    fails = check_design(design)
+    if fails:
+        return fails
+    from .sch_emit import _parts_from_design
+    from .sch_place import apply_sch_places
+
+    kinds = {n.name: n.kind for n in design.nets.values()}
+    try:
+        apply_sch_places(design, _parts_from_design(design, kinds))
+    except ValueError as exc:
+        fails.append(f"schematic: {exc}")
+    return fails

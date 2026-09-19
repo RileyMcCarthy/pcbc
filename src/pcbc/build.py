@@ -91,7 +91,12 @@ def build_job(
     if "sch" in plan:
         sch = layout / "schematic.kicad_sch"
         report: dict = {}
-        emit_schematic_file(design, sch, title=name, report=report)
+        try:
+            emit_schematic_file(design, sch, title=name, report=report)
+        except ValueError as exc:
+            result["steps"].append({"stage": "sch", "error": str(exc)})
+            result["error"] = f"schematic: {exc}"
+            return result
         step = {"stage": "sch", "sch": str(sch), "readability": report.get("issues", [])}
         try:
             fails = check_schematic(design, sch)

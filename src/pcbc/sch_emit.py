@@ -1028,6 +1028,11 @@ class _Site:
 
 _EPS = 0.05
 _CLEAN = 0.6  # mm² of overlap below which a placement counts as touching nothing
+
+
+def _bkey(v: float) -> int:
+    """Coordinate bucket one tolerance wide; a lookup checks the neighbours too."""
+    return int(round(v / _EPS))
 Box = tuple[float, float, float, float]
 
 
@@ -1127,10 +1132,54 @@ class _Sheet:
         self.occupants: list[_Occupant] = []
         # Label anchors and power-symbol pins: a wire through or onto one connects.
         self.anchors: list[tuple[float, float, str, str]] = []
+        # Pin ends bucketed by coordinate, wires split by axis with their
+        # extents: a candidate segment only does geometry against what lies
+        # on its own line.
+        self.pins_x: dict[int, list[tuple[float, float]]] = defaultdict(list)
+        self.pins_y: dict[int, list[tuple[float, float]]] = defaultdict(list)
+        for px, py in self.pin_ends:
+            self.pins_x[_bkey(px)].append((px, py))
+            self.pins_y[_bkey(py)].append((px, py))
+        self.vsegs: list[tuple[float, float, float, str]] = []  # x, lo, hi, net
+        self.hsegs: list[tuple[float, float, float, str]] = []  # y, lo, hi, net
+        self._stale = True
+
+    def _index(self) -> None:
+        if not self._stale:
+            return
+        self.vsegs = []
+        self.hsegs = []
+        for x0, y0, x1, y1, net in self.segs:
+            if abs(x0 - x1) < _EPS:
+                self.vsegs.append((x0, min(y0, y1), max(y0, y1), net))
+            else:
+                self.hsegs.append((y0, min(x0, x1), max(x0, x1), net))
+        self._stale = False
+
+    def _pins_at_x(self, x: float):
+        k = _bkey(x)
+        for kk in (k - 1, k, k + 1):
+            yield from self.pins_x.get(kk, ())
+
+    def _pins_at_y(self, y: float):
+        k = _bkey(y)
+        for kk in (k - 1, k, k + 1):
+            yield from self.pins_y.get(kk, ())
 
     # -- connectivity --------------------------------------------------------
     def on_pin_end(self, x: float, y: float) -> bool:
-        return any(_near(x, y, px, py) for px, py in self.pin_ends)
+        return any(_near(x, y, px, py) for px, py in self._pins_at_x(x))
+
+    def on_wire_interior(self, x: float, y: float) -> bool:
+        """Strictly inside some wire, any net (a symbol pin there does not connect)."""
+        self._index()
+        for sx, lo, hi, _n in self.vsegs:
+            if abs(sx - x) < _EPS and lo + _EPS < y < hi - _EPS:
+                return True
+        for sy, lo, hi, _n in self.hsegs:
+            if abs(sy - y) < _EPS and lo + _EPS < x < hi - _EPS:
+                return True
+        return False
 
     def anchor(self, x: float, y: float, net: str, tag: str = "") -> None:
         self.anchors.append((x, y, net, tag))
@@ -1143,21 +1192,23 @@ class _Sheet:
         self.seg_boxes = [self.seg_boxes[i] for i in keep]
         self.occupants = [o for o in self.occupants if o.tag != tag]
         self.anchors = [a for a in self.anchors if a[3] != tag]
+        self._stale = True
 
     def segment_ok(self, x0: float, y0: float, x1: float, y1: float, net: str = "") -> bool:
         """Interior off every pin end, every label anchor and every symbol's
         graphics, and no contact with another net's wire other than a plain
         crossing (KiCad joins collinear wires that touch, and a T without a
         junction misleads)."""
-        if abs(x0 - x1) < _EPS:
-            lo, hi = min(y0, y1) + _EPS, max(y0, y1) - _EPS
-            for px, py in self.pin_ends:
-                if abs(px - x0) < _EPS and lo < py < hi:
+        vertical = abs(x0 - x1) < _EPS
+        if vertical:
+            lo, hi = min(y0, y1), max(y0, y1)
+            for px, py in self._pins_at_x(x0):
+                if abs(px - x0) < _EPS and lo + _EPS < py < hi - _EPS:
                     return False
         else:
-            lo, hi = min(x0, x1) + _EPS, max(x0, x1) - _EPS
-            for px, py in self.pin_ends:
-                if abs(py - y0) < _EPS and lo < px < hi:
+            lo, hi = min(x0, x1), max(x0, x1)
+            for px, py in self._pins_at_y(y0):
+                if abs(py - y0) < _EPS and lo + _EPS < px < hi - _EPS:
                     return False
         for ax, ay, anet, _tag in self.anchors:
             if anet == net:
@@ -1166,17 +1217,39 @@ class _Sheet:
                 return False
         if any(_segment_crosses_box(x0, y0, x1, y1, box) for box in self.cores):
             return False
-        for sx0, sy0, sx1, sy1, snet in self.segs:
-            if snet == net:
-                continue
-            if _collinear_touch(x0, y0, x1, y1, sx0, sy0, sx1, sy1):
-                return False
-            if _inside_segment(sx0, sy0, x0, y0, x1, y1) or _inside_segment(sx1, sy1, x0, y0, x1, y1):
-                return False
-            if _inside_segment(x0, y0, sx0, sy0, sx1, sy1) or _inside_segment(x1, y1, sx0, sy0, sx1, sy1):
-                return False
-            if _crosses(x0, y0, x1, y1, sx0, sy0, sx1, sy1):
-                return False
+        self._index()
+        # Against other nets' wires: no collinear contact, no endpoint of
+        # either on the other's interior, no crossing.
+        if vertical:
+            x = x0
+            for sx, slo, shi, snet in self.vsegs:
+                if snet != net and abs(sx - x) < _EPS and max(lo, slo) <= min(hi, shi) + _EPS:
+                    return False
+            for sy, slo, shi, snet in self.hsegs:
+                if snet == net:
+                    continue
+                if lo + _EPS < sy < hi - _EPS:
+                    if abs(slo - x) < _EPS or abs(shi - x) < _EPS:
+                        return False  # their end on my interior
+                    if slo + _EPS < x < shi - _EPS:
+                        return False  # crossing
+                if (abs(lo - sy) < _EPS or abs(hi - sy) < _EPS) and slo + _EPS < x < shi - _EPS:
+                    return False  # my end on their interior
+        else:
+            y = y0
+            for sy, slo, shi, snet in self.hsegs:
+                if snet != net and abs(sy - y) < _EPS and max(lo, slo) <= min(hi, shi) + _EPS:
+                    return False
+            for sx, slo, shi, snet in self.vsegs:
+                if snet == net:
+                    continue
+                if lo + _EPS < sx < hi - _EPS:
+                    if abs(slo - y) < _EPS or abs(shi - y) < _EPS:
+                        return False
+                    if slo + _EPS < y < shi - _EPS:
+                        return False
+                if (abs(lo - sx) < _EPS or abs(hi - sx) < _EPS) and slo + _EPS < y < shi - _EPS:
+                    return False
         return True
 
     def point_free(self, x: float, y: float, net: str) -> bool:
@@ -1185,14 +1258,12 @@ class _Sheet:
             return False
         if any(anet != net and _near(x, y, ax, ay) for ax, ay, anet, _t in self.anchors):
             return False
-        for sx0, sy0, sx1, sy1, snet in self.segs:
-            if snet == net:
-                continue
-            if (
-                _near(x, y, sx0, sy0)
-                or _near(x, y, sx1, sy1)
-                or _inside_segment(x, y, sx0, sy0, sx1, sy1)
-            ):
+        self._index()
+        for sx, lo, hi, snet in self.vsegs:
+            if snet != net and abs(sx - x) < _EPS and lo - _EPS <= y <= hi + _EPS:
+                return False
+        for sy, lo, hi, snet in self.hsegs:
+            if snet != net and abs(sy - y) < _EPS and lo - _EPS <= x <= hi + _EPS:
                 return False
         return True
 
@@ -1215,6 +1286,7 @@ class _Sheet:
             self.seg_tags.append(tag)
             self.seg_boxes.append(_seg_box(ax, ay, bx, by))
             out.append(_wire(ax, ay, bx, by))
+        self._stale = True
         return out
 
     # -- readability ----------------------------------------------------------
@@ -1435,7 +1507,7 @@ def _hat_candidates(sheet: _Sheet, members: list[_Site], net: str, gnd: bool) ->
                 if not sheet.path_ok(pts, net) or not sheet.point_free(hx, hy, net):
                     continue
                 # kicad-cli: a symbol pin on a wire's interior does not connect.
-                if any(_inside_segment(hx, hy, *seg[:4]) for seg in sheet.segs):
+                if sheet.on_wire_interior(hx, hy):
                     continue
             box = _hat_box(net, hx, hy, gnd, rot)
             # The symbol may not sit on its own wire: a GND jogged up and
@@ -1574,6 +1646,33 @@ def _place_wire_label(sheet: _Sheet, segs: list[Box], net: str, owner: str, tag:
     return [_label(net, mx, my, rot, just, vjust)]
 
 
+def _junctions(sheet: _Sheet) -> list[str]:
+    """Junction dots where eeschema would put them: a wire ending on another
+    wire of its own net (a symbol's stub leaving a route), three or more
+    wire ends at one point, or a pin end with two wires. Same-net only by
+    construction - other nets' wires never touch."""
+    sheet._index()
+    ends: dict[tuple[int, int], tuple[float, float, int]] = {}
+    for x0, y0, x1, y1, _net in sheet.segs:
+        for x, y in ((x0, y0), (x1, y1)):
+            k = (_bkey(x), _bkey(y))
+            px, py, n = ends.get(k, (x, y, 0))
+            ends[k] = (px, py, n + 1)
+    out: list[str] = []
+    for (px, py, n) in ends.values():
+        on_pin = sheet.on_pin_end(px, py)
+        if n >= 3 or (on_pin and n >= 2) or sheet.on_wire_interior(px, py):
+            out.append(
+                f'\t(junction\n'
+                f'\t\t(at {_fmt(px)} {_fmt(py)})\n'
+                f'\t\t(diameter 0)\n'
+                f'\t\t(color 0 0 0 0)\n'
+                f'\t\t(uuid "{_uid(f"junction:{_fmt(px)},{_fmt(py)}")}")\n'
+                f'\t)\n'
+            )
+    return out
+
+
 def _joint_hats(sheet: _Sheet, a: tuple, b: tuple, drawn: dict[str, list[str]]) -> None:
     """Place two power symbols together: the pair whose spots are cleanest, and
     among clean pairs the least overlap. Only better than what each had alone
@@ -1591,6 +1690,9 @@ def _joint_hats(sheet: _Sheet, a: tuple, b: tuple, drawn: dict[str, list[str]]) 
     sheet.remove(tag_a)
     sheet.remove(tag_b)
     best = None
+    # The partner is enumerated afresh for each of our candidates: its best
+    # spot next to us (a supply hung below its pin) is rarely among its best
+    # spots alone, so a fixed shortlist would miss the pair that works.
     for ca in _hat_candidates(sheet, mem_a, net_a, gnd_a)[:10]:
         _commit_hat(sheet, ca, net_a, gnd_a, tag_a)
         cbs = _hat_candidates(sheet, mem_b, net_b, gnd_b)
@@ -2049,6 +2151,7 @@ def _annotate(
     sheet.occupants = [o for o in sheet.occupants if o.kind != "reserve"]
     for tag, _job in jobs:
         out.extend(drawn[tag])
+    out.extend(_junctions(sheet))
     two_pin = [p for p in parts if _two_pin(p)]
     for _round in range(2):
         for p in two_pin:

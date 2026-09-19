@@ -68,7 +68,17 @@ re-keys its ids; `test_blinky_fab` is green; CI installs KRT at `KRT_SHA`.
   byte-for-byte. `test_blinky_fab` goes green. Fail loudly when KRT is missing; CI
   clones the pinned SHA.
 
-### Phase 1. Placement language, `pcbc pcb` (the big one, like the schematic pass)
+### Phase 1. Placement language, `pcbc pcb` (the big one, like the schematic pass) — first cut 2026-09-19
+
+Landed: `Place(to=, toward=, gap=, edge=, overhang=)` in `language.py`/`model.py`,
+`pcb_place.py` (anchors by CSS, relations in dependency order, smallest cap nearest,
+search outward then beside earlier takers, keepout = courtyard ∪ pads, stuck parts
+reported), `layout_report` (overlaps, off-board, decap 2.5/5 mm, connector edge),
+`pcbc pcb board.py [--json]`. c3_usb and node are fully relational (2–5 anchors each)
+and report nothing to move. What the first render showed and the report did not:
+silkscreen references on top of each other (Phase 3), crowding without overlap.
+Not yet: `side="B"` by relation, hot-loop and in-line rules, airwire crossings, the
+KRT floorplan grader as a second opinion.
 
 - **Anchors keep CSS.** `Place("J1", edge="left")` puts a connector on an edge with its
   overhang; `Place("U1", parent="mcu", left=…, top=…)`; `Region`, `Keepout` as now.

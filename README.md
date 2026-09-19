@@ -116,6 +116,31 @@ cd ~/Downloads/KiCadRoutingTools && git checkout 3244726b2c15668fb109a0bb2438475
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt && .venv/bin/python build_router.py
 ```
 
+### Copper placement
+
+`Place()` is placed the way `SchPlace()` is: anchors by CSS, everything else by what it belongs to, and the tool picks the spot:
+
+```python
+Place("J1", edge="bottom")                    # a connector on that edge, face out, centred (left=/right= say where along it)
+Place("U1", position="absolute", left=1, top=1, rotate=90)   # an anchor: CSS, as before
+Place("C_MCU_HF", to="U1.3V3")                # this part's pad on that net, right outside U1, on the side the pin faces
+Place("C_MCU", to="U1.3V3")                   # the next cap on the same pin goes beside the first; smallest capacitance nearest
+Place("D1", to="R_LED.2", toward="right")     # toward= overrides the side; gap= the courtyard clearance (0.2 mm)
+```
+
+`pcbc pcb board.py` is the inner loop: check, seed, place, and a numbered list of moves (`--json` adds every part's pose). Parts keep off each other's courtyards **and pads** (EasyEDA draws the body on the courtyard; pads stick out), off keepouts and the board edge; a part with no clear spot stays where the collision is and is reported.
+
+| Rule | Test |
+|---|---|
+| A relation names a real part, a real pin, and a pin of the placed part on that net, or `check` says which is wrong | `test_pcb_place.py::test_validate_names_the_mistake` |
+| `to=` puts the part's pad next to the pin, outside the target's keepout | `test_pcb_place.py::test_to_puts_the_pad_next_to_the_pin_outside_the_target` |
+| Parts on one pin share it, smallest capacitance nearest; `toward=` picks the side | `test_two_parts_on_one_pin_share_it_smallest_first`, `test_toward_overrides_the_side` |
+| `edge=` is the old CSS for a connector, with the rotation picked from where its pads are | `test_edge_is_the_old_css_for_a_connector` |
+| A boxed-in part is reported, never hidden | `test_a_boxed_in_part_is_reported_not_hidden` |
+| Courtyards never overlap; nothing sits outside the board; the first decoupling cap on a pin is within 2.5 mm and the next within 5; a connector is on an edge, or the report says so | `test_report_reads_a_hand_placed_board` |
+| The same `board.py` places the same, byte for byte | `test_the_same_board_places_the_same` |
+| The examples stay under the bar: c3_usb 0, node 0 | `test_c3_usb_layout_bar`, `test_node.py::test_node_layout_bar` |
+
 ### Copper rules
 
 The AI never draws a track. KRT routes the placed board; the gate is KiCad's own verdict plus the netlist:

@@ -37,6 +37,13 @@ class PlaceSpec:
     translate_y: object | None = None
     from_box: str = "courtyard"
     parent: str | None = None
+    # Relational placement (pcb_place): next to a pin, or on a board edge.
+    to: str | None = None
+    toward: str | None = None
+    gap: float | None = None
+    edge: str | None = None
+    overhang: float = 0.0
+    rot_set: bool = False
 
     def has_css(self) -> bool:
         return any(

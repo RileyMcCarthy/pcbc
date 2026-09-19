@@ -19,6 +19,7 @@ from .sexp import (
     has_edge_cuts_shape,
     matching_paren,
     new_uuid,
+    stable_uuid,
 )
 
 
@@ -142,7 +143,7 @@ def _edge_rect(w: float, h: float) -> str:
         f"\t\t(stroke (width 0.05) (type default))\n"
         f"\t\t(fill none)\n"
         f'\t\t(layer "Edge.Cuts")\n'
-        f'\t\t(uuid "{new_uuid()}")\n'
+        f'\t\t(uuid "{stable_uuid("edge", w, h)}")\n'
         f"\t)\n"
     )
 
@@ -186,7 +187,7 @@ def _apply_keepouts(text: str, job: CompiledJob) -> str:
 		(net 0)
 		(net_name "")
 		(layers "F&B.Cu" "In1.Cu" "In2.Cu")
-		(uuid "{new_uuid()}")
+		(uuid "{stable_uuid("keepout", ko.name)}")
 		(name "{ko.name}")
 		(hatch edge 0.5)
 		(keepout

@@ -47,6 +47,33 @@ def planned(current: str | None, *, upto: str, force: bool) -> list[str]:
     return list(STAGES[start : end + 1])
 
 
+def pcb_job(board: Path) -> dict:
+    """The copper inner loop: check, seed, place; the layout report as moves. No schematic, no routing."""
+    from .pcb_place import validate
+
+    board = Path(board).resolve()
+    design = load_board(board)
+    layout = layout_dir(board)
+    name = board.stem
+    result: dict = {"board": str(board), "layout": str(layout), "error": None}
+    fails = check_design(design, pcb=True) + validate(design)
+    result["check"] = fails
+    if fails:
+        result["error"] = "; ".join(fails)
+        return result
+    seed = seed_pcb(board)
+    result["seed"] = seed_job(design, seed, name=name)
+    placed = layout / "placed" / "layout.kicad_pcb"
+    step = place_job(design, seed, out=placed)
+    result["placed"] = str(placed)
+    result["layout_report"] = step.get("layout", [])
+    result["poses"] = step.get("poses", {})
+    result["applied"] = step.get("applied")
+    if step.get("error"):
+        result["error"] = step["error"]
+    return result
+
+
 def build_job(
     board: Path,
     *,

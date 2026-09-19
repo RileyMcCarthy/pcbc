@@ -138,9 +138,26 @@ def Place(
     parent: str | None = None,
     box: str | None = None,
     transform: str | None = None,
+    to: str | None = None,
+    toward: str | None = None,
+    gap: float | None = None,
+    edge: str | None = None,
+    overhang: float = 0.0,
     **css,
 ) -> PlaceSpec:
+    """Where a part goes on the copper.
+
+    Anchors take CSS (left/top/right/bottom, margin auto, a Region parent) or at=.
+    Everything else says what it belongs to: to="U1.VIN" puts this part's pad on that
+    net right outside U1, on the side the pin faces (toward= overrides, gap= is courtyard
+    clearance in mm); edge="bottom" stands a connector on that board edge, face out,
+    centred unless left/right (or top/bottom) say where along it.
+    """
     who = f"Place({ref!r})"
+    if to is not None and (at is not None or edge is not None):
+        raise ValueError(f"{who}: to= places by relation; drop at= / edge=")
+    if to is not None and any(css.get(k) is not None for k in ("left", "right", "top", "bottom")):
+        raise ValueError(f"{who}: to= places by relation; drop left/top/right/bottom")
     if "padding" in css or "padding_top" in css:
         raise ValueError(
             f"{who}: padding belongs on Board or Region, not a footprint "
@@ -174,6 +191,12 @@ def Place(
         side=side.upper()[:1],
         locked=bool(locked),
         reason=reason,
+        to=str(to) if to is not None else None,
+        toward=str(toward) if toward is not None else None,
+        gap=float(gap) if gap is not None else None,
+        edge=str(edge) if edge is not None else None,
+        overhang=float(overhang),
+        rot_set=rotate is not None or rot is not None,
     )
     spec = apply_style_to_spec(spec, st)
     spec.rot = float(st.rotate)
@@ -182,11 +205,11 @@ def Place(
         spec.from_box = "origin"
         spec.left = at[0]
         spec.top = at[1]
-    elif st.is_absolute():
+    elif st.is_absolute() or edge is not None:
         spec.position = "absolute"
-    if spec.locked and spec.at is None and not spec.has_css():
+    if spec.locked and spec.at is None and not spec.has_css() and not (spec.to or spec.edge):
         raise ValueError(
-            f"{who}: locked=True needs at=(x, y) or CSS top/right/bottom/left."
+            f"{who}: locked=True needs at=(x, y), CSS top/right/bottom/left, to=\"U1.PIN\" or edge=."
         )
     _doc().places.append(spec)
     return spec
@@ -545,6 +568,10 @@ def check_board(path: str | Path, pcb: bool = True) -> list[str]:
     schematic loop passes ``pcb=False``: no Place() needed to draw a sheet."""
     design = load_board(path)
     fails = check_design(design, pcb=pcb)
+    if pcb:
+        from .pcb_place import validate
+
+        fails += validate(design)
     if fails:
         return fails
     from .sch_emit import _parts_from_design

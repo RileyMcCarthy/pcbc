@@ -6,10 +6,8 @@ import io
 import json
 import os
 import stat
-import sys
 from pathlib import Path
 
-import pytest
 
 from pcbc.cli import main
 from pcbc.seed import _absolute_models
@@ -54,7 +52,7 @@ def _footprint(pads: list[str], *, legacy: bool = False, courtyard: bool = True,
     pad_lines = "".join(
         f'\n  (pad "{p}" smd rect (at {i * 1.27:.2f} 0) (size 0.6 1.0) (layers "F.Cu" "F.Paste" "F.Mask"))' for i, p in enumerate(pads)
     )
-    crt = '\n  (fp_rect (start -2 -2) (end 2 2) (stroke (width 0.05) (type default)) (fill no) (layer "F.CrtYd"))' if courtyard else ""
+    crt = '\n  (fp_rect (start -4.5 -2) (end 4.5 2) (stroke (width 0.05) (type default)) (fill no) (layer "F.CrtYd"))' if courtyard else ""
     fabl = '\n  (fp_rect (start -1.5 -1.5) (end 1.5 1.5) (stroke (width 0.1) (type default)) (fill no) (layer "F.Fab"))' if fab else ""
     silk = '\n  (fp_line (start -1 -1) (end 1 -1) (stroke (width 0.12) (type default)) (layer "F.SilkS"))'
     mdl = '\n  (model "part.step" (offset (xyz 0 0 0)) (scale (xyz 1 1 1)) (rotate (xyz 0 0 0)))' if model else ""
@@ -240,7 +238,7 @@ def test_cli_score_and_fetch(tmp_path: Path, capsys):
     assert main(["score", str(bad), "--json"]) == 1
     rows = json.loads(capsys.readouterr().out)
     assert rows[0]["grade"] == "bad"
-    fake = _fake_easyeda2kicad(tmp_path)
+    _fake_easyeda2kicad(tmp_path)
     old = os.environ.get("PATH", "")
     os.environ["PATH"] = f"{tmp_path}{os.pathsep}{old}"
     try:

@@ -52,9 +52,10 @@ jobs:
           test -f examples/blinky/layout/blinky/fab/bom.csv
           test -d examples/blinky/layout/blinky/fab/gerbers
           grep -q C21190 examples/blinky/layout/blinky/fab/bom.csv
-      - name: c3_usb check + seed + schematic + CSS place
+      - name: c3_usb check + seed + schematic + place
         run: |
           pcbc check examples/c3_usb/c3_usb.py
+          pcbc pcb examples/c3_usb/c3_usb.py
           pcbc build examples/c3_usb/c3_usb.py --upto place --force
           test -f examples/c3_usb/layout/c3_usb/schematic.kicad_sch
           test -f examples/c3_usb/layout/c3_usb/placed/layout.kicad_pcb
@@ -65,9 +66,10 @@ jobs:
         run: |
           pcbc check examples/buck/buck.py
           pcbc sch examples/buck/buck.py
-      - name: node schematic (31 parts, no PCB placement yet)
+      - name: node schematic + copper placement (31 parts)
         run: |
           pcbc sch examples/node/node.py
+          pcbc pcb examples/node/node.py
       - uses: actions/upload-artifact@v4
         with:
           name: blinky-fab

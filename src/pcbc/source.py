@@ -24,8 +24,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-from .geom import _graphics_bbox, _iter_tagged, box_size_mm
-from .sexp import matching_paren
+from .geom import _graphics_bbox, _iter_tagged, _pads_bbox, box_size_mm
 from .symbol import _CHAR_W, _pins_geom, extract_main_symbol, parse_symbol_layout, symbol_units
 
 JLCSEARCH = "https://jlcsearch.tscircuit.com/api/search"
@@ -421,6 +420,12 @@ def score_footprint(text: str) -> dict:
         add("warn", 10, "no courtyard: placement cannot keep parts apart")
     if _graphics_bbox(text, ".Fab") is None:
         add("info", 3, "no fabrication outline (EasyEDA draws the body on the courtyard)")
+    crt = _graphics_bbox(text, "CrtYd")
+    pb = _pads_bbox(text)
+    if crt is not None and pb is not None:
+        out = max(crt[0] - pb[0], crt[1] - pb[1], pb[2] - crt[2], pb[3] - crt[3])
+        if out > 0.05:
+            add("info", 2, f"pads reach {out:.2f} mm outside the courtyard (EasyEDA draws the body, not the land); pcbc keeps parts off the pads anyway")
     if "SilkS" not in text:
         add("info", 5, "no silkscreen")
     if not _MODEL.search(text):

@@ -23,6 +23,7 @@ from .sexp import (
     footprint_at,
     footprint_reference,
     new_uuid,
+    stable_uuid,
 )
 
 
@@ -270,8 +271,8 @@ def via_in_pad_blockers(hits: list[dict]) -> list[dict]:
 
 
 def _fiducial_sexp(ref: str, x: float, y: float) -> str:
-    uid = new_uuid()
-    puid = new_uuid()
+    uid = stable_uuid("fiducial", ref)
+    puid = stable_uuid("fiducial", ref, "ref")
     return f'''	(footprint "Fiducial_1mm_Mask2mm"
 		(layer "F.Cu")
 		(uuid "{uid}")
@@ -279,7 +280,7 @@ def _fiducial_sexp(ref: str, x: float, y: float) -> str:
 		(property "Reference" "{ref}"
 			(at 0 -1.95 0)
 			(layer "F.SilkS")
-			(uuid "{new_uuid()}")
+			(uuid "{puid}")
 			(effects
 				(font
 					(size 0.5 0.5)

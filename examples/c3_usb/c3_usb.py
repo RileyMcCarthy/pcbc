@@ -204,45 +204,29 @@ Led(
 
 Board(width=40, height=30, layers=2, stackup="jlcpcb_2l_1oz")
 
-Place(
-    "J1",
-    position="absolute",
-    left=0,
-    right=0,
-    bottom=0,
-    margin_left="auto",
-    margin_right="auto",
-    locked=True,
-    reason="USB-C at south edge",
-)
-Place(
-    "U1",
-    position="absolute",
-    left=1,
-    top=1,
-    rotate=90,
-    locked=True,
-    reason="ESP32-C3-MINI antenna at west",
-)
+# Copper: two anchors say where the board's shape is decided (the connector on its
+# edge, the module with its antenna at the west edge); everything else says what it
+# belongs to and the tool puts it there. `pcbc pcb c3_usb.py` lists what to move.
+Place("J1", edge="bottom", reason="USB-C at south edge")
+Place("U1", position="absolute", left=1, top=1, rotate=90, reason="ESP32-C3-MINI antenna at west")
 Keepout("ANTENNA", position="absolute", left=0, top=0, width=4, height=15)
-
 Place("U2", position="absolute", right=4, top=10, reason="LDO")
-Place("U3", position="absolute", left=18, bottom=10, reason="USB ESD")
-Place("SW_RST", position="absolute", right=4, bottom=12, reason="reset")
-Place("SW_BOOT", position="absolute", right=9, bottom=12, reason="boot")
-Place("D1", position="absolute", right=3, top=3, reason="status LED")
-Place("R_LED", position="absolute", right=7, top=3)
-Place("R_CC1", position="absolute", left=18, bottom=6)
-Place("R_CC2", position="absolute", right=10, bottom=6)
-Place("C_VBUS", position="absolute", left=22, bottom=10)
-Place("C_VBUS_HF", position="absolute", left=26, bottom=10)
-Place("C_3V3", position="absolute", right=8, top=10)
-Place("C_3V3_HF", position="absolute", right=12, top=10)
-Place("R_EN", position="absolute", right=8, bottom=16)
-Place("C_EN", position="absolute", right=12, bottom=16)
-Place("R_BOOT", position="absolute", left=18, top=12)
-Place("C_MCU", position="absolute", left=18, top=8)
-Place("C_MCU_HF", position="absolute", left=22, top=8)
+Place("U3", to="J1.DP1", reason="USB ESD at the connector")
+Place("R_CC1", to="J1.CC1")
+Place("R_CC2", to="J1.CC2")
+Place("C_VBUS", to="U2.VIN")
+Place("C_VBUS_HF", to="U2.VIN")
+Place("C_3V3", to="U2.VOUT")
+Place("C_3V3_HF", to="U2.VOUT")
+Place("R_EN", to="U1.EN")
+Place("C_EN", to="U1.EN")
+Place("SW_RST", to="U1.EN")
+Place("R_BOOT", to="U1.IO9")
+Place("SW_BOOT", to="U1.IO9")
+Place("C_MCU", to="U1.3V3")
+Place("C_MCU_HF", to="U1.3V3")
+Place("R_LED", to="U1.IO10")
+Place("D1", to="R_LED.2")
 
 # Schematic. CSS parks the multi-pin symbols; everything else hangs off a pin:
 # to="U1.EN" puts the pin that shares that net in line with it, along= stacks

@@ -25,8 +25,8 @@ def _pin(part, key):
 
 
 def test_node_checks():
-    assert check_board(BOARD, pcb=False) == []  # schematic-first: no Place() yet
-    assert any("no Place()" in f for f in check_board(BOARD))  # a build would want them
+    assert check_board(BOARD, pcb=False) == []
+    assert check_board(BOARD) == []  # every part has a Place(): anchors by CSS, the rest by relation
     d = load_board(BOARD)
     assert len(d.instances) == 31 and len(d.nets) == 18
 
@@ -71,3 +71,11 @@ def test_node_readability_bar():
     rest = [i for i in report["issues"] if ".kicad_sym" not in i]
     assert len(library) == 1
     assert len(rest) <= 2, rest
+
+
+def test_node_layout_bar():
+    from pcbc.build import pcb_job
+
+    result = pcb_job(BOARD)
+    assert result.get("error") is None, result
+    assert result["layout_report"] == [], result["layout_report"]

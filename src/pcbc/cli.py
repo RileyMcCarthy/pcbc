@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 
 from . import __version__
-from .build import STAGES, build_job
+from .build import STAGES, build_job, pcb_job
 from .language import check_board, load_board
 from .netcheck import KicadMissing, check_erc, check_schematic
 from .project import layout_dir
@@ -33,6 +33,11 @@ def main(argv: list[str] | None = None) -> int:
     sc.add_argument("board")
     sc.add_argument("--json", action="store_true", help="the full report: parts' poses, issues, netlist")
     sc.set_defaults(func=cmd_sch)
+
+    pc = sub.add_parser("pcb", help="Place the copper from board.py's Place() lines and list what to move")
+    pc.add_argument("board")
+    pc.add_argument("--json", action="store_true", help="the full report: every part's pose, the moves")
+    pc.set_defaults(func=cmd_pcb)
 
     rv = sub.add_parser("review", help="HTML: schematic, copper, 3D")
     rv.add_argument("board")
@@ -162,6 +167,37 @@ def cmd_review(args: argparse.Namespace) -> int:
         print(result["error"], file=sys.stderr)
         return 1
     return 0
+
+
+def cmd_pcb(args: argparse.Namespace) -> int:
+    path = Path(args.board)
+    if not path.exists():
+        print(f"no such file: {path}", file=sys.stderr)
+        return 2
+    try:
+        result = pcb_job(path)
+    except ValueError as exc:
+        print(f"placement: {exc}", file=sys.stderr)
+        return 2
+    if args.json:
+        print(json.dumps(result, indent=2, default=str))
+        return 0 if not result.get("error") else 1
+    if result.get("check"):
+        print("check failed:")
+        for f in result["check"]:
+            print(f"  - {f}")
+        return 2
+    print(f"placed: {result['placed']}")
+    if result.get("error"):
+        print(f"error: {result['error']}")
+    report = result.get("layout_report", [])
+    if report:
+        print(f"layout: {len(report)} to fix by editing Place() lines")
+        for i, m in enumerate(report, 1):
+            print(f"  {i}. {m}")
+    else:
+        print("layout: nothing to move")
+    return 1 if result.get("error") else 0
 
 
 def cmd_search(args: argparse.Namespace) -> int:

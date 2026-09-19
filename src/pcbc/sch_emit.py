@@ -1081,6 +1081,7 @@ class _Occupant:
     owner: str
     net: str = ""
     tag: str = ""  # placement this belongs to, so it can be taken back
+    rot: int | None = None  # a power symbol's rotation, to re-score it in place
 
 
 class _Sheet:
@@ -1415,10 +1416,20 @@ def _hat_candidates(sheet: _Sheet, members: list[_Site], net: str, gnd: bool) ->
                 if any(_inside_segment(hx, hy, *seg[:4]) for seg in sheet.segs):
                     continue
             box = _hat_box(net, hx, hy, gnd, rot)
+            # The symbol may not sit on its own wire: a GND jogged up and
+            # pointing back down through the jog is legal and looks broken.
+            if any(
+                _point_in_aabb((ax + bx) / 2.0, (ay + by) / 2.0, box, pad=-0.05)
+                for (ax, ay), (bx, by) in zip(pts, pts[1:])
+                if not _near(ax, ay, bx, by)
+            ):
+                continue
             hard = sheet.hard_cost(box, net)
             c = sheet.cost(box, net)
             if rot == 180 and not vertical:
-                c += 3.0
+                # Upside down: a supply pointing down is seen often enough;
+                # a ground pointing up hardly ever.
+                c += 4.0 if gnd else 2.5
             for (ax, ay), (bx, by) in zip(pts, pts[1:]):
                 if not _near(ax, ay, bx, by):
                     sb = _seg_box(ax, ay, bx, by)
@@ -1447,6 +1458,7 @@ def _commit_hat(sheet: _Sheet, cand: _HatCand, net: str, gnd: bool, tag: str) ->
     out = sheet.add(pts, net, tag) if len(pts) > 1 else []
     out.append(_hat(net, hx, hy, gnd=gnd, rot=rot))
     sheet.occupy(_hat_box(net, hx, hy, gnd, rot), "hat", s.part.ref, net, tag)
+    sheet.occupants[-1].rot = rot
     sheet.anchor(hx, hy, net, tag)
     return out
 
@@ -1524,14 +1536,21 @@ def _place_wire_label(sheet: _Sheet, segs: list[Box], net: str, owner: str, tag:
 def _joint_hats(sheet: _Sheet, a: tuple, b: tuple, drawn: dict[str, list[str]]) -> None:
     """Place two power symbols together: the pair whose spots are cleanest, and
     among clean pairs the least overlap. Only better than what each had alone
-    is kept."""
+    is kept. Labels within reach are lifted first - they are re-placed around
+    the symbols in the pass that follows, so they should not decide this."""
     tag_a, mem_a, net_a, gnd_a = a
     tag_b, mem_b, net_b, gnd_b = b
+    sites = list(mem_a) + list(mem_b)
+    for o in list(sheet.occupants):
+        if o.kind == "label" and o.tag:
+            cx, cy = (o.box[0] + o.box[2]) / 2.0, (o.box[1] + o.box[3]) / 2.0
+            if any(math.hypot(cx - st.x, cy - st.y) <= 12.7 for st in sites):
+                sheet.remove(o.tag)
     before = _pair_key(sheet, a, b)
     sheet.remove(tag_a)
     sheet.remove(tag_b)
     best = None
-    for ca in _hat_candidates(sheet, mem_a, net_a, gnd_a)[:6]:
+    for ca in _hat_candidates(sheet, mem_a, net_a, gnd_a)[:10]:
         _commit_hat(sheet, ca, net_a, gnd_a, tag_a)
         cbs = _hat_candidates(sheet, mem_b, net_b, gnd_b)
         sheet.remove(tag_a)
@@ -1550,31 +1569,32 @@ def _joint_hats(sheet: _Sheet, a: tuple, b: tuple, drawn: dict[str, list[str]]) 
 
 
 def _pair_key(sheet: _Sheet, a: tuple, b: tuple) -> tuple[int, float] | None:
-    """How the two symbols score where they are now (each judged with the other in place)."""
+    """How the two symbols score where they are now, each judged the way a
+    candidate is (with the other in place, flip and stub penalties included)."""
     total = [0, 0.0]
-    for tag, _m, net, _g in (a, b):
+    for tag, members, net, gnd in (a, b):
         occ = [o for o in sheet.occupants if o.tag == tag]
         if not occ:
             return None
-        box = occ[0].box
-        mine = [(sheet.segs[i], sheet.seg_boxes[i]) for i, t in enumerate(sheet.seg_tags) if t == tag]
-        # Measure with this one lifted off the sheet, so it does not count itself.
-        saved = (sheet.occupants, sheet.segs, sheet.seg_tags, sheet.seg_boxes)
-        sheet.occupants = [o for o in sheet.occupants if o.tag != tag]
-        keep = [i for i, t in enumerate(sheet.seg_tags) if t != tag]
-        sheet.segs = [sheet.segs[i] for i in keep]
-        sheet.seg_tags = [sheet.seg_tags[i] for i in keep]
-        sheet.seg_boxes = [sheet.seg_boxes[i] for i in keep]
+        mine = [sheet.segs[i][:4] for i, t in enumerate(sheet.seg_tags) if t == tag]
+        rot = getattr(occ[0], "rot", None)
+        sheet.remove(tag)
         try:
-            hard = sheet.hard_cost(box, net)
-            c = sheet.cost(box, net)
-            for _seg, sb in mine:
-                hard += sheet.hard_cost(sb, net)
-                c += sheet.cost(sb, net)
+            match = None
+            for cand in _hat_candidates(sheet, members, net, gnd):
+                segs = [(ax, ay, bx, by) for (ax, ay), (bx, by) in zip(cand[2], cand[2][1:]) if not _near(ax, ay, bx, by)]
+                if cand[3] == rot and len(segs) == len(mine) and all(
+                    _near(p[0], p[1], q[0], q[1]) and _near(p[2], p[3], q[2], q[3]) for p, q in zip(segs, mine)
+                ):
+                    match = cand
+                    break
         finally:
-            sheet.occupants, sheet.segs, sheet.seg_tags, sheet.seg_boxes = saved
-        total[0] += 0 if hard < _CLEAN else 1
-        total[1] += c
+            if match is not None:
+                _commit_hat(sheet, match, net, gnd, tag)
+        if match is None:
+            return None  # not a legal spot any more: anything the pair finds is better
+        total[0] += match[0][0]
+        total[1] += match[0][1]
     return (total[0], total[1])
 
 

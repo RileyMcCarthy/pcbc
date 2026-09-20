@@ -2,7 +2,7 @@
 # buffered by an op-amp into an ADC pin, and a MOSFET switching a load.
 # 33 parts, six groups - the hardest sheet so far. The AI writes the netlist
 # and one SchPlace() per part; the tool draws everything else.
-from pcbc import Board, Capacitor, Ground, Keepout, Led, Net, NetReq, Place, Power, Resistor, SchPlace, SchRegion, load
+from pcbc import Board, Capacitor, Chain, Ground, Keepout, Led, Net, NetReq, Place, Power, Resistor, SchPlace, SchRegion, load
 
 VBUS, V33, GND = Power("VBUS"), Power("3V3"), Ground("GND")
 USB_DP, USB_DN, CC1, CC2 = Net("USB_DP"), Net("USB_DN"), Net("CC1"), Net("CC2")
@@ -144,3 +144,5 @@ NetReq("USB_DP", "USB_DN", kind="usb_hs", z_diff_ohm=90, pair=True)
 NetReq("VBUS", "3V3", "GND", kind="power", volts=5, amps=1)
 NetReq("T_DIV", "T_OUT", kind="analog")
 NetReq("LOAD", kind="power", volts=3.3, amps=1)
+Chain("USB_DP", "J1.B6", "U3.6", "U1.27")  # the pair's feed order: connector, ESD, module; a third pad off the line is a stub
+Chain("USB_DN", "J1.A7", "U3.4", "U1.26")

@@ -10,6 +10,7 @@ from .compile import compile_design
 from .model import Design
 from .pcb_place import layout_report, resolve_places
 from .project import copy_with_siblings
+from .route_checks import route_aware_report
 
 
 def _decaps(design: Design) -> list[str]:
@@ -64,6 +65,10 @@ def place_job(design: Design, seed: Path, *, out: Path) -> dict:
     fails = check_job(job, out)
     report = moves + layout_report(design, job, out.read_text()) + silk.get("issues", [])
     notes = list(silk.get("notes", []))
+    # Route-aware checks (docs/r1-design.md section F): what the copper will need, before any track exists.
+    route_moves, route_notes = route_aware_report(design, job, out.read_text())
+    report += route_moves
+    notes += route_notes
     result = {
         "pcb": str(out),
         "applied": applied,

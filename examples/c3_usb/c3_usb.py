@@ -6,6 +6,7 @@ Pin kwargs are the names on each part's .kicad_sym (3V3, I/O1, …).
 from pcbc import (
     Board,
     Capacitor,
+    Chain,
     Ground,
     Keepout,
     Led,
@@ -261,3 +262,7 @@ SchPlace("D1", to="R_LED.2")
 NetReq("USB_DP", "USB_DN", kind="usb_hs", z_diff_ohm=90, pair=True)
 NetReq("VBUS", "3V3", "GND", kind="power", volts=3.3, amps=0.5)
 NetReq("EN", "BOOT", "LED", "LED_A", "CC1", "CC2", kind="digital")
+# The pair's feed order: connector, ESD, module. Three pads on a high-speed net need the order
+# said, else the third is a stub (`pcbc pcb` asks for these lines).
+Chain("USB_DP", "J1.A6", "U3.1", "U1.27")
+Chain("USB_DN", "J1.A7", "U3.3", "U1.26")

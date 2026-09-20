@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from .circuit import check_design
-from .compile import compile_design
+from .compile import CompiledJob, compile_design
 from .fab import fab_job
 from .language import load_board
 from .netcheck import KicadMissing, check_copper, check_erc, check_schematic
@@ -16,6 +16,34 @@ from .sch_emit import emit_schematic_file
 from .seed import seed_job
 
 STAGES = ("check", "seed", "sch", "place", "route", "fab")
+
+
+def rules_summary(job: CompiledJob) -> dict:
+    """What `job.dru` holds, for the one report line `constraints.py` cannot print itself (it sits
+    below `dru.py`, so it never sees the rules): every rule pcbc wrote, how many are errors, how many
+    are warnings (the soft kinds of R1, the two geometry rules and the canary: none fails the gate),
+    and the net the canary rule watches."""
+    cs = job.constraints
+    return {
+        "written": len(job.dru),
+        "error": sum(1 for r in job.dru if r.severity == "error"),
+        "soft": sum(1 for r in job.dru if r.severity == "warning"),
+        "canary_net": cs.canary_net if cs is not None else None,
+    }
+
+
+def rules_line(summary: dict) -> str:
+    canary = f"canary on net {summary['canary_net']}" if summary.get("canary_net") else "no canary (no net has two pads)"
+    return f"rules: {summary['written']} written ({summary['error']} error, {summary['soft']} soft), {canary}"
+
+
+def constraint_lines(job: CompiledJob) -> list[str]:
+    """`pcbc check --constraints`: one number per line with its source (`cs.lines`, sorted by net,
+    ending in the class summary), then the rules line."""
+    cs = job.constraints
+    if cs is None:
+        return []
+    return list(cs.lines) + [rules_line(rules_summary(job))]
 
 
 def _done(layout: Path) -> str | None:
@@ -61,6 +89,9 @@ def pcb_job(board: Path) -> dict:
     if fails:
         result["error"] = "; ".join(fails)
         return result
+    job = compile_design(design)
+    result["constraints"] = job.constraints.to_dict() if job.constraints is not None else None
+    result["rules"] = rules_summary(job)
     seed = seed_pcb(board)
     result["seed"] = seed_job(design, seed, name=name)
     placed = layout / "placed" / "layout.kicad_pcb"
@@ -103,7 +134,10 @@ def build_job(
 
     if "check" in plan:
         fails = check_design(design)
-        result["steps"].append({"stage": "check", "fails": fails})
+        step = {"stage": "check", "fails": fails}
+        if not fails:
+            step["constraints"] = constraint_lines(compile_design(design))
+        result["steps"].append(step)
         if fails:
             result["error"] = "; ".join(fails)
             return result
@@ -166,6 +200,11 @@ def build_job(
             entry["copper"] = "verified" if gate["ok"] else gate["fails"]
             entry["drc_warnings"] = gate["drc_warnings"]
             entry["geometry"] = gate.get("geometry")
+            # R1 (docs/r1-design.md section E, S3): `check_copper` gains "soft" {rule_name: hits} for the
+            # warnings of pcbc's soft rules and "rules" {rule_name: hits} for every pcbc rule. Carried as
+            # given; None until netcheck provides them.
+            entry["soft"] = gate.get("soft")
+            entry["rules"] = gate.get("rules")
             from .sexp import pin_all_uuids
 
             routed.write_text(pin_all_uuids(routed.read_text(), name, "routed"))  # KiCad's save invented ids

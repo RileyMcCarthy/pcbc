@@ -6,7 +6,8 @@ import sys
 from pathlib import Path
 
 from . import __version__
-from .build import STAGES, build_job, pcb_job
+from .build import STAGES, build_job, constraint_lines, pcb_job, rules_line
+from .compile import compile_design
 from .language import check_board, load_board
 from .netcheck import KicadMissing, check_erc, check_schematic
 from .project import layout_dir
@@ -19,8 +20,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--version", action="version", version=f"pcbc {__version__}")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    ck = sub.add_parser("check", help="Load board.py; unbound pins, Place(), LCSC")
+    ck = sub.add_parser("check", help="Load board.py; unbound pins, Place(), LCSC, a NetReq line that does not compile")
     ck.add_argument("board")
+    ck.add_argument("--constraints", action="store_true", help="then every number a NetReq/Pair/Bus line became, one per line with its source")
+    ck.add_argument("--json", action="store_true", help="with --constraints: the ConstraintSet as JSON instead of the lines")
     ck.set_defaults(func=cmd_check)
 
     bd = sub.add_parser("build", help="check → seed → sch → place → route → fab")
@@ -37,6 +40,7 @@ def main(argv: list[str] | None = None) -> int:
     pc = sub.add_parser("pcb", help="Place the copper from board.py's Place() lines and list what to move")
     pc.add_argument("board")
     pc.add_argument("--json", action="store_true", help="the full report: every part's pose, the moves")
+    pc.add_argument("--constraints", action="store_true", help="also print the constraint report the placement was checked against")
     pc.set_defaults(func=cmd_pcb)
 
     rv = sub.add_parser("review", help="HTML: schematic, copper, 3D")
@@ -75,9 +79,20 @@ def cmd_check(args: argparse.Namespace) -> int:
     if fails:
         for f in fails:
             print(f, file=sys.stderr)
+        if args.json:
+            print(json.dumps({"ok": False, "fails": fails}, indent=2))
         return 1
     design = load_board(path)
+    if args.constraints and args.json:
+        # ConstraintSet.to_dict(): every Derived as {"value", "unit", "formula", "ref", "note"}.
+        print(json.dumps(compile_design(design).constraints.to_dict(), indent=2))
+        return 0
     print(json.dumps({"ok": True, "instances": len(design.instances), "nets": len(design.nets)}))
+    if args.constraints:
+        # One number per line with its source, sorted by net (docs/r1-design.md A.1); the numbers the
+        # AI did not have to know. A caveat (the 2-layer USB note) is a line, never a failure.
+        for line in constraint_lines(compile_design(design)):
+            print(line)
     return 0
 
 
@@ -202,6 +217,11 @@ def cmd_pcb(args: argparse.Namespace) -> int:
         print(f"style: {len(notes)} note{'s' if len(notes) > 1 else ''} (legal, not counted)")
         for m in notes:
             print(f"  - {m}")
+    if args.constraints and result.get("constraints"):
+        lines = list(result["constraints"]["lines"]) + [rules_line(result["rules"])]
+        print(f"constraints: {len(lines)} lines (what the placement was checked against; pcbc check --constraints prints them alone)")
+        for line in lines:
+            print(f"  {line}")
     return 1 if result.get("error") else 0
 
 

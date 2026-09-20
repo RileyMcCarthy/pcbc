@@ -241,9 +241,12 @@ def _board_of(job) -> BoardSpec:
 
 
 def lane_rules(job) -> tuple[Stackup, float]:
-    """(stackup, the widest net class clearance): what a closed pad row's lane is sized from."""
+    """(stackup, the widest net class lane clearance): what a closed pad row's lane is sized from.
+    A class reads `lane_clearance_mm` (the kind's number without the voltage row, docs/r1-design.md
+    A.3), so a 250 V class never widens every closed row's fanout lane; None reads as `clearance_mm`."""
     stack = get_stackup(job.stackup)
-    clearance = max([c.clearance_mm for c in getattr(job, "classes", [])] + [stack.clearance_min])
+    lanes = [c.lane_clearance_mm if getattr(c, "lane_clearance_mm", None) is not None else c.clearance_mm for c in getattr(job, "classes", [])]
+    clearance = max(lanes + [stack.clearance_min])
     return stack, clearance
 
 

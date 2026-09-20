@@ -357,9 +357,8 @@ def test_chain_on_the_ds2_addon_validates_its_pads_against_the_net(tmp_path: Pat
     """`U1.12` is AVDD (pad 12): pin names or pad numbers, as Place(to=) takes them."""
     board = _ds2(tmp_path)
     lines = board.read_text().split("\n")
-    assert lines[96] == "", "line 97 of ds2_addon.py is the blank line the spec's Chain example lands on"
-    lines[96] = 'Chain("VDDA", "J2.1", "C4.1", "U1.12")'
-    board.write_text("\n".join(lines))
+    # The DS2 board carries the line S4's chain check asked for (R1: an intent line, never a coordinate).
+    assert lines[96].startswith('Chain("VDDA", "J2.1", "C4.1", "U1.12")'), "line 97 of ds2_addon.py is the VDDA chain"
     cs = compile_constraints(load_board(board))
     assert cs.refusals == () and cs.groups[0].members == ("J2.1", "C4.1", "U1.12")
     assert "VDDA: chain J2.1 -> C4.1 -> U1.12 (Chain line 97)" in cs.lines

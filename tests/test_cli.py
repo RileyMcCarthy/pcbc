@@ -83,6 +83,13 @@ def _rule_counts(job) -> tuple[int, int, int]:
     )
 
 
+# The DS2 board's VDDA chain line (Chain line 97) prints between VDDA's via and loop lines.
+DS2_CONSTRAINT_LINES.insert(
+    next(i for i, l in enumerate(DS2_CONSTRAINT_LINES) if l.startswith("VDDA: loop ")),
+    "VDDA: chain J2.1 -> C4.1 -> U1.12 (Chain line 97)",
+)
+
+
 def test_check_constraints_prints_every_number_with_its_source(tmp_path: Path, capsys):
     board = _ds2(tmp_path)
     assert main(["check", str(board), "--constraints"]) == 0, "S5 acceptance: exit code as `check` today; a clean board is 0"

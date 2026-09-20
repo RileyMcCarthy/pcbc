@@ -171,7 +171,7 @@ The AI never draws a track. The route stage compiles `NetReq` into an ordered KR
 | No step passes `--clearance` but the pours (it is a ceiling on every class; the pair step's 0.16 once capped Power); on four layers the plane nets are welded to their planes in their own `plane_taps` step with the same-net keepout off, since KRT's pour places no tap vias and the keepout stops the welds | `test_route_plan.py::test_node_pours_its_planes_before_the_signals_and_asks_90_ohm` |
 | Every way KRT reports an unreached pad is read (`failed_single`, `pad_pairs_open`, a pour's `unconnected pad`) and becomes a move naming the net, its parts and the pad; only constrained copper is locked, short hops stay movable | `test_route.py::test_a_net_krt_could_not_finish_is_reported_as_a_move`, `test_a_pad_krt_left_open_is_reported_whichever_field_names_it` |
 
-Placement language and the routing plan compiled from `NetReq` are the next phases: see `docs/copper-plan.md`.
+What KRT taught the tool is in `docs/copper-plan.md`. The plan for pcbc's own constraint-first router, with the requirements every routing practice imposes and what KiCad 10 can enforce as rules, is `docs/router-plan.md`.
 
 Blinky is a 40×25 mm 2-layer LED + resistor. `pcbc build` writes:
 

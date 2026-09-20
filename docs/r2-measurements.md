@@ -382,3 +382,44 @@ stage is **not wired in**: C.1 puts it between KRT's `planes` and `signals` step
 S5's owned files, so S4 leaves `POST` empty and `pattern_copper(stage=...)` taking the argument, and
 S5 adds `tap` to the list and one call. A.4 rule 4 (the mask dam) is still advisory and still counts
 zero, because the hop places no vias and a track's mask opening is its own copper.
+
+## Verification of S2 to S4, independent of the agents that wrote them
+
+Re-run on a clean checkout of the committed tree, not taken on trust:
+
+- **The five bug-grade findings the attacks raised are refused now**, each checked directly: a
+  star-wound point list is not accepted as a hull; a repeated point is rejected by `Path`; a
+  zero-length leg makes `is_octilinear` and `turn_ok` return False rather than raise;
+  `octile_path(a, a)` raises; `clears` returns True when the requirement is at or below zero.
+  `turn_ok` was checked against the stated rule (interior angle at least 135 degrees) computed
+  independently with `atan2` over all 64 octant pairs: no disagreement.
+- **Determinism holds.** Two builds of c3_usb in the *same* directory give a byte-identical routed
+  board; two builds in *different* directories differ in exactly two lines, both the absolute path
+  in a `(model ...)` line, which is the caveat `docs/constraints.md` already records. `copper.json`
+  and the Gerbers are identical either way, including across `PYTHONHASHSEED`.
+- **The escape hatch is exact.** `PCBC_PATTERNS=off` on node reproduces the S1b row to the digit
+  (28 vias, 63 off-45, 181 micro, T_OUT 1.72x, 512.8 mm), so the pattern stage is the only thing
+  that moves a number.
+- **All five boards build to fab with the gate verified**, and the full suite is 437 green with
+  KiCad and KRT.
+
+### What the hop is worth, and what it costs
+
+| board | leftover | vias | off 0/45/90 | under 0.2 mm | worst detour | verdict |
+|---|---|---|---|---|---|---|
+| blinky | 100 % → **0 %** | 0 | 0 | 2 → **0** | 1.03 → 1.04 | its one net is a hop |
+| buck | 100 % | 4 | 3 | 26 | 2.09 | nothing: both its local nets refuse |
+| c3_usb | 98.3 % → **95.2 %** | 13 → 14 | 7 | 139 → **168** | 1.92 → **1.81** | mixed |
+| node | 100 % → **97.0 %** | 28 | 63 → **57** | 181 → **154** | 1.72 | better |
+| ds2 | 97.1 % → **92.7 %** | 32 → **28** | 13 → **11** | 113 → 118 | 3.23 | better |
+
+Three boards better, one untouched, one mixed. c3_usb's is the one to watch: hopping CC1, CC2 and
+LED locks copper beside the USB-C, and KRT answers with 29 more staircase segments and one more
+via while the pair itself comes out **shorter** (1.92 → 1.81). That trade is accepted on purpose —
+a differential pair's length is electrical and a staircase is not, and R3's own router removes
+staircases wholesale — but it is the first place where pattern copper has made a neighbour worse,
+and the tap pattern will change the same neighbourhood again.
+
+The leftover share barely moves on the big boards, which is exactly what the census predicted: a
+hop is 5.7 % of the copper. The design's 70 % target needs the tap (12 %), and its 45 % target
+needs the spine (37 %).

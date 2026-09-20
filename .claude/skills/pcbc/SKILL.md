@@ -96,8 +96,11 @@ Each line is a move: what collides, and the `Place()`/`SchPlace()` edit that fix
   lane, a decoupling cap farther than 2.5 mm (the next one 5 mm; plus the lane on a fine-pitch
   row), a connector off every edge, copper within 0.3 mm of the edge, a net past its `max_mm`.
 - `pcbc build`: the copper gate is KiCad's own DRC with nothing unconnected, plus the pads
-  bound exactly as `board.py` says. A routing failure names the nets; move the parts on them
-  closer or give them a free side. Do not tune router flags.
+  bound exactly as `board.py` says. A routing failure names the net, then one line per
+  unreached pad: what is in its corridor, which step put it there, whose part it belongs to,
+  and the move (move that part, or give a net in the way another layer). Do not tune router
+  flags. The `copper:` lines are the bar: detours, vias, staircases; a long detour on a net
+  usually means its parts sit on the wrong side of something.
 
 The examples stay at zero moves; hold a new board to the same bar before `build`.
 

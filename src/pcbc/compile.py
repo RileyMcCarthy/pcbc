@@ -41,6 +41,7 @@ class DruRule:
     name: str
     constraint: str
     condition: str
+    severity: str = "error"  # KiCad: error | warning | ignore
 
 
 @dataclass
@@ -120,6 +121,16 @@ def compile_design(design: Design) -> CompiledJob:
             condition="A.Type == 'Pad' && B.Type == 'Pad' && A.Reference == B.Reference",
         )
     ]
+    # Geometry KiCad can count: a grid router's staircases and 90 degree corners. Warnings, so
+    # they reach the copper bar without failing a legal board; the bar decides.
+    dru.append(DruRule("pcbc_geometry_segments", "(constraint track_segment_length (min 0.2mm))", "A.Type == 'Track'", "warning"))
+    # No unit on the angle: "(min 135deg)" makes KiCad 10 drop the whole rule file, silently.
+    dru.append(DruRule("pcbc_geometry_angles", "(constraint track_angle (min 135))", "A.Type == 'Track'", "warning"))
+    # The canary: one malformed rule silently disables every rule and kicad-cli says nothing.
+    # This fires once on every board that has copper; the gate fails when it does not.
+    canary_net = _canary_net(design)
+    if canary_net:
+        dru.append(DruRule("pcbc_canary", "(constraint length (max 0.001mm))", f"A.NetName == '{canary_net}'", "warning"))
     skip: list[str] = []
 
     for req in design.netreqs:
@@ -345,6 +356,20 @@ def _sensitive_groups(
             ordered.append(by_kind.pop(kind))
     ordered.extend(by_kind.values())
     return ordered
+
+
+def _canary_net(design: Design) -> str | None:
+    """The first net (sorted) with two or more pads: it always carries copper on a routed board."""
+    count: dict[str, int] = {}
+    for inst in design.instances:
+        for pname, net in inst.pins.items():
+            pin = inst.part.pins.get(pname)
+            if pin and net:
+                count[net] = count.get(net, 0) + len(pin.pads)
+    for net in sorted(count):
+        if count[net] >= 2 and "'" not in net:
+            return net
+    return None
 
 
 def _slug(s: str) -> str:

@@ -386,6 +386,9 @@ def route_job(design: Design, placed: Path, *, out: Path, name: str = "board") -
         return result
     text = pin_copper_ids(last.read_text(), name)
     out.write_text(text)
+    from .copper_bar import copper_bar
+
+    result["copper_bar"] = copper_bar(text)
     opens = unrouted_nets(text)
     result["segments"] = len(re.findall(r"\n\t\(segment\b", text))
     result["vias"] = len(re.findall(r"\n\t\(via\b", text))
@@ -397,7 +400,12 @@ def route_job(design: Design, placed: Path, *, out: Path, name: str = "board") -
             opens.append(net)
     result["unrouted"] = sorted(opens)
     if opens:
-        result["error"] = "unrouted: " + "; ".join(_unrouted_move(job, design, n, unreached.get(n)) for n in sorted(opens))
+        from .blocking import blocking_lines
+
+        blocking: dict[str, list[str]] = {n: blocking_lines(design, text, work, n, unreached.get(n)) for n in sorted(opens)}
+        result["blocking"] = blocking
+        moves = [_unrouted_move(job, design, n, unreached.get(n)) for n in sorted(opens)]
+        result["error"] = "unrouted: " + "; ".join(moves) + "".join(f"\n  {line}" for n in sorted(opens) for line in blocking[n])
     return result
 
 

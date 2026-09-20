@@ -178,10 +178,23 @@ def check_copper(design: Design, pcb: Path, cli: Path | None = None, floor_mm: f
     nets = compare(expected_nets(design), copper_nets(text), what="copper")
     fails += nets
     doc = kicad_drc(pcb, cli, refill=refill)
+    job = compile_design(design)
     if floor_mm is None:
         from .stackup import get_stackup
 
-        floor_mm = get_stackup(compile_design(design).stackup).clearance_min
+        floor_mm = get_stackup(job.stackup).clearance_min
+    violations = doc.get("violations") or []
+    canary_written = any(r.name == "pcbc_canary" for r in job.dru)
+    canary_fired = any("rule 'pcbc_canary'" in str(v.get("description", "")) for v in violations)
+    if canary_written and not canary_fired:
+        fails.append(
+            "KiCad applied none of pcbc's custom rules (the canary rule did not fire): a rule in the board's "
+            ".kicad_dru does not parse, and kicad-cli does not say which; every rule is off until it does"
+        )
+    geometry = {
+        "segments": sum(1 for v in violations if v.get("type") == "track_segment_length"),
+        "angles": sum(1 for v in violations if v.get("type") == "track_angle"),
+    }
     errors = [
         f"{v.get('type')}: {v.get('description')}"
         for v in copper_drc_errors(doc, floor_mm=floor_mm)
@@ -197,7 +210,13 @@ def check_copper(design: Design, pcb: Path, cli: Path | None = None, floor_mm: f
         "nets": nets,
         "drc_errors": errors,
         "unconnected": len(unconnected),
-        "drc_warnings": sum(1 for v in doc.get("violations") or [] if (v.get("severity") or "").lower() == "warning"),
+        "drc_warnings": sum(
+            1
+            for v in violations
+            if (v.get("severity") or "").lower() == "warning" and v.get("type") not in ("track_segment_length", "track_angle", "length_out_of_range")
+        ),
+        "geometry": geometry,  # KiCad's own count of staircases and 90 degree corners
+        "canary": canary_fired,
     }
 
 

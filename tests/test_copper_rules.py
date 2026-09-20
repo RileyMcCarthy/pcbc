@@ -218,3 +218,26 @@ def test_an_edge_placed_header_keeps_its_pads_off_the_edge(tmp_path: Path):
     assert flush.bottom == 0.0
     over = _edge_css(PlaceSpec(ref="J1", edge="bottom", overhang=1.5), usb)
     assert over.bottom == -1.5
+
+
+def test_pcbc_writes_the_geometry_rules_and_a_canary_that_must_fire():
+    """One malformed rule silently disables every custom rule and kicad-cli prints nothing (a
+    combined probe file reported zero violations). The canary fires once on every board with
+    copper; the gate fails when it is missing. The geometry rules are warnings: they feed the
+    copper bar and never fail a legal board."""
+    from pcbc.apply import _render_dru
+    from pcbc.compile import _canary_net
+
+    design = load_board(EXAMPLES / "blinky" / "blinky.py")
+    job = compile_design(design)
+    names = {r.name: r for r in job.dru}
+    assert names["pcbc_geometry_segments"].severity == "warning" and "track_segment_length (min 0.2mm)" in names["pcbc_geometry_segments"].constraint
+    assert names["pcbc_geometry_angles"].severity == "warning" and names["pcbc_geometry_angles"].constraint == "(constraint track_angle (min 135))"
+    assert "deg" not in names["pcbc_geometry_angles"].constraint  # the unit suffix silently kills every rule in KiCad 10.0.6
+    canary = names["pcbc_canary"]
+    assert canary.severity == "warning" and canary.constraint == "(constraint length (max 0.001mm))"
+    assert canary.condition == f"A.NetName == '{_canary_net(design)}'" and _canary_net(design)
+    rendered = _render_dru(job)
+    assert '(rule "pcbc_canary"\n\t(severity warning)\n\t(constraint length (max 0.001mm))' in rendered
+    assert '(rule "pads_of_one_footprint"\n\t(constraint' in rendered  # an error rule carries no severity line
+

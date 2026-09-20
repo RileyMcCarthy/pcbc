@@ -51,7 +51,7 @@ written into the board's `.kicad_dru`:
 | `via_count (max 0)` | one net | `too_many_vias` |
 | `creepage (min 3mm)` | `A.NetName == 'VDDA' && B.NetName == 'GND'` | `creepage`, 2 hits |
 | `track_segment_length (min 0.2mm)` | `A.Type == 'Track'` | 111 hits: exactly the router's micro-jogs |
-| `track_angle (min 135deg)` | `A.Type == 'Track'` | parses; 0 hits (45 degree bends are 135 inside) |
+| `track_angle (min 135)` | `A.Type == 'Track'` | works; `(min 135deg)` with the unit silently disables the whole file (found by the canary on its first day) |
 | `clearance (min 1mm)` | `A.hasNetclass('Analog') && B.hasNetclass('Power')` | 303 hits: class conditions work |
 | `disallow track` | `A.intersectsArea('FID1_mask')` | 0 hits: rule areas work, and the fiducial masks are clear |
 | `physical_clearance (min 0.5mm)` | two nets by name | parses; 0 hits on this board |
@@ -210,7 +210,7 @@ enforces it: **L** language, **C** compile (numbers), **P** placement check, **R
 
 - R-M1 Every limit in section 3 from the stackup, none in the router. **C, R, K**.
 - R-M2 Geometry: 0/45/90 by construction; no segment under 0.2 mm except pad entries; no
-  acute angle. **R**, **K** (`track_segment_length (min 0.2mm)`, `track_angle (min 135deg)`),
+  acute angle. **R**, **K** (`track_segment_length (min 0.2mm)`, `track_angle (min 135)`),
   **B**.
 - R-M3 Teardrops on tracks entering vias and pads thinner than the via: KiCad can generate
   them; the router leaves room. Deferred.
@@ -361,7 +361,7 @@ the router obeyed: class clearances and widths (project classes), `creepage` by 
 `length (max)` per net, `skew (max)` per group, `via_count (max)` for no-via nets,
 `diff_pair_gap` / `diff_pair_uncoupled` per pair, `disallow` in rule areas (isolation,
 fiducial masks, keep-aways), `track_segment_length (min 0.2mm)` and `track_angle (min
-135deg)` for geometry, `hole_to_hole` as an error, and the canary. Severities: everything
+135)` for geometry, `hole_to_hole` as an error, and the canary. Severities: everything
 pcbc writes is an error.
 
 ### 6.7 Verification beyond KiCad (`verify.py`)
@@ -393,6 +393,11 @@ pairs and buses with skew, determinism unstated); pcbc's own as it comes up. The
 not a gate for building pcbc-route; it is the evidence for when KRT can be removed.
 
 ## 8. Phases
+
+Status: **R0 landed 2026-09-19** (`copper_bar.py`, `blocking.py`, the geometry rules and the
+canary in `compile.py`, the examples' bar in `test_examples_fab.py`). The canary paid for
+itself the same day: `track_angle (min 135deg)` had silently disabled every rule on every
+board; `(min 135)` is what KiCad 10 parses.
 
 Effort is one person, part time, with the AI doing the typing; each phase ends green on the
 examples and with its rows in the README tables.

@@ -92,6 +92,14 @@ def check_design(design: Design, pcb: bool = True) -> list[str]:
             fails.append(f"{inst.ref}: no Place() — every part is CSS-placed")
         if inst.ref not in sch_placed:
             fails.append(f"{inst.ref}: no SchPlace() — schematic pose is CSS, not auto-layout")
+    if design.board is not None:
+        # A bad NetReq / Pair / Bus / Chain / Isolation / Guard line fails here, before anything is drawn.
+        from .constraints import compile_constraints
+
+        try:
+            fails.extend(compile_constraints(design).refusals)
+        except (KeyError, ValueError) as exc:
+            fails.append(str(exc.args[0]) if exc.args else str(exc))
     return fails
 
 

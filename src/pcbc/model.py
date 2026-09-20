@@ -150,10 +150,67 @@ class NetReqSpec:
     pair: bool = False
     vias: bool | None = None
     layers: tuple[str, ...] | None = None
-    keep_clear_of: str | None = None
+    keep_clear_of: tuple[str, ...] = ()  # globs; constraints.Constraint expands them
     keep_clear_mm: float | None = None
     autoroute: bool | str | None = None
     class_name: str | None = None
+    # R1 (docs/r1-design.md A.2)
+    length_mm: float | None = None  # routed length -> KiCad length (max)
+    uncoupled_mm: float | None = None
+    vias_max: int | None = None
+    reference: str | None = None  # "In1.Cu"
+    clock: str | None = None  # spi: the net the others match to
+    pf_max: float | None = None  # i2c bus capacitance budget
+    loop_mm2: float | None = None
+    line: int = 0  # board.py line of the NetReq; 0 when not loaded from a board file
+
+
+@dataclass(frozen=True)
+class PairReq:
+    p: str
+    n: str
+    z_diff_ohm: float = 90.0
+    match_mm: float = 0.5
+    uncoupled_mm: float = 2.0
+    gap_mm: float | None = None
+    layers: tuple[str, ...] | None = None
+    reference: str | None = None
+    line: int = 0
+
+
+@dataclass(frozen=True)
+class BusReq:
+    nets: tuple[str, ...]
+    match_mm: float
+    clock: str | None = None
+    length_mm: float | None = None
+    line: int = 0
+
+
+@dataclass(frozen=True)
+class ChainReq:
+    net: str
+    pads: tuple[str, ...]  # ("J2.1", "C4.1", "U1.12"), pin names as Place(to=) takes them
+    line: int = 0
+
+
+@dataclass(frozen=True)
+class IsolationReq:
+    a: str
+    b: str
+    volts: float
+    slot: bool = False
+    across: tuple[str, ...] = ()
+    reinforced: bool = False
+    line: int = 0
+
+
+@dataclass(frozen=True)
+class GuardReq:
+    net: str
+    stitch_mm: float = 2.5
+    ground: str = "GND"
+    line: int = 0
 
 
 @dataclass
@@ -214,6 +271,11 @@ class Design:
     keepouts: list[KeepoutSpec] = field(default_factory=list)
     regions: list[RegionSpec] = field(default_factory=list)
     netreqs: list[NetReqSpec] = field(default_factory=list)
+    pairs: list[PairReq] = field(default_factory=list)
+    buses: list[BusReq] = field(default_factory=list)
+    chains: list[ChainReq] = field(default_factory=list)
+    isolations: list[IsolationReq] = field(default_factory=list)
+    guards: list[GuardReq] = field(default_factory=list)
     nets: dict[str, Net] = field(default_factory=dict)
     instances: list[Instance] = field(default_factory=list)
     sch_places: list[SchPlaceSpec] = field(default_factory=list)

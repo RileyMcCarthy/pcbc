@@ -1,24 +1,32 @@
-"""Compile Place/NetReq intent into KiCad geometry and engine flags."""
+"""Compile Place/NetReq intent into KiCad geometry and engine flags.
+
+Since R1 the numbers live in `constraints.compile_constraints` (docs/r1-design.md section A.3):
+`CompiledClass`, `CompiledNet` and the rule list are projections of the `ConstraintSet`, and every
+existing consumer (`route.py`, `fanout.py`, `copper.py`, `apply.py`, `seed.py`) reads them unchanged.
+"""
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import asdict, dataclass, replace
 
+from . import dru as _dru
+from .constraints import (  # noqa: F401  (re-exported for today's importers)
+    _KIND_CLASS,
+    CompiledClass,
+    Constraint,
+    ConstraintSet,
+    Derived,
+    DruRule,
+    RuleArea,
+    Source,
+    _canary_net,
+    compile_constraints,
+    slug,
+)
 from .layout import resolve_keepout, resolve_regions
 from .model import Design, KeepoutSpec, PlaceSpec, RegionSpec
-from .stackup import diff_pair_geometry, get_stackup, hole_floor, ipc2221_width_mm, width_for_z0
 
-
-@dataclass
-class CompiledClass:
-    name: str
-    track_width_mm: float
-    clearance_mm: float
-    via_diameter_mm: float = 0.45
-    via_drill_mm: float = 0.20
-    diff_pair_width_mm: float | None = None
-    diff_pair_gap_mm: float | None = None
-    patterns: list[str] = field(default_factory=list)
+_slug = slug
 
 
 @dataclass
@@ -37,14 +45,6 @@ class CompiledNet:
 
 
 @dataclass
-class DruRule:
-    name: str
-    constraint: str
-    condition: str
-    severity: str = "error"  # KiCad: error | warning | ignore
-
-
-@dataclass
 class CompiledJob:
     board_size_mm: tuple[float, float]
     layers: int
@@ -60,6 +60,7 @@ class CompiledJob:
     dru: list[DruRule]
     skip_autoroute_patterns: list[str]
     krt: dict
+    constraints: ConstraintSet | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -85,201 +86,80 @@ class CompiledJob:
             "dru": [asdict(r) for r in self.dru],
             "skip_autoroute_patterns": self.skip_autoroute_patterns,
             "krt": self.krt,
+            "constraints": self.constraints.to_dict() if self.constraints is not None else None,
+            "rule_areas": [asdict(a) for a in self.constraints.rule_areas] if self.constraints is not None else [],
         }
-
-
-_KIND_CLASS = {
-    "usb_hs": "USB",
-    "power": "Power",
-    "analog": "Analog",
-    "clock": "Clock",
-    "switch_node": "SwitchNode",
-    "digital": "Default",
-    "default": "Default",
-}
 
 
 def compile_design(design: Design) -> CompiledJob:
     if design.board is None:
         raise ValueError("design has no Board()")
     board = design.board
-    stack = get_stackup(board.stackup)
+    cs = compile_constraints(design)
 
-    # Every class clears at least what a via's hole needs from the copper beside it: KiCad checks
-    # copper-to-hole, the router keeps copper-to-ring, and the difference is the annular ring.
-    floor_clear = max(stack.clearance_min, hole_floor(stack))
-    classes: dict[str, CompiledClass] = {
-        "Default": CompiledClass("Default", max(0.16, stack.track_min), max(0.16, floor_clear), stack.via_diameter, stack.via_drill),
-    }
+    classes = [replace(c, patterns=list(c.patterns)) for c in cs.classes]
+    class_by_name = {c.name: c for c in classes}
     compiled_nets: list[CompiledNet] = []
-    dru: list[DruRule] = [
-        # A connector's own pads sit closer than a power class asks (USB-C: 0.1 mm); that is the
-        # land, not a routing choice. Inside one footprint only the fab floor applies.
-        DruRule(
-            name="pads_of_one_footprint",
-            constraint="(constraint clearance (min 0.1mm))",
-            condition="A.Type == 'Pad' && B.Type == 'Pad' && A.Reference == B.Reference",
-        )
-    ]
-    # Geometry KiCad can count: a grid router's staircases and 90 degree corners. Warnings, so
-    # they reach the copper bar without failing a legal board; the bar decides.
-    dru.append(DruRule("pcbc_geometry_segments", "(constraint track_segment_length (min 0.2mm))", "A.Type == 'Track'", "warning"))
-    # No unit on the angle: "(min 135deg)" makes KiCad 10 drop the whole rule file, silently.
-    dru.append(DruRule("pcbc_geometry_angles", "(constraint track_angle (min 135))", "A.Type == 'Track'", "warning"))
-    # The canary: one malformed rule silently disables every rule and kicad-cli says nothing.
-    # This fires once on every board that has copper; the gate fails when it does not.
-    canary_net = _canary_net(design)
-    if canary_net:
-        dru.append(DruRule("pcbc_canary", "(constraint length (max 0.001mm))", f"A.NetName == '{canary_net}'", "warning"))
     skip: list[str] = []
+    tolerances: list[float] = []
 
-    for req in design.netreqs:
-        cls_name = req.class_name or _KIND_CLASS.get(req.kind, req.kind.title().replace(" ", ""))
-        width, clearance = max(0.16, stack.track_min), max(0.16, floor_clear)
-        via_d, via_h = stack.via_diameter, stack.via_drill
-        dp_w = dp_g = None
-        autoroute: bool | str = True
-        vias = True
-        layers: tuple[str, ...] = ("F.Cu", "B.Cu")
-
-        if req.kind == "usb_hs":
-            z = req.z_diff_ohm or 90.0
-            dp_w, dp_g = diff_pair_geometry(z, stack)
-            # Loosely-coupled 90 Ω on 1.6 mm 2-layer wants ~2 mm members.
-            # USB-C pad pitch is ~0.5 mm. Clamp to a tightly-coupled pair at
-            # the board floor; true 90 Ω needs 4-layer (or thinner dielectric).
-            # Pair gap is not other-net clearance — keep class clearance at
-            # the board floor so DRC is not graded at 1.5 mm.
-            if dp_w > 0.25:
-                dp_w, dp_g = 0.10, 0.10
-            width = dp_w
-            clearance = min(0.16, dp_w)
-            autoroute = "diff_pair"
-            layers = req.layers or ("F.Cu", "B.Cu")
-        elif req.kind == "power":
-            amps = req.amps or 0.2
-            width = ipc2221_width_mm(amps, req.temp_rise_c, stack.copper_oz)
-            width = max(width, 0.4 if amps >= 0.2 else 0.25)
-            clearance = 0.20
-            via_d, via_h = 0.80, 0.40
-            layers = req.layers or ("F.Cu", "B.Cu", "In1.Cu", "In2.Cu")
-        elif req.kind == "analog":
-            width, clearance = 0.20, 0.20
-            via_d, via_h = 0.60, 0.30
-            autoroute = False
-            vias = False
-            layers = req.layers or ("F.Cu",)
-        elif req.kind == "clock":
-            width, clearance = 0.15, 0.20
-            via_d, via_h = 0.60, 0.30
-            layers = req.layers or ("F.Cu", "B.Cu")
-        elif req.kind == "switch_node":
-            width, clearance = 0.30, 0.20
-            via_d, via_h = 0.60, 0.30
-            autoroute = False
-            vias = False
-            layers = req.layers or ("F.Cu",)
-        elif req.z_se_ohm:
-            width = width_for_z0(req.z_se_ohm, stack)
-            clearance = 0.16
-
-        via_d, via_h = max(via_d, stack.via_diameter), max(via_h, stack.via_drill)
-        width, clearance = max(width, stack.track_min), max(clearance, floor_clear)
-        if dp_w is not None:
-            dp_w = max(dp_w, stack.track_min)  # a 90 ohm pair on 1.6 mm FR4 wants less than the fab can etch
-        if dp_g is not None:
-            dp_g = max(dp_g, stack.clearance_min)
-        if req.autoroute is not None:
-            autoroute = req.autoroute
-        if req.vias is not None:
-            vias = req.vias
-        if req.layers is not None:
-            layers = tuple(req.layers)
-
-        if cls_name not in classes:
-            classes[cls_name] = CompiledClass(
-                name=cls_name,
-                track_width_mm=width,
-                clearance_mm=clearance,
-                via_diameter_mm=via_d,
-                via_drill_mm=via_h,
-                diff_pair_width_mm=dp_w,
-                diff_pair_gap_mm=dp_g,
-            )
+    def project(patterns: tuple[str, ...], c: Constraint, explicit_match: bool) -> None:
+        if c.group is not None and c.group.kind == "bus":
+            match_group: tuple[str, ...] | None = c.group.members
+            tolerance = c.group.match_mm if c.group.match_mm is not None else 2.0
+        elif c.pair is not None and explicit_match:
+            match_group = patterns
+            tolerance = c.pair.skew_mm.value
         else:
-            c = classes[cls_name]
-            c.track_width_mm = width
-            c.clearance_mm = clearance
-            c.via_diameter_mm = via_d
-            c.via_drill_mm = via_h
-            if dp_w is not None:
-                c.diff_pair_width_mm = dp_w
-                c.diff_pair_gap_mm = dp_g
-        classes[cls_name].patterns.extend(req.nets)
-
-        match_group = None
-        if req.kind == "clock" and len(req.nets) > 1:
-            match_group = req.nets
-        if req.match_mm is not None and len(req.nets) > 1:
-            match_group = req.nets
-        if req.pair:
-            autoroute = "diff_pair"
-
-        max_mm = req.max_mm
-        if max_mm is None and req.kind == "analog":
-            max_mm = 25.0
-        if max_mm is None and req.kind == "switch_node":
-            max_mm = 8.0
-
+            match_group, tolerance = None, 2.0
         compiled_nets.append(
             CompiledNet(
-                patterns=req.nets,
-                class_name=cls_name,
-                autoroute=autoroute,
-                vias=vias,
-                layers=layers,
-                max_length_mm=max_mm,
+                patterns=patterns,
+                class_name=c.class_name,
+                autoroute=c.autoroute,
+                vias=c.via.allowed,
+                layers=c.layers,
+                max_length_mm=c.airwire_max_mm,
                 match_group=match_group,
-                keep_clear_of=req.keep_clear_of,
-                keep_clear_mm=req.keep_clear_mm,
-                kind=req.kind,
-                amps=req.amps if req.kind == "power" else None,
+                keep_clear_of=c.keep_away[0].other if c.keep_away else None,
+                keep_clear_mm=c.keep_away[0].mm if c.keep_away else None,
+                kind=c.kind,
+                amps=c.current.amps if c.kind == "power" and c.current is not None else None,
             )
         )
-        if autoroute is False:
-            skip.extend(req.nets)
+        tolerances.append(tolerance)
+        if c.autoroute is False:
+            skip.extend(patterns)
 
-        if req.keep_clear_of and req.keep_clear_mm:
-            dru.append(
-                DruRule(
-                    name=f"{cls_name.lower()}_away_from_{_slug(req.keep_clear_of)}",
-                    constraint=f"(constraint clearance (min {req.keep_clear_mm}mm))",
-                    condition=(
-                        f"A.NetClass == '{cls_name}' && "
-                        f"B.NetName == '{req.keep_clear_of}'"
-                    ),
-                )
-            )
-        # max_mm is an airwire / cluster budget (pcbc check). Do not
-        # emit a KiCad length rule: the maze path is longer than the
-        # airwire, and Analog nets with different max_mm share one class.
-        if dp_g is not None:
-            dru.append(
-                DruRule(
-                    name=f"{cls_name.lower()}_pair_gap",
-                    constraint=(
-                        f"(constraint diff_pair_gap (min {max(0.1, dp_g - 0.03):.2f}mm) "
-                        f"(opt {dp_g:.2f}mm))"
-                    ),
-                    condition=f"A.NetClass == '{cls_name}'",
-                )
-            )
+    by_req: dict[int, Constraint] = {}
+    for c in cs.constraints:
+        if c.req_index >= 0 and c.req_index not in by_req:
+            by_req[c.req_index] = c
+    for i, req in enumerate(design.netreqs):
+        c = by_req.get(i)
+        if c is None:
+            continue  # every net of this NetReq was claimed by an earlier line (a refusal says so)
+        project(req.nets, c, req.match_mm is not None and len(req.nets) > 1)
+        # The user's literals and the kind as written ("digital"), as today's projection carried them.
+        compiled_nets[-1].kind = req.kind
+        compiled_nets[-1].amps = req.amps if req.kind == "power" else None
+        compiled_nets[-1].max_length_mm = req.max_mm if req.max_mm is not None else c.airwire_max_mm
+    seen = {n for net in compiled_nets for n in net.patterns}
+    for c in cs.constraints:
+        if c.req_index >= 0 or c.net in seen:
+            continue
+        if c.pair is not None:
+            pair = (c.net, c.pair.partner) if c.net < c.pair.partner else (c.pair.partner, c.net)
+            cls = class_by_name.get(c.class_name)
+            patterns = tuple(cls.patterns) if cls is not None and set(cls.patterns) == set(pair) else pair
+            project(patterns, c, True)
+            seen.update(patterns)
+        elif c.group is not None and c.group.kind == "bus" and all(m not in seen for m in c.group.members):
+            project(c.group.members, c, True)
+            seen.update(c.group.members)
 
     region_rects = resolve_regions(board, design.regions)
-    keepouts = [
-        replace(ko, box=resolve_keepout(ko, board, region_rects))
-        for ko in design.keepouts
-    ]
+    keepouts = [replace(ko, box=resolve_keepout(ko, board, region_rects)) for ko in design.keepouts]
 
     krt = {
         "skip_patterns": skip,
@@ -290,17 +170,11 @@ def compile_design(design: Design) -> CompiledJob:
             if n.autoroute == "diff_pair"
         ],
         "length_match": [
-            {"nets": list(n.match_group), "tolerance_mm": next(
-                (r.match_mm or 2.0 for r in design.netreqs if r.nets == n.patterns),
-                2.0,
-            )}
-            for n in compiled_nets
+            {"nets": list(n.match_group), "tolerance_mm": tol}
+            for n, tol in zip(compiled_nets, tolerances)
             if n.match_group
         ],
-        "power_nets": [
-            n
-            for n, _ in board.planes
-        ]
+        "power_nets": [n for n, _ in board.planes]
         + [
             p
             for req in design.netreqs
@@ -308,7 +182,7 @@ def compile_design(design: Design) -> CompiledJob:
             for p in req.nets
             if p not in {a for a, _ in board.planes}
         ],
-        "sensitive": _sensitive_groups(compiled_nets, classes),
+        "sensitive": _sensitive_groups(compiled_nets, class_by_name),
     }
 
     return CompiledJob(
@@ -321,11 +195,12 @@ def compile_design(design: Design) -> CompiledJob:
         keepouts=keepouts,
         regions=list(design.regions),
         padding=board.padding,
-        classes=list(classes.values()),
+        classes=classes,
         nets=compiled_nets,
-        dru=dru,
+        dru=_dru.rules(cs),
         skip_autoroute_patterns=skip,
         krt=krt,
+        constraints=cs,
     )
 
 
@@ -358,19 +233,16 @@ def _sensitive_groups(
     return ordered
 
 
-def _canary_net(design: Design) -> str | None:
-    """The first net (sorted) with two or more pads: it always carries copper on a routed board."""
-    count: dict[str, int] = {}
-    for inst in design.instances:
-        for pname, net in inst.pins.items():
-            pin = inst.part.pins.get(pname)
-            if pin and net:
-                count[net] = count.get(net, 0) + len(pin.pads)
-    for net in sorted(count):
-        if count[net] >= 2 and "'" not in net:
-            return net
-    return None
-
-
-def _slug(s: str) -> str:
-    return "".join(ch.lower() if ch.isalnum() else "_" for ch in s).strip("_")
+__all__ = [
+    "CompiledClass",
+    "CompiledJob",
+    "CompiledNet",
+    "Constraint",
+    "ConstraintSet",
+    "Derived",
+    "DruRule",
+    "RuleArea",
+    "Source",
+    "compile_constraints",
+    "compile_design",
+]

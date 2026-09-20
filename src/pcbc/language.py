@@ -7,6 +7,12 @@ Schematic: SchRegion, SchPlace (CSS body, or pin=/to=/gap= attach).
 
 from __future__ import annotations
 
+import ast
+import difflib
+import inspect
+import re
+import sys
+from collections.abc import Sequence
 from pathlib import Path
 
 from .circuit import check_design, load_part
@@ -20,10 +26,15 @@ from .css import (
 )
 from .model import (
     BoardSpec,
+    BusReq,
+    ChainReq,
     Design,
+    GuardReq,
+    IsolationReq,
     KeepoutSpec,
     Net,
     NetReqSpec,
+    PairReq,
     Part,
     Pin,
     PlaceSpec,
@@ -33,6 +44,7 @@ from .model import (
 
 _current: Design | None = None
 _board_dir: Path | None = None
+_board_path: Path | None = None  # the board file being loaded: constraint lines cite their line in it
 
 
 def _doc() -> Design:
@@ -43,9 +55,19 @@ def _doc() -> Design:
 
 
 def reset() -> None:
-    global _current, _board_dir
+    global _current, _board_dir, _board_path
     _current = Design()
     _board_dir = None
+    _board_path = None
+
+
+def _line() -> int:
+    """The board.py line of the constructor call two frames up, when that frame is the board being
+    loaded; 0 otherwise (a call from Python). Deterministic: it is a property of the file."""
+    frame = sys._getframe(2)
+    if _board_path is not None and frame.f_code.co_filename == str(_board_path):
+        return int(frame.f_lineno)
+    return 0
 
 
 def _register_net(net: Net) -> Net:
@@ -360,30 +382,188 @@ def SchPlace(
     return spec
 
 
-def NetReq(*nets: str, kind: str, **kwargs) -> NetReqSpec:
+def NetReq(
+    *nets: str,
+    kind: str = "generic",
+    z_diff_ohm: float | None = None,
+    z_se_ohm: float | None = None,
+    volts: float | None = None,
+    amps: float | None = None,
+    temp_rise_c: float = 10.0,
+    max_mm: float | None = None,
+    length_mm: float | None = None,
+    match_mm: float | None = None,
+    uncoupled_mm: float | None = None,
+    pair: bool = False,
+    vias: bool | None = None,
+    vias_max: int | None = None,
+    layers: Sequence[str] | None = None,
+    reference: str | None = None,
+    keep_clear_of: str | Sequence[str] | None = None,
+    keep_clear_mm: float | None = None,
+    clock: str | None = None,
+    pf_max: float | None = None,
+    loop_mm2: float | None = None,
+    autoroute: bool | str | None = None,
+    class_name: str | None = None,
+) -> NetReqSpec:
+    """What a net needs (docs/r1-design.md section D): a preset `kind` plus the numbers the board
+    overrides. No `**kwargs`: an unknown keyword is a TypeError at load and `pcbc check` names the
+    line and the nearest keyword; a keyword the kind does not use is a `check` refusal."""
     if not nets:
         raise ValueError("NetReq needs at least one net or glob")
-    layers = kwargs.get("layers")
+    if isinstance(keep_clear_of, str):
+        keep = (keep_clear_of,)
+    else:
+        keep = tuple(str(k) for k in keep_clear_of) if keep_clear_of is not None else ()
     spec = NetReqSpec(
         nets=tuple(str(n) for n in nets),
         kind=str(kind),
-        z_diff_ohm=kwargs.get("z_diff_ohm"),
-        z_se_ohm=kwargs.get("z_se_ohm"),
-        volts=kwargs.get("volts"),
-        amps=kwargs.get("amps"),
-        temp_rise_c=float(kwargs.get("temp_rise_c", 10)),
-        max_mm=kwargs.get("max_mm"),
-        match_mm=kwargs.get("match_mm"),
-        pair=bool(kwargs.get("pair", False)),
-        vias=kwargs.get("vias"),
+        z_diff_ohm=z_diff_ohm,
+        z_se_ohm=z_se_ohm,
+        volts=volts,
+        amps=amps,
+        temp_rise_c=float(temp_rise_c),
+        max_mm=max_mm,
+        match_mm=match_mm,
+        pair=bool(pair),
+        vias=vias,
         layers=tuple(layers) if layers is not None else None,
-        keep_clear_of=kwargs.get("keep_clear_of"),
-        keep_clear_mm=kwargs.get("keep_clear_mm"),
-        autoroute=kwargs.get("autoroute"),
-        class_name=kwargs.get("class_name"),
+        keep_clear_of=keep,
+        keep_clear_mm=keep_clear_mm,
+        autoroute=autoroute,
+        class_name=class_name,
+        length_mm=length_mm,
+        uncoupled_mm=uncoupled_mm,
+        vias_max=vias_max,
+        reference=reference,
+        clock=clock,
+        pf_max=pf_max,
+        loop_mm2=loop_mm2,
+        line=_line(),
     )
     _doc().netreqs.append(spec)
     return spec
+
+
+def Pair(
+    p: str,
+    n: str,
+    *,
+    z_diff_ohm: float = 90.0,
+    match_mm: float = 0.5,
+    uncoupled_mm: float = 2.0,
+    gap_mm: float | None = None,
+    layers: Sequence[str] | None = None,
+    reference: str | None = None,
+) -> PairReq:
+    """A differential pair: the explicit form of `NetReq(kind="usb_hs")`, or its override
+    (only z_diff_ohm, match_mm, uncoupled_mm, gap_mm, layers, reference)."""
+    spec = PairReq(
+        p=str(p),
+        n=str(n),
+        z_diff_ohm=float(z_diff_ohm),
+        match_mm=float(match_mm),
+        uncoupled_mm=float(uncoupled_mm),
+        gap_mm=float(gap_mm) if gap_mm is not None else None,
+        layers=tuple(layers) if layers is not None else None,
+        reference=reference,
+        line=_line(),
+    )
+    _doc().pairs.append(spec)
+    return spec
+
+
+def Bus(*nets: str, match_mm: float, clock: str | None = None, length_mm: float | None = None) -> BusReq:
+    """Nets routed as a ribbon and length-matched within `match_mm` (to `clock` when named)."""
+    if len(nets) < 2:
+        raise ValueError("Bus needs at least two nets")
+    spec = BusReq(
+        nets=tuple(str(n) for n in nets),
+        match_mm=float(match_mm),
+        clock=str(clock) if clock is not None else None,
+        length_mm=float(length_mm) if length_mm is not None else None,
+        line=_line(),
+    )
+    _doc().buses.append(spec)
+    return spec
+
+
+def Chain(net: str, *pads: str) -> ChainReq:
+    """The feed order of a net's pads, `"REF.PIN"` as `Place(to=)` takes them: cap before pin."""
+    if len(pads) < 2:
+        raise ValueError(f'Chain({net!r}) needs at least two "REF.PIN" pads')
+    for pad in pads:
+        if "." not in str(pad):
+            raise ValueError(f"Chain({net!r}): {pad!r}: write REF.PIN, e.g. U1.VIN")
+    spec = ChainReq(net=str(net), pads=tuple(str(p) for p in pads), line=_line())
+    _doc().chains.append(spec)
+    return spec
+
+
+def Isolation(
+    a: str,
+    b: str,
+    *,
+    volts: float,
+    slot: bool = False,
+    across: Sequence[str] = (),
+    reinforced: bool = False,
+) -> IsolationReq:
+    """An isolation barrier between two `Region`s; `across` names the parts that span it."""
+    spec = IsolationReq(
+        a=str(a),
+        b=str(b),
+        volts=float(volts),
+        slot=bool(slot),
+        across=tuple(str(r) for r in across),
+        reinforced=bool(reinforced),
+        line=_line(),
+    )
+    _doc().isolations.append(spec)
+    return spec
+
+
+def Guard(net: str, *, stitch_mm: float = 2.5, ground: str = "GND") -> GuardReq:
+    """A stitched ground guard around a net (recorded in R1; the router pattern is R2)."""
+    spec = GuardReq(net=str(net), stitch_mm=float(stitch_mm), ground=str(ground), line=_line())
+    _doc().guards.append(spec)
+    return spec
+
+
+_CONSTRUCTORS: dict[str, object] = {}
+
+
+def _explain_type_error(exc: TypeError, path: Path) -> str | None:
+    """`NetReq("VBUS") line 144: unexpected keyword 'amp'; did you mean amps=?` for a bad keyword on
+    one of the board constructors; None for any other TypeError (re-raised by the caller)."""
+    m = re.match(r"^(\w+)\(\) got an unexpected keyword argument '(\w+)'", str(exc))
+    if not m:
+        return None
+    name, kw = m.group(1), m.group(2)
+    fn = _CONSTRUCTORS.get(name)
+    if fn is None:
+        return None
+    lineno = 0
+    tb = exc.__traceback__
+    while tb is not None:
+        if tb.tb_frame.f_code.co_filename == str(path):
+            lineno = tb.tb_lineno
+        tb = tb.tb_next
+    first = ""
+    try:
+        tree = ast.parse(path.read_text(), str(path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and getattr(node.func, "id", None) == name and node.lineno == lineno:
+                if node.args and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str):
+                    first = f'"{node.args[0].value}"'
+                break
+    except (SyntaxError, OSError):
+        pass
+    params = [p for p in inspect.signature(fn).parameters if p not in ("nets", "pads")]  # type: ignore[arg-type]
+    close = difflib.get_close_matches(kw, params, n=1)
+    hint = f"did you mean {close[0]}=?" if close else "it takes " + ", ".join(f"{p}=" for p in params)
+    return f"{name}({first}) line {lineno}: unexpected keyword '{kw}'; {hint}"
 
 
 def _generic(
@@ -530,16 +710,22 @@ def load(path: str | Path) -> Part:
 
 def load_board(path: str | Path) -> Design:
     """Execute a board.py and return the collected design."""
-    global _board_dir
+    global _board_dir, _board_path
     path = Path(path).resolve()
     reset()
     _board_dir = path.parent
+    _board_path = path
     ns = {
         "Board": Board,
         "Place": Place,
         "Keepout": Keepout,
         "Region": Region,
         "NetReq": NetReq,
+        "Pair": Pair,
+        "Bus": Bus,
+        "Chain": Chain,
+        "Isolation": Isolation,
+        "Guard": Guard,
         "AUTO": AUTO,
         "Net": Net_,
         "Power": Power,
@@ -566,7 +752,13 @@ def check_board(path: str | Path, pcb: bool = True) -> list[str]:
     Place()/SchPlace(), and a SchPlace that names a pin or part that is not
     there or hangs a part off a pin it does not share a net with. The
     schematic loop passes ``pcb=False``: no Place() needed to draw a sheet."""
-    design = load_board(path)
+    try:
+        design = load_board(path)
+    except TypeError as exc:
+        msg = _explain_type_error(exc, Path(path).resolve())
+        if msg is None:
+            raise
+        return [msg]
     fails = check_design(design, pcb=pcb)
     if pcb:
         from .pcb_place import validate
@@ -583,3 +775,6 @@ def check_board(path: str | Path, pcb: bool = True) -> list[str]:
     except ValueError as exc:
         fails.append(f"schematic: {exc}")
     return fails
+
+
+_CONSTRUCTORS.update({"NetReq": NetReq, "Pair": Pair, "Bus": Bus, "Chain": Chain, "Isolation": Isolation, "Guard": Guard})

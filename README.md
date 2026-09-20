@@ -176,6 +176,89 @@ The AI never draws a track. The route stage compiles `NetReq` into an ordered KR
 
 What KRT taught the tool is in `docs/copper-plan.md`. The plan for pcbc's own constraint-first router, with the requirements every routing practice imposes and what KiCad 10 can enforce as rules, is `docs/router-plan.md`.
 
+### Constraints
+
+The AI never types a width, a clearance or a pair gap. It states intent, one line per net or group, and `constraints.py` turns the line into numbers from the stackup (`stackup.py`: JLC's own dielectrics, Hammerstad-Jensen / Wadell / Ghione-Naldi impedance, IPC-2152 with the IPC-2221 floor, IPC-2221B Table 6-1 and IEC 60664-1 for voltage). The same numbers are enforced three times with no second copy: at placement before any copper exists (`route_checks.py`), in the router's plan, and in KiCad's own rule file (`dru.py`), so the arbiter judges exactly what the router obeyed. Every formula, its reference and its calibration against JLC's published rows is in `docs/constraints.md`; the design is `docs/r1-design.md`.
+
+```python
+NetReq("VBUS", "3V3", "GND", kind="power", volts=5, amps=1)        # width, vias per change, clearance row
+NetReq("HV+", "HV-", kind="power", volts=300)                       # clearance and creepage rows
+NetReq("SW", kind="switch_node")                                    # one layer, no vias, hot loop budget
+NetReq("FB", kind="feedback", keep_clear_of="SW")                   # far from SW, no vias, one layer
+NetReq("AIN0", "AIN1", kind="analog", keep_clear_of="SW", keep_clear_mm=3)
+NetReq("USB_DP", "USB_DN", kind="usb_hs")                           # 90 ohm pair, skew 0.5, uncoupled 2
+NetReq("SCK", "MOSI", "MISO", kind="spi", clock="SCK")              # matched to the clock
+NetReq("SDA", "SCL", kind="i2c", pf_max=400)                        # length from capacitance
+NetReq("SENSE+", "SENSE-", kind="sense")                            # Kelvin pair: same layer, matched
+Pair("USB_DP", "USB_DN", z_diff_ohm=90, match_mm=0.5)               # explicit form of the preset
+Bus("D0", "D1", "D2", "D3", match_mm=1.0, clock="CLK")
+Chain("VDDA", "J2.1", "C4.1", "U1.12")                              # feed order: cap before pin
+Isolation("primary", "secondary", volts=250, across=("U7",), slot=True)  # two Regions, the isolators that span them
+Guard("AIN0", stitch_mm=2.5)
+```
+
+Kinds: `generic` (`digital`, `default`), `power`, `analog`, `switch_node`, `clock`, `usb_hs`, `spi`, `i2c`, `sense`, `feedback`. A kwarg a kind does not use, an unknown kwarg (`amp=` for `amps=`), an unknown kind, a `Chain` pad off its net, a `Bus` clock outside the bus, an `Isolation` side that is not a `Region` or a part on neither side: each is a `pcbc check` failure naming the `board.py` line. Nothing is dropped silently, and a later `NetReq` never overwrites an earlier class's numbers (it gets `Power_2`, and the report says so).
+
+`pcbc check board.py --constraints` prints, after the check line, every number a line became, one per line with its source, sorted by net; `--json` prints the same `ConstraintSet` as a document; `pcbc pcb --constraints` prints them after the moves; `pcbc build` carries them in the `check` step. Node:
+
+```
+USB_DP: pair with USB_DN, 0.2291 mm wide, gap 0.15 mm on F.Cu over In1.Cu (GND): 90 ohm (hj_coupled_microstrip x 0.85 JLC04161H-7628; JLC row 0.2332/0.15; target 90 +-15 %; NetReq line 143)
+USB_DP: clearance 0.18 mm (class_floor hole_clearance 0.25 - ring 0.075 + 0.005)
+USB_DP: via 0.35/0.2 mm (stackup jlcpcb_4l_1oz), at most 2 (preset usb_hs) [soft: warning in R1]
+USB_DP: skew 0.5 mm (preset usb_hs; TI usb_layout_basics) [soft: warning in R1]
+USB_DP: uncoupled 2 mm (preset usb_hs; TI usb_layout_basics) [soft: warning in R1]
+USB_DP: length none (give length_mm=)
+VBUS: width 0.4 mm (pcbc_floor amps >= 0.2; ipc2221_ext 1 A 10 C 1 oz 0.300; ipc2152_fit x board 1.099 x plane 0.430 at 0.2104 mm In1.Cu 0.134)
+VBUS: clearance 0.2 mm (preset power; ipc2221_6_1 row 0-15 V B2 0.1)
+VBUS: via 0.8/0.4 mm (preset power), 2 per layer change (via_barrel 0.4/0.018 mm 0.871 A at 10 C) [report only in R1]
+T_DIV: width 0.2 mm (preset analog)
+T_DIV: no vias (preset analog)
+T_DIV: airwire 25 mm (preset analog)
+T_DIV: keep_clear_of none
+T_DIV: spacing 5W (preset analog)
+classes: Default 0.16/0.18, USB 0.2291/0.18 pair 0.2291/0.15, Power 0.4/0.2 via 0.8/0.4, Analog 0.2/0.2 via 0.6/0.3
+rules: 5 written (2 error, 3 soft), canary on net 3V3
+```
+
+A number with no standard behind it says `pcbc default`; a formula off its calibrated rows says `uncalibrated` or `formula only`; a 2-layer USB pair that cannot reach 90 ohm says so (`USB_DP/USB_DN: 90 ohm needs 0.7764 mm members at gap 0.15 on jlcpcb_2l_1oz (formula only); pair written at the fab floor 0.127/0.127 = 140.1 ohm; fine for USB full speed, use Board(stackup="jlcpcb_4l_1oz") for high speed`) and is not a failure. `[soft: warning in R1]` marks a rule KiCad checks as a warning: `track_width`, `skew`, `via_count` budgets, `diff_pair_uncoupled` and preset lengths are counted by the copper bar and pinned per example, not gated, until the router can hold them (`docs/r1-design.md` H.3). Promotion: a soft rule that hits zero on the four examples and the DS2 Addon is switched to an error in the same PR that shows the zeros.
+
+| Rule | Test |
+|---|---|
+| Every formula reproduces its reference: H&J microstrip with the thickness factor (55.165 ohm at JLC's 7628 row, as KiCad), coupled H&J even/odd, Wadell stripline (and the exact conformal map at t = 0), Ghione-Naldi CPWG, IPC-2152 (chart fit, board and plane modifiers), the via barrel, IPC-2221B 6-1, IEC 60664-1 F.1/F.2/F.5, I2C length from capacitance; 26 vectors with their tolerances | `test_stackup.py::test_vector_1_hj_textbook_alumina_line` … `test_vector_26_existing_pins_unchanged` |
+| The stackups are JLC's own (7628, 3313, 2116, 1080, the 2-layer core), by name and JLC code, and the fab limits are unchanged; the bias is fitted to JLC's published rows and printed on every number it touches | `test_stackup.py::test_the_five_stackups_and_their_jlc_codes`, `test_the_bias_and_the_published_rows`, `test_the_fab_limits_are_todays_and_jlcs_own_are_for_the_report` |
+| A pair the stackup cannot reach is clamped to the fab floor, `controlled=False`, and the report says so instead of printing 90 ohm | `test_stackup.py::test_vector_10_the_pair_fit_clamp_on_two_layers`, `test_constraints.py::test_c3_usb_keeps_its_two_layer_pair_and_its_report_stops_lying` |
+| The five boards keep today's classes, nets and router plan byte for byte; node's USB pair is the one change (0.2291 / 0.15 on JLC04161H-7628) | `test_constraints.py::test_the_five_boards_keep_todays_classes_nets_and_krt`, `test_to_dict_round_trips_identically_on_two_compiles` |
+| Every kind compiles on two and four layers and each number's line is pinned with its source; node's, buck's and the DS2 Addon's lines are pinned | `test_constraints.py::test_every_kind_compiles_on_two_layers_and_its_lines_are_pinned`, `test_every_kind_compiles_on_four_layers_and_its_lines_are_pinned`, `test_node_lines_are_pinned`, `test_buck_lines_are_pinned`, `test_ds2_addon_lines_are_pinned` |
+| An unknown kwarg is refused with a did-you-mean, a kind-foreign kwarg with the list it takes, an unknown kind with the known ones, each citing the line; every refusal of a `Pair`, `Bus`, `Chain`, `Isolation` line is pinned | `test_constraints.py::test_an_unknown_kwarg_is_refused_with_the_did_you_mean_line`, `test_a_kind_foreign_kwarg_and_an_unknown_kind_are_refused_citing_the_line`, `test_every_refusal_of_a4_is_pinned`, `test_chain_on_the_ds2_addon_validates_its_pads_against_the_net`, `test_isolation_refusals_name_the_part_and_the_short` |
+| `volts=48` gets the 0.6 mm IPC-2221B row and no creepage rule; `volts=250` gets 1.25 mm and 2.5 mm creepage; a `Pair` overrides only its own fields and says so | `test_constraints.py::test_a_netreq_at_48_v_gets_0_6_and_no_creepage_and_250_v_gets_1_25_and_2_5`, `test_pair_bus_chain_and_guard_load_validate_and_override_never_silently` |
+| A controlled pair on four layers wants its reference plane declared (`Board(planes=[("GND", "In1.Cu")])`) or `check` refuses | `test_constraints.py::test_a_controlled_pair_on_four_layers_wants_its_plane_declared` |
+| `pcbc check --constraints` prints every number with its source after the check line; `--json` is the `ConstraintSet`; a refusal exits 1 and a caveat does not; `pcbc pcb --constraints` and the build's check step carry the same lines | `test_cli.py::test_check_constraints_prints_every_number_with_its_source`, `test_check_constraints_json_prints_the_constraintset_with_its_keys`, `test_check_constraints_exit_code_is_checks_and_a_caveat_is_not_a_failure`, `test_pcb_constraints_prints_the_lines_and_json_carries_the_constraintset`, `test_build_check_step_carries_the_constraint_lines` |
+| E.1–E.2 The geometry rules (`track_segment_length (min 0.2mm)`, `track_angle (min 135)`, no unit) are warnings on every board | `test_copper_rules.py::test_pcbc_writes_the_geometry_rules_and_a_canary_that_must_fire`, `test_dru.py` |
+| E.3 Every class wider than the fab floor gets `track_width (min)` by `hasNetclass`, a warning (soft) | `test_dru.py` |
+| E.4 Every keep-away is a `clearance (min)` between the class and the other net, a footprint's own pads exempt | `test_dru.py` |
+| E.5 Voltage clearance is the class row in `.kicad_pro` (`max(kind, IPC-2221B 6-1)`), never a duplicate rule | `test_constraints.py::test_a_netreq_at_48_v_gets_0_6_and_no_creepage_and_250_v_gets_1_25_and_2_5`, `test_stackup.py::test_vector_22_ipc2221_table_6_1_clearance`, `test_dru.py` |
+| E.6 A class at 60 V or more gets `creepage (min)` against every other class | `test_dru.py` |
+| E.7 `length_mm=` and the I2C budget become `length (max)` per net, an error; `max_mm` never does | `test_dru.py` |
+| E.8 Every pair and bus gets `skew (max)` over its members, a warning (soft) | `test_dru.py` |
+| E.9 Every no-via net gets `via_count (max 0)`, an error | `test_dru.py` |
+| E.10 A via budget (`usb_hs`, `clock`) is `via_count (max n)`, a warning (soft) | `test_dru.py` |
+| E.11 Every pair gets `diff_pair_gap (min/opt)` by `hasNetclass` | `test_constraints.py::test_the_dru_stub_rebuilds_todays_rules`, `test_dru.py` |
+| E.12 Every pair gets `diff_pair_uncoupled (max)`, a warning (soft) | `test_dru.py` |
+| E.13–E.14 An `Isolation` writes `clearance` and `creepage` between the two sides' nets (no creepage rule with `slot=True`: the slot is the path) | `test_dru.py` |
+| E.15 An `Isolation` writes a rule area `ISO_{a}_{b}` over the corridor with `disallow track via zone`, and the zone is in the placed board | `test_constraints.py::test_isolation_sides_come_from_place_lines_and_the_corridor_is_a_rule_area`, `test_dru.py` |
+| E.16 A footprint's own pads are held to the fab floor, after every clearance rule so it wins | `test_copper_rules.py::test_design_rules_exempt_a_footprints_own_pads_down_to_the_floor` |
+| E.17 The canary (`length (max 0.001mm)` on one net) is last and must fire, or the gate fails; `validate` refuses `(min 135deg)`, an unknown constraint, a duplicate name before any write | `test_copper_rules.py::test_pcbc_writes_the_geometry_rules_and_a_canary_that_must_fire`, `test_dru.py` |
+| E.18 `hole_to_hole` is an error in pcbc's project | `test_fanout.py::test_kicad_finds_no_copper_error_in_the_fanned_board` |
+| E.19 Fiducial masks and keepouts are KiCad keepout zones | `test_copper_rules.py::test_fiducials_take_free_corners_and_are_kept_clear` |
+| E: each rule kind written alone into the built DS2 board on a violating fixture, then all together, the canary firing every time; `seed` and `apply` write identical class rows and the examples' `.kicad_pro` files do not change; the gate returns `soft` and `rules` counts and the examples' counts are pinned beside the bar | `test_dru.py` (kicad-marked), `test_examples_fab.py` |
+| F.1 Airwire length and skew: a net over `max_mm` or a pair/bus over `match_mm` is a move before a track exists (c3_usb spread 0.096 mm) | `test_route_checks.py` |
+| F.2 Chain order, no stubs: `Chain` pads lie in order along the feed with nothing between; a third pad off the line on a `usb_hs` or `sense` net asks for the `Chain` line | `test_route_checks.py` |
+| F.3 A wide net (>= 0.4 mm) has a channel of width plus two clearances between its pads on some outer layer, or the pinch is named (node under 3 s) | `test_route_checks.py` |
+| F.4 Decap loops are a `style:` note over 6 mm2; a hot loop over its budget is a move naming the input cap or the low side (buck 3.3 mm2) | `test_route_checks.py` |
+| F.5 A keep-away is measured pad to pad and to courtyards, a footprint's own pads exempt (buck FB to the boot cap: 1.84 mm) | `test_route_checks.py` |
+| F.6 A controlled net's pads sit over its reference plane, outside any keepout that forbids copper; on 2L the pour is the reference | `test_constraints.py::test_a_controlled_pair_on_four_layers_wants_its_plane_declared`, `test_route_checks.py` |
+| F.7 An `Isolation`'s Regions are at least clearance and creepage apart along one axis, every part on its side, an `across` part spanning the gap; the rule area matches the placed gap | `test_route_checks.py` |
+
 Blinky is a 40×25 mm 2-layer LED + resistor. `pcbc build` writes:
 
 - `layout/blinky/layout.kicad_pcb` — seed

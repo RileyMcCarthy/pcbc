@@ -46,6 +46,7 @@ jobs:
           PCBC_REQUIRE_KRT: "1"
       - name: Produce blinky KiCad project + JLC package
         run: |
+          pcbc check examples/blinky/blinky.py --constraints
           pcbc build examples/blinky/blinky.py --force
           test -f examples/blinky/layout/blinky/layout.kicad_pcb
           test -f examples/blinky/layout/blinky/schematic.kicad_sch
@@ -54,7 +55,7 @@ jobs:
           grep -q C21190 examples/blinky/layout/blinky/fab/bom.csv
       - name: c3_usb check + place + route + fab
         run: |
-          pcbc check examples/c3_usb/c3_usb.py
+          pcbc check examples/c3_usb/c3_usb.py --constraints
           pcbc pcb examples/c3_usb/c3_usb.py
           pcbc build examples/c3_usb/c3_usb.py --force
           test -f examples/c3_usb/layout/c3_usb/routed/layout.kicad_pcb
@@ -66,11 +67,12 @@ jobs:
           test -f examples/c3_usb/layout/c3_usb/review/index.html
       - name: buck schematic + copper (2 layers, switch node on one layer)
         run: |
-          pcbc check examples/buck/buck.py
+          pcbc check examples/buck/buck.py --constraints
           pcbc sch examples/buck/buck.py
           pcbc build examples/buck/buck.py --force
       - name: node schematic + copper (31 parts, 4 layers, planes)
         run: |
+          pcbc check examples/node/node.py --constraints
           pcbc sch examples/node/node.py
           pcbc pcb examples/node/node.py
           pcbc build examples/node/node.py --force

@@ -15,14 +15,19 @@ Every stage prints a numbered list of moves; you edit `board.py` until the list 
 ```bash
 pcbc search "TPS54202"            # LCSC hits: id, package, stock, price, basic/extended
 pcbc fetch C191884 --into components   # → components/<Mfr>/<MPN>/{part.py, .kicad_sym, .kicad_mod, .step}, scored
-pcbc check board.py               # loads it: unbound pins, missing lands, bad parts, bad relations
+pcbc check board.py               # loads it: unbound pins, missing lands, bad parts, bad relations, a NetReq line that does not compile
+pcbc check board.py --constraints # every number a NetReq/Pair/Bus line became, one per line with its source
 pcbc sch board.py                 # draws the sheet, proves the netlist with kicad-cli, ERC, lists moves
-pcbc pcb board.py                 # places the copper, lists moves
+pcbc pcb board.py                 # places the copper, lists moves (--constraints adds the numbers it was checked against)
 pcbc build board.py --force       # check → seed → sch → place → route (KRT) → copper gate → fab
 pcbc review board.py              # one HTML page: schematic, copper, 3D, BOM, notes
 ```
 
 Run them in that order. Do not skip `check`: it names the mistake before anything is drawn.
+**Read `pcbc check --constraints` before placing**: it prints the width, clearance, via,
+pair geometry, keep-away and loop budget every net got, with the formula and the standard
+behind each, so you place knowing what the copper will need (a 0.78 mm VIN track wants a
+channel; an analog net has no vias and one layer; a pair has a reference plane).
 `pcbc sch` and `pcbc pcb` are the inner loops; `--json` on either gives every part's pose.
 
 ## Parts
@@ -46,10 +51,34 @@ Run them in that order. Do not skip `check`: it names the mistake before anythin
    `MCU("U1", **{"3V3": V33}, GND=GND, EN=EN, ...)`. Every non-optional pin gets a net.
 3. `Board(width=60, height=45, layers=4, stackup="jlcpcb_4l_1oz", planes=[("GND", "In1.Cu"), ("3V3", "In2.Cu")])`.
    The stackup is the one source of the fab's limits (track, clearance, vias, rings, holes).
-4. Intent: `NetReq("VBUS", "3V3", "GND", kind="power", volts=5, amps=1)` sets track widths;
-   `kind="switch_node"` and `kind="analog"` route first, on one layer, without vias, and are
-   held to `max_mm`; `NetReq("USB_DP", "USB_DN", kind="usb_hs", z_diff_ohm=90, pair=True)`
-   routes as a pair.
+4. Intent, one line per net or group. You say what the net is; the tool derives the numbers
+   from the stackup and the standards and prints them (`pcbc check --constraints`):
+
+   ```python
+   NetReq("VBUS", "3V3", "GND", kind="power", volts=5, amps=1)        # width, vias per change, clearance row
+   NetReq("HV+", "HV-", kind="power", volts=300)                       # clearance and creepage rows
+   NetReq("SW", kind="switch_node")                                    # one layer, no vias, hot loop budget
+   NetReq("FB", kind="feedback", keep_clear_of="SW")                   # far from SW, no vias, one layer
+   NetReq("AIN0", "AIN1", kind="analog", keep_clear_of="SW", keep_clear_mm=3)
+   NetReq("USB_DP", "USB_DN", kind="usb_hs")                           # 90 ohm pair, skew 0.5, uncoupled 2
+   NetReq("SCK", "MOSI", "MISO", kind="spi", clock="SCK")              # matched to the clock
+   NetReq("SDA", "SCL", kind="i2c", pf_max=400)                        # length from capacitance
+   NetReq("SENSE+", "SENSE-", kind="sense")                            # Kelvin pair: same layer, matched
+   Pair("USB_DP", "USB_DN", z_diff_ohm=90, match_mm=0.5)               # explicit form of the preset
+   Bus("D0", "D1", "D2", "D3", match_mm=1.0, clock="CLK")
+   Chain("VDDA", "J2.1", "C4.1", "U1.12")                              # feed order: cap before pin
+   Isolation("primary", "secondary", volts=250, across=("U7",), slot=True)  # two Regions, the isolators that span them
+   Guard("AIN0", stitch_mm=2.5)
+   ```
+
+   Kinds: `generic`, `power`, `analog`, `switch_node`, `clock`, `usb_hs`, `spi`, `i2c`,
+   `sense`, `feedback`. **Never type a number the report can derive**: no widths, clearances,
+   gaps, via sizes or lengths. Give what only you know (`amps=`, `volts=`, `keep_clear_of=`,
+   `clock=`, `pf_max=`, a `Chain` order, an `Isolation` voltage) and read the number back. A
+   kwarg the kind does not take, a typo (`amp=`), an unknown kind, a `Chain` pad off its net,
+   an `Isolation` side that is not a `Region`: each fails `check` naming the line. Nothing is
+   dropped silently. `max_mm` is an airwire budget for placement, never a KiCad rule;
+   `length_mm=` is the routed-length rule.
 5. Schematic: `SchRegion("mcu", left=, top=, width=, height=)` and `SchPlace(...)`.
 6. Copper: `Place(...)`.
 
@@ -90,11 +119,29 @@ Rules the tool applies, so you do not have to:
 ## Reading the reports
 
 Each line is a move: what collides, and the `Place()`/`SchPlace()` edit that fixes it.
+- `pcbc check --constraints`: one number per line, sorted by net, the source in parentheses:
+  `VBUS: width 0.4 mm (pcbc_floor amps >= 0.2; ipc2221_ext 1 A 10 C 1 oz 0.300; ipc2152_fit ...)`,
+  `USB_DP: pair with USB_DN, 0.2291 mm wide, gap 0.15 mm on F.Cu over In1.Cu (GND): 90 ohm (hj_coupled_microstrip x 0.85 JLC04161H-7628; ...)`.
+  `pcbc default` is a number with no standard behind it; `uncalibrated` / `formula only` is a
+  formula off JLC's published rows; `[soft: warning in R1]` is a rule KiCad reports as a
+  warning, counted by the copper bar; `[report only in R1]` (vias per layer change) is
+  printed and not gated. A caveat is a line, not a failure: a 2-layer USB pair says it cannot
+  reach 90 ohm and what to do (`use Board(stackup="jlcpcb_4l_1oz") for high speed`);
+  `FB: keep_clear_of none; NetReq("FB", kind="analog", keep_clear_of="SW") holds 3 mm` is the
+  hint to write the keep-away. The last lines are `classes: ...` (what the `.kicad_pro` gets)
+  and `rules: N written (E error, S soft), canary on net X` (what the `.kicad_dru` holds).
 - `pcbc sch`: overlaps, wires through text, a part that had to slide far, a symbol boxed in.
   `style:` notes (a supply symbol that had to point down) are legal and not counted.
 - `pcbc pcb`: courtyard overlaps, a part off the board, a part in a fine-pitch row's fanout
   lane, a decoupling cap farther than 2.5 mm (the next one 5 mm; plus the lane on a fine-pitch
-  row), a connector off every edge, copper within 0.3 mm of the edge, a net past its `max_mm`.
+  row), a connector off every edge, copper within 0.3 mm of the edge, a net past its `max_mm`;
+  and, from the constraints, before any copper exists: a net's airwire over its budget, a pair
+  or bus whose members differ by more than `match_mm`, a `Chain` out of order or a stub on a
+  high-speed net, no channel for a wide track (the pinch is named), a hot loop over its
+  budget, a keep-away too close, a controlled pad off its reference plane, an `Isolation`
+  gap too narrow or a part on the wrong side. Every one names refs, pins and the numbers and
+  ends in the `board.py` line to write; a measured loop over the preset becomes a visible
+  `loop_mm2=` on the `NetReq`, never a recorded number.
 - `pcbc build`: the copper gate is KiCad's own DRC with nothing unconnected, plus the pads
   bound exactly as `board.py` says. A routing failure names the net, then one line per
   unreached pad: what is in its corridor, which step put it there, whose part it belongs to,
@@ -106,7 +153,12 @@ The examples stay at zero moves; hold a new board to the same bar before `build`
 
 ## Do not
 
-- Edit a `.kicad_sch`, `.kicad_pcb` or `.kicad_pro` by hand. `pcbc build --force` rewrites them.
+- Edit a `.kicad_sch`, `.kicad_pcb`, `.kicad_pro` or `.kicad_dru` by hand. `pcbc build --force` rewrites them.
+- Type a number the report can derive. A track width, a clearance, a pair gap, a via size, a
+  creepage distance: `NetReq(kind=, amps=, volts=)` and the stackup decide them and
+  `pcbc check --constraints` prints them. If the printed number is wrong, the fix is in
+  `stackup.py` / `constraints.py` with a test vector and its reference, not a literal in
+  `board.py`. `class_name=` and `layers=` are intent; `z_diff_ohm=90` is intent; `0.2291` is not.
 - Decide from a render. Renders are for a human at the end (`pcbc review`); the reports and
   the tests decide. If a report misses something a render shows, that is a missing rule in
   the tool: add the rule and its test, do not hand-place around it.
@@ -117,8 +169,14 @@ The examples stay at zero moves; hold a new board to the same bar before `build`
 ## When you change the tool
 
 - A rule is a test first (`tests/test_rules.py`, `test_pcb_place.py`, `test_copper_rules.py`,
-  `test_route_plan.py`) and a row in the README tables; `docs/copper-plan.md` keeps the
-  seen/now table of what broke and what the tool does about it. Add to it.
+  `test_route_plan.py`, `test_constraints.py`, `test_dru.py`, `test_route_checks.py`) and a
+  row in the README tables; a formula is a vector in `test_stackup.py` with its reference in
+  the assertion message and a row in `docs/constraints.md`; every report message is asserted
+  as an exact string. `docs/copper-plan.md` keeps the seen/now table of what broke and what
+  the tool does about it. Add to it.
+- A number a `NetReq` becomes lives in one place: `constraints.py` derives it, `dru.py` writes
+  the KiCad rule from it, `route_checks.py` checks placement against it, the report prints it.
+  Never add a second copy in a consumer; read `job.constraints.by_net(name)`.
 - `PCBC_REQUIRE_KICAD=1 PCBC_REQUIRE_KRT=1 pytest` must stay green. KRT lives at
   `KRT_HOME` (default `~/Downloads/KiCadRoutingTools`, pinned to `pcbc.route.KRT_SHA`).
 - Everything is deterministic: the same `board.py` gives the same files byte for byte. Keep it so.

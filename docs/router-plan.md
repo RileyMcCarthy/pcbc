@@ -84,17 +84,19 @@ neighbours (crosstalk); serpentine geometry; the copper bar.
 
 Limits (their capabilities page; pcbc's `Stackup` carries the ones in bold, the rest are new):
 
-| item | JLC | pcbc today |
+| item | JLC | pcbc today (after R1, 2026-09-20) |
 |---|---|---|
-| track / space, 1 oz | 0.10 / 0.10 (2L), 0.09 / 0.09 (4L+) | **0.127 / 0.127** (2L), **0.0889** (4L): held at the free rung |
-| track / space, 2 oz | 0.16 (2L), 0.15 (4L+) | not modelled: `copper_oz` exists, limits do not follow it |
-| via hole / diameter | 0.15 / 0.25 min; 0.3 / 0.5 standard | **0.3 / 0.5** (2L), **0.2 / 0.35** (4L) |
-| annular ring | 0.15 min, 0.2 multilayer | **0.1** (2L), **0.075** (4L): to reconcile |
+| track / space, 1 oz | 0.10 / 0.10 (2L), 0.09 / 0.09 (4L+) | **0.127 / 0.127** (2L), **0.0889** (4L): held at the free rung; JLC's own numbers are carried in `JLC_LIMITS` for the report only |
+| track / space, 2 oz | 0.16 (2L), 0.15 (4L+) | in `JLC_LIMITS`; no 2 oz stackup is encoded (`copper_oz` exists, limits do not follow it) |
+| via hole / diameter | 0.15 / 0.25 min; 0.3 / 0.5 standard | **0.3 / 0.5** (2L), **0.2 / 0.35** (4L); `via_plating_mm 0.018` (JLC's "average 18 um") sizes the barrel's ampacity and the vias per layer change (printed, not gated) |
+| annular ring | 0.15 min, 0.2 multilayer | **0.1** (2L), **0.075** (4L): to reconcile (a fab decision, not R1) |
 | via to via (hole to hole) | 0.2 stated; pads 0.45 | **0.5**: JLC's number for pad holes; keep, it is what KiCad's default judged |
 | hole to copper | 0.2 (NPTH), 0.28 PTH-to-track | **0.25** (what KRT holds on its grid) |
 | copper to edge | 0.2 | **0.3** (routing wants the lane) |
 | solder mask bridge | 0.10 (1 oz) | not modelled; KiCad's `solder_mask_bridge` check exists |
 | via-in-pad | filled and capped, 0.15 to 0.55 | refused on passives at fab, allowed on IC pins |
+| dielectrics | the four impedance stackups below, core Dk 4.6 | every stackup carries its stack top to bottom (copper, prepreg, core) with JLC's thickness and Dk; `jlcpcb_4l_1oz` is **JLC04161H-7628** (what JLC builds when no impedance stackup is picked), the other three by their JLC code |
+| impedance | JLC's calculator (Polar-type, mask and etch modelled) | closed forms (H&J, Wadell, Ghione-Naldi) times a per-stackup **fab bias** fitted to JLC's published 50 / 90 / 100 ohm rows: +-3 % on 7628, +-3 % / +-6 % on 1080, interpolated and labelled on 3313 / 2116, `formula only` on 2L and inner layers (`docs/constraints.md`) |
 
 The annular ring row matters: a 0.5/0.3 via has a 0.1 ring, under JLC's stated 0.15 minimum
 for a 2-layer board. Their standard via is nonetheless 0.3/0.5 (they cap the drill, not the
@@ -110,9 +112,11 @@ solder mask Dk 3.8 (0.03 mm above substrate, 0.015 above trace):
 | JLC04161H-2116 | 2116 | 0.1164 mm | 4.16 |
 | JLC04161H-1080 | 1080 | 0.0764 mm | 3.91 |
 
-pcbc's `jlcpcb_4l_1oz` says `h_mm 0.12, er 4.5`, which is none of these. Requirement R-Z1:
-a stackup names its JLC code and carries every dielectric, so microstrip, stripline and
-coplanar widths come from real numbers, and the compile report says which.
+Before R1 pcbc's `jlcpcb_4l_1oz` said `h_mm 0.12, er 4.5`, which is none of these. Requirement
+R-Z1, met in R1: a stackup names its JLC code and carries every dielectric, so microstrip,
+stripline and coplanar widths come from real numbers, and the compile report says which
+(`stackup.py`; node's USB pair moved from 0.1554 / 0.12 to 0.2291 / 0.15 on 7628, JLC's own
+row being 0.2332 / 0.15).
 
 ## 4. Requirements, by practice
 
@@ -246,8 +250,10 @@ Guard("AIN0", stitch_mm=2.5)                              # ground guard around 
 ```
 
 Every preset's expansion is printed by `pcbc check --constraints`, one line per number with its
-source: "USB_DP: 0.19 mm, gap 0.15 mm on F.Cu over In1.Cu, 90.4 ohm (IPC-2141 microstrip,
-JLC04161H-3313)". The AI reads numbers it did not have to know.
+source (as it prints since R1): `USB_DP: pair with USB_DN, 0.2291 mm wide, gap 0.15 mm on F.Cu
+over In1.Cu (GND): 90 ohm (hj_coupled_microstrip x 0.85 JLC04161H-7628; JLC row 0.2332/0.15;
+target 90 +-15 %; NetReq line 143)`. The AI reads numbers it did not have to know. The exact
+signatures, the preset table and every refusal are in `docs/r1-design.md` sections A and D.
 
 ## 6. Architecture
 
@@ -362,7 +368,11 @@ the router obeyed: class clearances and widths (project classes), `creepage` by 
 `diff_pair_gap` / `diff_pair_uncoupled` per pair, `disallow` in rule areas (isolation,
 fiducial masks, keep-aways), `track_segment_length (min 0.2mm)` and `track_angle (min
 135)` for geometry, `hole_to_hole` as an error, and the canary. Severities: everything
-pcbc writes is an error.
+pcbc writes is an error, with R1's stated exception (`r1-design.md` H.3): `track_width`,
+`skew`, via budgets, `diff_pair_uncoupled` and preset lengths are warnings KRT is not held to,
+counted by the copper bar and pinned per example; a kind that hits zero on the four examples
+and the DS2 Addon is promoted to an error in the same PR that shows the zeros, and R4's tuning
+pass promotes the rest.
 
 ### 6.7 Verification beyond KiCad (`verify.py`)
 
@@ -399,6 +409,21 @@ canary in `compile.py`, the examples' bar in `test_examples_fab.py`). The canary
 itself the same day: `track_angle (min 135deg)` had silently disabled every rule on every
 board; `(min 135)` is what KiCad 10 parses.
 
+**R1 landed 2026-09-20**, built to `docs/r1-design.md` in five slices: S1 `stackup.py` (JLC's
+five stackups by code, H&J / Wadell / Ghione-Naldi impedance with the fab bias, IPC-2152 with
+the IPC-2221 floor, the via barrel, IPC-2221B 6-1, IEC 60664-1; 26 pinned vectors), S2
+`constraints.py` and the language (`NetReq` with an exact signature, `Pair`, `Bus`, `Chain`,
+`Isolation`, `Guard`; every number a `Derived` with its source; the five boards' classes and
+nets byte-identical but node's pair), S3 `dru.py` (every rule of section 6.6 KiCad can check,
+`validate` before any write, `project_classes` as the one writer for seed and apply, the gate's
+`soft` counts), S4 `route_checks.py` (airwires and skew, chain order, corridors, loops,
+keep-aways, reference plane, the isolation line, each as a move), S5 `pcbc check --constraints`
+and the docs. Two bugs it found reading the code are in `copper-plan.md`'s table (the silent
+`NetReq` kwarg, the IPC-2141 validity range). Not in R1, named in `r1-design.md` H: return
+vias, plane-split verification, 3W measurement, serpentines, neck-down areas, 2 oz stackups;
+vias per amp and the soft rules are printed and counted, not gated, until the router can hold
+them (R2, R4).
+
 Effort is one person, part time, with the AI doing the typing; each phase ends green on the
 examples and with its rows in the README tables.
 
@@ -406,10 +431,11 @@ examples and with its rows in the README tables.
 `track_segment_length` and `track_angle` rules with the canary; blocking analysis on every
 failure from KRT; `Reason` on copper pcbc writes. Pays off immediately with KRT still routing.
 
-**R1. Constraints and rules (1 week).** `constraints.py` with the presets in section 5, real
-JLC dielectrics, stripline and coplanar formulas calibrated, IPC-2152, the voltage rows;
-`dru.py` writing every rule KiCad can check; `pcbc check --constraints`; route-aware
-placement checks (section 6.3). Tests pin the numbers.
+**R1. Constraints and rules (1 week) — landed 2026-09-20.** `constraints.py` with the presets
+in section 5, real JLC dielectrics, stripline and coplanar formulas calibrated, IPC-2152, the
+voltage rows; `dru.py` writing every rule KiCad can check; `pcbc check --constraints`;
+route-aware placement checks (section 6.3). Tests pin the numbers (`test_stackup.py`,
+`test_constraints.py`, `test_dru.py`, `test_route_checks.py`, `test_cli.py`).
 
 **R2. Patterns (1 to 2 weeks).** Hops, chains, taps, spines, buses as patterns in Python with
 exact geometry checks; KRT routes only what is left; measure the leftover on the six boards.

@@ -94,6 +94,10 @@ The score is what pcbc needs from a library, not taste. `fail` items break the n
 
 `good` ≥ 90, `usable` ≥ 70, else `bad` (and `pcbc score` exits 1). Anything scores — SnapEDA, the KiCad library, a hand-drawn symbol — so two candidates for one chip can be compared before `load()`-ing one. The examples' USB-C receptacle scores `bad`: its symbol numbers the joined pins `A1B12` while the footprint has `A1` and `B12`; the schematic is right, the copper would not be.
 
+## For the AI that designs the next board
+
+`.claude/skills/pcbc/SKILL.md` is the loop in order, the placement vocabulary, how to read each report, and what not to do. Read it before writing a `board.py`; `docs/copper-plan.md` keeps the table of what broke and what the tool does about it now.
+
 ## Install
 
 ```bash

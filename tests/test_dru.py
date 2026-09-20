@@ -557,10 +557,27 @@ def ds2_routed(tmp_path_factory) -> tuple[Path, Path]:
     return board, board.parent / "layout" / "ds2_addon" / "routed" / "layout.kicad_pcb"
 
 
-def _probe(ds2_routed: tuple[Path, Path], tmp_path: Path, name: str, probe_rules: list[DruRule], area: RuleArea) -> dict[str, int]:
-    """Write `probe_rules` (plus the canary) beside a copy of the routed DS2 board that carries the
+@pytest.fixture(scope="module")
+def buck_routed(tmp_path_factory) -> tuple[Path, Path]:
+    """`examples/buck` built to the routed stage once, in a temp copy: a two-layer board with a
+    power, a switch_node and an analog class, so the rule-kind probe runs wherever this repo is
+    checked out (the DS2 Addon lives outside it and skips in CI)."""
+    from pcbc.build import build_job
+
+    work = tmp_path_factory.mktemp("buck")
+    src = Path(__file__).resolve().parent.parent / "examples" / "buck"
+    board = work / "buck.py"
+    board.write_text((src / "buck.py").read_text())
+    shutil.copytree(src / "components", work / "components")
+    result = build_job(board, upto="route", force=True)
+    assert result.get("error") is None, result.get("error")
+    return board, work / "layout" / "buck" / "routed" / "layout.kicad_pcb"
+
+
+def _probe(routed_board: tuple[Path, Path], tmp_path: Path, name: str, probe_rules: list[DruRule], area: RuleArea) -> dict[str, int]:
+    """Write `probe_rules` (plus the canary) beside a copy of a routed board that carries the
     probe rule area, run DRC, return the violation types."""
-    _board_py, routed = ds2_routed
+    _board_py, routed = routed_board
     job = compile_design(load_board(_board_py))
     canary = next(r for r in job.dru if r.name == "pcbc_canary")
     work = tmp_path / name
@@ -577,33 +594,48 @@ def _probe(ds2_routed: tuple[Path, Path], tmp_path: Path, name: str, probe_rules
 
 @pytest.mark.kicad
 @pytest.mark.krt
-def test_each_rule_kind_fires_alone_on_the_routed_ds2_board_and_then_all_together(ds2_routed, tmp_path: Path):
+def _rule_kind_probe(routed_board: tuple[Path, Path], tmp_path: Path, analog: tuple[str, str], area_box: tuple[float, float, float, float]) -> None:
     """Every E row's constraint and condition form, one at a time on a deliberately violating
     fixture, with the canary firing every time (H.7: the probe is the safety net for the rule
     semantics no source states all in one file), then all together."""
-    _board_py, routed = ds2_routed
+    _board_py, routed = routed_board
     copper = copper_by_net(routed.read_text())
     via_net = max(copper, key=lambda n: (copper[n]["via"], n))
     assert copper[via_net]["via"] >= 1
-    # A strip across the middle of the 47 x 25.4 board that the routed copper crosses.
-    area = RuleArea("ISO_left_right", (22.0, 0.0, 25.0, 25.4), ("F&B.Cu",), ("track", "via", "zone"), "probe")
+    a, b = analog
+    area = RuleArea("ISO_left_right", area_box, ("F&B.Cu",), ("track", "via", "zone"), "probe")
     probes = {
-        "length_out_of_range": DruRule("length_ain0", "(constraint length (max 1mm))", "A.NetName == 'AIN0'"),
-        "skew_out_of_range": DruRule("skew_ain0_ain1", "(constraint skew (max 0.01mm))", "A.NetName == 'AIN0' || A.NetName == 'AIN1'", "warning"),
+        "length_out_of_range": DruRule(f"length_{a.lower()}", "(constraint length (max 1mm))", f"A.NetName == '{a}'"),
+        "skew_out_of_range": DruRule("skew_probe", "(constraint skew (max 0.01mm))", f"A.NetName == '{a}' || A.NetName == '{b}'", "warning"),
         "too_many_vias": DruRule(f"novia_{via_net.lower()}", "(constraint via_count (max 0))", f"A.NetName == '{via_net}'"),
-        "creepage": DruRule("creepage_power", "(constraint creepage (min 3mm))", "A.hasNetclass('Power') && !B.hasNetclass('Power')"),
+        "creepage": DruRule("creepage_power", "(constraint creepage (min 3mm))", "A.hasNetclass('Power') && !B.hasNetclass('Power') && B.NetName != ''"),
         "clearance": DruRule("analog_away_from_gnd", "(constraint clearance (min 1mm))", f"A.hasNetclass('Analog') && B.NetName == 'GND' && {NOT_OWN}"),
         "items_not_allowed": DruRule("iso_left_right_area", "(constraint disallow track via zone)", "A.intersectsArea('ISO_left_right')"),
         "track_width": DruRule("width_power", "(constraint track_width (min 1mm))", "A.hasNetclass('Power')"),
     }
     for typ, rule in probes.items():
-        types = _probe(ds2_routed, tmp_path, typ, [rule], area)
+        types = _probe(routed_board, tmp_path, typ, [rule], area)
         assert types.get(typ, 0) > 0, (typ, types)
         assert types.get("length_out_of_range", 0) >= 1
-    together = _probe(ds2_routed, tmp_path, "all", list(probes.values()), area)
+    together = _probe(routed_board, tmp_path, "all", list(probes.values()), area)
     for typ in probes:
         assert together.get(typ, 0) > 0, (typ, together)
-    assert together["length_out_of_range"] == 2, "the canary and the AIN0 length rule"
+    assert together["length_out_of_range"] == 2, "the canary and the length rule"
+
+
+@pytest.mark.kicad
+@pytest.mark.krt
+def test_each_rule_kind_fires_alone_on_an_example_and_then_all_together(buck_routed, tmp_path: Path):
+    """On `examples/buck`, so the probe runs in CI: FB and SW carry the Analog and SwitchNode
+    copper, and the strip crosses the middle of the 40 x 25 board."""
+    _rule_kind_probe(buck_routed, tmp_path, ("FB", "SW"), (19.0, 0.0, 22.0, 25.0))
+
+
+@pytest.mark.kicad
+@pytest.mark.krt
+def test_each_rule_kind_fires_alone_on_the_routed_ds2_board_and_then_all_together(ds2_routed, tmp_path: Path):
+    """The same probe on the real board, when it is on this machine."""
+    _rule_kind_probe(ds2_routed, tmp_path, ("AIN0", "AIN1"), (22.0, 0.0, 25.0, 25.4))
 
 
 @pytest.mark.kicad

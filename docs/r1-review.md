@@ -130,12 +130,12 @@ pins both directions against KiCad itself.
 
 ## Still open after the second pass
 
-- **The DS2-dependent tests skip in CI.** `test_cli.py`, `test_constraints.py`,
-  `test_dru.py` and `test_route_checks.py` each pin something on the MaD DS2 Addon, which
-  lives outside this repo. `test_cli.py::test_check_constraints_on_an_example_prints_every_number_with_its_source`
-  now pins the same acceptance on `examples/buck`, and `test_dru.py`'s rule-kind probes still
-  need the DS2 board; running them everywhere means bringing a two-layer board with an analog
-  kind into `examples/`.
+- **The DS2-dependent tests skip in CI** (closed for the two acceptances). Both named
+  acceptances now run on `examples/buck`, which is a two-layer board with a power, a
+  switch_node and an analog class: `test_cli.py::test_check_constraints_on_an_example_prints_every_number_with_its_source`
+  (S5) and `test_dru.py::test_each_rule_kind_fires_alone_on_an_example_and_then_all_together`
+  (S3's live KiCad probe of every rule kind). The DS2 versions stay as extra coverage when the
+  board is on the machine; what they add is a real 47 mm board with six analog nets.
 - **`width_usb` cannot reach zero.** KRT routes the pair 0.0004 mm under the class the plan
   hands it, so the soft rule always hits. It cannot be promoted until pcbc owns the router
   (R3) or KRT's quantisation is understood; the count is pinned so a change shows.

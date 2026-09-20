@@ -41,11 +41,11 @@ def _ds2(tmp_path: Path) -> Path:
 def _power(net: str) -> list[str]:
     """The DS2 Addon's four power nets share one NetReq (line 95) and so every number."""
     return [
-        f"{net}: width 0.25 mm (pcbc_floor amps < 0.2; ipc2221_ext 0.1 A 10 C 1 oz 0.150; ipc2152_fit x board 1.092 x plane 0.593 at 1.53 mm B.Cu pour 0.003)",
+        f"{net}: width 0.25 mm (pcbc_floor amps < 0.2; ipc2221_ext 0.1 A 10 C 1 oz 0.150; ipc2152_fit x board 1.092 x plane 0.593 at 1.53 mm B.Cu pour 0.003; below 0.274 A the IPC-2152 fit extrapolates)",
         f"{net}: clearance 0.2 mm (preset power; ipc2221_6_1 row 0-15 V B2 0.1)",
         f"{net}: via 0.8/0.4 mm (preset power), 1 per layer change (via_barrel 0.4/0.018 mm 0.871 A at 10 C) [report only in R1]",
         f"{net}: loop 6 mm2 (preset power; decap loop, pcbc default)",
-        f"{net}: layers F.Cu, B.Cu, In1.Cu, In2.Cu (preset power)",
+        f"{net}: layers F.Cu, B.Cu (preset power)",
         f"{net}: spacing 3W (preset power)",
     ]
 
@@ -125,7 +125,7 @@ def test_check_constraints_json_prints_the_constraintset_with_its_keys(tmp_path:
     ], "A.1 Constraint, plus S2's additive req_index"
     assert doc["constraints"][0]["width_mm"] == {
         "value": 0.25, "unit": "mm", "formula": "pcbc_floor", "ref": "amps < 0.2",
-        "note": "ipc2221_ext 0.1 A 10 C 1 oz 0.150; ipc2152_fit x board 1.092 x plane 0.593 at 1.53 mm B.Cu pour 0.003",
+        "note": "ipc2221_ext 0.1 A 10 C 1 oz 0.150; ipc2152_fit x board 1.092 x plane 0.593 at 1.53 mm B.Cu pour 0.003; below 0.274 A the IPC-2152 fit extrapolates",
     }, "A.1: a Derived flattens to {value, unit, formula, ref, note}"
     assert sorted(doc["classes"][0]) == [
         "clearance_mm", "diff_pair_gap_mm", "diff_pair_width_mm", "lane_clearance_mm", "name", "patterns", "track_width_mm", "via_diameter_mm", "via_drill_mm",
@@ -171,7 +171,7 @@ def test_pcb_constraints_prints_the_lines_and_json_carries_the_constraintset(tmp
     lines = constraint_lines(job)
     head = out.index(f"constraints: {len(lines)} lines (what the placement was checked against; pcbc check --constraints prints them alone)")
     assert out[head + 1 :] == [f"  {line}" for line in lines], "S5: `pcbc pcb --constraints` prints the constraints: lines after the moves"
-    assert "VCC: width 0.25 mm (pcbc_floor amps < 0.2; ipc2221_ext 0.05 A 10 C 1 oz 0.150; ipc2152_fit x board 1.092 x plane 0.593 at 1.53 mm B.Cu pour 0.001)" in lines, "D power at 0.05 A: the 0.25 floor"
+    assert "VCC: width 0.25 mm (pcbc_floor amps < 0.2; ipc2221_ext 0.05 A 10 C 1 oz 0.150; ipc2152_fit x board 1.092 x plane 0.593 at 1.53 mm B.Cu pour 0.001; below 0.274 A the IPC-2152 fit extrapolates)" in lines, "D power at 0.05 A: the 0.25 floor"
     assert lines[-1].endswith(", canary on net LED"), "E.17: blinky's canary net"
     assert main(["pcb", str(board), "--json"]) == 0
     doc = json.loads(capsys.readouterr().out)

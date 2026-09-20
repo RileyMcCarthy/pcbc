@@ -172,7 +172,7 @@ def rules(cs: ConstraintSet) -> list[DruRule]:
         if cls.diff_pair_gap_mm is None:
             continue
         g = cls.diff_pair_gap_mm
-        out.append(DruRule(f"{slug(cls.name)}_pair_gap", f"(constraint diff_pair_gap (min {max(0.1, g - 0.03):.2f}mm) (opt {g:.2f}mm))", f"A.hasNetclass('{cls.name}')"))
+        out.append(DruRule(f"{slug(cls.name)}_pair_gap", f"(constraint diff_pair_gap (min {_mm(max(0.1, round(g - 0.03, 4)))}) (opt {_mm(g)}))", f"A.hasNetclass('{cls.name}')"))
         uncoupled = [c.pair.uncoupled_mm.value for c in by_class.get(cls.name, []) if c.pair is not None]
         if uncoupled:
             out.append(DruRule(f"uncoupled_{slug(cls.name)}", f"(constraint diff_pair_uncoupled (max {_mm(max(uncoupled))}))", f"A.hasNetclass('{cls.name}')", "warning"))
@@ -213,6 +213,16 @@ _VALUES = re.compile(r"\((min|max|opt) ([^()]*)\)")
 _ANGLE_UNIT = re.compile(r"track_angle \(min [0-9.]+[A-Za-z]")
 
 
+def _numbers(constraint: str) -> list[tuple[str, float]]:
+    out: list[tuple[str, float]] = []
+    for which, value in _VALUES.findall(constraint):
+        try:
+            out.append((which, float(value.strip().rstrip("mm").strip() or "0")))
+        except ValueError:
+            continue
+    return out
+
+
 def validate(rules: list[DruRule]) -> list[str]:
     """What would make KiCad drop the whole file, before any write; a non-empty list raises ValueError
     in `apply.write_dru`. Refuses a constraint name KiCad 10 does not know, a unit on `track_angle`
@@ -237,6 +247,15 @@ def validate(rules: list[DruRule]) -> list[str]:
                     errs.append(f"rule {r.name!r}: {kind} ({which} {value}) needs a length in mm")
         if not r.condition.strip():
             errs.append(f"rule {r.name!r}: empty condition")
+        # A name with a quote closes KiCad's string early and the whole file is dropped in
+        # silence: `A.NetName == 'it's'`. `check` refuses such names, and this is the backstop.
+        if r.condition.count("'") % 2:
+            errs.append(
+                f"rule {r.name!r}: the condition {r.condition!r} has an unbalanced quote (a net or class name "
+                "carries one); KiCad reads the string as ending there and drops every rule in the file"
+            )
+        if any(v < 0 for _which, v in _numbers(r.constraint)):
+            errs.append(f"rule {r.name!r}: {r.constraint!r} carries a negative value; KiCad takes it and the rule can never be met")
         if r.severity not in _SEVERITIES:
             errs.append(f"rule {r.name!r}: severity {r.severity!r} is not one of error, warning, ignore")
     for name, n in seen.items():

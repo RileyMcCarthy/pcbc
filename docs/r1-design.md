@@ -774,7 +774,7 @@ Notes on the table:
 - **Keep-away is explicit.** `analog`, `sense` and `feedback` hold a keep-away only when
   `keep_clear_of=` is written; when the board has a `switch_node` net and the line has none,
   the report prints `FB: keep_clear_of none; NetReq("FB", kind="analog", keep_clear_of="SW")
-  holds 3 mm`. Reason: buck as placed has R_FB_TOP.2 (FB) 1.84 mm edge-to-edge from C_BOOT.2
+  holds 3 mm`. Reason: buck as placed has R_FB_TOP.2 (FB) 1.62 mm edge-to-edge from C_BOOT.2
   (SW), and U1's own FB and SW pins 1 mm apart; a silent 3 mm default would fail the stock
   example in KiCad and in F.5 with a move the AI cannot make (the boot cap belongs at BOOT).
   The AI states the distance; the tool holds it.
@@ -950,7 +950,7 @@ board.py, never a recorded number. Test: buck stock -> note `SW: hot loop 3.3 mm
 edge-to-edge distance between the net's pads and (a) the other net's pads, (b) the courtyards
 of parts with a pad on the other net, excluding pads of one footprint; `< mm` -> move,
 `toward` = the quantised direction away from the offending pad.
-Message: `FB: R_FB_TOP.2 is 1.84 mm from C_BOOT.2 (SW); keep_clear_mm=3 (NetReq line 51): Place("R_FB_TOP", to="U1.FB", toward="up"), or keep_clear_mm=1.5 if the boot cap must sit there`.
+Message: `FB: R_FB_TOP.2 is 1.62 mm from C_BOOT.2 (SW); keep_clear_mm=3 (NetReq line 51): Place("R_FB_TOP", to="U1.FB", toward="up"), or keep_clear_mm=1.5 if the boot cap must sit there`.
 Test: buck with `NetReq("FB", kind="analog", keep_clear_of="SW")` prints that line (numbers
 pinned: 1.84); stock buck (no `keep_clear_of`) prints nothing and the constraint report
 carries the `keep_clear_of none` note of section D.

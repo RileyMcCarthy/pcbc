@@ -116,6 +116,22 @@ Rules the tool applies, so you do not have to:
   there is allowed that much further. Do not fight it with `gap=` or `toward=`.
 - One `Place()` and one `SchPlace()` per ref. A second one is refused, not an override.
 
+## What the constraint report is, and what each number reaches
+
+`pcbc check board.py --constraints` prints one number per line with where it came from: a
+formula name, the stackup it was evaluated on, the JLC row it was fitted to, or `preset <kind>`
+when pcbc chose it with nothing behind it. Read it before placing; never type a number it can
+derive. Three things about scope, so you do not expect more than the tool does:
+
+- `[soft: warning in R1]` marks a rule KiCad writes as a warning. It is counted, pinned per
+  example and never fails the gate; a soft rule is promoted to an error in the PR that shows it
+  hitting zero on every example. `width_usb` cannot reach zero yet: the router quantises the
+  pair 0.0004 mm under its class.
+- `spacing 3W` and `N per layer change` are printed and nothing consumes them: they are
+  intent for the router of R2/R3, not a check.
+- A `Chain` line is read at placement only (order along the feed, and what sits in the corridor
+  of a hop up to 8 mm). It never becomes a KiCad rule and the router does not see it.
+
 ## Reading the reports
 
 Each line is a move: what collides, and the `Place()`/`SchPlace()` edit that fixes it.

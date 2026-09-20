@@ -131,6 +131,16 @@ def Board(
         w, h = float(width), float(height)
     else:
         raise ValueError("Board needs size_mm=(w, h) or width= and height= (mm)")
+    from .stackup import get_stackup
+
+    stack = get_stackup(stackup)
+    if int(layers) != stack.layers:
+        # The seed writes `layers` copper layers while every number comes from the stackup: a
+        # 4-layer board on a 2-layer stackup was seeded with In1/In2 and 2-layer impedances.
+        raise ValueError(
+            f"Board(layers={int(layers)}, stackup={stackup!r}): {stackup} is a {stack.layers}-layer stackup; "
+            f"write layers={stack.layers}, or pick a {int(layers)}-layer stackup"
+        )
     spec = BoardSpec(
         size_mm=(w, h),
         layers=int(layers),
@@ -412,6 +422,23 @@ def NetReq(
     line and the nearest keyword; a keyword the kind does not use is a `check` refusal."""
     if not nets:
         raise ValueError("NetReq needs at least one net or glob")
+    who = f'NetReq("{nets[0]}")'
+    z_diff_ohm = _num(z_diff_ohm, "z_diff_ohm", who, positive=True, hi=400.0)
+    z_se_ohm = _num(z_se_ohm, "z_se_ohm", who, positive=True, hi=400.0)
+    volts = _num(volts, "volts", who, positive=True, allow_zero=True, hi=1000.0)
+    amps = _num(amps, "amps", who, positive=True, hi=30.0)
+    temp_rise_c = _num(temp_rise_c, "temp_rise_c", who, positive=True) or 10.0
+    max_mm = _num(max_mm, "max_mm", who, positive=True)
+    length_mm = _num(length_mm, "length_mm", who, positive=True)
+    match_mm = _num(match_mm, "match_mm", who, positive=True, allow_zero=True)
+    uncoupled_mm = _num(uncoupled_mm, "uncoupled_mm", who, positive=True, allow_zero=True)
+    keep_clear_mm = _num(keep_clear_mm, "keep_clear_mm", who, positive=True)
+    pf_max = _num(pf_max, "pf_max", who, positive=True)
+    loop_mm2 = _num(loop_mm2, "loop_mm2", who, positive=True)
+    if vias_max is not None and (isinstance(vias_max, bool) or not isinstance(vias_max, int) or vias_max < 0):
+        raise ValueError(f"{who}: vias_max={vias_max!r} must be a whole number of vias, 0 or more")
+    if layers is not None and not tuple(layers):
+        raise ValueError(f'{who}: layers=[] names no layer; drop it, or name one: layers=["F.Cu"]')
     if isinstance(keep_clear_of, str):
         keep = (keep_clear_of,)
     else:
@@ -459,6 +486,11 @@ def Pair(
 ) -> PairReq:
     """A differential pair: the explicit form of `NetReq(kind="usb_hs")`, or its override
     (only z_diff_ohm, match_mm, uncoupled_mm, gap_mm, layers, reference)."""
+    who = f'Pair("{p}", "{n}")'
+    z_diff_ohm = _num(z_diff_ohm, "z_diff_ohm", who, positive=True, hi=400.0)
+    match_mm = _num(match_mm, "match_mm", who, positive=True, allow_zero=True)
+    uncoupled_mm = _num(uncoupled_mm, "uncoupled_mm", who, positive=True, allow_zero=True)
+    gap_mm = _num(gap_mm, "gap_mm", who, positive=True)
     spec = PairReq(
         p=str(p),
         n=str(n),
@@ -477,7 +509,10 @@ def Pair(
 def Bus(*nets: str, match_mm: float, clock: str | None = None, length_mm: float | None = None) -> BusReq:
     """Nets routed as a ribbon and length-matched within `match_mm` (to `clock` when named)."""
     if len(nets) < 2:
-        raise ValueError("Bus needs at least two nets")
+        raise ValueError(f'Bus("{nets[0]}") needs at least two nets' if nets else "Bus needs at least two nets")
+    who = f'Bus("{nets[0]}")'
+    match_mm = _num(match_mm, "match_mm", who, positive=True, allow_zero=True)
+    length_mm = _num(length_mm, "length_mm", who, positive=True)
     spec = BusReq(
         nets=tuple(str(n) for n in nets),
         match_mm=float(match_mm),
@@ -511,12 +546,16 @@ def Isolation(
     reinforced: bool = False,
 ) -> IsolationReq:
     """An isolation barrier between two `Region`s; `across` names the parts that span it."""
+    who = f'Isolation("{a}", "{b}")'
+    volts = _num(volts, "volts", who, positive=True, hi=1000.0)
+    if str(a) == str(b):
+        raise ValueError(f"{who}: both sides name the same Region; an isolation separates two")
     spec = IsolationReq(
         a=str(a),
         b=str(b),
         volts=float(volts),
         slot=bool(slot),
-        across=tuple(str(r) for r in across),
+        across=(across,) if isinstance(across, str) else tuple(str(r) for r in across),
         reinforced=bool(reinforced),
         line=_line(),
     )
@@ -526,6 +565,7 @@ def Isolation(
 
 def Guard(net: str, *, stitch_mm: float = 2.5, ground: str = "GND") -> GuardReq:
     """A stitched ground guard around a net (recorded in R1; the router pattern is R2)."""
+    stitch_mm = _num(stitch_mm, "stitch_mm", f'Guard("{net}")', positive=True)
     spec = GuardReq(net=str(net), stitch_mm=float(stitch_mm), ground=str(ground), line=_line())
     _doc().guards.append(spec)
     return spec
@@ -747,6 +787,42 @@ def load_board(path: str | Path) -> Design:
     return design
 
 
+def _at_board_line(exc: Exception, board: Path) -> str:
+    """`msg` with `line N` from the deepest traceback frame inside the board file."""
+    import traceback
+
+    line = 0
+    for frame in traceback.extract_tb(exc.__traceback__):
+        try:
+            same = Path(frame.filename).resolve() == board
+        except OSError:
+            same = False
+        if same:
+            line = frame.lineno or 0
+    return f"line {line}: {exc}" if line else str(exc)
+
+
+def _num(value, what: str, who: str, *, positive: bool = False, allow_zero: bool = False, hi: float | None = None):
+    """A number the board wrote, or a ValueError naming what to change. `language` raises; the
+    loader turns it into a line-cited refusal, so `pcbc check` never prints a traceback."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{who}: {what}={value!r} is not a number; write {what}=5 (millimetres, volts, amps or ohms, no unit)")
+    v = float(value)
+    if v != v or v in (float("inf"), float("-inf")):
+        raise ValueError(f"{who}: {what}={value!r} is not a finite number")
+    if positive and (v < 0 or (v == 0 and not allow_zero)):
+        raise ValueError(f"{who}: {what}={_g_num(v)} is not physical; {what} must be {'at least 0' if allow_zero else 'greater than 0'}")
+    if hi is not None and v > hi:
+        raise ValueError(f"{who}: {what}={_g_num(v)} is past what pcbc models ({_g_num(hi)}); say what the board really needs")
+    return v
+
+
+def _g_num(v: float) -> str:
+    return f"{v:g}"
+
+
 def check_board(path: str | Path, pcb: bool = True) -> list[str]:
     """Everything that can be wrong before a build: unbound pins, missing
     Place()/SchPlace(), and a SchPlace that names a pin or part that is not
@@ -759,6 +835,10 @@ def check_board(path: str | Path, pcb: bool = True) -> list[str]:
         if msg is None:
             raise
         return [msg]
+    except ValueError as exc:
+        # Everything language.py refuses at load (a Bus of one net, a Chain pad without a dot, a
+        # number that is not a number): the board's line, not a 15-line traceback.
+        return [_at_board_line(exc, Path(path).resolve())]
     fails = check_design(design, pcb=pcb)
     if pcb:
         from .pcb_place import validate

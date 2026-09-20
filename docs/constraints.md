@@ -55,7 +55,7 @@ bias); via plating 0.018 mm (JLC capabilities: "average hole plating 18 um").
 `jlcpcb_4l_1oz` is 7628 because that is what JLC builds for a 1.6 mm 4-layer order that does
 not pick an impedance stackup (r1-design H.2). `Board(stackup="JLC04161H-3313")` takes the
 JLC code as an alias. The fab limits (track, clearance, via, ring, hole, edge) are unchanged
-from before R1; JLC's own 1 oz / 2 oz numbers are in `JLC_LIMITS` for the report.
+from before R1; JLC's own 1 oz / 2 oz numbers are in `JLC_LIMITS` as data for a later rung (nothing reads them yet).
 
 Published rows (JLC's calculator as JITX records them, `jitxlib.jlcpcb`):
 
@@ -213,7 +213,7 @@ Reference: IPC-2221B eq. 6-2 internal, barrel-as-internal-trace convention (D. B
 *PCB Design Guide to Via and Trace Currents and Temperatures*, Artech 2021, ch. 9; Saturn PCB
 Toolkit uses the same). Plating 0.018 mm is JLC's figure; 0.025 would be 20 % optimistic. A
 0.3 mm via carries 0.707 A at 10 C, a 0.2 mm via 0.527 A; node's 1 A LOAD on 0.2 mm drills
-wants 2 per layer change. Printed and counted in the copper bar, not gated, until the router
+wants 2 per layer change. Printed in the constraint report only: nothing places the second via until the router does (R2), and the copper bar does not count them, not gated, until the router
 can place two (R2). Vectors 20-21.
 
 ### Voltage (C.8): IPC-2221B Table 6-1 clearance, IEC 60664-1 creepage and impulse clearance
@@ -315,7 +315,7 @@ Synthesised widths with the bias against JLC's rows:
 | code | 50 ohm SE | 90 ohm pair (gap) | 100 ohm pair (gap) |
 |---|---|---|---|
 | 7628 | 0.3244 (row 0.3244, by construction) | 0.2288 at 0.15 (row 0.2332, -1.8 %) | 0.1759 at 0.15 (row 0.1722, +2.3 %) |
-| 1080 | 0.1176 (row 0.1176) | 0.0958 at 0.09 (row 0.09, +6 %) | 0.0846 at 0.137 (row 0.09, -6 %) |
+| 1080 | 0.1176 (row 0.1176) | 0.0958 at 0.09 (row 0.09, +6 %) | 0.0889 at 0.137 (the solve is 0.0846, under the fab floor the bisection starts from) |
 
 Stated accuracy: **+-3 % impedance / +-3 % width on 7628, +-3 % / +-6 % on 1080**, inside
 USB 2.0's +-15 % and 100 ohm Ethernet's +-10 %; off-row stackups and 2L print `uncalibrated`
@@ -346,7 +346,7 @@ overrides preset usb_hs 0.5`; a kwarg the kind does not use is refused.
 Keep-away is explicit: `analog`, `sense` and `feedback` hold one only when `keep_clear_of=` is
 written; with a `switch_node` on the board and none written the report prints `FB:
 keep_clear_of none; NetReq("FB", kind="analog", keep_clear_of="SW") holds 3 mm`. Buck as
-placed has R_FB_TOP.2 (FB) 1.84 mm from C_BOOT.2 (SW) and the IC's own FB and SW pins 1 mm
+placed has R_FB_TOP.2 (FB) 1.62 mm from C_BOOT.2 (SW) and the IC's own FB and SW pins 1 mm
 apart; a silent default would fail the stock example with a move that cannot be made (the boot
 cap belongs at BOOT). The AI states the distance; the tool holds it.
 
@@ -355,7 +355,7 @@ cap belongs at BOOT). The AI states the distance; the tool holds it.
 KiCad rules (`dru.py`): class `track_width` (warning), keep-away `clearance` with the
 footprint's own pads exempt, `creepage` from 60 V, `length (max)` from `length_mm=` and I2C,
 `skew` per pair and bus (warning), `via_count (max 0)` on no-via nets, via budgets (warning),
-`diff_pair_gap` and `diff_pair_uncoupled` (warning), isolation `clearance` / `creepage` / rule
+`diff_pair_gap` (error) and `diff_pair_uncoupled` (warning), isolation `clearance` / `creepage` / rule
 area, the footprint exemption, the canary last. KiCad applies the last matching rule of a
 type, so the file is ordered general to specific, and `validate` refuses a malformed rule
 before any write (one malformed rule silently disables the whole file). Placement checks
@@ -377,7 +377,7 @@ The README's Constraints table maps each to its test.
 | power widths from IPC-2221 external alone | `max(IPC-2221 external, IPC-2152 with board and plane modifiers)`, the loser printed; every example's width unchanged |
 | one via per layer change on any current | vias per change from the barrel's ampacity (JLC 18 um plating), printed and counted in the bar; not gated until R2 |
 | `volts=` set nothing | class clearance from IPC-2221B 6-1 B2 / B1; creepage from IEC 60664-1 F.5 at 60 V and up; `Isolation` with clearance, creepage, rule area and slot |
-| a 3 mm keep-away default would have failed the stock buck (FB 1.84 mm from the boot cap on SW) | keep-away is explicit and the report prints the hint |
+| a 3 mm keep-away default would have failed the stock buck (FB 1.62 mm from the boot cap on SW) | keep-away is explicit and the report prints the hint |
 | a `NetReq`'s numbers were visible only in the `.kicad_pro` after a build | `pcbc check board.py --constraints` prints every number with its source; `--json` the `ConstraintSet`; `pcbc pcb --constraints`; the build's `check` step |
 | plan section 6.6 said everything pcbc writes is an error; KRT is not held to length, skew, uncoupled length, via budgets or a per-segment width floor, and fanout stubs are `track_min` wide by design | those five kinds are warnings counted by the bar and pinned per example, marked `[soft: warning in R1]`; a kind at zero on the four examples and the DS2 Addon is promoted in the same PR that shows the zeros |
 

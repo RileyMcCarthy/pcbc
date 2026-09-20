@@ -118,8 +118,8 @@ def test_every_row_of_e_is_pinned_on_two_layers(tmp_path: Path):
         ("length_miso", "(constraint length (max 80mm))", "A.NetName == 'MISO'", "error"),
         ("length_mosi", "(constraint length (max 80mm))", "A.NetName == 'MOSI'", "error"),
         ("length_sck", "(constraint length (max 80mm))", "A.NetName == 'SCK'", "error"),
-        ("length_scl", "(constraint length (max 9405.94mm))", "A.NetName == 'SCL'", "error"),
-        ("length_sda", "(constraint length (max 9405.94mm))", "A.NetName == 'SDA'", "error"),
+        ("length_scl", "(constraint length (max 9412.47mm))", "A.NetName == 'SCL'", "error"),
+        ("length_sda", "(constraint length (max 9412.47mm))", "A.NetName == 'SDA'", "error"),
         # E.9 no vias (R-D3, R-A1), per net: analog, feedback, sense, switch_node
         ("novia_ain0", "(constraint via_count (max 0))", "A.NetName == 'AIN0'", "error"),
         ("novia_fb", "(constraint via_count (max 0))", "A.NetName == 'FB'", "error"),
@@ -134,8 +134,8 @@ def test_every_row_of_e_is_pinned_on_two_layers(tmp_path: Path):
         ("skew_d_n_d_p", "(constraint skew (max 0.5mm))", "A.NetName == 'D_N' || A.NetName == 'D_P'", "warning"),
         ("skew_miso_mosi_sck", "(constraint skew (max 2.5mm))", "A.NetName == 'MISO' || A.NetName == 'MOSI' || A.NetName == 'SCK'", "warning"),
         ("skew_sense_n_sense_p", "(constraint skew (max 1mm))", "A.NetName == 'SENSE_N' || A.NetName == 'SENSE_P'", "warning"),
-        # E.11 pair gap (R-Z5), error, today's .2f: max(0.1, 0.127 - 0.03) / 0.127; E.12 uncoupled 2 mm, soft
-        ("usb_pair_gap", "(constraint diff_pair_gap (min 0.10mm) (opt 0.13mm))", "A.hasNetclass('USB')", "error"),
+        # E.11 pair gap (R-Z5), error, the class's own 3-dp gap (the .2f form printed 0.13 where the class and the report say 0.127): max(0.1, 0.127 - 0.03) / 0.127; E.12 uncoupled 2 mm, soft
+        ("usb_pair_gap", "(constraint diff_pair_gap (min 0.1mm) (opt 0.127mm))", "A.hasNetclass('USB')", "error"),
         ("uncoupled_usb", "(constraint diff_pair_uncoupled (max 2mm))", "A.hasNetclass('USB')", "warning"),
         # E.16 the footprint's own pads, after every clearance rule so it wins; E.17 the canary last
         ("pads_of_one_footprint", "(constraint clearance (min 0.1mm))", "A.Type == 'Pad' && B.Type == 'Pad' && A.Reference == B.Reference", "error"),
@@ -149,7 +149,7 @@ def test_every_row_of_e_is_pinned_on_four_layers(tmp_path: Path):
     assert ("width_usb", "(constraint track_width (min 0.2288mm))", "A.hasNetclass('USB')", "warning") in got, "E.3: the 7628 pair (C.2 vector 9) is wider than track_min, so its class gets the soft width rule"
     assert ("width_z50", "(constraint track_width (min 0.3244mm))", "A.hasNetclass('Z50')", "warning") in got, "C.2 vector 5: 50 ohm on 7628 = 0.3244"
     assert ("usb_pair_gap", "(constraint diff_pair_gap (min 0.12mm) (opt 0.15mm))", "A.hasNetclass('USB')", "error") in got, "E.11: max(0.1, 0.15 - 0.03) / 0.15 at 2 dp"
-    assert ("length_sda", "(constraint length (max 4175.82mm))", "A.NetName == 'SDA'", "error") in got, "C.9 on 7628 at the 0.16 mm floor"
+    assert ("length_sda", "(constraint length (max 4177.07mm))", "A.NetName == 'SDA'", "error") in got, "C.9 on 7628 at the 0.16 mm floor"
     assert names[:2] == ["pcbc_geometry_segments", "pcbc_geometry_angles"] and names[-2:] == ["pads_of_one_footprint", "pcbc_canary"]
     assert names.index("width_usb") < names.index("analog_away_from_sw") < names.index("creepage_power_2") < names.index("length_miso") < names.index("novia_ain0") < names.index("vias_clk") < names.index("skew_d_n_d_p") < names.index("usb_pair_gap") < names.index("uncoupled_usb"), "E: general to specific, KiCad applies the last matching rule of a type"
 
@@ -194,7 +194,7 @@ def test_todays_rules_are_still_written_unchanged_and_the_examples_lists_are_pin
         "node": ["pcbc_geometry_segments", "pcbc_geometry_angles", "width_usb", "width_power", "novia_t_div", "novia_t_out", "vias_usb_dn", "vias_usb_dp", "skew_usb_dn_usb_dp", "usb_pair_gap", "uncoupled_usb", "pads_of_one_footprint", "pcbc_canary"],
     }
     c3 = {r.name: r for r in compile_design(load_board(EXAMPLES / "c3_usb" / "c3_usb.py")).dru}
-    assert (c3["usb_pair_gap"].constraint, c3["usb_pair_gap"].condition) == ("(constraint diff_pair_gap (min 0.10mm) (opt 0.13mm))", "A.hasNetclass('USB')"), "E.11: today's numbers, the condition rewritten from A.NetClass =="
+    assert (c3["usb_pair_gap"].constraint, c3["usb_pair_gap"].condition) == ("(constraint diff_pair_gap (min 0.1mm) (opt 0.127mm))", "A.hasNetclass('USB')"), "E.11: today's numbers, the condition rewritten from A.NetClass =="
     node = {r.name: r for r in compile_design(load_board(EXAMPLES / "node" / "node.py")).dru}
     assert node["usb_pair_gap"].constraint == "(constraint diff_pair_gap (min 0.12mm) (opt 0.15mm))", "H.2: node's pair at 0.2288 / 0.15"
     assert node["width_usb"].constraint == "(constraint track_width (min 0.2288mm))"

@@ -393,6 +393,14 @@ def _has_glob(pattern: str) -> bool:
     return any(ch in pattern for ch in "*?[")
 
 
+def _closest(name: str, net_names: list[str]) -> str:
+    """'; did you mean X?' when one of the board's nets is close to what was written."""
+    import difflib
+
+    near = difflib.get_close_matches(name, net_names, n=1, cutoff=0.6)
+    return f"; did you mean {near[0]!r}?" if near else ""
+
+
 def _expand(patterns: tuple[str, ...], net_names: list[str]) -> list[str]:
     """Globs expanded against the design's nets (sorted); a literal name is kept as written, and a
     glob that matches nothing is kept too so today's class patterns still carry it."""
@@ -538,14 +546,35 @@ def compile_constraints(design: Design) -> ConstraintSet:
     pair_for_req: dict[int, PairReq] = {}  # req index -> the Pair that overrides it
     bare_pairs: list[PairReq] = []
     req_nets: list[list[str]] = [_expand(r.nets, net_names) for r in design.netreqs]
+    known = set(net_names)
+    for req, got in zip(design.netreqs, req_nets, strict=True):
+        for pat in req.nets:
+            hit = [n for n in got if n in known and (fnmatch.fnmatchcase(n, pat) if _has_glob(pat) else n == pat)]
+            if not hit:
+                near = _closest(pat, net_names)
+                refusals.append(
+                    f'NetReq("{req.nets[0]}") line {req.line}: {"no net matches " if _has_glob(pat) else "no net "}{pat!r}{near}'
+                )
+    for pr in design.pairs:
+        for name in (pr.p, pr.n):
+            if name not in known:
+                refusals.append(f'Pair line {pr.line}: no net {name!r}{_closest(name, net_names)}')
+    for bus_req in design.buses:
+        for name in bus_req.nets:
+            if name not in known and not _has_glob(name):
+                refusals.append(f'Bus line {bus_req.line}: no net {name!r}{_closest(name, net_names)}')
     for i, req in enumerate(design.netreqs):
         for n in req_nets[i]:
             if n in owner:
                 who, line = owner[n]
-                refusals.append(
-                    f"{n}: {who} line {line} and NetReq line {req.line} both name it; say it once "
-                    "(Pair overrides only z_diff_ohm, match_mm, uncoupled_mm, gap_mm, layers, reference)"
+                # No Pair is involved when two NetReqs collide: pointing at a Pair's overrides
+                # sent the AI somewhere it could not go.
+                how = (
+                    "(merge them: every net of one NetReq shares every number)"
+                    if who == "NetReq"
+                    else "(a Pair carries its own z_diff_ohm, match_mm, uncoupled_mm, gap_mm, layers, reference)"
                 )
+                refusals.append(f"{n}: {who} line {line} and NetReq line {req.line} both name it; say it once {how}")
             else:
                 owner[n] = ("NetReq", req.line)
     for pr in design.pairs:
@@ -557,10 +586,15 @@ def compile_constraints(design: Design) -> ConstraintSet:
         named = [(n, o) for n, o in zip((pr.p, pr.n), owners) if o is not None]
         if named:
             n, (who, line) = named[0]
-            refusals.append(
-                f"{n}: {who} line {line} and Pair line {pr.line} both name it; say it once "
-                "(Pair overrides only z_diff_ohm, match_mm, uncoupled_mm, gap_mm, layers, reference)"
+            # The overrides listed here are only available on a usb_hs NetReq; on any other kind a
+            # Pair is refused outright, so pointing the AI at them would be a dead end.
+            how = (
+                "(a Pair overrides only z_diff_ohm, match_mm, uncoupled_mm, gap_mm, layers, reference "
+                "on a kind=\"usb_hs\" NetReq)"
+                if who == "NetReq"
+                else "(one of them, not both)"
             )
+            refusals.append(f"{n}: {who} line {line} and Pair line {pr.line} both name it; say it once {how}")
             continue
         owner[pr.p] = owner[pr.n] = ("Pair", pr.line)
         bare_pairs.append(pr)
@@ -578,6 +612,17 @@ def compile_constraints(design: Design) -> ConstraintSet:
             if kw not in allowed:
                 refusals.append(f'NetReq("{first}") line {req.line}: kind="{kind}" does not take {kw}=; it takes {", ".join(allowed)}')
         nets = req_nets[i]
+        for name in nets:
+            if "'" in name or '"' in name:
+                refusals.append(
+                    f'NetReq("{first}") line {req.line}: the net name {name!r} carries a quote; KiCad\'s rule file '
+                    "reads the condition as ending there and silently drops every rule. Rename the net."
+                )
+        if req.class_name and ("'" in req.class_name or '"' in req.class_name):
+            refusals.append(
+                f'NetReq("{first}") line {req.line}: class_name={req.class_name!r} carries a quote; it goes into '
+                "every rule condition as `A.hasNetclass('...')` and silently drops the whole rule file"
+            )
         if kind == "usb_hs" and req.z_se_ohm is not None:
             refusals.append(
                 f'NetReq("{first}") line {req.line}: kind="usb_hs" does not take z_se_ohm=; '
@@ -804,8 +849,11 @@ def compile_constraints(design: Design) -> ConstraintSet:
 
 
 def _kicad_pairs(p: str, n: str) -> bool:
-    """KiCad pairs names that differ only by a P/N, _P/_N or +/- suffix."""
-    return len(p) > 1 and len(n) > 1 and p[:-1] == n[:-1] and (p[-1], n[-1]) in (("P", "N"), ("+", "-"))
+    """KiCad pairs names that differ only by a P/N, _P/_N or +/- suffix, in either order: a board
+    is free to write the negative net first, and a glob hands them over sorted (USB_DN, USB_DP)."""
+    if len(p) < 2 or len(n) < 2 or p[:-1] != n[:-1]:
+        return False
+    return (p[-1], n[-1]) in (("P", "N"), ("+", "-"), ("N", "P"), ("-", "+"))
 
 
 def _pair_spec(num: _Numbers, net: str) -> PairSpec | None:
@@ -864,6 +912,19 @@ def _compile_req(
         layers, layers_src = tuple(req.layers), f"NetReq line {line}"
     if pair_req is not None and pair_req.layers is not None:
         layers, layers_src = tuple(pair_req.layers), f"Pair line {pair_req.line}"
+    have = stack.copper_layers()
+    if layers == POWER_LAYERS:  # the preset names four; a 2-layer board has two
+        layers = tuple(lay for lay in POWER_LAYERS if lay in have)
+    written = req.layers is not None or (pair_req is not None and pair_req.layers is not None)
+    unknown = [lay for lay in layers if lay not in have] if written else []
+    if unknown:
+        # This used to reach stackup.plane_below and die with `tuple.index(x): x not in tuple`.
+        refusals.append(
+            f'NetReq("{first}") line {line}: {", ".join(unknown)}: {stack.name} has {", ".join(have)}'
+            if pair_req is None or pair_req.layers is None
+            else f'Pair line {pair_req.line}: {", ".join(unknown)}: {stack.name} has {", ".join(have)}'
+        )
+        layers = tuple(lay for lay in layers if lay in have) or (have[0],)
     layer0 = layers[0] if layers else "F.Cu"
     inner_only = bool(layers) and not any(is_outer(lay) for lay in layers)
 
@@ -896,6 +957,11 @@ def _compile_req(
                 width = cur
         else:
             width = cur if cur.value > preset.width_mm else _preset(preset.width_mm, "mm", kind, both)  # type: ignore[arg-type]
+        # C.6: below 0.274 A the IPC-2152 fit extrapolates. The Derived carried that clause and the
+        # report line dropped it, so a 0.1 A rail read as if the chart covered it.
+        clause = next((part for part in (cur.source.note or "").split("; ") if "extrapolat" in part), "")
+        if clause and clause not in (width.source.note or ""):
+            width = replace(width, source=replace(width.source, note=f"{width.source.note}; {clause}"))
 
     # clearance: the kind number, then the voltage row, then the floor
     lane = preset.clearance_mm if preset.clearance_mm is not None else class_clear
@@ -973,7 +1039,14 @@ def _compile_req(
             z_src_who = f"Pair line {pair_req.line}"
             if pair_req.gap_mm is not None:
                 gap_given = pair_req.gap_mm
-                gap_src = Source("Pair", f"line {pair_req.line}", f"overrides gap max(0.15, clearance_min {_g(stack.clearance_min)})")
+                raised = pair_gap_mm(stack, gap_given) > gap_given
+                gap_src = Source(
+                    "Pair",
+                    f"line {pair_req.line}",
+                    f"gap_mm={_g(pair_req.gap_mm)} raised to the fab floor clearance_min {_g(stack.clearance_min)}"
+                    if raised
+                    else f"overrides gap max(0.15, clearance_min {_g(stack.clearance_min)})",
+                )
         pair_layer = layer0 if is_outer(layer0) else "F.Cu"
         w, g = diff_pair_geometry(z_target, stack, pair_layer, gap_given)
         solved = diff_pair_width_mm(z_target, stack, pair_layer, gap_given)
@@ -1050,7 +1123,21 @@ def _compile_req(
             formula, ref = "hj_microstrip", f"x {_g(stack.z_bias_se)} {stack.jlc_code or stack.name}"
         cal = stack.z_bias_source if is_outer(layer0) else "JLC publishes no inner-layer rows"
         width = Derived(w, "mm", Source(formula, ref, cal))
-        z_se = (z_target, Derived(z, "ohm", Source(formula, ref, f"{cal}; target {_g(z_target)}")))
+        # A target the fab floor (or 6 mm of copper) cannot reach was printed as if it were met.
+        off = abs(z - z_target) / z_target if z_target else 0.0
+        if off > 0.02:
+            why = (
+                f"the fab floor {_g(stack.track_min)} mm stops at {_g(z)} ohm"
+                if abs(w - stack.track_min) < 1e-9
+                else f"6 mm of copper only reaches {_g(z)} ohm"
+                if w >= 5.999
+                else f"the solver lands {off * 100:.0f} % off"
+            )
+            reached = f"; not reached: {why}"
+            notes.append(f"{first}: z_se_ohm={_g(z_target)} is not reachable on {stack.name} {layer0}: {why}")
+        else:
+            reached = ""
+        z_se = (z_target, Derived(z, "ohm", Source(formula, ref, f"{cal}; target {_g(z_target)}{reached}")))
         if w > stack.track_min:
             soft.append("track_width")
 
@@ -1062,7 +1149,7 @@ def _compile_req(
         airwire_src = Source("NetReq", f"line {line}", f"overrides preset {kind} {_g(preset.airwire_mm)}" if preset.airwire_mm is not None else "")
     length: Derived | None = None
     length_none = False
-    if kind in ("usb_hs", "spi"):
+    if kind in ("usb_hs", "spi") and not bare_pair:
         if req.length_mm is not None:
             length = Derived(round(req.length_mm, 4), "mm", Source("NetReq", f"line {line}"))
         else:
@@ -1075,8 +1162,15 @@ def _compile_req(
         # the busiest line: the shorter, safer length of the two.
         pins = max((len(pads_by_net.get(n, ())) for n in nets), default=0)
         z0, eeff = microstrip(width.value, stack.h_mm, stack.copper_t("F.Cu"), stack.er)
-        c = capacitance_pf_per_mm(z0 * stack.z_bias_se, eeff / stack.z_bias_se**2)
-        mm = i2c_max_mm(pf_max, pins, c)
+        c_exact = capacitance_pf_per_mm(z0 * stack.z_bias_se, eeff / stack.z_bias_se**2, exact=True)
+        c = round(c_exact, 4)
+        mm = i2c_max_mm(pf_max, pins, c_exact)
+        if mm <= 0:
+            refusals.append(
+                f'NetReq("{first}") line {line}: pf_max={_g(pf_max)} pF is under the {pins} device pin{"s" if pins != 1 else ""} on the bus '
+                f"({10 * pins} pF at 10 pF each, UM10204 7.1): no length is left for copper"
+            )
+            mm = 0.0
         length = Derived(mm, "mm", Source("i2c_capacitance", f"{_g(pf_max)} pF ({pf_src}) - 10 pF x {pins} pins on the busiest line at {_g(c)} pF/mm ({_g(width.value)} mm F.Cu)"))
 
     # keep-away
@@ -1251,7 +1345,7 @@ def _compile_isolation(
         top, bottom = (ra, rb) if ra.y1 <= rb.y0 else (rb, ra)
         box = (0.0, round(top.y1, 4), float(bw), round(bottom.y0, 4))
     else:
-        refusals.append(f"{tag}: Regions overlap in both axes; no straight line separates them")
+        refusals.append(f"{tag} line {iso.line}: Regions overlap in both axes; no straight line separates them")
         box = None
     if box is not None:
         layers = ("F&B.Cu",) if stack.layers == 2 else ("F&B.Cu",) + tuple(lay for lay in stack.copper_layers() if not is_outer(lay))

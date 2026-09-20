@@ -32,6 +32,13 @@ def test_blinky_fab(tmp_path: Path):
     board.write_text(BLINKY.read_text())
     result = build_job(board, upto="fab", force=True)
     assert result.get("error") is None, result
+    # The soft-rule counts, as the other examples pin them (E's promotion procedure needs every
+    # example at zero before a soft rule becomes an error). blinky writes width_power.
+    from pcbc.netcheck import check_copper
+    from pcbc.language import load_board
+
+    gate = check_copper(load_board(board), tmp_path / "layout" / "blinky" / "routed" / "layout.kicad_pcb", refill=False)
+    assert gate["soft"] == {"width_power": 0}, gate["soft"]
     fab = tmp_path / "layout" / "blinky" / "fab"
     assert (fab / "bom.csv").exists()
     bom = (fab / "bom.csv").read_text()

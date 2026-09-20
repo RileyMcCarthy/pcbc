@@ -122,8 +122,8 @@ def test_a_moved_esd_part_skews_the_pair_and_the_move_says_how_much_serpentine(t
     moves, _notes = _report(board)
     assert (
         'USB_DN/USB_DP: airwires 36.6 and 34.5 mm differ by 2.1 mm; skew budget 0.5 mm (preset usb_hs): '
-        'Place("U3", to="J1.A7") evens them, or the router adds 1.6 mm of serpentine'
-    ) in moves, "measured on the copy: U3 at (30, 18) turned 90 puts its DN pads 2.1 mm farther along; 2.1 - 0.5 = 1.6 mm"
+        'Place("U3", to="J1.A7") evens them, or the router adds 1.61 mm of serpentine'
+    ) in moves, "measured on the copy: U3 at (30, 18) turned 90 puts its DN pads 2.1 mm farther along; 2.1 - 0.5 = 1.61 mm at two decimals (one decimal read 0.0 mm on a sub-0.1 mm shortfall)"
 
 
 def test_the_whole_nets_airwire_is_held_to_max_mm(tmp_path: Path, stock):
@@ -241,7 +241,7 @@ def test_a_far_input_cap_opens_the_hot_loop(tmp_path: Path):
     moves, _notes = _report(board)
     assert (
         "SW: hot loop C_IN1.1 -> U1.VIN -> U1.GND -> C_IN1.2 encloses 22.9 mm2 over the 20 mm2 budget (preset switch_node, pcbc default): "
-        'Place("C_IN1", to="U1.VIN") closes it, or NetReq("SW", kind="switch_node", loop_mm2=25) records it as intent'
+        'Place("C_IN1", to="U1.VIN") closes it, or loop_mm2=25 on NetReq line 56 records it as intent'
     ) in moves, "U1's VIN and GND pads are 1.9 mm apart, the cap's pads 12.04 mm below them"
 
 

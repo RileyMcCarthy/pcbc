@@ -369,7 +369,7 @@ the router obeyed: class clearances and widths (project classes), `creepage` by 
 fiducial masks, keep-aways), `track_segment_length (min 0.2mm)` and `track_angle (min
 135)` for geometry, `hole_to_hole` as an error, and the canary. Severities: everything
 pcbc writes is an error, with R1's stated exception (`r1-design.md` H.3): `track_width`,
-`skew`, via budgets, `diff_pair_uncoupled` and preset lengths are warnings KRT is not held to,
+`skew`, via budgets and `diff_pair_uncoupled` are warnings KRT is not held to (there is no preset length rule),
 counted by the copper bar and pinned per example; a kind that hits zero on the four examples
 and the DS2 Addon is promoted to an error in the same PR that shows the zeros, and R4's tuning
 pass promotes the rest.

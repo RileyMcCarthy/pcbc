@@ -219,10 +219,10 @@ T_DIV: airwire 25 mm (preset analog)
 T_DIV: keep_clear_of none
 T_DIV: spacing 5W (preset analog)
 classes: Default 0.16/0.18, USB 0.2288/0.18 pair 0.2288/0.15, Power 0.4/0.2 via 0.8/0.4, Analog 0.2/0.2 via 0.6/0.3
-rules: 5 written (2 error, 3 soft), canary on net 3V3
+rules: 13 written (4 error, 9 soft), canary on net 3V3
 ```
 
-A number with no standard behind it says `pcbc default`; a formula off its calibrated rows says `uncalibrated` or `formula only`; a 2-layer USB pair that cannot reach 90 ohm says so (`USB_DP/USB_DN: 90 ohm needs 0.7746 mm members at gap 0.15 on jlcpcb_2l_1oz (formula only); pair written at the fab floor 0.127/0.127 = 140.1 ohm; fine for USB full speed, use Board(stackup="jlcpcb_4l_1oz") for high speed`) and is not a failure. `[soft: warning in R1]` marks a rule KiCad checks as a warning: `track_width`, `skew`, `via_count` budgets, `diff_pair_uncoupled` and preset lengths are counted by the copper bar and pinned per example, not gated, until the router can hold them (`docs/r1-design.md` H.3). Promotion: a soft rule that hits zero on the four examples and the DS2 Addon is switched to an error in the same PR that shows the zeros.
+A number with no standard behind it says `pcbc default`; a formula off its calibrated rows says `uncalibrated` or `formula only`; a 2-layer USB pair that cannot reach 90 ohm says so (`USB_DP/USB_DN: 90 ohm needs 0.7746 mm members at gap 0.15 on jlcpcb_2l_1oz (formula only); pair written at the fab floor 0.127/0.127 = 140.1 ohm; fine for USB full speed, use Board(stackup="jlcpcb_4l_1oz") for high speed`) and is not a failure. `[soft: warning in R1]` marks a rule KiCad checks as a warning: `track_width`, `skew`, `via_count` budgets and `diff_pair_uncoupled` (there is no preset length rule: H.6) are counted by the copper bar and pinned per example, not gated, until the router can hold them (`docs/r1-design.md` H.3). Promotion: a soft rule that hits zero on the four examples and the DS2 Addon is switched to an error in the same PR that shows the zeros.
 
 | Rule | Test |
 |---|---|
@@ -244,7 +244,7 @@ A number with no standard behind it says `pcbc default`; a formula off its calib
 | E.8 Every pair and bus gets `skew (max)` over its members, a warning (soft) | `test_dru.py` |
 | E.9 Every no-via net gets `via_count (max 0)`, an error | `test_dru.py` |
 | E.10 A via budget (`usb_hs`, `clock`) is `via_count (max n)`, a warning (soft) | `test_dru.py` |
-| E.11 Every pair gets `diff_pair_gap (min/opt)` by `hasNetclass` | `test_constraints.py::test_the_dru_stub_rebuilds_todays_rules`, `test_dru.py` |
+| E.11 Every pair gets `diff_pair_gap (min/opt)` by `hasNetclass` | `test_dru.py::test_todays_rules_are_still_written_unchanged_and_the_examples_lists_are_pinned`, `test_dru.py` |
 | E.12 Every pair gets `diff_pair_uncoupled (max)`, a warning (soft) | `test_dru.py` |
 | E.13–E.14 An `Isolation` writes `clearance` and `creepage` between the two sides' nets (no creepage rule with `slot=True`: the slot is the path) | `test_dru.py` |
 | E.15 An `Isolation` writes a rule area `ISO_{a}_{b}` over the corridor with `disallow track via zone`, and the zone is in the placed board | `test_constraints.py::test_isolation_sides_come_from_place_lines_and_the_corridor_is_a_rule_area`, `test_dru.py` |
@@ -257,7 +257,7 @@ A number with no standard behind it says `pcbc default`; a formula off its calib
 | F.2 Chain order, no stubs: `Chain` pads lie in order along the feed with nothing between; a third pad off the line on a `usb_hs` or `sense` net asks for the `Chain` line | `test_route_checks.py` |
 | F.3 A wide net (>= 0.4 mm) has a channel of width plus two clearances between its pads on some outer layer, or the pinch is named (node under 3 s) | `test_route_checks.py` |
 | F.4 Decap loops are a `style:` note over 6 mm2; a hot loop over its budget is a move naming the input cap or the low side (buck 3.3 mm2) | `test_route_checks.py` |
-| F.5 A keep-away is measured pad to pad and to courtyards, a footprint's own pads exempt (buck FB to the boot cap: 1.84 mm) | `test_route_checks.py` |
+| F.5 A keep-away is measured pad to pad and to courtyards, a footprint's own pads exempt (buck FB to the boot cap: 1.62 mm) | `test_route_checks.py` |
 | F.6 A controlled net's pads sit over its reference plane, outside any keepout that forbids copper; on 2L the pour is the reference | `test_constraints.py::test_a_controlled_pair_on_four_layers_wants_its_plane_declared`, `test_route_checks.py` |
 | F.7 An `Isolation`'s Regions are at least clearance and creepage apart along one axis, every part on its side, an `across` part spanning the gap; the rule area matches the placed gap | `test_route_checks.py` |
 

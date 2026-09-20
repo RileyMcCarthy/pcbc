@@ -424,7 +424,7 @@ def check_airwires(ctx: Ctx) -> list[str]:
         out.append(
             f"{longest}/{shortest}: airwires {msts[longest]:.1f} and {msts[shortest]:.1f} mm differ by {spread:.1f} mm; "
             f"skew budget {_g(budget)} mm ({source}): {_even_move(ctx, longest, shortest)} evens them, "
-            f"or the router adds {spread - budget:.1f} mm of serpentine"
+            f"or the router adds {max(spread - budget, 0.05):.2f} mm of serpentine"
         )
     return out
 
@@ -1035,10 +1035,13 @@ def check_loops(ctx: Ctx) -> tuple[list[str], list[str]]:
             far = low if dl > dc else cin
         far_pin = _pin(ctx, ic, (ic_rail if far == cin else ic_sw).num)
         suggested = math.ceil(area / 5.0) * 5
+        # The NetReq that already names this net, so the AI edits that line instead of writing a
+        # second one (two NetReqs on one net is itself a refusal).
+        sw_where = f"NetReq line {c.line}" if c.line else f'NetReq("{sw}", kind="switch_node")'
         path = " -> ".join(f"{r}.{_pin(ctx, r, p.num)}" for r, p in chain)
         moves.append(
             f"{sw}: hot loop {path} encloses {area:.1f} mm2 over the {_g(budget)} mm2 budget ({_loop_src(c, 'switch_node')}): "
-            f'Place("{far}", to="{ic}.{far_pin}") closes it, or NetReq("{sw}", kind="switch_node", loop_mm2={suggested}) records it as intent'
+            f'Place("{far}", to="{ic}.{far_pin}") closes it, or loop_mm2={suggested} on {sw_where} records it as intent'
         )
     return moves, notes
 

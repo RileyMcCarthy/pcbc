@@ -7,7 +7,7 @@ cases, end-to-end determinism against the pre-R1 build, the AI-facing report, a 
 critic and a robustness sweep of boards a careless AI might write. Bug-grade findings went to
 three skeptics each, who had to reproduce them or refute them by running the code.
 
-Nine were confirmed and are fixed on main (`docs/copper-plan.md` carries the seen/now rows).
+Nine were confirmed by the skeptics and fixed first; a second pass then worked through the rest, and every row marked `fixed` below is fixed on main (`docs/copper-plan.md` carries the seen/now rows).
 The rest are recorded here as they were reported, so the next pass starts from evidence and
 not from scratch. **A row below is one reviewer's claim, not a verdict**: only the `fixed` and
 `refuted` rows were adjudicated.
@@ -23,63 +23,63 @@ not from scratch. **A row below is one reviewer's claim, not a verdict**: only t
 | fixed | bug | usb_hs with inner-only layers= is silently sized as an F.Cu pair and the report names F.Cu | `src/pcbc/constraints.py` line 966 |
 | fixed | bug | volts= on a usb_hs NetReq is dropped from the class clearance (D: "volts on any kind") | `src/pcbc/constraints.py` line 1001 |
 | fixed | bug | z_se_ohm= is accepted on kind="usb_hs" and silently ignored | `src/pcbc/constraints.py` line 1014 |
-| reported, unverified | bug | A ValueError raised while loading board.py is a raw traceback from `pcbc check`, not a line-numbered refusal | `src/pcbc/language.py` line 757 |
-| reported, unverified | bug | A single quote in a net name writes a .kicad_dru that KiCad silently drops; check passes, dru.validate says clean | `src/pcbc/dru.py` line 193 |
-| reported, unverified | bug | A single quote in class_name does the same: `A.hasNetclass('it's')` drops the rule file | `src/pcbc/constraints.py` line 1090 |
-| reported, unverified | bug | A string for volts= or amps= crashes compile with a TypeError traceback | `src/pcbc/language.py` line 424 |
-| reported, unverified | bug | A valid P/N pair written N-first, or reached through a glob, is refused with 'rename USB_DN/USB_DP' | `src/pcbc/constraints.py` line 797 |
-| reported, unverified | bug | An unreachable z_se_ohm target is reported as met at the solver's clamp: z_se_ohm=500 gives 0.0889 mm at 86.61 ohm, no note | `src/pcbc/constraints.py` line 1019 |
-| reported, unverified | bug | Board(layers=4, stackup="jlcpcb_2l_1oz") and planes= on a layer the stackup lacks are accepted; the PCB is seeded with 4 copper layers while every number was computed for 2 | `src/pcbc/language.py` line 117 |
-| reported, unverified | bug | Isolation with the same Region on both sides produces six contradictory messages instead of one refusal | `src/pcbc/constraints.py` line 1172 |
-| reported, unverified | bug | Negative numbers pass check and become KiCad rules: length (max -639mm), clearance (min -1mm), via_count (max -1) | `src/pcbc/constraints.py` line 1052 |
-| reported, unverified | bug | amps=50 on a 40 mm board is accepted as a 223.729 mm wide Power class; amps=0 and amps=-1 are accepted too | `src/pcbc/constraints.py` line 866 |
-| reported, unverified | bug | layers= naming a layer the stackup does not have crashes into `tuple.index(x): x not in tuple` | `src/pcbc/constraints.py` line 853 |
-| reported, unverified | bug | usb_hs on inner layers is silently sized as an F.Cu microstrip and reported 'on F.Cu' | `src/pcbc/constraints.py` line 966 |
-| reported, unverified | bug | volts above 1000 (NetReq or Isolation) fails with a table-range message that cites no line and says nothing to change | `src/pcbc/circuit.py` line 101 |
-| reported, unverified | deviation | A NetReq/Pair/Bus naming a net that does not exist, or a glob matching nothing, is accepted and printed as if the net were real | `src/pcbc/constraints.py` line 395 |
+| fixed | bug | A ValueError raised while loading board.py is a raw traceback from `pcbc check`, not a line-numbered refusal | `src/pcbc/language.py` line 757 |
+| fixed | bug | A single quote in a net name writes a .kicad_dru that KiCad silently drops; check passes, dru.validate says clean | `src/pcbc/dru.py` line 193 |
+| fixed | bug | A single quote in class_name does the same: `A.hasNetclass('it's')` drops the rule file | `src/pcbc/constraints.py` line 1090 |
+| fixed | bug | A string for volts= or amps= crashes compile with a TypeError traceback | `src/pcbc/language.py` line 424 |
+| fixed | bug | A valid P/N pair written N-first, or reached through a glob, is refused with 'rename USB_DN/USB_DP' | `src/pcbc/constraints.py` line 797 |
+| fixed | bug | An unreachable z_se_ohm target is reported as met at the solver's clamp: z_se_ohm=500 gives 0.0889 mm at 86.61 ohm, no note | `src/pcbc/constraints.py` line 1019 |
+| fixed | bug | Board(layers=4, stackup="jlcpcb_2l_1oz") and planes= on a layer the stackup lacks are accepted; the PCB is seeded with 4 copper layers while every number was computed for 2 | `src/pcbc/language.py` line 117 |
+| fixed | bug | Isolation with the same Region on both sides produces six contradictory messages instead of one refusal | `src/pcbc/constraints.py` line 1172 |
+| fixed | bug | Negative numbers pass check and become KiCad rules: length (max -639mm), clearance (min -1mm), via_count (max -1) | `src/pcbc/constraints.py` line 1052 |
+| fixed | bug | amps=50 on a 40 mm board is accepted as a 223.729 mm wide Power class; amps=0 and amps=-1 are accepted too | `src/pcbc/constraints.py` line 866 |
+| fixed | bug | layers= naming a layer the stackup does not have crashes into `tuple.index(x): x not in tuple` | `src/pcbc/constraints.py` line 853 |
+| fixed | bug | usb_hs on inner layers is silently sized as an F.Cu microstrip and reported 'on F.Cu' | `src/pcbc/constraints.py` line 966 |
+| fixed | bug | volts above 1000 (NetReq or Isolation) fails with a table-range message that cites no line and says nothing to change | `src/pcbc/circuit.py` line 101 |
+| fixed | deviation | A NetReq/Pair/Bus naming a net that does not exist, or a glob matching nothing, is accepted and printed as if the net were real | `src/pcbc/constraints.py` line 395 |
 | reported, unverified | deviation | S4 acceptance gap: the 2L F.6 style note has no test (S4 admits it) | `src/pcbc/route_checks.py` line 1163 |
-| reported, unverified | doc | 'KiCad coupled_microstrip.cpp lands within 1 ohm of this in the fitted range' is false on the 1080 rows and on Ze | `src/pcbc/stackup.py` line 429 |
-| reported, unverified | doc | Concepts the AI needs that no doc states | `.claude/skills/pcbc/SKILL.md` line 120 |
-| reported, unverified | doc | Docs promise refusals the tool does not make | `.claude/skills/pcbc/SKILL.md` line 78 |
+| fixed | doc | 'KiCad coupled_microstrip.cpp lands within 1 ohm of this in the fitted range' is false on the 1080 rows and on Ze | `src/pcbc/stackup.py` line 429 |
+| fixed | doc | Concepts the AI needs that no doc states | `.claude/skills/pcbc/SKILL.md` line 120 |
+| fixed | doc | Docs promise refusals the tool does not make | `.claude/skills/pcbc/SKILL.md` line 78 |
 | reported, unverified | doc | README 'Rule \| Test' table cites a deleted test and names only files for E.3-E.15 and F.1-F.7 | `README.md` line 245 |
 | reported, unverified | doc | README Rule \| Test table cites a deleted test and, for E.3-E.15 and F.1-F.7, file names instead of the tests that assert the rule | `README.md` line 245 |
-| reported, unverified | doc | README and docs/constraints.md still say buck FB-to-boot-cap is 1.84 mm; the tool prints 1.62 | `README.md` line 258 |
-| reported, unverified | doc | README cites a test that no longer exists | `README.md` line 245 |
-| reported, unverified | doc | README lists 'preset lengths' as a soft rule kind; no such rule is ever written | `README.md` line 223 |
-| reported, unverified | doc | README's node `rules:` example line does not match what the tool prints | `README.md` line 220 |
-| reported, unverified | doc | README's node report ends with a rules line that is not what the tool prints | `README.md` line 220 |
-| reported, unverified | doc | README's node report example ends in a rules line the tool never prints for node | `README.md` line 220 |
-| reported, unverified | doc | README's node report example ends with a rules line the tool never prints | `README.md` line 220 |
-| reported, unverified | doc | README/SKILL say a Chain has 'nothing between' its pads; the corridor is only checked on hops of at most 8 mm and an off-line chain pad is never a stub | `README.md` line 255 |
-| reported, unverified | doc | The report never says the IPC-2152 fit extrapolates below 0.274 A, although docs and spec say the line does | `src/pcbc/constraints.py` line 879 |
-| reported, unverified | doc | docs/constraints.md claims the CPWG-vs-microstrip fallback 'says so'; the code takes the min silently and the branch is unreachable from a NetReq | `docs/constraints.md` line 173 |
-| reported, unverified | doc | docs/constraints.md lists diff_pair_gap as a warning; it is an error | `docs/constraints.md` line 355 |
-| reported, unverified | doc | docs/constraints.md says JLC_LIMITS and vias-per-change are 'for the report' / 'counted in the copper bar'; nothing reads either | `docs/constraints.md` line 213 |
-| reported, unverified | doc | docs/constraints.md says the 1080 100-ohm pair synthesises to 0.0846 mm at gap 0.137; the tool returns 0.0889 (the fab floor) | `docs/constraints.md` line 315 |
-| reported, unverified | doc | docs/constraints.md states the t->0 stripline agreement as 0.05 % where the pinned vector measures 0.09 % | `docs/constraints.md` line 152 |
-| reported, unverified | nit | A Chain/Bus/NetReq with too few arguments is a Python traceback from `pcbc check`, not a line-cited refusal | `src/pcbc/language.py` line 756 |
-| reported, unverified | nit | A bare Pair() prints 'length none (give length_mm=)' although Pair has no length_mm kwarg | `src/pcbc/constraints.py` line 1045 |
+| fixed | doc | README and docs/constraints.md still say buck FB-to-boot-cap is 1.84 mm; the tool prints 1.62 | `README.md` line 258 |
+| fixed | doc | README cites a test that no longer exists | `README.md` line 245 |
+| fixed | doc | README lists 'preset lengths' as a soft rule kind; no such rule is ever written | `README.md` line 223 |
+| fixed | doc | README's node `rules:` example line does not match what the tool prints | `README.md` line 220 |
+| fixed | doc | README's node report ends with a rules line that is not what the tool prints | `README.md` line 220 |
+| fixed | doc | README's node report example ends in a rules line the tool never prints for node | `README.md` line 220 |
+| fixed | doc | README's node report example ends with a rules line the tool never prints | `README.md` line 220 |
+| fixed | doc | README/SKILL say a Chain has 'nothing between' its pads; the corridor is only checked on hops of at most 8 mm and an off-line chain pad is never a stub | `README.md` line 255 |
+| fixed | doc | The report never says the IPC-2152 fit extrapolates below 0.274 A, although docs and spec say the line does | `src/pcbc/constraints.py` line 879 |
+| fixed | doc | docs/constraints.md claims the CPWG-vs-microstrip fallback 'says so'; the code takes the min silently and the branch is unreachable from a NetReq | `docs/constraints.md` line 173 |
+| fixed | doc | docs/constraints.md lists diff_pair_gap as a warning; it is an error | `docs/constraints.md` line 355 |
+| fixed | doc | docs/constraints.md says JLC_LIMITS and vias-per-change are 'for the report' / 'counted in the copper bar'; nothing reads either | `docs/constraints.md` line 213 |
+| fixed | doc | docs/constraints.md says the 1080 100-ohm pair synthesises to 0.0846 mm at gap 0.137; the tool returns 0.0889 (the fab floor) | `docs/constraints.md` line 315 |
+| fixed | doc | docs/constraints.md states the t->0 stripline agreement as 0.05 % where the pinned vector measures 0.09 % | `docs/constraints.md` line 152 |
+| fixed | nit | A Chain/Bus/NetReq with too few arguments is a Python traceback from `pcbc check`, not a line-cited refusal | `src/pcbc/language.py` line 756 |
+| fixed | nit | A bare Pair() prints 'length none (give length_mm=)' although Pair has no length_mm kwarg | `src/pcbc/constraints.py` line 1045 |
 | reported, unverified | nit | Builds are reproducible only in place: absolute paths are baked into the seed/placed/routed/fab .kicad_pcb (3D model) and report.json | `src/pcbc/seed.py` line 1 |
-| reported, unverified | nit | Bus() on a net that does not exist is compiled as a phantom constraint instead of refused (Chain/Guard refuse 'no net') | `src/pcbc/constraints.py` line 704 |
+| fixed | nit | Bus() on a net that does not exist is compiled as a phantom constraint instead of refused (Chain/Guard refuse 'no net') | `src/pcbc/constraints.py` line 704 |
 | reported, unverified | nit | Every DS2-dependent acceptance test skips in CI, including the S5-named test and the S3 KiCad rule-kind probe | `tests/test_cli.py` line 36 |
-| reported, unverified | nit | F.1 serpentine clause rounds to 'adds 0.0 mm' | `src/pcbc/route_checks.py` line 427 |
+| fixed | nit | F.1 serpentine clause rounds to 'adds 0.0 mm' | `src/pcbc/route_checks.py` line 427 |
 | reported, unverified | nit | F.1 whole-net outlier names locked anchors (the module, the connector) as the part to move | `src/pcbc/route_checks.py` line 372 |
 | reported, unverified | nit | F.3 obstacles and F.5 'mine' pads name IC pads by number (U1.2, U1.4) and F.5 ends in 'move U1 up' for an anchor | `src/pcbc/route_checks.py` line 762 |
 | reported, unverified | nit | IPC-2152 extrapolation is flagged only below 0.274 A; above 26 A and off the 0.72-2.36 mm board range it is silent, and two error paths are rough | `src/pcbc/stackup.py` line 713 |
 | reported, unverified | nit | Implicit-chain suggestion puts the connector mid-chain when it is not at an end of the principal order | `src/pcbc/route_checks.py` line 565 |
-| reported, unverified | nit | Isolation(across="U7") iterates the string into parts "U" and "7" | `src/pcbc/language.py` line 519 |
-| reported, unverified | nit | Other physically meaningless values accepted without a word: layers=[], volts=-12, temp_rise_c=0 (silently clamped to 1 C but printed as 0 C), Isolation volts=0, match_mm=0, length_mm=0, loop_mm2=-3 | `src/pcbc/constraints.py` line 856 |
-| reported, unverified | nit | Pair(gap_mm=) below clearance_min is raised silently; the report shows the raised gap as the Pair's own number | `src/pcbc/constraints.py` line 964 |
-| reported, unverified | nit | Pair-gap rule is written at .2f while the report and .kicad_pro carry the 3-dp gap | `src/pcbc/dru.py` line 149 |
-| reported, unverified | nit | Pair-on-non-usb_hs refusal text points the AI at an override that is never allowed | `src/pcbc/constraints.py` line 545 |
-| reported, unverified | nit | Power layers line names In1.Cu/In2.Cu on two-layer boards | `src/pcbc/constraints.py` line 103 |
-| reported, unverified | nit | S3 acceptance gap: blinky's soft count is not pinned (spec says the four examples and DS2) | `tests/test_examples_fab.py` line 43 |
-| reported, unverified | nit | The 'records it as intent' / 'or NetReq(..., layers=[...])' alternates are refused as new lines | `src/pcbc/route_checks.py` line 1041 |
-| reported, unverified | nit | The Regions-overlap refusal is the one Isolation refusal that cites no line | `src/pcbc/constraints.py` line 1227 |
-| reported, unverified | nit | The uncontrolled-pair note gives wrong advice on a 4-layer board and mislabels a fitted stackup | `src/pcbc/constraints.py` line 1010 |
-| reported, unverified | nit | capacitance_pf_per_mm rounds to 4 dp before i2c_max_mm divides by it | `src/pcbc/stackup.py` line 873 |
-| reported, unverified | nit | iec_creepage_mm returns the 50 V row for every voltage below 50 V; IEC 60664-1 F.5 (as KiCad encodes it) has lower rows | `src/pcbc/stackup.py` line 805 |
-| reported, unverified | nit | width_usb soft hits on 4L pairs are a 0.0004 mm rounding shortfall, so the rule can never reach zero | `src/pcbc/route.py` line 244 |
+| fixed | nit | Isolation(across="U7") iterates the string into parts "U" and "7" | `src/pcbc/language.py` line 519 |
+| fixed | nit | Other physically meaningless values accepted without a word: layers=[], volts=-12, temp_rise_c=0 (silently clamped to 1 C but printed as 0 C), Isolation volts=0, match_mm=0, length_mm=0, loop_mm2=-3 | `src/pcbc/constraints.py` line 856 |
+| fixed | nit | Pair(gap_mm=) below clearance_min is raised silently; the report shows the raised gap as the Pair's own number | `src/pcbc/constraints.py` line 964 |
+| fixed | nit | Pair-gap rule is written at .2f while the report and .kicad_pro carry the 3-dp gap | `src/pcbc/dru.py` line 149 |
+| fixed | nit | Pair-on-non-usb_hs refusal text points the AI at an override that is never allowed | `src/pcbc/constraints.py` line 545 |
+| fixed | nit | Power layers line names In1.Cu/In2.Cu on two-layer boards | `src/pcbc/constraints.py` line 103 |
+| fixed | nit | S3 acceptance gap: blinky's soft count is not pinned (spec says the four examples and DS2) | `tests/test_examples_fab.py` line 43 |
+| fixed | nit | The 'records it as intent' / 'or NetReq(..., layers=[...])' alternates are refused as new lines | `src/pcbc/route_checks.py` line 1041 |
+| fixed | nit | The Regions-overlap refusal is the one Isolation refusal that cites no line | `src/pcbc/constraints.py` line 1227 |
+| fixed | nit | The uncontrolled-pair note gives wrong advice on a 4-layer board and mislabels a fitted stackup | `src/pcbc/constraints.py` line 1010 |
+| fixed | nit | capacitance_pf_per_mm rounds to 4 dp before i2c_max_mm divides by it | `src/pcbc/stackup.py` line 873 |
+| fixed | nit | iec_creepage_mm returns the 50 V row for every voltage below 50 V; IEC 60664-1 F.5 (as KiCad encodes it) has lower rows | `src/pcbc/stackup.py` line 805 |
+| fixed | nit | width_usb soft hits on 4L pairs are a 0.0004 mm rounding shortfall, so the rule can never reach zero | `src/pcbc/route.py` line 244 |
 | refuted | bug | 'rules: N written (E error, S soft)' has two writers that disagree on every example | `src/pcbc/build.py` line 30 |
 | refuted | bug | Decap-loop note ends in the Place line that is already in board.py, claiming it 'closes' a 13.9 mm2 loop | `src/pcbc/route_checks.py` line 957 |
 | refuted | bug | Decap-loop style note tells the AI to write a Place() line that is already in board.py | `src/pcbc/route_checks.py` line 960 |

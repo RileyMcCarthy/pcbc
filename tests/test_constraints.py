@@ -92,8 +92,19 @@ def test_the_five_boards_keep_todays_classes_nets_and_krt(tmp_path: Path):
     for name, path in _boards(tmp_path).items():
         was = json.loads((FIXTURES / f"{name}.json").read_text())
         now = json.loads(json.dumps(compile_design(load_board(path)).to_dict()))
-        for key in ("nets", "krt", "keepouts", "places", "regions", "planes", "skip_autoroute_patterns"):
+        for key in ("krt", "keepouts", "places", "regions", "planes", "skip_autoroute_patterns"):
             assert now[key] == was[key], (name, key)
+        # The one deliberate difference in `nets`: a power net on a two-layer board used to be
+        # told it runs on In1.Cu and In2.Cu (the preset's four-layer tuple, printed verbatim in
+        # the report). The preset is now trimmed to the stackup's own layers; nothing reads the
+        # field for an unconstrained net (route.krt_plan takes the board's copper layers), so
+        # only the report changes. Every other key is byte-identical.
+        two_layer = now["layers"] == 2
+        for a, b in zip(now["nets"], was["nets"], strict=True):
+            if two_layer and a.get("layers") != b.get("layers"):
+                assert b["layers"] == ["F.Cu", "B.Cu", "In1.Cu", "In2.Cu"] and a["layers"] == ["F.Cu", "B.Cu"], (name, a["patterns"])
+                a = {**a, "layers": b["layers"]}
+            assert a == b, (name, a.get("patterns"))
         classes = [{k: v for k, v in c.items() if k != "lane_clearance_mm"} for c in now["classes"]]
         if name == "node":
             # H.2: jlcpcb_4l_1oz is JLC04161H-7628, so the 90 ohm pair is 0.2288 / 0.15 (was 0.1554 / 0.12).
@@ -176,9 +187,9 @@ Isolation("primary", "secondary", volts=250)
 '''
     p = _board(tmp_path, "refuse", TWO, reqs)
     assert check_board(p) == [
-        "VCC: NetReq line 15 and NetReq line 16 both name it; say it once (Pair overrides only z_diff_ohm, match_mm, uncoupled_mm, gap_mm, layers, reference)",
+        'VCC: NetReq line 15 and NetReq line 16 both name it; say it once (merge them: every net of one NetReq shares every number)',
         # the first Pair on the usb_hs NetReq is the legal override (A.4 precedence); the second names the net again
-        "D_P: NetReq line 17 and Pair line 19 both name it; say it once (Pair overrides only z_diff_ohm, match_mm, uncoupled_mm, gap_mm, layers, reference)",
+        'D_P: NetReq line 17 and Pair line 19 both name it; say it once (a Pair overrides only z_diff_ohm, match_mm, uncoupled_mm, gap_mm, layers, reference on a kind="usb_hs" NetReq)',
         'NetReq("SCK") line 21: kind="spi" with 3 nets needs clock=; which one is the clock?',
         "Pair line 20: KiCad pairs names ending P/N, _P/_N or +/-; rename SENSE_P/SIG",
         'Bus line 22: clock "CLK" is not one of AIN0, MISO',
@@ -215,7 +226,7 @@ def test_every_kind_compiles_on_two_layers_and_its_lines_are_pinned(tmp_path: Pa
         ("VCC: clearance 0.2 mm (preset power; ipc2221_6_1 row 0-15 V B2 0.1)", "D power: clearance max(0.20, B2 row); IPC-2221B 6-1 0-15 V B2 = 0.1"),
         ("VCC: via 0.8/0.4 mm (preset power), 2 per layer change (via_barrel 0.4/0.018 mm 0.871 A at 10 C) [report only in R1]", "C.7: 0.4 mm drill at 18 um plating carries 0.871 A at 10 C; ceil(1/0.871) = 2, not a gate"),
         ("VCC: loop 6 mm2 (preset power; decap loop, pcbc default)", "D power: loop_mm2 6.0 decap loop, pcbc default"),
-        ("VCC: layers F.Cu, B.Cu, In1.Cu, In2.Cu (preset power)", "today's power layers tuple, kept byte for byte"),
+        ("VCC: layers F.Cu, B.Cu (preset power)", "D: the preset's four-layer tuple trimmed to the stackup (a 2-layer board has no In1.Cu)"),
         ("VCC: spacing 3W (preset power)", "D: 3W"),
         # power at 250 V: the row wins the class clearance and creepage is written at >= 60 V
         ("HV: clearance 1.25 mm (ipc2221_6_1 IPC-2221B 6-1 row 171-250 V B2; over preset power 0.2)", "C.8 Table 6-1 171-250 V B2 = 1.25"),
@@ -254,7 +265,7 @@ def test_every_kind_compiles_on_two_layers_and_its_lines_are_pinned(tmp_path: Pa
         ("MISO: clearance 0.2 mm (preset spi)", "D spi: 0.20"),
         ("MISO: width 0.16 mm (class_floor max(0.16, track_min 0.127))", "D: floor max(0.16, track_min)"),
         # i2c: length from capacitance at the class width on the outer layer
-        ("SDA: length 9405.94 mm (i2c_capacitance 400 pF (NetReq line 22) - 10 pF x 2 pins on the busiest line at 0.0404 pF/mm (0.16 mm F.Cu))", "C.9: 0.16 mm on 2L is 0.0391 pF/mm (vector 25); (400 - 30) / 0.0391"),
+        ("SDA: length 9412.47 mm (i2c_capacitance 400 pF (NetReq line 22) - 10 pF x 2 pins on the busiest line at 0.0404 pF/mm (0.16 mm F.Cu))", "C.9: 0.16 mm on 2L is 0.0391 pF/mm (vector 25); (400 - 30) / 0.0391"),
         # generic with volts=48: B2 row 0.6 over the floor, no creepage under 60 V
         ("SIG: clearance 0.6 mm (ipc2221_6_1 IPC-2221B 6-1 row 31-50 V B2; over class_floor 0.16)", "C.8 Table 6-1 31-50 V B2 = 0.6 (vector 22)"),
         ("SIG: width 0.16 mm (class_floor max(0.16, track_min 0.127))", "D generic: floor"),
@@ -290,7 +301,7 @@ def test_every_kind_compiles_on_four_layers_and_its_lines_are_pinned(tmp_path: P
         ("Z50: width 0.3244 mm (hj_microstrip x 0.9147 JLC04161H-7628; fitted to JLC04161H-7628 rows (JITX), 2026-09-19)", "C.10 vector 5: width_for_z0(50, jlcpcb_4l_1oz) = 0.3244 (the JLC row, by construction of the bias)"),
         ("Z50: 0.3244 mm on F.Cu over In1.Cu (GND): 50 ohm (hj_microstrip x 0.9147 JLC04161H-7628; fitted to JLC04161H-7628 rows (JITX), 2026-09-19; target 50)", "D: reference plane_below(F.Cu) = In1.Cu (GND) when declared"),
         ("MISO: width 0.16 mm (class_floor max(0.16, track_min 0.0889))", "D: floor max(0.16, 4L track_min 0.0889)"),
-        ("SDA: length 4175.82 mm (i2c_capacitance 400 pF (NetReq line 22) - 10 pF x 2 pins on the busiest line at 0.091 pF/mm (0.16 mm F.Cu))", "C.9 on 7628: 0.16 mm at 0.2104 mm Dk 4.4 with bias 0.9064"),
+        ("SDA: length 4177.07 mm (i2c_capacitance 400 pF (NetReq line 22) - 10 pF x 2 pins on the busiest line at 0.091 pF/mm (0.16 mm F.Cu))", "C.9 on 7628: 0.16 mm at 0.2104 mm Dk 4.4 with bias 0.9064"),
         ("SIG: clearance 0.6 mm (ipc2221_6_1 IPC-2221B 6-1 row 31-50 V B2; over class_floor 0.18)", "C.8 31-50 V B2 = 0.6 over the 4L floor 0.18"),
         ("class Default_2 (Default is the class floor at 0.16/0.18 mm)", "A.3 collision on the 4L floor"),
     ])
@@ -424,7 +435,7 @@ def test_isolation_refusals_name_the_part_and_the_short(tmp_path: Path):
     ]
     overlapping = ISO_HEAD.replace('Region("secondary", left=22, top=0, width=18, height=25)', 'Region("secondary", left=10, top=0, width=18, height=25)')
     p.write_text(overlapping + 'Isolation("primary", "secondary", volts=250, across=("U7",))\nPlace("U7", parent="primary", left=14, top=10)\n' + ISO_TAIL)
-    assert check_board(p) == ["Isolation primary/secondary: Regions overlap in both axes; no straight line separates them"]
+    assert check_board(p) == ["Isolation primary/secondary line 12: Regions overlap in both axes; no straight line separates them"]
 
 
 # ---------------------------------------------------------------------------------------------
@@ -489,10 +500,137 @@ def test_ds2_addon_lines_are_pinned(tmp_path: Path):
         ("AIN0: no vias (preset analog)", "D analog"),
         ("AIN0: keep_clear_of none", "D notes: no switch_node net on the DS2 Addon"),
         ("REFP_F: airwire 30 mm (NetReq line 96; overrides preset analog 25)", "every net of the NetReq shares the number"),
-        ("VDDA: width 0.25 mm (pcbc_floor amps < 0.2; ipc2221_ext 0.1 A 10 C 1 oz 0.150; ipc2152_fit x board 1.092 x plane 0.593 at 1.53 mm B.Cu pour 0.003)", "D power: 0.25 floor under 0.2 A; C.6 below 0.274 A the 2152 fit extrapolates"),
+        ("VDDA: width 0.25 mm (pcbc_floor amps < 0.2; ipc2221_ext 0.1 A 10 C 1 oz 0.150; ipc2152_fit x board 1.092 x plane 0.593 at 1.53 mm B.Cu pour 0.003; below 0.274 A the IPC-2152 fit extrapolates)", "D power: 0.25 floor under 0.2 A; C.6 below 0.274 A the 2152 fit extrapolates"),
         ("VDDA: via 0.8/0.4 mm (preset power), 1 per layer change (via_barrel 0.4/0.018 mm 0.871 A at 10 C) [report only in R1]", "C.7 at 0.1 A"),
         ("classes: Default 0.16/0.16, Power 0.25/0.2 via 0.8/0.4, Analog 0.2/0.2 via 0.6/0.3", "the DS2 classes, unchanged"),
     ])
     vdda = cs.by_net("VDDA")
     assert vdda is not None and vdda.current is not None and vdda.current.width_ipc2152.source.note == "below 0.274 A the fit extrapolates"
     assert vdda.airwire_max_mm is None and cs.by_net("AIN0").airwire_max_mm == 30
+
+
+# ---------------------------------------------------------------------------------------------
+# Boards a careless AI writes: every one of these was a traceback, a silent number or a wrong
+# refusal in R1 as first merged (docs/r1-review.md, the robustness lens).
+# ---------------------------------------------------------------------------------------------
+
+ROBUST_HEAD = '''from pcbc import *
+VCC = Power("VCC"); GND = Ground("GND"); DP = Net("USB_DP"); DN = Net("USB_DN")
+Resistor("R1", "1k", package="0603", mpn="X", lcsc="C1", p1=DP, p2=DN)
+Capacitor("C1", "1uF", package="0603", mpn="X", lcsc="C1", p1=VCC, p2=GND)
+Board(width=40, height=25, layers={layers}, stackup="{stackup}")
+'''
+
+
+def _robust(tmp_path: Path, name: str, line: str, *, layers: int = 2, stackup: str = "jlcpcb_2l_1oz") -> list[str]:
+    board = tmp_path / f"{name}.py"
+    board.write_text(ROBUST_HEAD.format(layers=layers, stackup=stackup) + line + "\n")
+    from pcbc.language import check_board
+
+    return check_board(board, pcb=False)
+
+
+@pytest.mark.parametrize(
+    ("name", "line", "expected"),
+    [
+        ("volts_str", 'NetReq("VCC", kind="power", volts="5V")',
+         'line 6: NetReq("VCC"): volts=\'5V\' is not a number; write volts=5 (millimetres, volts, amps or ohms, no unit)'),
+        ("amps_str", 'NetReq("VCC", kind="power", amps="2A")',
+         'line 6: NetReq("VCC"): amps=\'2A\' is not a number; write amps=5 (millimetres, volts, amps or ohms, no unit)'),
+        ("amps_zero", 'NetReq("VCC", kind="power", amps=0)',
+         'line 6: NetReq("VCC"): amps=0 is not physical; amps must be greater than 0'),
+        ("amps_huge", 'NetReq("VCC", kind="power", amps=50)',
+         'line 6: NetReq("VCC"): amps=50 is past what pcbc models (30); say what the board really needs'),
+        ("volts_negative", 'NetReq("VCC", kind="power", volts=-12, amps=1)',
+         'line 6: NetReq("VCC"): volts=-12 is not physical; volts must be at least 0'),
+        ("volts_past_table", 'NetReq("VCC", kind="power", volts=2000, amps=0.05)',
+         'line 6: NetReq("VCC"): volts=2000 is past what pcbc models (1000); say what the board really needs'),
+        ("temp_zero", 'NetReq("VCC", kind="power", amps=1, temp_rise_c=0)',
+         'line 6: NetReq("VCC"): temp_rise_c=0 is not physical; temp_rise_c must be greater than 0'),
+        ("keep_negative", 'NetReq("VCC", kind="analog", keep_clear_of="GND", keep_clear_mm=-1)',
+         'line 6: NetReq("VCC"): keep_clear_mm=-1 is not physical; keep_clear_mm must be greater than 0'),
+        ("layers_empty", 'NetReq("VCC", layers=[])',
+         'line 6: NetReq("VCC"): layers=[] names no layer; drop it, or name one: layers=["F.Cu"]'),
+        ("bus_one_net", 'Bus("VCC", match_mm=1)', 'line 6: Bus("VCC") needs at least two nets'),
+        ("chain_one_pad", 'Chain("VCC", "R1.1")', 'line 6: Chain(\'VCC\') needs at least two "REF.PIN" pads'),
+        ("chain_no_dot", 'Chain("VCC", "R1", "C1")', 'line 6: Chain(\'VCC\'): \'R1\': write REF.PIN, e.g. U1.VIN'),
+        ("layer_not_on_stackup", 'NetReq("VCC", layers=["In1.Cu"])',
+         'NetReq("VCC") line 6: In1.Cu: jlcpcb_2l_1oz has F.Cu, B.Cu'),
+        ("i2c_budget_gone", 'NetReq("USB_DP", kind="i2c", pf_max=5)',
+         'NetReq("USB_DP") line 6: pf_max=5 pF is under the 1 device pin on the bus (10 pF at 10 pF each, UM10204 7.1): no length is left for copper'),
+        ("vias_max_negative", 'NetReq("VCC", kind="clock", vias_max=-1)',
+         'line 6: NetReq("VCC"): vias_max=-1 must be a whole number of vias, 0 or more'),
+    ],
+)
+def test_a_board_that_writes_nonsense_is_refused_with_its_line(tmp_path: Path, name: str, line: str, expected: str):
+    """No traceback, no silent number: the board's own line and what to change. (A refusal the
+    compiler raises lands after check_design's own lines; one the language raises is the only one.)"""
+    fails = _robust(tmp_path, name, line)
+    assert expected in fails, fails
+
+
+def test_a_pair_written_negative_first_is_the_same_pair(tmp_path: Path):
+    """`_kicad_pairs` was order-dependent, so `NetReq("USB_DN", "USB_DP")` (and any glob, which
+    hands the nets over sorted) was refused with "rename USB_DN/USB_DP"."""
+    from pcbc.constraints import _kicad_pairs
+
+    assert _kicad_pairs("USB_DP", "USB_DN") and _kicad_pairs("USB_DN", "USB_DP")
+    assert _kicad_pairs("D+", "D-") and _kicad_pairs("D-", "D+")
+    assert not _kicad_pairs("D_A", "D_B") and not _kicad_pairs("SCK", "SDA")
+    fails = _robust(tmp_path, "npair", 'NetReq("USB_DN", "USB_DP", kind="usb_hs")', layers=4, stackup="jlcpcb_4l_1oz")
+    assert not any("rename" in f for f in fails), fails
+
+
+def test_a_two_layer_board_is_not_told_its_power_runs_on_inner_layers(tmp_path: Path):
+    """The power preset names four layers; a 2-layer board has two, and the report printed the
+    preset's tuple verbatim. Nothing but the report reads the field for an unconstrained net."""
+    board = tmp_path / "pl.py"
+    board.write_text(ROBUST_HEAD.format(layers=2, stackup="jlcpcb_2l_1oz") + 'NetReq("VCC", "GND", kind="power", amps=1)\n')
+    cs = compile_constraints(load_board(board))
+    assert cs.refusals == ()
+    assert "VCC: layers F.Cu, B.Cu (preset power)" in cs.lines
+    assert not any("In1.Cu" in line for line in cs.lines)
+
+
+def test_a_net_that_does_not_exist_is_a_typo_not_a_net(tmp_path: Path):
+    """R1 as merged accepted `NetReq("NOPE")` and printed six lines about a net with no pads, and
+    a glob matching nothing became a class pattern with the literal `*` in it."""
+    for line, expected in [
+        ('NetReq("NOPE", kind="digital")', 'NetReq("NOPE") line 6: no net \'NOPE\''),
+        ('NetReq("VCX", kind="power", amps=1)', 'NetReq("VCX") line 6: no net \'VCX\'; did you mean \'VCC\'?'),
+        ('NetReq("SPI_*")', "NetReq(\"SPI_*\") line 6: no net matches 'SPI_*'"),
+        ('Pair("X_P", "X_N")', "Pair line 6: no net 'X_P'"),
+        ('Bus("Y0", "Y1", match_mm=1)', "Bus line 6: no net 'Y0'"),
+    ]:
+        fails = _robust(tmp_path, f"nope{abs(hash(line))}", line)
+        assert expected in fails, (line, fails)
+    # A glob that does match is not a refusal.
+    assert not [f for f in _robust(tmp_path, "glob_ok", 'NetReq("USB_*", kind="digital")') if "no net" in f]
+
+
+def test_a_board_whose_layer_count_and_stackup_disagree_is_refused(tmp_path: Path):
+    """The seed writes `layers` copper layers while every number comes from the stackup: a
+    4-layer board on a 2-layer stackup was seeded with In1/In2 and 2-layer impedances."""
+    board = tmp_path / "mismatch.py"
+    board.write_text(ROBUST_HEAD.format(layers=4, stackup="jlcpcb_2l_1oz"))
+    from pcbc.language import check_board
+
+    assert check_board(board, pcb=False)[:1] == [
+        "line 5: Board(layers=4, stackup='jlcpcb_2l_1oz'): jlcpcb_2l_1oz is a 2-layer stackup; write layers=2, or pick a 4-layer stackup"
+    ]
+
+
+def test_an_impedance_target_the_fab_cannot_reach_says_so(tmp_path: Path):
+    """`z_se_ohm=5` solved to the 6 mm bisection ceiling and printed 'target 5' as if it were met."""
+    board = tmp_path / "unreachable.py"
+    board.write_text(
+        ROBUST_HEAD.format(layers=4, stackup="jlcpcb_4l_1oz").replace(
+            'Board(width=40, height=25, layers=4, stackup="jlcpcb_4l_1oz")',
+            'Board(width=40, height=25, layers=4, stackup="jlcpcb_4l_1oz", planes=[("GND", "In1.Cu")])',
+        )
+        + 'NetReq("VCC", z_se_ohm=5)\n'
+    )
+    cs = compile_constraints(load_board(board))
+    assert cs.refusals == ()
+    assert any("not reached: 6 mm of copper only reaches" in line for line in cs.lines), cs.lines
+    assert cs.by_net("VCC").notes == ("VCC: z_se_ohm=5 is not reachable on jlcpcb_4l_1oz F.Cu: 6 mm of copper only reaches 5.28 ohm",)

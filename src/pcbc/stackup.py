@@ -451,7 +451,10 @@ def coupled_microstrip(w: float, s: float, h: float, t: float, er: float) -> tup
     `eeff` are C.1's thickness-corrected single line at width `w`; `u = w/h` is the bare ratio
     (not `ur`) and `g = s/h`, so thickness enters only through `z0` and `eeff`. Valid
     0.1 <= u <= 10, 0.1 <= g <= 10. KiCad's `coupled_microstrip.cpp` uses separate even/odd
-    thickness widths and lands within 1 ohm of this in the fitted range.
+    thickness widths, which is close on the 7628 rows (under 0.6 ohm) and not on the thin ones:
+    3.1 ohm at the 1080 90 ohm row and 4.5 ohm at its 100 ohm row (2.7 to 3.8 %). The per-stackup
+    bias of C.2 is fitted against JLC's published rows, so that difference is absorbed where a
+    row exists and is stated as `interpolated` or `formula only` where none does.
     """
     if s <= 0:
         raise ValueError(f"coupled_microstrip needs s > 0; got s={s}")
@@ -835,7 +838,12 @@ _MATERIAL_COLUMN: dict[str, int] = {"I": 1, "II": 2, "IIIa": 3, "IIIb": 3}
 
 def iec_creepage_mm(volts_rms: float, material_group: str = "IIIa", pollution_degree: int = 2, reinforced: bool = False) -> float:
     """IEC 60664-1 Table F.5 creepage at PD2, looked up at the next row voltage >= `volts_rms`;
-    reinforced doubles. FR-4 is group IIIa. 4 dp."""
+    reinforced doubles. FR-4 is group IIIa. 4 dp.
+
+    The table as encoded starts at 50 V, so anything below it reads the 50 V row (1.2 mm on
+    IIIa). That is conservative, never permissive; the standard's rows below 50 V are smaller
+    (KiCad's `iec60664.cpp` carries them) and are not encoded here because no pcbc path reaches
+    them: an automatic creepage rule is written only at `CREEPAGE_FROM_V` (60 V) and above."""
     if pollution_degree != 2:
         raise ValueError(f"R1 encodes IEC 60664-1 Table F.5 at pollution degree 2 only; got {pollution_degree}")
     if material_group not in _MATERIAL_COLUMN:
@@ -899,9 +907,13 @@ def iec_clearance_mm(volts_rms: float, overvoltage_category: int = 2, reinforced
 # ---------------------------------------------------------------------------------------------
 
 
-def capacitance_pf_per_mm(z0: float, eeff: float) -> float:
-    """Line capacitance `sqrt(eeff) / (c z0)`: 4 dp pF/mm."""
-    return round(math.sqrt(eeff) / (C_MM_PER_NS * z0) * 1000.0, 4)
+def capacitance_pf_per_mm(z0: float, eeff: float, *, exact: bool = False) -> float:
+    """Line capacitance `sqrt(eeff) / (c z0)`, 4 dp pF/mm (`exact=True` keeps full precision).
+
+    `i2c_max_mm` divides a budget by this, so rounding first moved the answer by 0.1 %; the
+    length is computed from the exact value and only the printed pF/mm is rounded."""
+    c = math.sqrt(eeff) / (C_MM_PER_NS * z0) * 1000.0
+    return c if exact else round(c, 4)
 
 
 def i2c_max_mm(pf_max: float, pins: int, c_pf_per_mm: float) -> float:

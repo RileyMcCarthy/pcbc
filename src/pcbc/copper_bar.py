@@ -86,8 +86,26 @@ def airwire_mm(points: list[tuple[float, float]]) -> float:
     return total
 
 
-def copper_bar(text: str) -> dict:
-    """Per-net and total numbers, plus the lines a report prints."""
+def bar_key(kind: str, *parts) -> tuple:
+    """A copper item's geometry key, with a segment's two ends in a fixed order. `route.bar_key`'s
+    twin: the board is rewritten twice between the piece being written and the bar reading it, and
+    nothing guarantees which end KiCad writes first."""
+    if kind == "seg":
+        layer, a, b, w = parts
+        ra, rb = (round(a[0], 4), round(a[1], 4)), (round(b[0], 4), round(b[1], 4))
+        return ("seg", layer, min(ra, rb), max(ra, rb), round(w, 4))
+    (at,) = parts
+    return ("via", (round(at[0], 4), round(at[1], 4)))
+
+
+def copper_bar(text: str, reasons: dict | None = None) -> dict:
+    """Per-net and total numbers, plus the lines a report prints.
+
+    `reasons` maps `bar_key` to the pattern that wrote that piece (D.4). With it the totals gain
+    `by_reason`, `vias_pattern` and `vias_leftover`, and the report gains the line that says how much
+    of the board is pcbc's own. Without it the output is byte-identical to what it was before R2,
+    which is what `PCBC_PATTERNS=off` relies on.
+    """
     segs = segments(text)
     vs = vias(text)
     pads = pads_by_net(text)
@@ -113,6 +131,15 @@ def copper_bar(text: str) -> dict:
     for rec in nets.values():
         rec["routed_mm"] = round(rec["routed_mm"], 3)
         rec["detour"] = round(rec["routed_mm"] / rec["airwire_mm"], 2) if rec["airwire_mm"] >= 0.05 and rec["routed_mm"] > 0 else None
+    reasons = reasons or {}
+    by_reason: dict[str, dict] = {}
+    for item, key in [(s, bar_key("seg", s["layer"], s["start"], s["end"], s["width"])) for s in segs] + [(v, bar_key("via", v["at"])) for v in vs]:
+        row = by_reason.setdefault(reasons.get(key, "leftover"), {"segments": 0, "vias": 0, "mm": 0.0})
+        if "length" in item:
+            row["segments"] += 1
+            row["mm"] += item["length"]
+        else:
+            row["vias"] += 1
     totals = {
         "nets": len(nets),
         "segments": len(segs),
@@ -124,6 +151,9 @@ def copper_bar(text: str) -> dict:
     # The worst detour among nets long enough for the ratio to mean something.
     worst = max(((r["detour"], n) for n, r in nets.items() if r["detour"] is not None and r["airwire_mm"] >= 1.0), default=None)
     totals["worst_detour"] = [worst[1], worst[0]] if worst else None
+    totals["by_reason"] = {r: {"segments": v["segments"], "vias": v["vias"], "mm": round(v["mm"], 1)} for r, v in sorted(by_reason.items())}
+    totals["vias_pattern"] = {r: v["vias"] for r, v in sorted(by_reason.items()) if r != "leftover" and v["vias"]}
+    totals["vias_leftover"] = by_reason.get("leftover", {}).get("vias", 0)
     return {"nets": nets, "totals": totals, "lines": bar_lines(nets, totals)}
 
 
@@ -132,6 +162,15 @@ def bar_lines(nets: dict[str, dict], totals: dict) -> list[str]:
         f"copper: {totals['segments']} segments, {totals['vias']} vias, {totals['routed_mm']:g} mm; "
         f"{totals['off45']} off 0/45/90, {totals['micro']} under {MICRO_MM:g} mm"
     ]
+    owned = {r: v for r, v in totals.get("by_reason", {}).items() if r != "leftover"}
+    if owned:
+        left = totals["by_reason"].get("leftover", {"segments": 0, "mm": 0.0, "vias": 0})
+        what = ", ".join(f"{r} {v['segments']} seg" + (f" {v['vias']} vias" if v["vias"] else "") for r, v in owned.items())
+        lines.append(
+            f"copper: pcbc owns {sum(v['segments'] for v in owned.values())} segments / "
+            f"{round(sum(v['mm'] for v in owned.values()), 1):g} mm and {sum(v['vias'] for v in owned.values())} vias ({what}); "
+            f"leftover {left['segments']} segments / {left['mm']:g} mm / {left['vias']} vias"
+        )
     ranked = sorted(((r["detour"], n, r) for n, r in nets.items() if r["detour"] is not None and r["airwire_mm"] >= 1.0), reverse=True)
     for detour, net, r in ranked[:3]:
         if detour < 1.5:

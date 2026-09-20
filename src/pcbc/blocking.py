@@ -97,6 +97,20 @@ def _seg_in_box(a, b, box) -> bool:
     return False
 
 
+def move_line(net: str, what: str, goal: str, blockers: str, fixes: str = "", *, sep: str = " ") -> str:
+    """The one sentence shape every pcbc routing failure speaks, so a pattern refusal and a KRT
+    failure read the same and an AI that can act on one can act on the other (E.2).
+
+    "<net>: <what> cannot reach <goal>. In the way: <blockers>. <fixes>" — `sep` is what stands
+    between the sentences, a space for a one-line report and a newline plus two spaces for a
+    pattern's multi-line refusal. `fixes` always ends in a `board.py` edit; a failure line that does
+    not is a dead end, which is the whole reason this function exists rather than an f-string per
+    call site.
+    """
+    tail = f"{sep}{fixes}" if fixes else ""
+    return f"{net}: {what} cannot reach {goal}.{sep}In the way: {blockers}.{tail}"
+
+
 def blocking_lines(design: Design, text: str, work: Path | None, net: str, named: list[str] | None = None, limit: int = 4) -> list[str]:
     """One line per unreached pad of `net` (at most three): what is in its way and whose it is."""
     pads = _pads(design, text)
@@ -157,6 +171,6 @@ def blocking_lines(design: Design, text: str, work: Path | None, net: str, named
         what = "; ".join(f for _d, f in found[:limit]) or "nothing pcbc can see: the pad itself may be unreachable (a closed row with no lane, or a keepout)"
         goal = "its own copper" if own_pts else f"{net}'s other pads"
         parts = sorted({f.split(" ")[0].split(".")[0] for _d, f in found[:limit] if " pad [" in f} | {f.split("'s net")[0].rsplit(", ", 1)[-1].split(".")[0] for _d, f in found[:limit] if "'s net" in f})
-        move = f" Move {', '.join(parts)}, or give a net in the way another layer (NetReq(..., layers=))." if parts else ""
-        lines.append(f"{net}: {p['ref']}.{p['num']} at ({px:g},{py:g}) cannot reach {goal}. In the way: {what}.{move}")
+        move = f"Move {', '.join(parts)}, or give a net in the way another layer (NetReq(..., layers=))." if parts else ""
+        lines.append(move_line(net, f"{p['ref']}.{p['num']} at ({px:g},{py:g})", goal, what, move))
     return lines

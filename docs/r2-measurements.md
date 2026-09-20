@@ -249,3 +249,136 @@ half-to-even, so an R3 port that reaches for `.round()` fails on replay.
 - **`_seg_seg_dist`, `_pt_seg_dist`, `_segs_cross` and `_seg_rect_dist` stay in `route_checks.py`.**
   Moving them onto `hull_dist2` is a behaviour change to the placement report with no caller in this
   slice to justify it; it belongs in the slice whose patterns actually consume them.
+
+## S4 — the hop, and the pattern stage
+
+pcbc now writes copper. `src/pcbc/patterns/` is B.0's contract (`Piece`, `Refusal`, `PatternResult`,
+`PatternCtx`, `PatternPlan`, the shared link builder) plus B.1's `hop`; `src/pcbc/route_verify.py` is
+D.1's self-check; `route.py` runs the pre stage before KRT, hands KRT what is left
+(`krt_plan(..., plan)`), asserts after every KRT step that nothing of pcbc's moved, and writes
+`layout/<board>/routed/copper.json`. `copper_bar` gains `by_reason`, `vias_pattern` and
+`vias_leftover`; `blocking.move_line` is the one sentence shape a pattern refusal and a KRT failure
+both speak.
+
+**Before and after, every board, fresh builds** (`pcbc build --force` into a temp copy; the "before"
+column is the same source with `PCBC_PATTERNS=off`, which reproduces the S1b row **exactly** on all
+five — so every move below is the hops and nothing else, and C.5's change to `write_fab_overrides`
+moves nothing on its own):
+
+| board | leftover share | segments | vias | off 0/45/90 | under 0.2 mm | routed mm | worst detour | refusals | route wall |
+|---|---|---|---|---|---|---|---|---|---|
+| blinky | 100 % → **0 %** | 6 → **5** | 0 → 0 | 0 → 0 | 2 → **0** | 22.5 → 22.8 | 1.03 → 1.04 | 0 | 5.7 → **5.4 s** |
+| buck | 100 % → 100 % | 96 | 4 | 3 | 26 | 142.5 | VIN 2.09 | **2 hop** | 17.3 → **16.2 s** |
+| c3_usb | 98.3 % → **95.2 %** | 342 → 377 | 13 → 14 | 7 → 7 | 139 → 168 | 312.8 → 312.9 | 1.92 → **1.81** | **1 hop** | 24.6 → **18.1 s** |
+| node | 100 % → **97.0 %** | 437 → **411** | 28 → 28 | 63 → **57** | 181 → **154** | 512.8 → 513.1 | T_OUT 1.72 | **1 hop** | 34.1 → **32.8 s** |
+| ds2 | 97.1 % → **92.7 %** | 337 → 340 | 32 → **28** | 13 → **11** | 113 → 118 | 514.6 → **509.9** | REFP_F 3.23 | **5 hop** | 17.9 → 18.8 s |
+
+Zero hard refusals on every board; the gate is verified on all five (KiCad DRC clean, zero
+unconnected, canary fired); `verify_copper` is empty on all five; two builds are byte-identical in
+both the routed `.kicad_pcb` and `copper.json`; the pattern stage costs 9 to 80 ms.
+
+What pcbc owns now, exact per board (`copper.json`'s census, and `test_examples_fab.py::OWNS`):
+
+| board | fanout | hop | leftover |
+|---|---|---|---|
+| blinky | — | 5 seg / 22.8 mm | 0 |
+| buck | — | — | 96 seg / 142.5 mm / 4 vias |
+| c3_usb | 5 seg / 5 vias / 5.3 mm | 11 seg / 9.8 mm | 361 seg / 297.8 mm / 9 vias |
+| node | — | 11 seg / 15.4 mm | 400 seg / 497.7 mm / 28 vias |
+| ds2 | 9 seg / 9 vias / 13.5 mm | 10 seg / 23.7 mm | 321 seg / 472.7 mm / 19 vias |
+
+The nets the hop claimed: blinky `LED`; c3_usb `CC1`, `CC2`, `LED`; node `CC1`, `CC2`, `LED`,
+`LED_A`, `LOAD`; ds2 `A0`-`A3`, `DRDY`, `REFN`, `REFP`, `UART_RX`, `UART_TX`, `nRESET` — which is
+S4's acceptance list verbatim. buck claims none.
+
+What the KRT plan does with that (C.4): `local_hops` **disappears** from ds2's plan (all ten of its
+local nets are hops) and never existed on blinky. It stays on buck (`EN` and `BOOT` refused), on
+c3_usb (`LED_A`) and on node (`DRV`) — S4's acceptance expected it to go on buck and c3_usb, and it
+does not, because those are exactly the three boards with a refusal. Every other step is untouched.
+
+### Three of B.1's sentences do not survive contact with the boards
+
+Each is refuted by a test rather than by an argument, because each rests on a number measured before
+pads had exits.
+
+- **blinky's `LED` is not a straight line, and the line B.1 quotes is a short.** B.1 says it is
+  21.8675 mm of copper from `R1.2 (9.44, 12.5)` to `D1.2 (31.3075, 12.5)`. `D1.1 [GND]` sits **on**
+  that line: the straight candidate overlaps it by **0.2988 mm** against the 0.2 mm the
+  Default/Power pair needs. The number came from the checked-in routed artifact, whose `LED` track
+  crosses `D1.1` — the short S3's own agreement test reported. The hop steps around it in five legs,
+  **22.8182 mm**, and blinky reaches 0 % leftover the long way round
+  (`test_the_straight_line_b1_wanted_across_blinky_shorts_d1_1`).
+- **buck's `EN` is refused by its pads' exits, not by `U1.4`'s copper.** B.1 pins the refusal at
+  `U1.4 pad [FB]` leaving 0.089 of 0.200 mm. That is A.7's measurement of the **centre-to-centre**
+  line, which a pattern never draws. With exits, `U1.5`'s only one points down, away from `R_EN.2`,
+  so no candidate has a shape at all and the refusal says which exits exist — the fact that can be
+  acted on. Pinned verbatim in `test_bucks_en_is_refused_and_the_refusal_is_a_move`.
+- **`L-h` and `L-v` never survive.** Both are a right angle, and A.5's turn rule is an octant
+  difference of at most one, so B.0's seven shapes are five in practice. They stay in the
+  enumeration because B.0 names them and because the *filter* is what removes them.
+
+### Three decisions the measurement forced, each with its number
+
+- **A pad exit carries `EPS_MM`** (`route_scene.pad_exits`). A.7 sizes the distance out as
+  `half + between + width/2`, which for a neighbouring pad of the same size at the same offset puts
+  the link at **exactly** the clearance — and `clears` is one-sided, so it refuses its own exit. It
+  is not a corner case: it is every two-pad passive and every IC row. Measured: all sixteen of
+  blinky's candidates came back `0.2 mm of the 0.2 mm` before this term. `free_intervals` already
+  carries the same term for the same reason (S3).
+- **A right angle where copper leaves a pad is mitred, not written** (`patterns.mitre`, `MITRE_MM`
+  0.2). A.7's stubs are axis-aligned, so the join with a link is usually a quarter turn — which
+  `dru.py`'s own `(constraint track_angle (min 135))` counts. Writing those corners raised
+  `pcbc_geometry_angles` on blinky from **0 to 2**, i.e. the pattern raising the count of the warning
+  pcbc wrote to catch it. The mitre cuts 0.2 mm back along each leg (a 0.2828 mm new leg, over
+  `MICRO_MM`) and every board's angle count is what it was.
+- **`DETOUR_MAX = 1.5` and the exits are ordered toward the partner.** A.7 orders a pad's exits
+  *outward*, which is what a fanout escape needs and the opposite of what a link wants: taking that
+  order literally sent c3_usb's `LED_A` round the outside at 1.93x its 1.336 mm airwire and moved
+  c3_usb's worst detour from 1.92 to 2.02 for 1.36 mm of copper. Re-ordering the enumeration toward
+  the other pad fixed node's `CC1` (1.27 → 1.00x), node's `LED_A` (1.00x) and six of ds2's ten hops,
+  but not `LED_A` on c3_usb, whose two exits sit 0.08 mm from crossing. Every hop that fits on the
+  five boards is **1.00 to 1.24x**; 1.5 sits above all of them and below that one, which now refuses.
+
+### B.1's second clause, and the failure that narrowed it
+
+"The `direct` candidate alone clears" is B.1's rule for a net past `HOP_MM`; its *reason* is that a
+straight pad-to-pad line takes no corridor the airwire did not already need. Read as "any candidate,
+when the straight line is blocked only by the two pads' own footprints", it let three ds2 signals
+through — `GPIO0` at 17.34 mm, `ADC_TX` at 12.76 mm, `ADC_DRDY` at 16.80 mm — which locked **33 mm**
+of copper across the board before anything else was routed, and `GND` then could not reach five of
+its pads (`C5.2, C6.2, J1.2, J3.3, U1.4`). That is `route.py`'s own recorded failure mode, from the
+other side.
+
+The hole was that "no straight line exists at all" fell into the permissive branch. Past `HOP_MM` the
+full list is now allowed only when a straight candidate **existed** and every blocker of it was one
+of the two terminals' own pads — blinky and nothing else on the five boards. ds2 then hops exactly
+its ten local two-pad nets, which is S4's acceptance list.
+
+### The two numbers that got worse, and why they are recorded rather than fixed
+
+**c3_usb: `micro` 139 → 168, `vias` 13 → 14, and the soft rules `width_power` 34 → 36 and
+`vias_usb_dp` 0 → 1.** Every one of them is the **USB pair**, and the pair got *shorter*: locking
+`CC1`, `CC2` and `LED` moved `USB_DN` from 46.25 to 43.65 mm and its detour from 1.92 to **1.81**,
+and KRT's differential-pair router staircases more on the route it then takes (`USB_DN` 22 → 44
+micro segments, `USB_DP` 15 → 23 and one more via). Per-net, nothing else on the board moved except
+`CC1`, `LED` and `VBUS` by a segment or two.
+
+F.3 item 7 says soft-rule hits must not rise, and two of them do. The pair is the 14.3 % of copper R2
+explicitly does not touch and R4 owns, so the honest options were to record it or to stop hopping the
+three nets nearest the connector — and the second would cost the detour improvement that is the point
+of the slice. Recorded, and in S4's open issues.
+
+**ds2: `micro` 113 → 118 and `segments` 337 → 340**, against `vias` 32 → 28, `off45` 13 → 11,
+514.6 → **509.9 mm** and the soft `width_power` 5 → **3**. Per net: `VDDA` loses 19 micro segments
+and `VSS` two, `ADC_DRDY` gains 25 and `GND` eight, all of it KRT's. The board is shorter, has four
+fewer holes in it and is straighter, and it is the only board here drawn for a real order. ds2's
+ceilings are pinned for the first time, in `test_patterns.py::DS2_BAR` — S1 said they would be and
+they never were — and its `width_power` count moves in `test_dru.py`.
+
+### What is not measured here
+
+`bus`, `guard` and `stitch` read zero on every board because no example declares them (S8). The post
+stage is **not wired in**: C.1 puts it between KRT's `planes` and `signals` steps and G lists it under
+S5's owned files, so S4 leaves `POST` empty and `pattern_copper(stage=...)` taking the argument, and
+S5 adds `tap` to the list and one call. A.4 rule 4 (the mask dam) is still advisory and still counts
+zero, because the hop places no vias and a track's mask opening is its own copper.

@@ -696,7 +696,14 @@ def pad_exits(scene: Scene, pad: Item, width: float, layer: str, *, check: bool 
     for side in order:
         dx, dy = _SIDES[side]
         half = (box[2] - box[0]) / 2.0 if dx else (box[3] - box[1]) / 2.0
-        d = max(half + worst + width / 2.0, MICRO_MM)
+        # `EPS_MM` is here because `clears` is one-sided: it wants `need + EPS_MM`, so a stub placed
+        # at exactly `need` is copper this module's own judge refuses. The case is not a corner one —
+        # it is every two-pad passive and every IC row, where the pad beside this one is the same size
+        # and sits at the same offset, so a link leaving at this distance runs past it at exactly the
+        # clearance. Measured: blinky's `LED` had all sixteen of its candidates refused at
+        # `0.2 mm of the 0.2 mm` before this term, which left the one net on the simplest board in the
+        # repo to KRT. `free_intervals` already carries the same term for the same reason.
+        d = max(half + worst + width / 2.0 + EPS_MM, MICRO_MM)
         at = qp((cx + dx * d, cy + dy * d))
         ex = Exit(at=at, dir=(dx, dy), stub=(qp((cx, cy)), at), side=side, width=width, layer=layer)
         if check:

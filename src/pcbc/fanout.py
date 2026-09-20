@@ -30,9 +30,11 @@ from .stackup import fanout_stagger
 _LAYER = re.compile(r'\n\t\t\(layer "([^"]+)"\)')
 
 
-def _excluded(design: Design, job: CompiledJob) -> set[str]:
-    """Nets that keep their pads bare: no vias, one layer, or routed as a pair."""
-    out: set[str] = set()
+def _excluded(design: Design, job: CompiledJob, claimed: frozenset[str] = frozenset()) -> set[str]:
+    """Nets that keep their pads bare: no vias, one layer, routed as a pair, or already carried by a
+    pattern. The last is C.1's order: hops run before the fanout, and a closed row's lane is better
+    spent on the hop that needed it than on a via the hop then has to start from."""
+    out: set[str] = set(claimed)
     for cn in job.nets:
         if cn.autoroute == "diff_pair" or cn.vias is False or len(cn.layers) == 1:
             out.update(n for n in design.nets if any(fnmatch(n, p) for p in cn.patterns))
@@ -51,7 +53,7 @@ def _snap_out(v: float, sign: float, grid: float) -> float:
     return round((math.ceil(q - 1e-9) if sign > 0 else math.floor(q + 1e-9)) * grid, 4)
 
 
-def fanout_pieces(design: Design, job: CompiledJob, text: str, board: str = "board", scene: Scene | None = None) -> tuple[list[Piece], list[dict]]:
+def fanout_pieces(design: Design, job: CompiledJob, text: str, board: str = "board", scene: Scene | None = None, claimed: frozenset[str] = frozenset()) -> tuple[list[Piece], list[dict]]:
     """The escapes as `Piece`s, which is the model; the board text is a rendering of them.
 
     The footprints are read **through the scene** (`route_scene.build_scene`), so the `Foot`s the
@@ -69,7 +71,7 @@ def fanout_pieces(design: Design, job: CompiledJob, text: str, board: str = "boa
     for pins in nets_of.values():
         for net in pins.values():
             count[net] = count.get(net, 0) + 1
-    excluded = _excluded(design, job)
+    excluded = _excluded(design, job, claimed)
     default = next((c.track_width_mm for c in job.classes if c.name == "Default"), stack.track_min)
     pieces: list[Piece] = []
     notes: list[dict] = []
@@ -141,10 +143,10 @@ def _lane_clearance(job: CompiledJob) -> float:
     return lane_rules(job)[1]
 
 
-def fanout_copper(design: Design, job: CompiledJob, text: str, board: str = "board", scene: Scene | None = None) -> tuple[str, list[dict]]:
+def fanout_copper(design: Design, job: CompiledJob, text: str, board: str = "board", scene: Scene | None = None, claimed: frozenset[str] = frozenset()) -> tuple[str, list[dict]]:
     """The placed board with an escape stub and via on every closed-row pad of an unconstrained
     net, locked. Returns (text, one note per via: ref, pad, net, via)."""
-    pieces, notes = fanout_pieces(design, job, text, board, scene)
+    pieces, notes = fanout_pieces(design, job, text, board, scene, claimed)
     if not pieces:
         return text, []
     return write_pieces(text, pieces), notes

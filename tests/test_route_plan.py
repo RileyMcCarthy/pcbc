@@ -78,7 +78,9 @@ def test_short_hops_route_first_on_the_empty_board(tmp_path: Path):
 
 def test_the_plan_has_no_fanout_step_and_starts_from_the_board_it_is_given(tmp_path: Path):
     """The closed rows' escapes are pcbc's own copper (`fanout.py`), written before KRT runs;
-    KRT's qfn_fanout is not in the plan (see test_fanout.py for why)."""
+    KRT's qfn_fanout is not in the plan (see test_fanout.py for why). R2 S4 renamed the step file
+    `00_fanout` -> `00_patterns_pre`: the hops go in the same board and `blocking.step_boards` names
+    the step that placed an item, so the name has to be the truth (C.1)."""
     import shutil
 
     from pcbc.build import pcb_job
@@ -87,7 +89,7 @@ def test_the_plan_has_no_fanout_step_and_starts_from_the_board_it_is_given(tmp_p
     result = pcb_job(tmp_path / "c3_usb" / "c3_usb.py")
     assert result.get("error") is None, result
     design = load_board(tmp_path / "c3_usb" / "c3_usb.py")
-    start = tmp_path / "routed" / "00_fanout.kicad_pcb"
+    start = tmp_path / "routed" / "00_patterns_pre.kicad_pcb"
     plan = krt_plan(compile_design(design), design, start, tmp_path / "routed", Path("/krt"))
     names = [n for n, _ in plan]
     assert not any(n.startswith("fanout_") for n in names), names

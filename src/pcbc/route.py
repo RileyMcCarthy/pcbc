@@ -22,6 +22,7 @@ import re
 import subprocess
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from .compile import CompiledJob, compile_design
 from .copper import unrouted_nets
@@ -29,10 +30,13 @@ from .model import Design
 from .project import copy_with_siblings
 from .sexp import matching_paren, stable_uuid
 
+if TYPE_CHECKING:  # `patterns` sits on top of `route_scene`/`route_emit`, never on this module
+    from .patterns import PatternPlan
+
 KRT_REPO = "https://github.com/drandyhaas/KiCadRoutingTools.git"
 KRT_SHA = "3244726b2c15668fb109a0bb24384750a054af40"
 
-_UUID = re.compile(r'\(uuid\s+"[^"]*"\)')
+_UUID = re.compile(r'\(uuid\s+"([^"]*)"\)')
 _COPPER_ITEM = re.compile(r"\n\t\((segment|via|zone|arc)\b")
 
 
@@ -67,8 +71,14 @@ def copper_layers(n: int) -> list[str]:
     return ["F.Cu", *inner, "B.Cu"]
 
 
-def pin_copper_ids(text: str, board: str) -> str:
-    """Re-key every segment / via / zone uuid by its order on the sheet."""
+def pin_copper_ids(text: str, board: str, keep: frozenset[str] = frozenset()) -> str:
+    """Re-key every segment / via / zone uuid by its order on the sheet — except `keep`'s.
+
+    pcbc's own copper derives its uuid from the same geometry key the sidecar is keyed by
+    (`route_emit.piece_key`), so a piece stays traceable in KiCad's UI and `copper.json` cannot
+    silently point at ids that no longer exist. KRT's invented ids are still re-keyed exactly as
+    before, and a kept id still consumes its position, so nothing else moves (C.3).
+    """
     out: list[str] = []
     pos = 0
     counts: dict[str, int] = {}
@@ -83,7 +93,10 @@ def pin_copper_ids(text: str, board: str) -> str:
         block = text[open_at : end + 1]
         i = counts.get(tag, 0)
         counts[tag] = i + 1
-        block = _UUID.sub(f'(uuid "{stable_uuid(board, tag, i)}")', block, count=1)
+        have = _UUID.search(block)
+        mine = have is not None and have.group(1) in keep
+        if not mine:
+            block = _UUID.sub(f'(uuid "{stable_uuid(board, tag, i)}")', block, count=1)
         out.append(text[pos:open_at])
         out.append(block)
         pos = end + 1
@@ -134,8 +147,16 @@ def lock_copper(text: str, nets: set[str]) -> str:
     return "".join(out)
 
 
-def krt_plan(job: CompiledJob, design: Design, placed: Path, work: Path, home: Path) -> list[tuple[str, list[str]]]:
-    """(step name, command) pairs. Pure: the same board.py gives the same plan."""
+def krt_plan(job: CompiledJob, design: Design, placed: Path, work: Path, home: Path, plan: "PatternPlan | None" = None) -> list[tuple[str, list[str]]]:
+    """(step name, command) pairs. Pure: the same board.py gives the same plan.
+
+    `plan` is the `PatternPlan` the pattern stage handed back (C.4). What it changes: `local_hops` is
+    built from the hops the pattern **refused** and the step disappears when there are none; each
+    `{class}_nets` step drops the nets patterns finished; and `signals` gains a `!NET` for every one
+    of them, belt and braces, since KRT would skip them anyway. Everything else is untouched, so a
+    board where patterns fit nothing routes exactly as it did before R2.
+    """
+    done = set(plan.done) if plan is not None else set()
     py = str(krt_python(home))
     router = home / "py_router"
     from .stackup import get_stackup
@@ -210,7 +231,7 @@ def krt_plan(job: CompiledJob, design: Design, placed: Path, work: Path, home: P
                     power.append(n)
                     widths.append(_fmt(cls.track_width_mm if cls else 0.4))
     at_width = ["--power-nets", *power, "--power-nets-widths", *widths] if power else []
-    local = [n for n in _local_nets(design, placed) if n not in constrained]
+    local = [n for n in _local_nets(design, placed) if n not in constrained and n not in done]
     pairs = {n for cn in job.nets if cn.autoroute == "diff_pair" for n in _net_names(design, cn.patterns)}
     local = [n for n in local if n not in pairs and n not in {p for p, _ in job.planes}]
     if local:
@@ -223,10 +244,13 @@ def krt_plan(job: CompiledJob, design: Design, placed: Path, work: Path, home: P
     # than finished with the vias its NetReq forbids.
     for (lays, cls_name), names in sorted(groups.items()):
         cls = _class(job, cls_name)
+        left = sorted(set(names) - done)
+        if not left:
+            continue  # the patterns finished every net of this group; KRT has nothing to route here
         step(
             f"{cls_name.lower()}_nets",
             "route.py",
-            ["--nets", *sorted(set(names)), "--layers", *lays, "--track-width", _fmt(cls.track_width_mm if cls else floor), "--via-cost", "100000", "--max-ripup", "5"],
+            ["--nets", *left, "--layers", *lays, "--track-width", _fmt(cls.track_width_mm if cls else floor), "--via-cost", "100000", "--max-ripup", "5"],
         )
 
     # 3. Differential pairs.
@@ -255,7 +279,7 @@ def krt_plan(job: CompiledJob, design: Design, placed: Path, work: Path, home: P
         step("plane_taps", "route.py", ["--nets", *plane_nets, "--layers", *layers, "--track-width", _fmt(stack.track_min), "--max-ripup", "5", "--no-bga-zones", *at_width])
 
     # 4. Everything else. Power nets at their width.
-    signals = ["--nets", "*", *[f"!{n}" for n in constrained], *[f"!{n}" for n in plane_nets], "--layers", *layers, "--track-width", _fmt(stack.track_min), "--max-ripup", "5", "--no-bga-zones", *at_width]
+    signals = ["--nets", "*", *[f"!{n}" for n in constrained], *[f"!{n}" for n in plane_nets], *[f"!{n}" for n in sorted(done) if n not in constrained and n not in plane_nets], "--layers", *layers, "--track-width", _fmt(stack.track_min), "--max-ripup", "5", "--no-bga-zones", *at_width]
     step("signals", "route.py", signals)
 
     # 5. Two layers: pour GND on the back and tie what the pour could not reach.
@@ -307,10 +331,17 @@ def write_fab_overrides(job: CompiledJob, work: Path) -> Path:
 
     s = get_stackup(job.stackup)
     path = work / "fab_overrides.txt"
+    # C.5: the floor is the SMALLEST class clearance, not the stackup's absolute minimum. With pattern
+    # copper on the board KRT chooses routes it would not have chosen, and it was measured producing a
+    # violation of its own on ds2 (`clearance (netclass 'Power' 0.2000 mm; actual 0.1284 mm)`, a GPIO1
+    # track against a 3V3 via, both KRT's). By construction this is at most every class's own number —
+    # 0.155 on c3_usb, 0.16 on buck and ds2, 0.18 on node — so no class is ever escalated, which is
+    # what `max(class clearance)` would have done to node's USB pair and its 0.15 mm gap.
+    floor = max(min([c.clearance_mm for c in job.classes], default=s.clearance_min), s.clearance_min)
     path.write_text(
         "# pcbc: the fab's floor for this stackup; KRT must not escalate past it\n"
         f"via_diameter = {s.via_diameter:g}\nvia_drill = {s.via_drill:g}\nhole_to_hole = {s.hole_to_hole:g}\n"
-        f"clearance = {s.clearance_min:g}\ntrack_width = {s.track_min:g}\nboard_edge = {s.edge_clearance:g}\n"
+        f"clearance = {floor:g}\ntrack_width = {s.track_min:g}\nboard_edge = {s.edge_clearance:g}\n"
     )
     return path
 
@@ -330,25 +361,52 @@ def route_job(design: Design, placed: Path, *, out: Path, name: str = "board") -
     job = compile_design(design)
     work = out.parent
     write_fab_overrides(job, work)
-    # The closed pad rows' escapes go on first, pcbc's own copper, locked; KRT starts from them.
-    from .fanout import fanout_copper
+    # C.1's pre stage: pcbc writes the structured copper itself, locked, before KRT sees the board.
+    # Hops run FIRST, before the fanout, and the fanout then skips the nets they claimed: a hop
+    # between two neighbouring pads has one path and anything routed before it can cut that path, so
+    # a closed row's lane is better spent on the hop that needed it than on a via the hop then has to
+    # start from (`docs/copper-plan.md` line 181, and this module's own comment below).
+    from .fanout import fanout_pieces
+    from .patterns import empty_plan, hard_refusals, pattern_copper, patterns_off
+    from .route_emit import census as _census, sidecar, write_pieces, write_sidecar
 
-    fanned, fan = fanout_copper(design, job, placed.read_text(), name)
+    text = placed.read_text()
+    plan = empty_plan(text) if patterns_off() else pattern_copper(design, job, job.constraints, text, name, stage="pre")
+    fan_pieces, fan = fanout_pieces(design, job, plan.text, name, plan.scene, claimed=plan.claimed)
+    if fan_pieces and plan.scene is not None:
+        # The escapes join the scene the patterns were judged against, so the post stage (S5) and the
+        # self-check see them. With `PCBC_PATTERNS=off` there is no scene, and `fanout_pieces` builds
+        # its own exactly as it did before R2 — which is what makes the switch a true rollback.
+        plan.scene.add(plan.scene.item_of(pc) for pc in fan_pieces)
+    pre = tuple(plan.pieces) + tuple(fan_pieces)
     start = placed
-    if fan:
-        start = work / "00_fanout.kicad_pcb"
+    if pre:
+        start = work / "00_patterns_pre.kicad_pcb"
         copy_with_siblings(placed, start)
-        start.write_text(fanned)
-    steps = krt_plan(job, design, start, work, home)
+        start.write_text(write_pieces(plan.text, fan_pieces))
+    steps = krt_plan(job, design, start, work, home, plan)
     result: dict = {
         "pcb": str(out),
         "router": "krt",
         "krt": {"home": str(home), "version": krt_version(home)},
         "plan": [{"step": n, "cmd": cmd} for n, cmd in steps],
         "fanout": fan,
+        "patterns": _census(pre),
+        "pattern_moves": list(plan.moves),
+        "notes": list(plan.notes),
+        "refusals": [r.to_dict() for r in plan.refusals()],
+        "refused": plan.counts(),
+        "pattern_ms": plan.wall_ms,
         "steps": [],
         "error": None,
     }
+    fatal = hard_refusals(plan)
+    if fatal:
+        # C.6: a soft refusal is a printed move and a fall-through to KRT, and the build passes; a
+        # hard one is intent KRT structurally cannot honour. `--strict-patterns` makes every refusal
+        # hard, and R3 flips that default.
+        result["error"] = "pattern refused:\n" + "\n".join(r.move for r in fatal)
+        return result
     last: Path | None = None
     failed: dict[str, str] = {}
     unreached: dict[str, list[str]] = {}
@@ -380,15 +438,28 @@ def route_job(design: Design, placed: Path, *, out: Path, name: str = "board") -
                     break
                 named.add(a)
             produced.write_text(lock_copper(produced.read_text(), named))
+        missing = _lost(produced.read_text(), pre)
+        if missing:
+            # C.3's guard on the promise that `(locked yes)` holds. R2 writes ten times more locked
+            # copper than the fanout did and puts it in KRT's way, so the promise is checked rather
+            # than trusted: a step that moved or dropped a piece names itself here.
+            result["error"] = f"KRT {step_name} moved or dropped {len(missing)} piece(s) of pcbc's own locked copper: {'; '.join(missing[:3])}"
+            return result
         last = produced
     if last is None:
         result["error"] = "nothing to route"
         return result
-    text = pin_copper_ids(last.read_text(), name)
+    text = pin_copper_ids(last.read_text(), name, frozenset(p.uuid for p in pre if p.uuid))
     out.write_text(text)
     from .copper_bar import copper_bar
 
-    result["copper_bar"] = copper_bar(text)
+    reasons = {bar_key(p): p.reason for p in pre}
+    result["copper_bar"] = copper_bar(text, reasons)
+    result["leftover"] = result["copper_bar"]["totals"]["by_reason"].get("leftover", {})
+    write_sidecar(
+        out.parent / "copper.json",
+        sidecar(pre, step="patterns_pre", refusals=[r.to_dict() for r in plan.refusals()], notes=plan.notes, leftover=result["leftover"]),
+    )
     opens = unrouted_nets(text)
     result["segments"] = len(re.findall(r"\n\t\(segment\b", text))
     result["vias"] = len(re.findall(r"\n\t\(via\b", text))
@@ -407,6 +478,33 @@ def route_job(design: Design, placed: Path, *, out: Path, name: str = "board") -
         moves = [_unrouted_move(job, design, n, unreached.get(n)) for n in sorted(opens)]
         result["error"] = "unrouted: " + "; ".join(moves) + "".join(f"\n  {line}" for n in sorted(opens) for line in blocking[n])
     return result
+
+
+def bar_key(p) -> tuple:
+    """A piece as the routed board will name it: the geometry, with the two ends in a fixed order.
+
+    `copper_bar` reads a board file and cannot know which end KiCad wrote first, and the board is
+    rewritten twice (KRT's steps, then the gate's refill-and-save), so the key is order-free. It is
+    the one place a reason survives those rewrites: the reason cannot live in the file, because
+    `pin_copper_ids` re-keys uuids and KiCad invents its own (D.4).
+    """
+    if p.kind == "seg":
+        a, b = (round(p.a[0], 4), round(p.a[1], 4)), (round(p.b[0], 4), round(p.b[1], 4))
+        return ("seg", p.layer, min(a, b), max(a, b), round(p.w, 4))
+    return ("via", (round(p.a[0], 4), round(p.a[1], 4)))
+
+
+def _lost(text: str, pieces) -> list[str]:
+    """Which of pcbc's own pieces are no longer on this board, by geometry."""
+    from .copper_bar import segments as _segs, vias as _vias
+
+    have = {("seg", s["layer"], min(_r(s["start"]), _r(s["end"])), max(_r(s["start"]), _r(s["end"])), round(s["width"], 4)) for s in _segs(text)}
+    have |= {("via", _r(v["at"])) for v in _vias(text)}
+    return [f"{p.reason} {p.net} {bar_key(p)[1:]}" for p in pieces if bar_key(p) not in have]
+
+
+def _r(pt) -> tuple:
+    return (round(pt[0], 4), round(pt[1], 4))
 
 
 _UNREACHED = re.compile(r"unconnected pad (\S+) on '([^']+)' at \(([-0-9.]+), ([-0-9.]+)\)")

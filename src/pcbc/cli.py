@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import json
 import sys
 from pathlib import Path
@@ -30,6 +31,11 @@ def main(argv: list[str] | None = None) -> int:
     bd.add_argument("board")
     bd.add_argument("--upto", default="fab", choices=STAGES)
     bd.add_argument("--force", action="store_true")
+    bd.add_argument(
+        "--strict-patterns",
+        action="store_true",
+        help="fail the build on any pattern refusal, not only a hard one (docs/r2-design.md C.6)",
+    )
     bd.set_defaults(func=cmd_build)
 
     sc = sub.add_parser("sch", help="Draw the schematic, prove it is board.py's netlist, list what to move")
@@ -101,6 +107,10 @@ def cmd_build(args: argparse.Namespace) -> int:
     if not path.exists():
         print(f"no such file: {path}", file=sys.stderr)
         return 2
+    if getattr(args, "strict_patterns", False):
+        # C.6's escape hatch, the other way round: a refusal is a printed move and a fall-through to
+        # KRT in R2, and this says "I want the move to stop the build". R3 flips the default.
+        os.environ["PCBC_STRICT_PATTERNS"] = "1"
     result = build_job(path, upto=args.upto, force=args.force)
     print(json.dumps(result, indent=2, default=str))
     if result.get("error"):

@@ -645,7 +645,11 @@ def test_the_gate_reports_soft_and_rule_counts_on_the_routed_ds2_board(ds2_route
     design = load_board(board)
     gate = netcheck.check_copper(design, routed, refill=False)
     assert gate["ok"] and gate["canary"], gate["fails"]
-    assert gate["soft"] == {"width_power": 5}, "H.3: the DS2 power stubs on closed rows are track_min wide; a soft hit, pinned (promotion needs zero on every board)"
+    # Re-recorded 2026-09-20 for R2 S4: 5 -> 3. The hop pattern claims ten of ds2's two-pad nets
+    # before KRT runs and `nRESET`'s escape is no longer spent, so KRT necks a power track below its
+    # class twice less often (`docs/r2-measurements.md` S4). A fall, which is the direction a soft
+    # rule is allowed to move; promotion still needs zero on every board (H.3).
+    assert gate["soft"] == {"width_power": 3}, "H.3: the DS2 power stubs on closed rows are track_min wide; a soft hit, pinned (promotion needs zero on every board)"
     assert set(gate["rules"]) == {"pcbc_geometry_segments", "pcbc_geometry_angles", "width_power", "novia_ain0", "novia_ain1", "novia_ain2", "novia_ain3", "novia_refn_f", "novia_refp_f", "pads_of_one_footprint", "pcbc_canary"}
     assert gate["rules"]["pcbc_canary"] == 1 and all(gate["rules"][n] == 0 for n in gate["rules"] if n.startswith("novia_"))
     assert gate["rules"]["pcbc_geometry_segments"] == gate["geometry"]["segments"] and gate["rules"]["pcbc_geometry_angles"] == gate["geometry"]["angles"]

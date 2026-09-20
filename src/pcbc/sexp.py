@@ -100,18 +100,23 @@ def stable_uuid(*parts: object) -> str:
     return str(uuid.uuid5(_NS, "|".join(str(p) for p in parts)))
 
 
-_ANY_UUID = re.compile(r'\(uuid\s+"[^"]*"\)')
+_ANY_UUID = re.compile(r'\(uuid\s+"([^"]*)"\)')
 
 
-def pin_all_uuids(text: str, *key: object) -> str:
+def pin_all_uuids(text: str, *key: object, keep: frozenset[str] = frozenset()) -> str:
     """Every uuid in file order, keyed by position. KiCad invents random ids for items that
     have none when it saves a board (pads, footprint fields, graphics); after the copper gate
-    refills and saves, this puts the file back on a deterministic footing."""
+    refills and saves, this puts the file back on a deterministic footing.
+
+    `keep` is pcbc's own copper: those ids are derived from the piece's geometry
+    (`route_emit.piece_key`) and named by `layout/<board>/routed/copper.json`, so re-keying them here
+    would leave the sidecar pointing at ids that no longer exist and a piece untraceable in KiCad's
+    UI. A kept id still consumes its position, so nothing else moves (`docs/r2-design.md` D.4)."""
     n = 0
 
     def sub(m: re.Match) -> str:
         nonlocal n
         n += 1
-        return f'(uuid "{stable_uuid(*key, "id", n)}")'
+        return m.group(0) if m.group(1) in keep else f'(uuid "{stable_uuid(*key, "id", n)}")'
 
     return _ANY_UUID.sub(sub, text)

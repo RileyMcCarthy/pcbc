@@ -205,9 +205,14 @@ def build_job(
             # given; None until netcheck provides them.
             entry["soft"] = gate.get("soft")
             entry["rules"] = gate.get("rules")
+            from .route_emit import read_sidecar
             from .sexp import pin_all_uuids
 
-            routed.write_text(pin_all_uuids(routed.read_text(), name, "routed"))  # KiCad's save invented ids
+            # KiCad's save invented ids. pcbc's own copper keeps the ids the sidecar names, so a
+            # piece stays traceable from `copper.json` into the board and into KiCad's UI (D.4).
+            side = routed.parent / "copper.json"
+            mine = frozenset(i["uuid"] for i in read_sidecar(side).items) if side.exists() else frozenset()
+            routed.write_text(pin_all_uuids(routed.read_text(), name, "routed", keep=mine))
         except KicadMissing as exc:
             gate = {"ok": True, "fails": []}
             entry["copper"] = f"unchecked: {exc}"

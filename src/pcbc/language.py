@@ -265,7 +265,9 @@ def Keepout(
     spec = KeepoutSpec(
         name=str(name),
         box=(tuple(float(x) for x in box) if box is not None else None),  # type: ignore[arg-type]
-        no=tuple(no),
+        # `no="copper"` is one name, not six characters: a bare string used to be iterated into
+        # ('c', 'o', 'p', 'p', 'e', 'r') and the keepout then forbade nothing pcbc looks for.
+        no=(no,) if isinstance(no, str) else tuple(str(x) for x in no),
     )
     spec = apply_style_to_spec(spec, st)
     if spec.box is not None:

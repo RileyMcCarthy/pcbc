@@ -37,12 +37,12 @@ not from scratch. **A row below is one reviewer's claim, not a verdict**: only t
 | fixed | bug | usb_hs on inner layers is silently sized as an F.Cu microstrip and reported 'on F.Cu' | `src/pcbc/constraints.py` line 966 |
 | fixed | bug | volts above 1000 (NetReq or Isolation) fails with a table-range message that cites no line and says nothing to change | `src/pcbc/circuit.py` line 101 |
 | fixed | deviation | A NetReq/Pair/Bus naming a net that does not exist, or a glob matching nothing, is accepted and printed as if the net were real | `src/pcbc/constraints.py` line 395 |
-| reported, unverified | deviation | S4 acceptance gap: the 2L F.6 style note has no test (S4 admits it) | `src/pcbc/route_checks.py` line 1163 |
+| fixed | deviation | S4 acceptance gap: the 2L F.6 style note has no test (S4 admits it) | `src/pcbc/route_checks.py` line 1163 |
 | fixed | doc | 'KiCad coupled_microstrip.cpp lands within 1 ohm of this in the fitted range' is false on the 1080 rows and on Ze | `src/pcbc/stackup.py` line 429 |
 | fixed | doc | Concepts the AI needs that no doc states | `.claude/skills/pcbc/SKILL.md` line 120 |
 | fixed | doc | Docs promise refusals the tool does not make | `.claude/skills/pcbc/SKILL.md` line 78 |
-| reported, unverified | doc | README 'Rule \| Test' table cites a deleted test and names only files for E.3-E.15 and F.1-F.7 | `README.md` line 245 |
-| reported, unverified | doc | README Rule \| Test table cites a deleted test and, for E.3-E.15 and F.1-F.7, file names instead of the tests that assert the rule | `README.md` line 245 |
+| fixed | doc | README 'Rule \| Test' table cites a deleted test and names only files for E.3-E.15 and F.1-F.7 | `README.md` line 245 |
+| fixed | doc | README Rule \| Test table cites a deleted test and, for E.3-E.15 and F.1-F.7, file names instead of the tests that assert the rule | `README.md` line 245 |
 | fixed | doc | README and docs/constraints.md still say buck FB-to-boot-cap is 1.84 mm; the tool prints 1.62 | `README.md` line 258 |
 | fixed | doc | README cites a test that no longer exists | `README.md` line 245 |
 | fixed | doc | README lists 'preset lengths' as a soft rule kind; no such rule is ever written | `README.md` line 223 |
@@ -63,10 +63,10 @@ not from scratch. **A row below is one reviewer's claim, not a verdict**: only t
 | fixed | nit | Bus() on a net that does not exist is compiled as a phantom constraint instead of refused (Chain/Guard refuse 'no net') | `src/pcbc/constraints.py` line 704 |
 | reported, unverified | nit | Every DS2-dependent acceptance test skips in CI, including the S5-named test and the S3 KiCad rule-kind probe | `tests/test_cli.py` line 36 |
 | fixed | nit | F.1 serpentine clause rounds to 'adds 0.0 mm' | `src/pcbc/route_checks.py` line 427 |
-| reported, unverified | nit | F.1 whole-net outlier names locked anchors (the module, the connector) as the part to move | `src/pcbc/route_checks.py` line 372 |
-| reported, unverified | nit | F.3 obstacles and F.5 'mine' pads name IC pads by number (U1.2, U1.4) and F.5 ends in 'move U1 up' for an anchor | `src/pcbc/route_checks.py` line 762 |
-| reported, unverified | nit | IPC-2152 extrapolation is flagged only below 0.274 A; above 26 A and off the 0.72-2.36 mm board range it is silent, and two error paths are rough | `src/pcbc/stackup.py` line 713 |
-| reported, unverified | nit | Implicit-chain suggestion puts the connector mid-chain when it is not at an end of the principal order | `src/pcbc/route_checks.py` line 565 |
+| fixed | nit | F.1 whole-net outlier names locked anchors (the module, the connector) as the part to move | `src/pcbc/route_checks.py` line 372 |
+| fixed | nit | F.3 obstacles and F.5 'mine' pads name IC pads by number (U1.2, U1.4) and F.5 ends in 'move U1 up' for an anchor | `src/pcbc/route_checks.py` line 762 |
+| fixed | nit | IPC-2152 extrapolation is flagged only below 0.274 A; above 26 A and off the 0.72-2.36 mm board range it is silent, and two error paths are rough | `src/pcbc/stackup.py` line 713 |
+| fixed | nit | Implicit-chain suggestion puts the connector mid-chain when it is not at an end of the principal order | `src/pcbc/route_checks.py` line 565 |
 | fixed | nit | Isolation(across="U7") iterates the string into parts "U" and "7" | `src/pcbc/language.py` line 519 |
 | fixed | nit | Other physically meaningless values accepted without a word: layers=[], volts=-12, temp_rise_c=0 (silently clamped to 1 C but printed as 0 C), Isolation volts=0, match_mm=0, length_mm=0, loop_mm2=-3 | `src/pcbc/constraints.py` line 856 |
 | fixed | nit | Pair(gap_mm=) below clearance_min is raised silently; the report shows the raised gap as the Pair's own number | `src/pcbc/constraints.py` line 964 |
@@ -128,3 +128,14 @@ The nets an `across=` part carries now leave the condition instead, and
 `test_dru.py::test_kicad_resolves_creepage_per_net_pair_so_the_own_pads_exemption_is_dead`
 pins both directions against KiCad itself.
 
+## Still open after the second pass
+
+- **The DS2-dependent tests skip in CI.** `test_cli.py`, `test_constraints.py`,
+  `test_dru.py` and `test_route_checks.py` each pin something on the MaD DS2 Addon, which
+  lives outside this repo. `test_cli.py::test_check_constraints_on_an_example_prints_every_number_with_its_source`
+  now pins the same acceptance on `examples/buck`, and `test_dru.py`'s rule-kind probes still
+  need the DS2 board; running them everywhere means bringing a two-layer board with an analog
+  kind into `examples/`.
+- **`width_usb` cannot reach zero.** KRT routes the pair 0.0004 mm under the class the plan
+  hands it, so the soft rule always hits. It cannot be promoted until pcbc owns the router
+  (R3) or KRT's quantisation is understood; the count is pinned so a change shows.

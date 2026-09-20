@@ -384,3 +384,12 @@ The README's Constraints table maps each to its test.
 Not in R1 (named so nobody waits): return vias, plane-split verification, 3W parallel-run
 measurement, serpentines, the ESD-at-connector check, B4 coated rows, thermal via arrays,
 neck-down areas, membership netclasses, 2 oz stackups.
+
+## What "byte for byte" does and does not cover
+
+The same `board.py` compiled twice gives the same constraints, the same rules and the same
+copper, byte for byte, on the same machine and in the same directory. Two things carry the
+path of the build and so differ between two checkouts: the `(model ...)` line of each
+footprint, which KiCad resolves against the 3D model beside the part, and the `pcb` / `fab`
+paths in `report.json`. Neither reaches a Gerber, a drill file or the netlist, so the
+manufactured board is identical; a diff of two build trees in different directories is not.

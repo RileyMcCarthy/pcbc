@@ -634,3 +634,20 @@ def test_an_impedance_target_the_fab_cannot_reach_says_so(tmp_path: Path):
     assert cs.refusals == ()
     assert any("not reached: 6 mm of copper only reaches" in line for line in cs.lines), cs.lines
     assert cs.by_net("VCC").notes == ("VCC: z_se_ohm=5 is not reachable on jlcpcb_4l_1oz F.Cu: 6 mm of copper only reaches 5.28 ohm",)
+
+
+def test_a_single_name_given_as_a_string_is_one_name_not_its_letters(tmp_path: Path):
+    """`Keepout(no="copper")` was iterated into ('c','o','p','p','e','r') and the keepout then
+    forbade nothing the checks look for; `Isolation(across="U7")` did the same with ('U','7')."""
+    from pcbc.language import load_board
+
+    board = tmp_path / "strings.py"
+    board.write_text(
+        ROBUST_HEAD.format(layers=2, stackup="jlcpcb_2l_1oz")
+        + 'Keepout("K", position="absolute", left=1, top=1, width=2, height=2, no="copper")\n'
+        + 'Region("p", left=0, top=0, width=10, height=25)\nRegion("s", left=20, top=0, width=10, height=25)\n'
+        + 'Isolation("p", "s", volts=250, across="R1")\n'
+    )
+    design = load_board(board)
+    assert design.keepouts[0].no == ("copper",)
+    assert design.isolations[0].across == ("R1",)

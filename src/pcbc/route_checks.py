@@ -277,6 +277,30 @@ def _edge_mst_mm(boxes: list[tuple[float, float, float, float]]) -> float:
     return total
 
 
+def _structural(ctx: Ctx, ref: str) -> bool:
+    """True when this part's position is the board's structure rather than a choice to revisit: a
+    connector on an edge, or a multi-pin IC or module placed by CSS. Asking the AI to re-relate
+    one of those is asking it to undo the floorplan; a two-pad passive pinned by CSS is fair game."""
+    spec = next((p for p in ctx.job.places if p.ref == ref), None)
+    if spec is None or spec.to:
+        return False
+    foot = ctx.feet.get(ref)
+    pads = len([p for p in foot.pads if p.num]) if foot else 0
+    return bool(spec.edge) or pads > 4
+
+
+def _outliers(sites: list) -> list[tuple[float, str]]:
+    """(distance to the nearest pad of another part, ref) for every part on the net, worst first."""
+    out: dict[str, float] = {}
+    for i, (ref, _num, x, y, _w, _h) in enumerate(sites):
+        others = [(x2, y2) for j, (r2, _n2, x2, y2, _w2, _h2) in enumerate(sites) if j != i and r2 != ref]
+        if not others:
+            continue
+        near = min(math.hypot(x - x2, y - y2) for x2, y2 in others)
+        out[ref] = max(out.get(ref, 0.0), near)
+    return [(d, r) for r, d in out.items()]
+
+
 def _pin(ctx: Ctx, ref: str, num: str) -> str:
     inst = ctx.insts.get(ref)
     return _pin_name(inst, num) if inst is not None else num
@@ -376,6 +400,12 @@ def check_airwires(ctx: Ctx) -> list[str]:
             if worst is None or near > worst[0]:
                 worst = (near, ref, num)
         ref = worst[1] if worst else sites[0][0]
+        if _structural(ctx, ref):
+            # The module and the edge connector are the floorplan: naming one asks the AI to undo
+            # what it placed on purpose. Take the farthest part that is not structural instead.
+            movable = sorted(((near, r) for near, r in _outliers(sites) if not _structural(ctx, r)), reverse=True)
+            if movable:
+                ref = movable[0][1]
         ic = _ic_pad_on(ctx, c.net, exclude=ref)
         if ic is None:
             other = next((s for s in sites if s[0] != ref), None)
@@ -562,7 +592,14 @@ def _implicit_chain(ctx: Ctx, net: str, refs: list[str]) -> list[tuple[str, str,
     pad on the net nearest the pad before it."""
     centres = [ctx.feet[r].center() for r in refs]
     order = _principal_order(centres)
-    if refs[order[-1]].startswith("J") and not refs[order[0]].startswith("J"):
+    conns = [k for k, i in enumerate(order) if refs[i].startswith("J")]
+    if len(conns) == 1 and conns[0] not in (0, len(order) - 1):
+        # The feed comes from the connector, so it is an end of the chain, not a stop in the
+        # middle: move it to the nearer end and keep the rest in their order.
+        k = conns.pop()
+        i = order.pop(k)
+        order = ([i] + order) if k <= len(order) / 2 else (order + [i])
+    elif order and refs[order[-1]].startswith("J") and not refs[order[0]].startswith("J"):
         order = order[::-1]
     out: list[tuple[str, str, float, float]] = []
     prev: tuple[float, float] | None = None
@@ -759,7 +796,7 @@ def check_corridors(ctx: Ctx) -> list[str]:
                         continue
                     box = _pad_box(f, p)
                     g.fill(box, 1, dil)
-                    obs.append((f"{ref}.{p.num}" if p.num else f"{ref}'s hole", box))
+                    obs.append((f"{ref}.{_pin(ctx, ref, p.num)}" if p.num else f"{ref}'s hole", box))
                 for side, strip in _lane_strips(f).items():
                     if any(p.net == c.net and f.escape.get(p.num) == side for p in f.pads):
                         continue  # the net's own escape via sits in this lane
@@ -1098,7 +1135,7 @@ def check_keep_away(ctx: Ctx) -> list[str]:
             fix = f'Place("{a[0]}", to="{ic[0]}.{ic[1]}", toward="{toward}")' if ic else f"move {a[0]} {toward}"
             relax = math.floor(d * 2.0) / 2.0
             out.append(
-                f"{c.net}: {a[0]}.{a[1]} is {d:.2f} mm from {what}; keep_clear_mm={_g(ka.mm)} ({src}): "
+                f"{c.net}: {a[0]}.{_pin(ctx, a[0], a[1])} is {d:.2f} mm from {what}; keep_clear_mm={_g(ka.mm)} ({src}): "
                 f"{fix}, or keep_clear_mm={_g(relax)} if {oref} must sit there"
             )
     return out

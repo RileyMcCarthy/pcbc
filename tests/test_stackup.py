@@ -7,6 +7,7 @@ came from in the assertion message, so a drift names the standard it left.
 from __future__ import annotations
 
 import math
+from dataclasses import replace
 
 import pytest
 
@@ -407,3 +408,15 @@ def test_thickness_enters_the_coupled_line_only_through_z0_and_eeff():
     assert abs(z6 - 103.67) > 0.5 and abs(z6 - 104.635) <= 0.05, "C.3: the ur trap (103.67) is not what the bare-u form gives (104.635)"
     zc = 2 * coupled_microstrip(0.127, 0.127, 1.53, 0.035, 4.6)[1]
     assert abs(zc - 133.08) > 5 and abs(zc - 140.053) <= 0.05, "C.3: the ur trap (133.08) is not what the bare-u form gives (140.05)"
+
+
+def test_the_ipc2152_fit_says_when_it_is_off_its_chart():
+    """C.6 gives the fit's range (0.274 to 26 A, boards 0.72 to 2.36 mm). Only the low end said so,
+    so a 30 A rail or a 0.5 mm board read as if the chart covered it."""
+    L2 = get_stackup("jlcpcb_2l_1oz")
+    assert "below 0.274 A the IPC-2152 fit extrapolates" in current_width_mm(0.1, 10, L2, 1.53).source.note
+    assert "above 26 A the IPC-2152 fit extrapolates" in current_width_mm(28, 10, L2, 1.53).source.note
+    assert "extrapolates" not in current_width_mm(2, 10, L2, 1.53).source.note, "2 A on a 1.6 mm board is on the chart"
+    thin = replace(L2, stack=(Copper("F.Cu", 0.035), Dielectric("core", 0.43, 4.6, "core"), Copper("B.Cu", 0.035)))
+    note = current_width_mm(2, 10, thin, 0.43).source.note
+    assert "on a 0.5 mm board (the chart covers 0.72 to 2.36)" in note, note

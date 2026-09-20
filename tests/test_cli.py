@@ -190,3 +190,56 @@ def test_build_check_step_carries_the_constraint_lines(tmp_path: Path):
     assert not (tmp_path / "blinky" / "layout" / "blinky" / "layout.kicad_pcb").exists(), "--upto check writes no board"
     job = pcb_job(board)
     assert job["error"] is None and sorted(job["constraints"]) == sorted(compile_design(load_board(board)).constraints.to_dict())
+
+
+# The S5 acceptance pins `pcbc check --constraints` on the DS2 Addon, which lives outside this
+# repo and skips in CI. The same acceptance on an example runs everywhere.
+BUCK_CONSTRAINT_LINES = [
+    *[
+        f"{net}: {line}"
+        for net in ("5V", "GND", "VIN")
+        for line in (
+            "width 0.781 mm (ipc2221_ext IPC-2221B eq. 6-2 external 2 A 10 C 1 oz; IPC-2221 floor holds over ipc2152_fit x board 1.092 x plane 0.593 at 1.53 mm 0.646)",
+            "clearance 0.2 mm (preset power; ipc2221_6_1 row 0-15 V B2 0.1)",
+            "via 0.8/0.4 mm (preset power), 3 per layer change (via_barrel 0.4/0.018 mm 0.871 A at 10 C) [report only in R1]",
+            "loop 6 mm2 (preset power; decap loop, pcbc default)",
+            "layers F.Cu, B.Cu (preset power)",
+            "spacing 3W (preset power)",
+        )
+    ],
+]
+BUCK_ANALOG = [
+    "FB: width 0.2 mm (preset analog)",
+    "FB: clearance 0.2 mm (preset analog)",
+    "FB: no vias (preset analog)",
+    "FB: airwire 25 mm (preset analog)",
+    'FB: keep_clear_of none; NetReq("FB", kind="analog", keep_clear_of="SW") holds 3 mm',
+    "FB: layers F.Cu (preset analog)",
+    "FB: spacing 5W (preset analog)",
+]
+BUCK_SWITCH = [
+    "SW: width 0.3 mm (preset switch_node)",
+    "SW: clearance 0.2 mm (preset switch_node)",
+    "SW: no vias (preset switch_node)",
+    "SW: airwire 6 mm (NetReq line 56; overrides preset switch_node 8)",
+    "SW: loop 20 mm2 (preset switch_node; hot loop, pcbc default)",
+    "SW: layers F.Cu (preset switch_node)",
+    "SW: spacing 3W (preset switch_node)",
+]
+
+
+def test_check_constraints_on_an_example_prints_every_number_with_its_source(tmp_path: Path, capsys):
+    """The S5 acceptance, on a board this repo carries: every number one line, with its source
+    (IPC-2221 beating the 2152 fit and saying so, the 3 vias a 2 A rail wants per layer change,
+    the keep-away pcbc will not default, the airwire the NetReq overrode)."""
+    src = Path(__file__).resolve().parent.parent / "examples" / "buck"
+    board = tmp_path / "buck.py"
+    board.write_text((src / "buck.py").read_text())
+    shutil.copytree(src / "components", tmp_path / "components")
+    assert main(["check", str(board), "--constraints"]) == 0
+    out = capsys.readouterr().out.splitlines()
+    lines = out[1:]
+    expected = sorted(BUCK_CONSTRAINT_LINES + BUCK_ANALOG + BUCK_SWITCH, key=lambda line: line.split(":")[0])
+    assert lines[:-2] == expected, lines[:-2]
+    assert lines[-2] == "classes: Default 0.16/0.16, Power 0.781/0.2 via 0.8/0.4, SwitchNode 0.3/0.2 via 0.6/0.3, Analog 0.2/0.2 via 0.6/0.3"
+    assert lines[-1].startswith("rules: ") and "canary on net " in lines[-1]

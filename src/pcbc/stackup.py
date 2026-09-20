@@ -704,7 +704,14 @@ def ipc2221_width_mm(
     return round(max(0.15, width_mil * 0.0254), 3)
 
 
-IPC2152_MIN_AMPS = 0.274  # below this the universal-chart fit extrapolates
+IPC2152_MIN_AMPS = 0.274  # the universal-chart fit's range (C.6): 0.274 to 26 A,
+IPC2152_MAX_AMPS = 26.0  # on boards 0.72 to 2.36 mm thick. Outside it the fit extrapolates and
+IPC2152_MIN_BOARD_MM = 0.72  # says so on the Derived, so a number off the chart is never silent.
+IPC2152_MAX_BOARD_MM = 2.36
+
+
+def _num_g(v: float) -> str:
+    return f"{v:g}"
 IPC2152_PLANE_H_MIN_MM = 0.144  # Fig 5-11's digitised range starts here
 
 
@@ -744,7 +751,15 @@ def current_width_mm(amps: float, temp_rise_c: float, stack: Stackup, plane_h_mm
     oz = f"{stack.copper_oz:g} oz"
     plane = f"plane {ipc2152_plane_modifier(plane_h_mm):.3f} at {plane_h_mm:g} mm" if plane_h_mm is not None else "no plane"
     fit = f"ipc2152_fit x board {ipc2152_board_modifier(stack.board_mm):.3f} x {plane}"
-    extrapolated = "; below 0.274 A the IPC-2152 fit extrapolates" if 0 < amps < IPC2152_MIN_AMPS else ""
+    outside = []
+    if 0 < amps < IPC2152_MIN_AMPS:
+        outside.append(f"below {_num_g(IPC2152_MIN_AMPS)} A")
+    elif amps > IPC2152_MAX_AMPS:
+        outside.append(f"above {_num_g(IPC2152_MAX_AMPS)} A")
+    board_mm = stack.board_mm
+    if board_mm and not IPC2152_MIN_BOARD_MM <= board_mm <= IPC2152_MAX_BOARD_MM:
+        outside.append(f"on a {_num_g(board_mm)} mm board (the chart covers {_num_g(IPC2152_MIN_BOARD_MM)} to {_num_g(IPC2152_MAX_BOARD_MM)})")
+    extrapolated = f"; {' and '.join(outside)} the IPC-2152 fit extrapolates" if outside else ""
     if w2221 >= w2152:
         return Derived(
             w2221,

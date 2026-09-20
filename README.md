@@ -236,30 +236,30 @@ A number with no standard behind it says `pcbc default`; a formula off its calib
 | A controlled pair on four layers wants its reference plane declared (`Board(planes=[("GND", "In1.Cu")])`) or `check` refuses | `test_constraints.py::test_a_controlled_pair_on_four_layers_wants_its_plane_declared` |
 | `pcbc check --constraints` prints every number with its source after the check line; `--json` is the `ConstraintSet`; a refusal exits 1 and a caveat does not; `pcbc pcb --constraints` and the build's check step carry the same lines | `test_cli.py::test_check_constraints_prints_every_number_with_its_source`, `test_check_constraints_json_prints_the_constraintset_with_its_keys`, `test_check_constraints_exit_code_is_checks_and_a_caveat_is_not_a_failure`, `test_pcb_constraints_prints_the_lines_and_json_carries_the_constraintset`, `test_build_check_step_carries_the_constraint_lines` |
 | E.1–E.2 The geometry rules (`track_segment_length (min 0.2mm)`, `track_angle (min 135)`, no unit) are warnings on every board | `test_copper_rules.py::test_pcbc_writes_the_geometry_rules_and_a_canary_that_must_fire`, `test_dru.py` |
-| E.3 Every class wider than the fab floor gets `track_width (min)` by `hasNetclass`, a warning (soft) | `test_dru.py` |
-| E.4 Every keep-away is a `clearance (min)` between the class and the other net, a footprint's own pads exempt | `test_dru.py` |
+| E.3 Every class wider than the fab floor gets `track_width (min)` by `hasNetclass`, a warning (soft) | `test_dru.py::test_every_row_of_e_is_pinned_on_two_layers`, `test_every_row_of_e_is_pinned_on_four_layers` |
+| E.4 Every keep-away is a `clearance (min)` between the class and the other net, a footprint's own pads exempt | `test_dru.py::test_every_row_of_e_is_pinned_on_two_layers`, `test_every_row_of_e_is_pinned_on_four_layers` |
 | E.5 Voltage clearance is the class row in `.kicad_pro` (`max(kind, IPC-2221B 6-1)`), never a duplicate rule | `test_constraints.py::test_a_netreq_at_48_v_gets_0_6_and_no_creepage_and_250_v_gets_1_25_and_2_5`, `test_stackup.py::test_vector_22_ipc2221_table_6_1_clearance`, `test_dru.py` |
-| E.6 A class at 60 V or more gets `creepage (min)` against every other class | `test_dru.py` |
-| E.7 `length_mm=` and the I2C budget become `length (max)` per net, an error; `max_mm` never does | `test_dru.py` |
-| E.8 Every pair and bus gets `skew (max)` over its members, a warning (soft) | `test_dru.py` |
-| E.9 Every no-via net gets `via_count (max 0)`, an error | `test_dru.py` |
-| E.10 A via budget (`usb_hs`, `clock`) is `via_count (max n)`, a warning (soft) | `test_dru.py` |
+| E.6 A class at 60 V or more gets `creepage (min)` against every other class | `test_dru.py::test_every_row_of_e_is_pinned_on_two_layers`, `test_every_row_of_e_is_pinned_on_four_layers` |
+| E.7 `length_mm=` and the I2C budget become `length (max)` per net, an error; `max_mm` never does | `test_dru.py::test_every_row_of_e_is_pinned_on_two_layers`, `test_every_row_of_e_is_pinned_on_four_layers` |
+| E.8 Every pair and bus gets `skew (max)` over its members, a warning (soft) | `test_dru.py::test_every_row_of_e_is_pinned_on_two_layers`, `test_every_row_of_e_is_pinned_on_four_layers` |
+| E.9 Every no-via net gets `via_count (max 0)`, an error | `test_dru.py::test_every_row_of_e_is_pinned_on_two_layers`, `test_every_row_of_e_is_pinned_on_four_layers` |
+| E.10 A via budget (`usb_hs`, `clock`) is `via_count (max n)`, a warning (soft) | `test_dru.py::test_every_row_of_e_is_pinned_on_two_layers`, `test_every_row_of_e_is_pinned_on_four_layers` |
 | E.11 Every pair gets `diff_pair_gap (min/opt)` by `hasNetclass` | `test_dru.py::test_todays_rules_are_still_written_unchanged_and_the_examples_lists_are_pinned`, `test_dru.py` |
-| E.12 Every pair gets `diff_pair_uncoupled (max)`, a warning (soft) | `test_dru.py` |
-| E.13–E.14 An `Isolation` writes `clearance` and `creepage` between the two sides' nets (no creepage rule with `slot=True`: the slot is the path) | `test_dru.py` |
+| E.12 Every pair gets `diff_pair_uncoupled (max)`, a warning (soft) | `test_dru.py::test_every_row_of_e_is_pinned_on_two_layers`, `test_every_row_of_e_is_pinned_on_four_layers` |
+| E.13–E.14 An `Isolation` writes `clearance` and `creepage` between the two sides' nets (no creepage rule with `slot=True`: the slot is the path) | `test_dru.py::test_isolation_rows_e13_to_e15_are_pinned`, `test_kicad_resolves_creepage_per_net_pair_so_the_own_pads_exemption_is_dead` |
 | E.15 An `Isolation` writes a rule area `ISO_{a}_{b}` over the corridor with `disallow track via zone`, and the zone is in the placed board | `test_constraints.py::test_isolation_sides_come_from_place_lines_and_the_corridor_is_a_rule_area`, `test_dru.py` |
 | E.16 A footprint's own pads are held to the fab floor, after every clearance rule so it wins | `test_copper_rules.py::test_design_rules_exempt_a_footprints_own_pads_down_to_the_floor` |
 | E.17 The canary (`length (max 0.001mm)` on one net) is last and must fire, or the gate fails; `validate` refuses `(min 135deg)`, an unknown constraint, a duplicate name before any write | `test_copper_rules.py::test_pcbc_writes_the_geometry_rules_and_a_canary_that_must_fire`, `test_dru.py` |
 | E.18 `hole_to_hole` is an error in pcbc's project | `test_fanout.py::test_kicad_finds_no_copper_error_in_the_fanned_board` |
 | E.19 Fiducial masks and keepouts are KiCad keepout zones | `test_copper_rules.py::test_fiducials_take_free_corners_and_are_kept_clear` |
 | E: each rule kind written alone into the built DS2 board on a violating fixture, then all together, the canary firing every time; `seed` and `apply` write identical class rows and the examples' `.kicad_pro` files do not change; the gate returns `soft` and `rules` counts and the examples' counts are pinned beside the bar | `test_dru.py` (kicad-marked), `test_examples_fab.py` |
-| F.1 Airwire length and skew: a net over `max_mm` or a pair/bus over `match_mm` is a move before a track exists (c3_usb spread 0.096 mm) | `test_route_checks.py` |
-| F.2 Chain order, no stubs: `Chain` pads lie in order along the feed with nothing between; a third pad off the line on a `usb_hs` or `sense` net asks for the `Chain` line | `test_route_checks.py` |
-| F.3 A wide net (>= 0.4 mm) has a channel of width plus two clearances between its pads on some outer layer, or the pinch is named (node under 3 s) | `test_route_checks.py` |
-| F.4 Decap loops are a `style:` note over 6 mm2; a hot loop over its budget is a move naming the input cap or the low side (buck 3.3 mm2) | `test_route_checks.py` |
-| F.5 A keep-away is measured pad to pad and to courtyards, a footprint's own pads exempt (buck FB to the boot cap: 1.62 mm) | `test_route_checks.py` |
+| F.1 Airwire length and skew: a net over `max_mm` or a pair/bus over `match_mm` is a move before a track exists (c3_usb spread 0.096 mm) | `test_route_checks.py::test_the_whole_nets_airwire_is_held_to_max_mm`, `test_a_moved_esd_part_skews_the_pair_and_the_move_says_how_much_serpentine`, `test_a_move_never_asks_the_ai_to_undo_its_own_floorplan` |
+| F.2 Chain order, no stubs: `Chain` pads lie in order along the feed with nothing between; a third pad off the line on a `usb_hs` or `sense` net asks for the `Chain` line | `test_route_checks.py::test_ds2_chain_passes_as_placed_and_a_cap_after_the_pin_is_named`, `test_a_pad_in_the_chain_corridor_is_named`, `test_an_implicit_chain_puts_the_connector_at_an_end` |
+| F.3 A wide net (>= 0.4 mm) has a channel of width plus two clearances between its pads on some outer layer, or the pinch is named (node under 3 s) | `test_route_checks.py::test_a_boxed_pad_names_the_pinch`, `test_buck_wide_nets_have_their_channels_as_placed` |
+| F.4 Decap loops are a `style:` note over 6 mm2; a hot loop over its budget is a move naming the input cap or the low side (buck 3.3 mm2) | `test_route_checks.py::test_buck_hot_loop_is_measured_and_noted`, `test_a_far_input_cap_opens_the_hot_loop` |
+| F.5 A keep-away is measured pad to pad and to courtyards, a footprint's own pads exempt (buck FB to the boot cap: 1.62 mm) | `test_route_checks.py::test_keep_away_from_the_switch_node_names_the_boot_cap` |
 | F.6 A controlled net's pads sit over its reference plane, outside any keepout that forbids copper; on 2L the pour is the reference | `test_constraints.py::test_a_controlled_pair_on_four_layers_wants_its_plane_declared`, `test_route_checks.py` |
-| F.7 An `Isolation`'s Regions are at least clearance and creepage apart along one axis, every part on its side, an `across` part spanning the gap; the rule area matches the placed gap | `test_route_checks.py` |
+| F.7 An `Isolation`'s Regions are at least clearance and creepage apart along one axis, every part on its side, an `across` part spanning the gap; the rule area matches the placed gap | `test_route_checks.py::test_isolation_regions_keep_the_creepage_gap_and_parts_stay_on_their_side` |
 
 Blinky is a 40×25 mm 2-layer LED + resistor. `pcbc build` writes:
 

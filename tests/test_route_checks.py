@@ -402,3 +402,65 @@ def test_isolation_regions_keep_the_creepage_gap_and_parts_stay_on_their_side(tm
 
     moves = pcb_job(_isolation_board(tmp_path / "span", u7_left=4))["layout_report"]  # U7 at the far left also overlaps C1: reported by the check step
     assert 'Isolation primary/secondary: U7 is in across= but does not span the gap; Place("U7", parent="primary", right=-3.0)' in moves
+
+
+def test_a_move_never_asks_the_ai_to_undo_its_own_floorplan(tmp_path: Path):
+    """F.1 named whichever pad was farthest from its neighbours, which on a board-wide net is the
+    module or the edge connector: `Place("U1", to="J1.EH")` asks the AI to re-relate the part it
+    anchored on purpose. A connector on an edge and a multi-pin IC placed by CSS are the
+    floorplan; the farthest part that is not becomes the move."""
+    src = _example("c3_usb")
+    line = next(l for l in src.read_text().splitlines() if l.startswith('NetReq("VBUS"'))
+    board = _copy(tmp_path / "c3", src, [(line, line[:-1] + ", max_mm=5)")])
+    moves, _notes = _report(board)
+    airwire = [m for m in moves if "airwire (MST" in m]
+    assert len(airwire) == 3, airwire
+    named = {m.split('Place("')[1].split('"')[0] for m in airwire}
+    assert named == {"R_BOOT", "D1", "U3"}, named
+    assert not any(f'Place("{ref}"' in m for ref in ("U1", "J1") for m in airwire), "U1 is the module, J1 is edge-placed"
+
+
+def test_an_implicit_chain_puts_the_connector_at_an_end(tmp_path: Path):
+    """The feed comes from the connector, so it ends the chain. The order was only flipped when a
+    connector already sat last, so one in the middle of the principal order stayed there and the
+    Chain line the message printed then failed F.2's own order check when typed in."""
+    board = _copy(
+        tmp_path / "c3",
+        _example("c3_usb"),
+        [('Chain("USB_DP", "J1.A6", "U3.1", "U1.27")', ""), ('Chain("USB_DN", "J1.A7", "U3.3", "U1.26")', ""),
+         ('Place("U3", to="J1.DP1", reason="USB ESD at the connector")', 'Place("U3", position="absolute", left=30, top=18)')],
+    )
+    moves, _notes = _report(board)
+    stubs = [m for m in moves if "a third pad off the line is a stub" in m]
+    assert stubs, moves
+    for m in stubs:
+        pads = m.split('Chain("')[1].split('")')[0].split('", "')[1:]  # [0] is the net name
+        assert len(pads) == 3, m
+        assert not pads[1].startswith("J"), f"the connector must end the chain, not sit in it: {m}"
+        assert pads[0].startswith("J1.") or pads[-1].startswith("J1."), m
+
+
+def test_a_keepout_under_a_two_layer_controlled_line_is_a_style_note(tmp_path: Path):
+    """F.6 on two layers: the B.Cu pour is the reference, so a copper keepout under the straight
+    line between a controlled net's pads takes it away. S4 implemented it with no test."""
+    board = tmp_path / "ref2l.py"
+    board.write_text(
+        '''from pcbc import *
+VCC = Power("VCC"); GND = Ground("GND"); SIG = Net("SIG")
+Resistor("R1", "1k", package="0603", mpn="X", lcsc="C1", p1=SIG, p2=GND)
+Resistor("R2", "1k", package="0603", mpn="X", lcsc="C1", p1=SIG, p2=VCC)
+Capacitor("C1", "1uF", package="0603", mpn="X", lcsc="C1", p1=VCC, p2=GND)
+Board(width=40, height=20, layers=2, stackup="jlcpcb_2l_1oz")
+Keepout("SPLIT", position="absolute", left=18, top=0, width=4, height=20, no="copper")
+NetReq("SIG", z_se_ohm=50)
+Place("R1", position="absolute", left=4, top=8)
+Place("R2", position="absolute", left=32, top=8)
+Place("C1", to="R2.2")
+for i, r in enumerate(["R1", "R2", "C1"]):
+    SchPlace(r, left=20 + 30 * i, top=20)
+'''
+    )
+    _moves, notes = _report(board)
+    assert [n for n in notes if "SPLIT" in n] == [
+        "SIG: the line from R1.1 to R2.1 crosses Keepout SPLIT; the B.Cu pour is the track's reference and has a hole there"
+    ], notes

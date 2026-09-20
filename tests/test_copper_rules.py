@@ -201,3 +201,20 @@ def test_the_stackup_is_the_one_source_of_fab_limits(tmp_path: Path):
             assert cmd[cmd.index("--via-drill") + 1] == f"{stack.via_drill:g}"
             if "--routing-clearance-margin" in cmd:
                 assert float(cmd[cmd.index("--routing-clearance-margin") + 1]) >= 1.0
+
+
+def test_an_edge_placed_header_keeps_its_pads_off_the_edge(tmp_path: Path):
+    """A pin header's pads run right to its courtyard; flush with the edge they sat 0.27 mm from it
+    (JLC wants 0.3). edge= steps the part in by what its copper needs; a connector whose pads sit
+    deep inside (USB-C) still goes flush."""
+    from pcbc.pcb_place import EDGE_CLEAR, Foot, Pad, _edge_css
+    from pcbc.model import PlaceSpec
+
+    header = Foot("J4", (-1.3, -2.3, 1.3, 2.3), [Pad("1", 0, -1.27, 1.7, 1.7, "A"), Pad("2", 0, 1.27, 1.7, 1.7, "B")])
+    spec = _edge_css(PlaceSpec(ref="J4", edge="top"), header)
+    assert abs(spec.top - round(EDGE_CLEAR - (2.3 - 2.12), 3)) < 1e-6  # stepped in by what its copper needs
+    usb = Foot("J1", (-4.5, -2.3, 4.5, 5.1), [Pad("A1", -3.2, -2.5, 0.3, 1.2, "GND")])
+    flush = _edge_css(PlaceSpec(ref="J1", edge="bottom"), usb)
+    assert flush.bottom == 0.0
+    over = _edge_css(PlaceSpec(ref="J1", edge="bottom", overhang=1.5), usb)
+    assert over.bottom == -1.5

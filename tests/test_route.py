@@ -110,3 +110,35 @@ def test_route_starts_from_a_clean_work_dir(tmp_path: Path, monkeypatch):
         (work / name).write_text("stale")
     route_job(design, src, out=work / "layout.kicad_pcb")
     assert sorted(p.name for p in work.iterdir()) == ["layout.kicad_pcb"]
+
+
+def test_a_net_krt_could_not_finish_is_reported_as_a_move():
+    """KRT prints failed nets in its summary while the net still has copper; pcbc's open-net
+    check saw the copper and said nothing, and the gate then reported 'unconnected items'."""
+    from pcbc.route import _krt_summary
+
+    log = 'noise\nJSON_SUMMARY_MIN: {"failed": 3, "failed_single": ["VSS"], "multipoint_deficit": 3, "open_single": [], "routed": 5, "vias": 2}\nEXIT=0\n'
+    assert _krt_summary(log) == {"failed": 3, "failed_single": ["VSS"], "multipoint_deficit": 3, "open_single": [], "routed": 5, "vias": 2}
+    assert _krt_summary("nothing here") == {}
+
+
+def test_a_pad_krt_left_open_is_reported_whichever_field_names_it():
+    """The DS2 Addon's ground pin: route.py said `pad_pairs_open: {nets: [GND]}` with an empty
+    `failed_single`, route_planes.py said `unconnected pad U1 on 'GND' at (22.18, 15.07)`, and
+    pcbc read neither: 'unrouted: []', then the gate found the open item."""
+    from pcbc.route import _krt_summary, _unreached_pads
+
+    log = 'JSON_SUMMARY_MIN: {"failed": 1, "failed_single": [], "multipoint_deficit": 1, "open_single": [], "pad_pairs_open": {"count": 1, "nets": ["GND"]}, "routed": 0, "vias": 26}\n'
+    assert _krt_summary(log)["pad_pairs_open"] == {"count": 1, "nets": ["GND"]}
+    pour = "      GND: 4/5 pads connected to plane on B.Cu\n          unconnected pad U1 on 'GND' at (22.18, 15.07) [F.Cu]\n"
+    assert _unreached_pads(pour) == [("U1", "GND", "22.18", "15.07")]
+    assert _unreached_pads("all connected") == []
+    # The pour's list only annotates a net a route step left open: KRT's bare pour defers every
+    # tap to the route step after it (node: 55 GND pads "unconnected", all welded a step later).
+    from pcbc.compile import compile_design
+    from pcbc.language import load_board
+    from pcbc.route import _unrouted_move
+
+    design = load_board(Path(__file__).resolve().parent.parent / "examples" / "blinky" / "blinky.py")
+    move = _unrouted_move(compile_design(design), design, "GND", [f"P{i} at (0, {i})" for i in range(9)])
+    assert "the pour could not reach P0 at (0, 0), " in move and "P5 at (0, 5), ..." in move and "P6" not in move

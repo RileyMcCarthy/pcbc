@@ -150,6 +150,49 @@ graders, are what is left of this phase.
   the uuids are pinned; the KRT SHA is pinned and checked.
 - Tests: blinky, buck, c3_usb (a USB pair), node fab-clean.
 
+### Phase 4. A real board: the MaD DS2 Addon (started 2026-09-19)
+
+`Hardware/DS2Addon/pcbc/ds2_addon.py` in the MaD repo: rev 1's netlist (exported with
+kicad-cli), the ~RESET pull-up, the input and reference RC filters populated instead of
+DNP-behind-jumpers, every part with an LCSC id. First pass: check clean, netlist proven,
+ERC clean, copper placed with nothing to move, 17 schematic moves. What it taught the tool:
+- a series resistor off a header pin went up (the free-side rule is for hangers); now a
+  resistor whose far end goes on to another part lies in line with its pin;
+- the schematic report should say when a part lies past the sheet's edge (the headers'
+  pins pointed left, so their hangers ran off the sheet; the fix was `mirror="y"`) — not done yet;
+- two filter caps on adjacent 2.54 mm header rows collide; the idiom that draws clean is
+  the upper resistor further out (`gap=12.7`) so its cap hangs past the lower node;
+- left at 3 moves, all tool work: two hats on the DIP-style ADC's adjacent GND/AVSS and
+  DVDD/AVDD pins collide with the neighbouring pins' stub wires, and a resistor's text on
+  a 2.54 mm row meets the wire of the row beside it.
+
+Copper, the same board:
+
+| Seen | Now |
+|---|---|
+| all 22 passives were placed `to=` the TSSOP; its 0.65 mm pad rows had no escape and KRT left three pads unreached while pcbc's open-net check saw copper and said nothing | KRT's own `failed_single` list is read from every step and reported as a move with the net's parts and its constraint; the filters were moved to their connectors, the series resistors to the MCU header (an intent the AI decides) |
+| a pin header flush with the edge put its pads 0.27 mm from it | `edge=` steps a part in by what its copper needs (`_edge_css`); a USB-C whose pads sit deep inside still goes flush |
+| grouping relations by pin put DVDD's bulk cap where AVDD's cap had to go | relations are placed in file order and nothing else; the skill says to list the small decoupling cap first |
+| the lean of a cap's ground pad toward a ground pad outweighed its distance to its own pin (3.35 mm) | the attach distance dominates the score (lean at 0.15) |
+| the silk retry gave a decoupling cap more gap and the decap rule then failed it | decoupling caps never move for silk; a reference with no room is hidden and noted (`style:`) |
+| the second cap on a shared 0.65 mm pad row can physically sit no nearer than 3 mm | supply pins side by side share one decoupling row: the nearest cap 2.5 mm, the next 5 |
+| the signal step re-routed the no-via analog net with four vias after its own step; `--nets * !AIN0` did not keep KRT's rip-up off it | a constrained step's copper is KiCad-locked before the next step (`lock_copper`); the fab check then holds |
+| `NetReq(max_mm=20)` was a guess that failed on a 47 mm board | `max_mm=30`; the check reports the airwire it measured |
+| with the analog copper locked, two short hops (a header pin to the resistor beside it, 0.5 mm apart) found no path: long nets routed before them walled them in and rip-up could no longer move the locked copper | short hops (every pad of the net within 5 mm, `LOCAL_MM`) are routed right after the constrained nets, before anything long: they cost nothing and block nothing |
+| even routed first, the 0.2 mm hop from a header pin to its resistor found no path: `--same-net-pad-clearance` (pcb-space's fix for vias landing in 0603 pads) also keeps a track off a same-net pad | the flag stays on the plane step only, where the tap vias are; track steps route without it |
+| `(locked yes)` written between `(end)` and `(width)` made KRT's regex parser skip those segments entirely: they stopped being obstacles and the signal step routed straight through them (shorts, crossings) | the lock goes where KiCad writes it and KRT reads it: after `(width)` on a segment, after `(layers)` on a via (`test_route_plan.py`) |
+| the TSSOP's AVDD pad found no path on any layer: its decaps sat 0.48 mm above the 0.65 mm row (courtyard + 0.2), the locked analog copper ran under the body south of it, and the 0.65 mm neighbours left 0.31 mm on each side, less than a track and two clearances; the one corridor held one via, and 3V3's took it | a pad row nothing can pass between is *closed* and keeps a fanout lane outside it, one via plus the widest class clearance wide (0.9 mm on 2L): relations settle past it, the report says who sits in it, and a decoupling cap on such a row may sit that much further (`Foot.lane`, `stackup.fanout_lane`) |
+| the same rule read the turned ESP32 module's 0.8 mm rows as 0.4 mm gaps: in a board file a pad's angle includes the footprint's, and the parser swapped width and height in the wrong frame | pads are read in the footprint's own frame (`parse_foot` subtracts the footprint's angle); the edge rule turns them to world by the footprint's rotation as before |
+| with the lane the board routed, and the fab stage refused it: the signals step had dropped a VSS via inside the analog cap's pad | `--same-net-pad-clearance` goes on the long-net signals step as well as the pour (KRT's keepout blocks via placement only); the short-hop and constrained steps stay without it |
+| then the ground pin of the TSSOP stayed open and pcbc said `unrouted: []`: KRT named it only in `pad_pairs_open` (route.py) and as `unconnected pad U1 on 'GND'` (route_planes.py), and pcbc read only `failed_single` | both route-step fields are read; the pour's list only annotates a net a route step left open, since KRT's bare pour defers every tap to the step after it (node listed 55 GND pads, all welded a step later) (`_unreached_pads`, `test_route.py`) |
+| the short-hop step's copper was locked too (`lock_copper` keyed on step names ending in `_nets`, and the step was `local_nets`); a 2 mm header-to-resistor hop whose straight path the locked analog copper had cut, with vias costing 100000, became a 65 mm F.Cu detour around the board, locked, under the ADC | the step is `local_hops` and only `*_nets` (constrained) copper is locked |
+| unlocked and allowed a via, the cut hop dropped its via inside the resistor's pad and the fab stage refused the board; with the same-net keepout on the hop step instead, the 0.5 mm hop A0 was `boxed_in_static` by the locked analog copper: the analog step, first on the empty board, had run REFP_F through the 0.54 mm slot between J4.1 and R1.1 and AIN1 through the slot between J2.3 and R6.1 | order: hops first on the empty board (one path each; a long net goes around a hop for free), then the constrained nets, then the rest; the hop step carries the same-net keepout too, since nothing cuts a hop any more |
+| the pull-up on the TSSOP's ~RESET pin was placed beside the row at the row's own height, so its 2.5 mm hop ran along the lane under pins 1 and 2 and those had no escape (GND, GPIO0, GPIO1 open) | a part attached to a closed-row pad goes straight out through the pad's lane and nowhere else (`Foot.escape`, `_attach`); `toward=` still overrides |
+| with the lane 0.9 mm wide the analog nets, first on the empty board, ran along it (AIN0 at 8.15, AIN1 at 7.7, locked) and walled AVDD, DVDD and the UART pins in; before the lane they had gone under the body | the lane is spent before anything routes: a stub and a staggered via just past every unconstrained pad of a closed row, locked; constrained nets and pairs are left on their pads and escape between the vias or under the body |
+| the examples then broke: c3_usb's USB pair passed a VBUS pad at 0.195 (Power asks 0.2) because the pair step passed `--clearance 0.16`, and `--clearance` is a ceiling on every class; node's planes welded 4 of 59 GND pads because KRT's pour (its "bare pour", #562) places no tap vias, the route step welds pads to the plane, and the same-net keepout on that step stopped it; c3_usb's GND tracks sat 0.25 from the USB-C's mounting peg against a 0.254 rule KRT cannot hold on its 0.05 mm grid | no `--clearance` on the pair and constrained steps (the classes carry it); on four layers the plane nets get their own `plane_taps` step with the keepout off explicitly (`-1`, KRT records the keepout in the sibling project) and the signals step leaves them out; the stackup's hole clearance is 0.25 |
+| node's 1 A LOAD net was routed at 0.09 mm: its two pads sit within 5 mm, so it is a hop, and the hop step routed everything at the minimum width; the fab stage caught it (`LOAD copper 0.09 mm < 0.30 mm`) | every step that may route a power net carries `--power-nets` and their widths, the hop step included |
+| KRT's `qfn_fanout.py --escape-method underpad` did that, but staggered neighbouring vias by copper clearance alone (holes 0.42 mm apart on the 0.65 mm row; JLC wants 0.5, KiCad only warns) and, when its second via row did not fit the 0.9 mm lane, hunted past the decaps with 3.5 mm stubs that grazed their pads (Power clearance 0.2, actual 0.01) | the fanout is pcbc's own (`fanout.py`): the stackup's numbers and nothing else; the lane is sized for two via rows staggered for hole-to-hole (`fanout_lane`, `fanout_stagger`: 1.29 mm on a 0.65 mm row at 2L), vias on KRT's grid with the second row snapped from the first, and `hole_to_hole` is an error in pcbc's project so the gate sees it |
+
 ### Phase 3. Silk, fab, review (days) — landed 2026-09-19
 
 References are placed at the place stage (`silk.legalize_silk`): 16 spots around the part

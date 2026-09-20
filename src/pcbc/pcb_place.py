@@ -12,18 +12,20 @@ from __future__ import annotations
 
 import math
 import re
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 
 from .copper import _rotate
 from .css import Rect, rotate_local_bounds
 from .geom import _iter_tagged, footprint_box_local
 from .layout import content_rect, footprints_by_ref, resolve_keepout, resolve_place, resolve_regions
 from .model import BoardSpec, Design, PlaceSpec
+from .stackup import Stackup, fanout_lane, get_stackup, pass_mm
 
 _PAD_AT = re.compile(r"\(at\s+([0-9.+-]+)\s+([0-9.+-]+)(?:\s+([0-9.+-]+))?\)")
 _PAD_SIZE = re.compile(r"\(size\s+([0-9.+-]+)\s+([0-9.+-]+)\)")
 _PAD_NUM = re.compile(r'\(pad\s+"([^"]*)"')
 _PAD_NET = re.compile(r'\(net\s+(?:\d+\s+)?"([^"]*)"\)')
+_FOOT_AT = re.compile(r"\n\t\t\(at [0-9.+-]+ [0-9.+-]+(?: ([0-9.+-]+))?\)")
 
 GAP = 0.2  # courtyard to courtyard, mm
 EDGE_CLEAR = 0.3  # copper to board edge (JLC asks 0.2; routing wants a lane)
@@ -55,12 +57,85 @@ class Foot:
     pads: list[Pad]
     at: tuple[float, float] | None = None
     rot: float = 0.0
+    keep: tuple[float, float, float, float] | None = None  # local courtyard plus the fanout lanes
+    closed: frozenset[str] = frozenset()  # pads nothing can pass between: they escape straight out
+    escape: dict[str, str] = field(default_factory=dict)  # closed pad -> the side it escapes to
+    lanes: dict[str, float] = field(default_factory=dict)  # side -> its fanout lane, mm
+    lane_mm: float = 0.0  # the widest of them, for the report
 
     def world_box(self, at=None, rot=None) -> tuple[float, float, float, float]:
         at = at or self.at
         rot = self.rot if rot is None else rot
         x0, y0, x1, y1 = rotate_local_bounds(*self.box, rot)
         return (at[0] + x0, at[1] + y0, at[0] + x1, at[1] + y1)
+
+    def world_keep(self, at=None, rot=None) -> tuple[float, float, float, float]:
+        at = at or self.at
+        rot = self.rot if rot is None else rot
+        x0, y0, x1, y1 = rotate_local_bounds(*(self.keep or self.box), rot)
+        return (at[0] + x0, at[1] + y0, at[0] + x1, at[1] + y1)
+
+    def lane(self, stack: Stackup, clearance: float) -> None:
+        """Find the pads nothing can pass between (a 0.65 mm TSSOP row, a 0.5 mm QFN row) and
+        widen the keep box outside each such row by the fanout lane its pitch needs: a via just
+        past every pad, neighbours staggered so their holes keep the fab's hole-to-hole. A track
+        leaving one of those pads can only go straight out, and this is the room it takes: the
+        DS2 Addon's decaps sat 0.48 mm above the row and its AVDD pad had no path on any layer."""
+        passing = pass_mm(stack)
+        pads = [p for p in self.pads if p.num]
+        cx, cy = (self.box[0] + self.box[2]) / 2.0, (self.box[1] + self.box[3]) / 2.0
+        # For each pad, the sides (axis, sign) on which a neighbour sits too close to pass, and how far.
+        tight: dict[str, dict[tuple[str, float], float]] = {}
+        for a in pads:
+            for b in pads:
+                if b is a or b.num == a.num:
+                    continue
+                gx = abs(a.x - b.x) - (a.w + b.w) / 2.0
+                gy = abs(a.y - b.y) - (a.h + b.h) / 2.0
+                if max(gx, gy) >= passing:
+                    continue
+                axis = "x" if gx > gy else "y"
+                sign = math.copysign(1.0, (b.x - a.x) if axis == "x" else (b.y - a.y))
+                dist = abs(b.x - a.x) if axis == "x" else abs(b.y - a.y)
+                near = tight.setdefault(a.num, {})
+                near[(axis, sign)] = min(near.get((axis, sign), dist), dist)
+
+        def outward(a: Pad, axis: str) -> str:
+            if axis == "x":  # the row runs along x: the pad escapes up or down
+                return "top" if a.y < cy else "bottom"
+            return "left" if a.x < cx else "right"
+
+        # A pad with tight neighbours on both sides of a row is walled in; its whole row (the end
+        # pads included, they sit in the same lane) escapes straight out.
+        laned: set[str] = set()
+        for a in pads:
+            for axis in ("x", "y"):
+                if (axis, -1.0) in tight.get(a.num, {}) and (axis, 1.0) in tight.get(a.num, {}):
+                    laned.add(outward(a, axis))
+        keep = list(self.box)
+        closed: set[str] = set()
+        self.escape = {}
+        self.lanes = {}
+        for a in pads:
+            for (axis, _sign), pitch in tight.get(a.num, {}).items():
+                side = outward(a, axis)
+                if side not in laned:
+                    continue
+                closed.add(a.num)
+                self.escape[a.num] = side
+                lane = fanout_lane(stack, clearance, pitch)
+                self.lanes[side] = max(self.lanes.get(side, 0.0), lane)
+                if side == "top":
+                    keep[1] = min(keep[1], a.y - a.h / 2.0 - lane)
+                elif side == "bottom":
+                    keep[3] = max(keep[3], a.y + a.h / 2.0 + lane)
+                elif side == "left":
+                    keep[0] = min(keep[0], a.x - a.w / 2.0 - lane)
+                else:
+                    keep[2] = max(keep[2], a.x + a.w / 2.0 + lane)
+        self.closed = frozenset(closed)
+        self.lane_mm = round(max(self.lanes.values(), default=0.0), 4)
+        self.keep = tuple(round(v, 4) for v in keep) if closed else None
 
     def pad_world(self, pad: Pad, at=None, rot=None) -> tuple[float, float]:
         at = at or self.at
@@ -74,7 +149,12 @@ class Foot:
 
 
 def parse_foot(ref: str, block: str) -> Foot:
+    """Pads in the footprint's own frame. In a board file a pad's angle already includes the
+    footprint's, so a turned module's pads are un-turned by it before width and height are read
+    (the ESP32 module at 90 had its 0.8 mm rows read as 0.4 mm gaps: a closed row that was not)."""
     pads: list[Pad] = []
+    placed = _FOOT_AT.search(block)
+    frot = float(placed.group(1) or 0) if placed else 0.0
     for pad in _iter_tagged(block, "pad"):
         num = _PAD_NUM.match(pad)
         at = _PAD_AT.search(pad)
@@ -83,7 +163,7 @@ def parse_foot(ref: str, block: str) -> Foot:
             continue
         net = _PAD_NET.search(pad)
         w, h = float(size.group(1)), float(size.group(2))
-        if round(float(at.group(3) or 0)) % 180 == 90:
+        if round(float(at.group(3) or 0) - frot) % 180 == 90:
             w, h = h, w
         pads.append(Pad(num.group(1), float(at.group(1)), float(at.group(2)), w, h, net.group(1) if net else ""))
     crt = footprint_box_local(block, "courtyard")
@@ -160,8 +240,16 @@ def _board_of(job) -> BoardSpec:
     return BoardSpec(size_mm=job.board_size_mm, padding=job.padding, layers=job.layers, stackup=job.stackup, pcb=job.pcb, planes=job.planes)
 
 
+def lane_rules(job) -> tuple[Stackup, float]:
+    """(stackup, the widest net class clearance): what a closed pad row's lane is sized from."""
+    stack = get_stackup(job.stackup)
+    clearance = max([c.clearance_mm for c in getattr(job, "classes", [])] + [stack.clearance_min])
+    return stack, clearance
+
+
 def _overlap(a, b, gap: float = 0.0) -> bool:
-    return a[0] < b[2] + gap and b[0] < a[2] + gap and a[1] < b[3] + gap and b[1] < a[3] + gap
+    eps = 1e-6  # a part settled exactly on a lane's edge is not in it
+    return a[0] < b[2] + gap - eps and b[0] < a[2] + gap - eps and a[1] < b[3] + gap - eps and b[1] < a[3] + gap - eps
 
 
 def _inside(box, rect: Rect) -> bool:
@@ -190,10 +278,20 @@ def _rot_for_face(face: tuple[float, float], out: tuple[float, float]) -> float:
 def _edge_css(spec: PlaceSpec, foot: Foot) -> PlaceSpec:
     """`edge=` as CSS: flush with that edge (minus overhang), centred along it unless told."""
     out = _EDGE_OUT[spec.edge]
-    rot = spec.rot if spec.rot_set else _rot_for_face(_face(foot), out)
+    face = _face(foot)
+    rot = spec.rot if spec.rot_set else _rot_for_face(face, out)
     css: dict = {"position": "absolute", "rot": rot, "from_box": "courtyard"}
     along_set = any(getattr(spec, k) is not None for k in ("left", "right", "top", "bottom"))
-    css[spec.edge] = -float(spec.overhang)
+    # Flush with the edge, unless the part's copper would then sit inside the edge clearance
+    # (a pin header's pads run right to its courtyard): then it steps in by the difference.
+    x0, y0, x1, y1 = foot.box
+    crt_face = x1 if face == (1.0, 0.0) else -x0 if face == (-1.0, 0.0) else y1 if face == (0.0, 1.0) else -y0
+    reach = max(
+        (p.x * face[0] + p.y * face[1] + (p.w / 2 if face[0] else p.h / 2) for p in foot.pads if p.num),
+        default=crt_face - EDGE_CLEAR,
+    )
+    inset = round(max(-float(spec.overhang), EDGE_CLEAR - (crt_face - reach)), 3)
+    css[spec.edge] = inset
     if spec.edge in ("top", "bottom"):
         if not along_set:
             css.update(left=0, right=0, margin_left="auto", margin_right="auto")
@@ -232,16 +330,16 @@ def resolve_places(design: Design, job, pcb_text: str) -> tuple[list[PlaceSpec],
     blocks = footprints_by_ref(pcb_text)
     feet: dict[str, Foot] = {ref: parse_foot(ref, blk) for ref, blk in blocks.items()}
     nets_of = _pins_of(design)
+    stack, clearance = lane_rules(job)
     for ref, foot in feet.items():
         for pad in foot.pads:
             pad.net = nets_of.get(ref, {}).get(pad.num, pad.net)
+        foot.lane(stack, clearance)
     keepouts = [resolve_keepout(ko, board, regions) for ko in job.keepouts]
     values = {inst.ref: (inst.value or inst.part.value or "") for inst in design.instances}
-    order = {p.ref: i for i, p in enumerate(job.places)}  # file order: the first Place() on a pin gets the closest spot
-    first_on: dict[tuple[str, str], int] = {}
-    for p in job.places:
-        if p.to:
-            first_on.setdefault(parse_refpin(p.to), order[p.ref])
+    # File order, and nothing else: the first Place() written gets the closest spot. Grouping by
+    # pin (all of DVDD's caps before AVDD's) put a bulk cap where the neighbouring pin's cap had to go.
+    order = {p.ref: i for i, p in enumerate(job.places)}
     moves: list[str] = []
     resolved: dict[str, PlaceSpec] = {}
     placed: list[Foot] = []
@@ -293,7 +391,7 @@ def resolve_places(design: Design, job, pcb_text: str) -> tuple[list[PlaceSpec],
         if not ready or guard > 64:
             names = ", ".join(sorted(p.ref for p in pending))
             raise ValueError(f"Place(to=...) cycle or missing target among {names}")
-        ready.sort(key=lambda p: (first_on[parse_refpin(p.to)], _farads(values.get(p.ref, "")), _area(feet[p.ref].box), order[p.ref]))
+        ready.sort(key=lambda p: order[p.ref])
         spec = ready[0]
         pending.remove(spec)
         tref, tpin = parse_refpin(spec.to)
@@ -345,6 +443,11 @@ def _attach(spec: PlaceSpec, part: Foot, target: Foot, net: str, placed: list[Fo
         tw = target.pad_world(tp)
         if spec.toward:
             dirs = [_DIRS[spec.toward]]
+        elif tp.num in target.escape:
+            # A closed-row pad escapes straight out through its lane; a part beside the row
+            # (R10 left of the DS2 Addon's TSSOP, on the row's own height) needs a hop that runs
+            # along the lane under the pads between, and those pads then have no escape.
+            dirs = [_EDGE_OUT[target.escape[tp.num]]]
         else:
             dx, dy = tw[0] - tc[0], tw[1] - tc[1]
             first = (math.copysign(1.0, dx), 0.0) if abs(dx) >= abs(dy) else (0.0, math.copysign(1.0, dy))
@@ -355,14 +458,16 @@ def _attach(spec: PlaceSpec, part: Foot, target: Foot, net: str, placed: list[Fo
                 for ap in apads:
                     ao = _rotate(ap.x, ap.y, rot)
                     cb = rotate_local_bounds(*part.box, rot)
-                    tbox = target.world_box()
-                    # Along e, the part's courtyard must start past the target's courtyard + gap.
+                    ck = rotate_local_bounds(*(part.keep or part.box), rot)
+                    tbox, tkeep = target.world_box(), target.world_keep()
+                    # Along e, the part's courtyard must start past the target's courtyard + gap,
+                    # and past its fanout lane if that side of the target is a closed pad row.
                     if e[0]:
-                        edge = tbox[2] + gap if e[0] > 0 else tbox[0] - gap
+                        edge = max(tbox[2] + gap, tkeep[2]) if e[0] > 0 else min(tbox[0] - gap, tkeep[0])
                         near = cb[0] if e[0] > 0 else cb[2]
                         d0 = (edge - (tw[0] + near - ao[0])) * e[0]
                     else:
-                        edge = tbox[3] + gap if e[1] > 0 else tbox[1] - gap
+                        edge = max(tbox[3] + gap, tkeep[3]) if e[1] > 0 else min(tbox[1] - gap, tkeep[1])
                         near = cb[1] if e[1] > 0 else cb[3]
                         d0 = (edge - (tw[1] + near - ao[1])) * e[1]
                     d0 = max(d0, 0.0)
@@ -374,7 +479,8 @@ def _attach(spec: PlaceSpec, part: Foot, target: Foot, net: str, placed: list[Fo
                             aw = (tw[0] + e[0] * d + side[0] * lat, tw[1] + e[1] * d + side[1] * lat)
                             at = (aw[0] - ao[0], aw[1] - ao[1])
                             box = (at[0] + cb[0], at[1] + cb[1], at[0] + cb[2], at[1] + cb[3])
-                            clash = _clashes(box, others, keepouts, limit, gap)
+                            keep = (at[0] + ck[0], at[1] + ck[1], at[0] + ck[2], at[1] + ck[3])
+                            clash = _clashes(box, keep, others, keepouts, limit, gap)
                             if not clash:
                                 found = (at, math.hypot(d, lat))
                                 break
@@ -392,7 +498,9 @@ def _attach(spec: PlaceSpec, part: Foot, target: Foot, net: str, placed: list[Fo
                         sites = known.get(p.net) or []
                         if sites:
                             lean += min(math.hypot(pw[0] - s[0], pw[1] - s[1]) for s in sites)
-                    score = (d + 0.5 * lean + 0.02 * ri + 0.5 * di, at, rot)
+                    # The attach distance is what the decap rule measures; the lean of the other
+                    # pads toward their nets is a tie-breaker, not a reason to sit 3 mm from the pin.
+                    score = (d + 0.15 * lean + 0.02 * ri + 0.5 * di, at, rot)
                     if _TRACE == spec.ref:
                         print(f"  {spec.ref} dir={e} rot={rot:g} pad={ap.num} d={d:.2f} lean={lean:.2f} score={score[0]:.2f} at=({at[0]:.2f},{at[1]:.2f})")
                     if best is None or score < best:
@@ -418,12 +526,13 @@ def _laterals(reach: float = 4.0):
         lat += _STEP
 
 
-def _clashes(box, others: list[Foot], keepouts, limit: Rect, gap: float) -> list[str]:
+def _clashes(box, keep, others: list[Foot], keepouts, limit: Rect, gap: float) -> list[str]:
+    """Courtyards keep `gap` apart; a fanout lane (`keep` beyond `box`) keeps courtyards out of it."""
     hits: list[str] = []
     if not _inside(box, limit):
         hits.append("the board edge")
     for f in others:
-        if _overlap(box, f.world_box(), gap):
+        if _overlap(box, f.world_box(), gap) or _overlap(keep, f.world_box()) or _overlap(box, f.world_keep()):
             hits.append(f.ref)
     for i, ko in enumerate(keepouts):
         if _overlap(box, ko, 0.0):
@@ -443,6 +552,7 @@ def layout_report(design: Design, job, pcb_text: str) -> list[str]:
     from .sexp import footprint_at
 
     nets_of = _pins_of(design)
+    stack, clearance = lane_rules(job)
     for ref, blk in blocks.items():
         f = parse_foot(ref, blk)
         at = footprint_at(blk)
@@ -451,6 +561,7 @@ def layout_report(design: Design, job, pcb_text: str) -> list[str]:
         f.at, f.rot = (at[0], at[1]), at[2]
         for pad in f.pads:
             pad.net = nets_of.get(ref, {}).get(pad.num, pad.net)
+        f.lane(stack, clearance)
         feet[ref] = f
     issues: list[str] = []
     refs = sorted(feet)
@@ -458,6 +569,13 @@ def layout_report(design: Design, job, pcb_text: str) -> list[str]:
         for b in refs[i + 1 :]:
             if _overlap(feet[a].world_box(), feet[b].world_box()):
                 issues.append(f"{a} and {b} overlap (courtyards): give one of them its own spot or Place(to=) the other")
+                continue
+            for ic, part in ((a, b), (b, a)):
+                if feet[ic].closed and _overlap(feet[ic].world_keep(), feet[part].world_box()):
+                    issues.append(
+                        f"{part} sits in {ic}'s fanout lane: nothing passes between {ic}'s pads, so each row needs "
+                        f"{feet[ic].lane_mm:g} mm outside it for its escape vias; move {part} out, or Place({part!r}, to=\"{ic}.<pin>\") and the tool keeps the lane"
+                    )
     for ref in refs:
         box = feet[ref].world_box()
         over = max(content.x0 - box[0], content.y0 - box[1], box[2] - content.x1, box[3] - content.y1, 0.0)
@@ -491,14 +609,34 @@ def layout_report(design: Design, job, pcb_text: str) -> list[str]:
         if nearest:
             dmm, ic, num = nearest
             by_pin.setdefault((ic, _pin_name(inst_by[ic], num)), []).append((dmm, ref))
+    # Supply pins side by side (AVDD next to DVDD on a 0.65 mm TSSOP) share one decoupling
+    # row: the nearest cap of the row is held to 2.5 mm, the others to 5.
+    rows: list[tuple[list[tuple[str, str]], list[tuple[float, str]]]] = []
     for (ic, pin), caps in sorted(by_pin.items()):
-        caps.sort()
-        for i, (dmm, ref) in enumerate(caps):
-            limit = DECAP_MM if i == 0 else DECAP_NEXT_MM
+        num = next((p.pads[0] for n, p in inst_by[ic].part.pins.items() if n == pin), None)
+        here = feet[ic].pad_world(next(p for p in feet[ic].pads if p.num == num)) if num else None
+        for pins, members in rows:
+            if here and any(
+                math.hypot(here[0] - feet[oic].pad_world(next(p for p in feet[oic].pads if p.num == onum))[0], here[1] - feet[oic].pad_world(next(p for p in feet[oic].pads if p.num == onum))[1]) <= 1.0
+                for oic, onum in pins if oic == ic
+            ):
+                pins.append((ic, num))
+                members.extend((d, r, pin) for d, r in caps)
+                break
+        else:
+            rows.append(([(ic, num)], [(d, r, pin) for d, r in caps]))
+    for pins, members in rows:
+        members.sort()
+        ic = pins[0][0]
+        # A closed pad row keeps its fanout lane between the pin and the cap: the cap sits that much further.
+        extra = max((feet[oic].lane_mm for oic, num in pins if num in feet[oic].closed), default=0.0)
+        for i, (dmm, ref, pin) in enumerate(members):
+            limit = (DECAP_MM if i == 0 else DECAP_NEXT_MM) + extra
             if dmm > limit:
-                what = "a decoupling cap" if i == 0 else "the next cap on that pin"
+                what = "a decoupling cap" if i == 0 else "the next cap on that pin row"
+                why = f" ({limit - extra:g} + the {extra:g} mm fanout lane of a closed pad row)" if extra else ""
                 issues.append(
-                    f"{ref} is {dmm:.1f} mm from {ic}.{pin}: {what} belongs within {limit:g} mm; Place({ref!r}, to=\"{ic}.{pin}\")"
+                    f"{ref} is {dmm:.1f} mm from {ic}.{pin}: {what} belongs within {limit:g} mm{why}; Place({ref!r}, to=\"{ic}.{pin}\")"
                 )
     from fnmatch import fnmatch
 

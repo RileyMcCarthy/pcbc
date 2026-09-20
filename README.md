@@ -59,6 +59,7 @@ What the sheet is held to, and the test that pins each one (`tests/`):
 | Attached pins line up with their target, and the tool picks the gap | `test_sch.py::test_attach_picks_the_pin_on_the_target_net`, `test_gap_defaults_to_room_for_the_label`, `test_align_lands_the_hanging_pin_on_another_pins_row` |
 | 2-pin parts turn or mirror to face their node; ICs stay upright; field text stays horizontal | `test_sch.py::test_switch_mirrors_to_face_its_node`, `test_ic_stays_upright_when_attached`, `test_rotated_symbol_fields_stay_horizontal` |
 | A hanger takes the engineer's pose: down to ground, up to a supply, along for a series part; a divider's tap continues below | `test_buck.py::test_hangers_take_the_engineers_pose` |
+| A series resistor (its far end goes on to another part: a filter resistor off a header, a resistor before an LED) lies in line with its pin; caps between two signals still hang | `test_sch.py::test_a_series_resistor_lies_in_line_with_its_pin` |
 | A part that had to slide far, or could not be placed at all, is reported as a move, and stays where the collision is | `test_buck.py::test_a_taken_lane_is_reported` |
 | Off a pin that points up or down, a cap lies sideways from a short stub; a pull-up stands with its supply up, a part to ground with its ground down, or the report says so | `test_node.py::test_cap_lies_sideways_off_a_vertical_supply_pin`, `test_divider_and_pullups_stand_the_right_way_up` |
 | A supply may be wired as one short straight run, or a short U tying two of one part's pins; anything longer is a symbol per pin | `test_rules.py::test_power_is_symbols_or_one_short_wire` |
@@ -128,7 +129,7 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt && .venv/bin/
 Place("J1", edge="bottom")                    # a connector on that edge, face out, centred (left=/right= say where along it)
 Place("U1", position="absolute", left=1, top=1, rotate=90)   # an anchor: CSS, as before
 Place("C_MCU_HF", to="U1.3V3")                # this part's pad on that net, right outside U1, on the side the pin faces
-Place("C_MCU", to="U1.3V3")                   # the next cap on the same pin goes beside the first; smallest capacitance nearest
+Place("C_MCU", to="U1.3V3")                   # the next cap on the same pin goes beside the first: the first Place() written sits nearest
 Place("D1", to="R_LED.2", toward="right")     # toward= overrides the side; gap= the courtyard clearance (0.2 mm)
 ```
 
@@ -138,21 +139,22 @@ Place("D1", to="R_LED.2", toward="right")     # toward= overrides the side; gap=
 |---|---|
 | A relation names a real part, a real pin, and a pin of the placed part on that net, or `check` says which is wrong | `test_pcb_place.py::test_validate_names_the_mistake` |
 | `to=` puts the part's pad next to the pin, outside the target's keepout | `test_pcb_place.py::test_to_puts_the_pad_next_to_the_pin_outside_the_target` |
-| Parts on one pin share it, smallest capacitance nearest; `toward=` picks the side | `test_two_parts_on_one_pin_share_it_smallest_first`, `test_toward_overrides_the_side` |
+| Parts on one pin share it in file order, the first written nearest; `toward=` picks the side | `test_two_parts_on_one_pin_share_it_in_file_order`, `test_toward_overrides_the_side` |
 | `edge=` is the old CSS for a connector, with the rotation picked from where its pads are | `test_edge_is_the_old_css_for_a_connector` |
 | A boxed-in part is reported, never hidden | `test_a_boxed_in_part_is_reported_not_hidden` |
 | Courtyards never overlap; nothing sits outside the board; the first decoupling cap on a pin is within 2.5 mm and the next within 5; a connector is on an edge, or the report says so | `test_report_reads_a_hand_placed_board` |
 | The same `board.py` places the same, byte for byte | `test_the_same_board_places_the_same` |
-| The first `Place()` on a pin gets the closest spot (file order); on one pin the smallest capacitance goes nearest | `test_copper_rules.py::test_the_first_place_on_a_pin_gets_the_closest_spot` |
+| Relations are placed in file order and nothing else: the first `Place()` written gets the closest spot (list the small decoupling cap first) | `test_copper_rules.py::test_the_first_place_on_a_pin_gets_the_closest_spot` |
 | Copper stays 0.3 mm off the board edge; a net with `NetReq(max_mm=)` has no pad farther than that from its nearest neighbour | `test_copper_rules.py::test_report_holds_copper_off_the_edge_and_nets_to_their_max_mm` |
-| Turning a footprint turns its pads (KiCad stores pad angles as footprint + pad angle in a board file) | `test_copper_rules.py::test_turning_a_footprint_turns_its_pads` |
+| Turning a footprint turns its pads (KiCad stores pad angles as footprint + pad angle in a board file); the placement reads a turned footprint's pads back in its own frame | `test_copper_rules.py::test_turning_a_footprint_turns_its_pads`, `test_pcb_place.py::test_a_part_placed_on_a_closed_row_keeps_out_of_the_lane` |
+| A pad row nothing can pass between (a 0.65 mm TSSOP, a 0.5 mm QFN: gap < track + 2 x clearance) is closed; each closed row keeps a fanout lane outside it sized from the stackup for two staggered via rows (`stackup.fanout_lane`: 1.29 mm on a 0.65 mm row at JLC 2L), that relations stay out of and the report guards; a decoupling cap on such a row may sit the lane further | `test_pcb_place.py::test_a_closed_pad_row_gets_a_fanout_lane`, `test_a_part_placed_on_a_closed_row_keeps_out_of_the_lane` |
 | A footprint's own pads are held to the fab floor, not the net class; ringless mounting holes are repaired at fetch; touching pads fail the score; every generic has a vendored land | `test_copper_rules.py` |
 | Silkscreen references are placed by the tool: beside the part, turned to fit a narrow slot, on the body of a big part away from its pads; a reference with no room re-places its part with more gap, then is reported | `test_silk.py` |
 | The examples stay under the bar: c3_usb 0, buck 0, node 0, silk included | `test_c3_usb_layout_bar`, `test_node.py::test_node_layout_bar`, `test_silk.py::test_the_examples_references_all_fit` |
 
 ### Copper rules
 
-The AI never draws a track. The route stage compiles `NetReq` into an ordered KRT plan and runs it: nets that may not carry vias, or live on one layer (`kind="switch_node"`, `kind="analog"`, `vias=False`, `layers=`), go first on their layers while the board is empty; differential pairs (`pair=True`) as coupled pairs; on four layers the declared `planes=` pours with via taps; then everything else with power nets at the width their `amps` ask for; on two layers a GND pour on the back and one more pass. The plan is a pure function of `board.py` (`tests/test_route_plan.py`). The gate is KiCad's own verdict plus the netlist:
+The AI never draws a track. The route stage compiles `NetReq` into an ordered KRT plan and runs it: closed pad rows (a 0.65 mm TSSOP, a QFN) are fanned out first by pcbc itself (`fanout.py`): a stub and a via just past every unconstrained pad, neighbours staggered for the fab's hole-to-hole, on the router's grid, locked, so the lane placement kept free is spent on escapes and nothing routes along it; short hops (every pad of the net within 5 mm: a header pin to its resistor, a cap to its pin) next on the still-empty board, since a hop between neighbouring pads has one path and anything routed before it can cut that path; nets that may not carry vias, or live on one layer (`kind="switch_node"`, `kind="analog"`, `vias=False`, `layers=`), next on their layers, and their copper is then locked so no later step reroutes them; differential pairs (`pair=True`) as coupled pairs; on four layers the declared `planes=` pours, then every pad on a plane net welded to its plane in its own step; then everything else, with power nets at the width their `amps` ask for on every step that may route one; on two layers a GND pour on the back and one more pass. The plan is a pure function of `board.py` (`tests/test_route_plan.py`). The gate is KiCad's own verdict plus the netlist:
 
 | Rule | Test |
 |---|---|
@@ -163,6 +165,11 @@ The AI never draws a track. The route stage compiles `NetReq` into an ordered KR
 | The `Stackup` is the one source of the fab's limits: the project's constraints, the net classes' vias, the router's clearances and the gate all read it | `test_copper_rules.py::test_the_stackup_is_the_one_source_of_fab_limits` |
 | The gate judges filled pours and saves them, so what it judged is what the fab gets; fiducials carry a keepout so no track crosses their mask opening | `test_route.py::test_blinky_routes_clean_and_the_same_twice`, `test_copper_rules.py::test_fiducials_take_free_corners_and_are_kept_clear` |
 | Every route starts from a clean work dir; a killed build's step files are never inherited | `test_route.py::test_route_starts_from_a_clean_work_dir` |
+| Vias keep out of same-net SMD pads on the long-net step and the pour (a via in a passive's pad wicks solder and the fab stage refuses it); the short-hop and constrained steps route without that keepout | `test_route_plan.py::test_vias_keep_out_of_same_net_pads_on_the_long_nets_and_the_pour_only` |
+| A footprint with a closed pad row is fanned out before KRT runs: pcbc's own stub and via on every unconstrained pad (`fanout.py`), staggered for the fab's hole-to-hole, on the grid, locked, deterministic, clean under KiCad DRC; pairs and constrained nets keep their pads bare; a part attached to a closed-row pad is placed straight out through its lane, never beside the row | `test_fanout.py`, `test_route_plan.py::test_the_plan_has_no_fanout_step_and_starts_from_the_board_it_is_given`, `test_pcb_place.py::test_a_part_placed_on_a_closed_row_keeps_out_of_the_lane` |
+| Two holes closer than the fab's hole-to-hole are a DRC error in pcbc's project (KiCad's default is a warning, and the gate counts errors) | `test_fanout.py::test_kicad_finds_no_copper_error_in_the_fanned_board` |
+| No step passes `--clearance` but the pours (it is a ceiling on every class; the pair step's 0.16 once capped Power); on four layers the plane nets are welded to their planes in their own `plane_taps` step with the same-net keepout off, since KRT's pour places no tap vias and the keepout stops the welds | `test_route_plan.py::test_node_pours_its_planes_before_the_signals_and_asks_90_ohm` |
+| Every way KRT reports an unreached pad is read (`failed_single`, `pad_pairs_open`, a pour's `unconnected pad`) and becomes a move naming the net, its parts and the pad; only constrained copper is locked, short hops stay movable | `test_route.py::test_a_net_krt_could_not_finish_is_reported_as_a_move`, `test_a_pad_krt_left_open_is_reported_whichever_field_names_it` |
 
 Placement language and the routing plan compiled from `NetReq` are the next phases: see `docs/copper-plan.md`.
 

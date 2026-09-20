@@ -356,3 +356,21 @@ def test_multi_unit_symbols_are_refused(tmp_path: Path):
     board.write_text((src / "node.py").read_text())
     fails = [f for f in check_board(board, pcb=False) if "units" in f]
     assert fails and fails[0].startswith("U5:") and "2 units" in fails[0], fails
+
+
+def test_a_series_resistor_lies_in_line_with_its_pin():
+    """A filter resistor off a header pin, or a resistor before an LED, is a series element: its far
+    end goes on to another part. It lies in line with the pin, not up off the top pin of a side
+    (the free-side rule is for hangers). Caps between two signals still hang."""
+    from pcbc.sch_emit import _parts_from_design
+    from pcbc.sch_place import apply_sch_places, pin_world
+
+    design = load_board(EXAMPLES / "c3_usb" / "c3_usb.py")
+    parts = _parts_from_design(design, {n.name: n.kind for n in design.nets.values()})
+    apply_sch_places(design, parts)
+    by = {p.ref: p for p in parts}
+    r_led, u1 = by["R_LED"], by["U1"]
+    io10 = pin_world(u1, next(p for p in u1.pins if p.name == "IO10"))
+    ends = [pin_world(r_led, p) for p in r_led.pins]
+    assert r_led.rot % 180 == 90, "KiCad's R stands upright at rot 0; in line with a horizontal pin it is turned"
+    assert all(abs(y - io10[1]) < 0.01 for _x, y in ends), (ends, io10)

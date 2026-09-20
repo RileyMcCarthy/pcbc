@@ -172,8 +172,11 @@ def _set_reference(
     return block[:open_at] + prop + block[end + 1 :]
 
 
-def legalize_silk(text: str, board_mm: tuple[float, float]) -> tuple[str, dict]:
-    """Rewrite footprint Reference properties. Does not move footprints."""
+def legalize_silk(text: str, board_mm: tuple[float, float], hide_if_no_room: frozenset[str] = frozenset()) -> tuple[str, dict]:
+    """Rewrite footprint Reference properties. Does not move footprints.
+
+    A ref in `hide_if_no_room` (a decoupling cap: its distance to its pin matters more than its
+    label) is hidden when nothing fits, and noted, instead of printed over a neighbour."""
     bw, bh = board_mm
     edge = (0.4, 0.4, bw - 0.4, bh - 0.4)
     parts: list[dict] = []
@@ -208,7 +211,7 @@ def legalize_silk(text: str, board_mm: tuple[float, float]) -> tuple[str, dict]:
     parts.sort(key=lambda p: p["span"])
     occupied: list[tuple[float, float, float, float]] = []
     bodies = [p["keep"] for p in parts]
-    report = {"moved": [], "hidden": [], "sized": [], "issues": []}
+    report = {"moved": [], "hidden": [], "sized": [], "issues": [], "notes": []}
     names = {id(p["keep"]): p["ref"] for p in parts}
 
     new_blocks: dict[int, str] = {}
@@ -257,6 +260,11 @@ def legalize_silk(text: str, board_mm: tuple[float, float]) -> tuple[str, dict]:
                 break
             if placed:
                 break
+        if not placed and ref in hide_if_no_room:
+            new_blocks[p["start"]] = _set_reference(p["block"], lx=0, ly=0, prot=0, size=0.4, thick=0.08, hide=True)
+            report["hidden"].append(ref)
+            report["notes"].append(f"{ref}'s silkscreen reference is hidden: no room around it, and a decoupling cap stays at its pin")
+            continue
         if not placed:
             new_blocks[p["start"]] = _set_reference(
                 p["block"], lx=0, ly=-(p["span"] / 2 + 0.6), prot=(-frot) % 360,
@@ -289,10 +297,11 @@ def silk_job(
     *,
     out: Path | None = None,
     backup: bool = True,
+    hide_if_no_room: frozenset[str] = frozenset(),
 ) -> dict:
     pcb = Path(pcb)
     text = pcb.read_text()
-    new, report = legalize_silk(text, job.board_size_mm)
+    new, report = legalize_silk(text, job.board_size_mm, hide_if_no_room)
     dest = Path(out) if out else pcb
     if dest == pcb and backup:
         bak = pcb.with_suffix(pcb.suffix + ".bak-silk")

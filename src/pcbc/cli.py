@@ -197,6 +197,11 @@ def cmd_pcb(args: argparse.Namespace) -> int:
             print(f"  {i}. {m}")
     else:
         print("layout: nothing to move")
+    notes = result.get("layout_notes", [])
+    if notes:
+        print(f"style: {len(notes)} note{'s' if len(notes) > 1 else ''} (legal, not counted)")
+        for m in notes:
+            print(f"  - {m}")
     return 1 if result.get("error") else 0
 
 

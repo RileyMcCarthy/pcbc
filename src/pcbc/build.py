@@ -67,6 +67,7 @@ def pcb_job(board: Path) -> dict:
     step = place_job(design, seed, out=placed)
     result["placed"] = str(placed)
     result["layout_report"] = step.get("layout", [])
+    result["layout_notes"] = step.get("notes", [])
     result["poses"] = step.get("poses", {})
     result["applied"] = step.get("applied")
     if step.get("error"):

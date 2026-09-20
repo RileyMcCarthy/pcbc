@@ -250,6 +250,8 @@ def emit_pro(design: Design, *, name: str) -> str:
             "design_settings": {
                 "defaults": {},
                 "rules": board_rules(get_stackup(job.stackup)),
+                # KiCad warns about two holes too close; the fab drills through the web. An error.
+                "rule_severities": {"hole_to_hole": "error"},
             }
         },
         "meta": {"filename": f"{name}.kicad_pcb", "version": 1},

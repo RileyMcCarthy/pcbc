@@ -429,7 +429,7 @@ def _apply_along(spec: SchPlaceSpec, part, other, occupied: list, kinds=None) ->
     part.placed = True
 
 
-def _apply_attach(spec: SchPlaceSpec, part, other, other_pin_name: str, occupied: list, kinds=None) -> None:
+def _apply_attach(spec: SchPlaceSpec, part, other, other_pin_name: str, occupied: list, kinds=None, degree=None) -> None:
     if spec.along:
         _apply_along(spec, part, other, occupied, kinds)
         return
@@ -471,10 +471,15 @@ def _apply_attach(spec: SchPlaceSpec, part, other, other_pin_name: str, occupied
         ]
         top = oy <= min(same_side) + 0.05
         bottom = oy >= max(same_side) - 0.05
+        # A series element - its far end goes on to other parts (a filter resistor off a
+        # header, a resistor before an LED) - lies in line with the pin, as it is drawn.
+        series = part.kind == "r" and far_kind not in ("ground", "power") and (degree or {}).get(far, 0) >= 2
         if far_kind == "ground":
             poses = [down, up, facing]
         elif far_kind == "power":
             poses = [up, down, facing]
+        elif series:
+            poses = [facing, up if top and not bottom else down, down if top and not bottom else up]
         elif top and not bottom:
             poses = [up, facing, down]
         elif bottom and not top:
@@ -614,6 +619,12 @@ def apply_sch_places(design: Design, parts: list) -> None:
 
     regions = resolve_regions(SHEET, design.sch_regions)
     kinds = {n.name: n.kind for n in design.nets.values()}
+    degree: dict[str, int] = {}
+    for p in parts:
+        for pn in p.pins:
+            net = getattr(pn, "net", "")
+            if net:
+                degree[net] = degree.get(net, 0) + 1
     placed: set[str] = set()
 
     for spec in design.sch_places:
@@ -656,6 +667,7 @@ def apply_sch_places(design: Design, parts: list) -> None:
                 tpin,
                 [by_ref[r] for r in placed],
                 kinds,
+                degree,
             )
             placed.add(spec.ref)
         if len(nxt) == len(pending) and nxt:

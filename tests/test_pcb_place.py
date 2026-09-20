@@ -38,9 +38,9 @@ Place("U2", position="absolute", right=4, top=10)
 REST = "".join(
     f'Place("{r}", to="{t}")\n'
     for r, t in [
-        ("U3", "J1.DP1"), ("R_CC1", "J1.CC1"), ("R_CC2", "J1.CC2"), ("C_VBUS", "U2.VIN"), ("C_VBUS_HF", "U2.VIN"),
-        ("C_3V3", "U2.VOUT"), ("C_3V3_HF", "U2.VOUT"), ("R_EN", "U1.EN"), ("C_EN", "U1.EN"), ("SW_RST", "U1.EN"),
-        ("R_BOOT", "U1.IO9"), ("SW_BOOT", "U1.IO9"), ("C_MCU", "U1.3V3"), ("C_MCU_HF", "U1.3V3"), ("R_LED", "U1.IO10"), ("D1", "R_LED.2"),
+        ("U3", "J1.DP1"), ("R_CC1", "J1.CC1"), ("R_CC2", "J1.CC2"), ("C_VBUS_HF", "U2.VIN"), ("C_VBUS", "U2.VIN"),
+        ("C_3V3_HF", "U2.VOUT"), ("C_3V3", "U2.VOUT"), ("C_MCU_HF", "U1.3V3"), ("C_MCU", "U1.3V3"), ("R_EN", "U1.EN"), ("C_EN", "U1.EN"),
+        ("SW_RST", "U1.EN"), ("R_BOOT", "U1.IO9"), ("SW_BOOT", "U1.IO9"), ("R_LED", "U1.IO10"), ("D1", "R_LED.2"),
     ]
 )
 
@@ -88,13 +88,90 @@ def test_to_puts_the_pad_next_to_the_pin_outside_the_target(tmp_path: Path):
     assert result["layout_report"] == []
 
 
-def test_two_parts_on_one_pin_share_it_smallest_first(tmp_path: Path):
+def _pad_to_pin(result: dict, ref: str, target: str, net: str) -> float:
+    """Pad-to-pad distance on `net` between a placed part and its target, from the placed board."""
+    from pcbc.layout import footprints_by_ref
+    from pcbc.pcb_place import parse_foot
+    from pcbc.sexp import footprint_at
+
+    blocks = footprints_by_ref(Path(result["placed"]).read_text())
+    feet = {}
+    for r in (ref, target):
+        f = parse_foot(r, blocks[r])
+        at = footprint_at(blocks[r])
+        f.at, f.rot = (at[0], at[1]), at[2]
+        feet[r] = f
+    a = feet[ref].pad_world(next(p for p in feet[ref].pads if p.net == net))
+    b = feet[target].pad_world(next(p for p in feet[target].pads if p.net == net))
+    return _dist(a, b)
+
+
+def test_two_parts_on_one_pin_share_it_in_file_order(tmp_path: Path):
+    """The first Place() written gets the closest spot (pad to pin), whichever cap it is."""
+    board = _c3(tmp_path, ANCHORS + REST)
+    result, _poses = _placed(board)
+    assert result["layout_report"] == [], result["layout_report"]
+    assert _pad_to_pin(result, "C_MCU_HF", "U1", "3V3") < _pad_to_pin(result, "C_MCU", "U1", "3V3")
+    swapped = _c3(tmp_path / "swapped", ANCHORS + REST.replace('Place("C_MCU_HF", to="U1.3V3")\nPlace("C_MCU", to="U1.3V3")\n', 'Place("C_MCU", to="U1.3V3")\nPlace("C_MCU_HF", to="U1.3V3")\n'))
+    r2, _p2 = _placed(swapped)
+    assert _pad_to_pin(r2, "C_MCU", "U1", "3V3") < _pad_to_pin(r2, "C_MCU_HF", "U1", "3V3")
+
+
+def test_a_closed_pad_row_gets_a_fanout_lane():
+    """A TSSOP's 0.65 mm pads leave 0.31 mm between them: the thinnest track (0.127 + 2 x 0.127)
+    cannot pass, so every pad escapes straight out and needs room for a via there. The DS2
+    Addon's decaps sat 0.48 mm above the row and its AVDD pad had no path on any layer."""
+    from pcbc.stackup import fanout_lane, fanout_stagger, get_stackup
+
+    stack = get_stackup("jlcpcb_2l_1oz")
+    # Two neighbouring vias on a 0.65 mm row: their holes need 0.3 + 0.5 centre to centre.
+    assert fanout_stagger(stack, 0.2, 0.65) == round((0.8**2 - 0.65**2) ** 0.5, 4) == 0.4664
+    assert fanout_stagger(stack, 0.2, 1.0) == 0.0  # a coarse row: one row of vias
+    lane = fanout_lane(stack, 0.2, 0.65)
+    assert lane == round(0.127 + 0.5 + 0.2 + 0.4664, 4) == 1.2934  # keep-off, via, clearance, stagger
+    pads = [Pad(str(i + 1), -2.275 + 0.65 * i, 2.87, 0.343, 1.731, "") for i in range(8)]
+    pads += [Pad(str(16 - i), -2.275 + 0.65 * i, -2.87, 0.343, 1.731, "") for i in range(8)]
+    ic = Foot("U1", (-2.5, -3.74, 2.5, 3.74), pads)
+    ic.lane(stack, 0.2)
+    assert ic.closed == frozenset(str(i) for i in range(1, 17))
+    assert ic.lane_mm == lane and ic.lanes == {"top": lane, "bottom": lane}
+    assert ic.escape["1"] == "bottom" and ic.escape["16"] == "top"
+    assert ic.keep == (-2.5, round(-2.87 - 1.731 / 2 - lane, 4), 2.5, round(2.87 + 1.731 / 2 + lane, 4))
+    header = Foot("J1", (-2.54, -1.25, 2.54, 1.25), [Pad("1", -1.27, 0, 1.7, 1.7, ""), Pad("2", 1.27, 0, 1.7, 1.7, "")])
+    header.lane(stack, 0.2)
+    assert header.closed == frozenset() and header.keep is None and header.lane_mm == 0.0
+    assert header.world_keep(at=(10, 10)) == header.world_box(at=(10, 10))
+    cap = Foot("C1", (-1.48, -0.73, 1.48, 0.73), [Pad("1", -0.775, 0, 0.9, 0.95, ""), Pad("2", 0.775, 0, 0.9, 0.95, "")])
+    cap.lane(stack, 0.2)
+    assert cap.closed == frozenset()  # two pads with a free side each are not a row
+
+
+def test_a_part_placed_on_a_closed_row_keeps_out_of_the_lane(tmp_path: Path):
+    """U2 (SOT-23-5) has three 0.95 mm pads on one side; the cap on its VIN pad stops past the lane."""
     board = _c3(tmp_path, ANCHORS + REST)
     result, poses = _placed(board)
     assert result["layout_report"] == [], result["layout_report"]
-    hf, bulk = poses["C_MCU_HF"]["at"], poses["C_MCU"]["at"]
-    u1 = poses["U1"]["at"]
-    assert _dist(hf, u1) < _dist(bulk, u1)  # 100 nF closer to the module than 10 uF
+    from pcbc.layout import footprints_by_ref
+    from pcbc.pcb_place import lane_rules, parse_foot
+
+    design = load_board(board)
+    job = compile_design(design)
+    blocks = footprints_by_ref(Path(result["placed"]).read_text())
+    u2 = parse_foot("U2", blocks["U2"])
+    u2.at, u2.rot = tuple(poses["U2"]["at"]), poses["U2"]["rot"]
+    u2.lane(*lane_rules(job))
+    assert "1" in u2.closed and u2.keep != u2.box
+    cap = parse_foot("C_VBUS_HF", blocks["C_VBUS_HF"])
+    cap.at, cap.rot = tuple(poses["C_VBUS_HF"]["at"]), poses["C_VBUS_HF"]["rot"]
+    kb, cb = u2.world_keep(), cap.world_box()
+    assert cb[0] >= kb[2] - 1e-6 or cb[2] <= kb[0] + 1e-6 or cb[1] >= kb[3] - 1e-6 or cb[3] <= kb[1] + 1e-6, "the cap sits in U2's fanout lane"
+    # And it sits straight out from the row, on the side the pad escapes to, not beside the row.
+    side = u2.escape["1"]
+    from pcbc.pcb_place import _EDGE_OUT, _rotate
+
+    ox, oy = _rotate(*_EDGE_OUT[side], u2.rot)
+    past = {(1.0, 0.0): cb[0] >= kb[2] - 1e-6, (-1.0, 0.0): cb[2] <= kb[0] + 1e-6, (0.0, 1.0): cb[1] >= kb[3] - 1e-6, (0.0, -1.0): cb[3] <= kb[1] + 1e-6}
+    assert past[(round(ox), round(oy))], f"the cap is beside U2's closed row, not out through its lane ({side})"
 
 
 def test_toward_overrides_the_side(tmp_path: Path):

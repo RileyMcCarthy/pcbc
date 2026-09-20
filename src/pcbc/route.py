@@ -107,6 +107,33 @@ def _net_names(design: Design, patterns) -> list[str]:
     return sorted(n for n in design.nets if any(fnmatch(n, p) for p in patterns))
 
 
+_ITEM_NET = re.compile(r'\(net\s+(?:(\d+)|(?:\d+\s+)?"([^"]*)")\)')
+
+
+def lock_copper(text: str, nets: set[str]) -> str:
+    """`(locked yes)` on every segment and via of these nets: KiCad-locked copper is never
+    ripped by a later KRT step, so a net routed under its own rules stays as routed."""
+    names = {n: name for n, name in re.findall(r'\(net (\d+) "([^"]*)"\)', text)}
+    out: list[str] = []
+    pos = 0
+    for m in re.finditer(r"\n\t\((segment|via)\b", text):
+        if m.start() < pos:
+            continue
+        end = matching_paren(text, m.start() + 2)
+        block = text[m.start() : end + 1]
+        nm = _ITEM_NET.search(block)
+        net = (names.get(nm.group(1)) if nm and nm.group(1) else (nm.group(2) if nm else None))
+        if net in nets and "(locked" not in block:
+            # Where KiCad writes it and KRT's parser reads it: after (width) on a segment, after
+            # (layers) on a via. Anywhere else and KRT never sees the segment at all.
+            block = re.sub(r"(\n\t\t\(width [^\n]*\)\n|\n\t\t\(layers [^\n]*\)\n)", r"\1\t\t(locked yes)\n", block, count=1)
+        out.append(text[pos : m.start()])
+        out.append(block)
+        pos = end + 1
+    out.append(text[pos:])
+    return "".join(out)
+
+
 def krt_plan(job: CompiledJob, design: Design, placed: Path, work: Path, home: Path) -> list[tuple[str, list[str]]]:
     """(step name, command) pairs. Pure: the same board.py gives the same plan."""
     py = str(krt_python(home))
@@ -132,13 +159,24 @@ def krt_plan(job: CompiledJob, design: Design, placed: Path, work: Path, home: P
     def step(name: str, tool: str, args: list[str]) -> None:
         nonlocal prev
         out = work / f"{len(steps) + 1:02d}_{name}.kicad_pcb"
-        common = ["--no-fix-drc-settings", "--same-net-pad-clearance", _fmt(floor), "--grid-step", grid, *via, "--fab-overrides", str(overrides)]
+        common = ["--no-fix-drc-settings", "--grid-step", grid, *via, "--fab-overrides", str(overrides)]
+        if tool == "route_planes.py" or name in ("signals", "local_hops"):
+            # Keeps every via out of same-net SMD pads (a via in an 0603 pad wicks solder; the
+            # fab stage refuses it on a passive): the long nets' vias, and a hop's via if it ever
+            # needs one. Not on the constrained steps (no vias there anyway).
+            common += ["--same-net-pad-clearance", _fmt(floor)]
+        elif name == "plane_taps":
+            # KRT's pour places no tap vias (its "bare pour"); the route step welds each pad to the
+            # plane, and with the keepout on it welded nothing (node: 4 of 59 GND pads). KRT records
+            # the keepout in the sibling project, so this step must say no explicitly.
+            common += ["--same-net-pad-clearance", "-1"]
         if tool != "route_planes.py":
             common.append("--keep-input-copper")  # planes keep it regardless
         steps.append((name, [py, "-X", "utf8", str(router / tool), str(prev), str(out), *args, *common]))
         prev = out
 
-    # 1. Constrained nets: no vias, or a single layer. Grouped by (layers, class), named nets only.
+    # The constrained nets: no vias, or a single layer. Grouped by (layers, class), named nets only.
+    constrained: list[str] = []
     groups: dict[tuple[tuple[str, ...], str], list[str]] = {}
     for cn in job.nets:
         if cn.autoroute == "diff_pair":
@@ -148,36 +186,20 @@ def krt_plan(job: CompiledJob, design: Design, placed: Path, work: Path, home: P
             if names:
                 lays = tuple(cn.layers[:1]) if cn.vias is False else tuple(cn.layers)
                 groups.setdefault((lays, cn.class_name), []).extend(names)
-    for (lays, cls_name), names in sorted(groups.items()):
-        cls = _class(job, cls_name)
-        step(
-            f"{cls_name.lower()}_nets",
-            "route.py",
-            ["--nets", *sorted(set(names)), "--layers", *lays, "--track-width", _fmt(cls.track_width_mm if cls else floor),
-             "--clearance", _fmt(cls.clearance_mm if cls else default_clear), "--via-cost", "100000", "--max-ripup", "5"],
-        )
+    for (_lays, _cls_name), names in sorted(groups.items()):
+        constrained += sorted(set(names))
 
-    # 2. Differential pairs.
-    for cn in job.nets:
-        if cn.autoroute != "diff_pair":
-            continue
-        cls = _class(job, cn.class_name)
-        names = _net_names(design, cn.patterns)
-        if len(names) != 2:
-            continue
-        width = (cls.diff_pair_width_mm or cls.track_width_mm) if cls else floor
-        gap = max((cls.diff_pair_gap_mm or floor) if cls else floor, (cls.clearance_mm if cls else floor))
-        args = ["--nets", *names, "--track-width", _fmt(width), "--diff-pair-gap", _fmt(gap), "--clearance", _fmt(cls.clearance_mm if cls else default_clear),
-                "--layers", *layers, "--diff-pair-intra-match"]
-        if job.layers >= 4:
-            args += ["--impedance", "90"]
-        step(f"pair_{names[0].lower()}", "route_diff.py", args)
+    # 0. The escapes of every closed pad row are already on the board, locked (`fanout.py`): the
+    # router starts from a board whose fanout lanes are spent on stubs and vias, so nothing runs
+    # a track along them (the DS2 Addon's analog nets once did, and walled AVDD, DVDD and the
+    # UART pins in).
 
-    # 3. Planes first on four layers: the pours, with via taps.
-    if job.planes and job.layers > 2:
-        step("planes", "route_planes.py", ["--nets", *[n for n, _ in job.planes], "--plane-layers", *[layer for _, layer in job.planes], "--clearance", _fmt(default_clear)])
-
-    # 4. Everything else. Power nets at their width.
+    # 1. Short hops first, on the empty board: a header pin to the resistor beside it, a cap to
+    # its pin. A hop between two neighbouring pads has one path; anything routed before it can
+    # cut that path (the DS2 Addon's locked analog copper ran between a header pin and its
+    # resistor, and the 2 mm hop became a 65 mm detour with a via in the resistor's pad), and
+    # anything routed after it goes around a hop for free.
+    # Power nets at the width their amps ask for, on every step that may route one.
     power: list[str] = []
     widths: list[str] = []
     for cn in job.nets:
@@ -187,9 +209,53 @@ def krt_plan(job: CompiledJob, design: Design, placed: Path, work: Path, home: P
                 if n not in power:
                     power.append(n)
                     widths.append(_fmt(cls.track_width_mm if cls else 0.4))
-    signals = ["--nets", "*", "--layers", *layers, "--track-width", _fmt(stack.track_min), "--max-ripup", "5", "--no-bga-zones"]
-    if power:
-        signals += ["--power-nets", *power, "--power-nets-widths", *widths]
+    at_width = ["--power-nets", *power, "--power-nets-widths", *widths] if power else []
+    local = [n for n in _local_nets(design, placed) if n not in constrained]
+    pairs = {n for cn in job.nets if cn.autoroute == "diff_pair" for n in _net_names(design, cn.patterns)}
+    local = [n for n in local if n not in pairs and n not in {p for p, _ in job.planes}]
+    if local:
+        # Not "local_nets": only a constrained step's copper (`*_nets`) is locked afterwards. A hop
+        # on a power net (node's 1 A LOAD, a JST pin to the MOSFET beside it) keeps its width.
+        step("local_hops", "route.py", ["--nets", *local, "--layers", *layers, "--track-width", _fmt(stack.track_min), "--max-ripup", "2", *at_width])
+
+    # 2. Constrained nets on their layers while the board is otherwise empty. Later steps never
+    # touch them: a net that could not finish on its layer stays open and is reported, rather
+    # than finished with the vias its NetReq forbids.
+    for (lays, cls_name), names in sorted(groups.items()):
+        cls = _class(job, cls_name)
+        step(
+            f"{cls_name.lower()}_nets",
+            "route.py",
+            ["--nets", *sorted(set(names)), "--layers", *lays, "--track-width", _fmt(cls.track_width_mm if cls else floor), "--via-cost", "100000", "--max-ripup", "5"],
+        )
+
+    # 3. Differential pairs.
+    for cn in job.nets:
+        if cn.autoroute != "diff_pair":
+            continue
+        cls = _class(job, cn.class_name)
+        names = _net_names(design, cn.patterns)
+        if len(names) != 2:
+            continue
+        width = (cls.diff_pair_width_mm or cls.track_width_mm) if cls else floor
+        gap = max((cls.diff_pair_gap_mm or floor) if cls else floor, (cls.clearance_mm if cls else floor))
+        # No `--clearance`: it is a ceiling on every class, and the pair's 0.16 capped the Power
+        # class at 0.16 while USB_DN passed a VBUS pad (c3_usb: KiCad measured 0.195 against 0.2).
+        args = ["--nets", *names, "--track-width", _fmt(width), "--diff-pair-gap", _fmt(gap), "--layers", *layers, "--diff-pair-intra-match"]
+        if job.layers >= 4:
+            args += ["--impedance", "90"]
+        step(f"pair_{names[0].lower()}", "route_diff.py", args)
+
+    # 3. Planes first on four layers: the pours, then every pad on a plane net welded to its plane.
+    plane_nets = [n for n, _ in job.planes] if job.planes and job.layers > 2 else []
+    if plane_nets:
+        step("planes", "route_planes.py", ["--nets", *plane_nets, "--plane-layers", *[layer for _, layer in job.planes], "--clearance", _fmt(default_clear)])
+        # The pour placed no tap vias; this welds every pad on a plane net to its plane, alone,
+        # so the same-net keepout the signals step needs never sees these nets.
+        step("plane_taps", "route.py", ["--nets", *plane_nets, "--layers", *layers, "--track-width", _fmt(stack.track_min), "--max-ripup", "5", "--no-bga-zones", *at_width])
+
+    # 4. Everything else. Power nets at their width.
+    signals = ["--nets", "*", *[f"!{n}" for n in constrained], *[f"!{n}" for n in plane_nets], "--layers", *layers, "--track-width", _fmt(stack.track_min), "--max-ripup", "5", "--no-bga-zones", *at_width]
     step("signals", "route.py", signals)
 
     # 5. Two layers: pour GND on the back and tie what the pour could not reach.
@@ -197,6 +263,42 @@ def krt_plan(job: CompiledJob, design: Design, placed: Path, work: Path, home: P
         step("gnd_pour", "route_planes.py", ["--nets", "GND", "--plane-layers", "B.Cu", "--clearance", _fmt(default_clear)])
         step("finalize", "route.py", signals)
     return steps
+
+
+LOCAL_MM = 5.0
+
+
+def _local_nets(design: Design, placed: Path) -> list[str]:
+    """Nets whose pads all lie within LOCAL_MM of each other on the placed board, sorted."""
+    import math
+
+    from .layout import footprints_by_ref
+    from .pcb_place import _pins_of, parse_foot
+    from .sexp import footprint_at
+
+    if not Path(placed).exists():
+        return []
+    text = Path(placed).read_text()
+    nets_of = _pins_of(design)
+    sites: dict[str, list[tuple[float, float]]] = {}
+    for ref, block in footprints_by_ref(text).items():
+        at = footprint_at(block)
+        if at is None:
+            continue
+        foot = parse_foot(ref, block)
+        foot.at, foot.rot = (at[0], at[1]), at[2]
+        for pad in foot.pads:
+            net = nets_of.get(ref, {}).get(pad.num)
+            if net:
+                sites.setdefault(net, []).append(foot.pad_world(pad))
+    out = []
+    for net, pts in sites.items():
+        if len(pts) < 2:
+            continue
+        span = max(math.hypot(a[0] - b[0], a[1] - b[1]) for i, a in enumerate(pts) for b in pts[i + 1 :])
+        if span <= LOCAL_MM:
+            out.append(net)
+    return sorted(out)
 
 
 def write_fab_overrides(job: CompiledJob, work: Path) -> Path:
@@ -228,24 +330,56 @@ def route_job(design: Design, placed: Path, *, out: Path, name: str = "board") -
     job = compile_design(design)
     work = out.parent
     write_fab_overrides(job, work)
-    steps = krt_plan(job, design, placed, work, home)
+    # The closed pad rows' escapes go on first, pcbc's own copper, locked; KRT starts from them.
+    from .fanout import fanout_copper
+
+    fanned, fan = fanout_copper(design, job, placed.read_text(), name)
+    start = placed
+    if fan:
+        start = work / "00_fanout.kicad_pcb"
+        copy_with_siblings(placed, start)
+        start.write_text(fanned)
+    steps = krt_plan(job, design, start, work, home)
     result: dict = {
         "pcb": str(out),
         "router": "krt",
         "krt": {"home": str(home), "version": krt_version(home)},
         "plan": [{"step": n, "cmd": cmd} for n, cmd in steps],
+        "fanout": fan,
         "steps": [],
         "error": None,
     }
     last: Path | None = None
+    failed: dict[str, str] = {}
+    unreached: dict[str, list[str]] = {}
     for step_name, cmd in steps:
         proc = subprocess.run(cmd, capture_output=True, text=True, cwd=str(home))
-        log = ((proc.stdout or "") + (proc.stderr or ""))[-3000:]
+        full = (proc.stdout or "") + (proc.stderr or "")
+        log = full[-3000:]
         produced = Path(cmd[5])
-        result["steps"].append({"step": step_name, "returncode": proc.returncode, "log": log[-1200:]})
+        summary = _krt_summary(full)
+        result["steps"].append({"step": step_name, "returncode": proc.returncode, "log": log[-1200:], "summary": summary})
         if proc.returncode != 0 or not produced.exists():
             result["error"] = f"KRT {step_name} failed ({proc.returncode}): {log.strip()[-600:]}"
             return result
+        for net in summary.get("failed_single", []):
+            failed.setdefault(net, step_name)
+        for net in (summary.get("pad_pairs_open") or {}).get("nets", []):
+            failed.setdefault(net, step_name)  # a multipoint net KRT left with an open pad pair
+        for ref, net, x, y in _unreached_pads(full):
+            # The pour's own list. KRT's bare pour defers every tap to the route step after it, so
+            # this names pads and does not fail the net: the route steps' fields above do that.
+            unreached.setdefault(net, []).append(f"{ref} at ({x}, {y})")
+        if step_name.endswith("_nets"):
+            # A constrained step's copper is locked so the signal steps cannot rip it up
+            # and finish the net with vias its NetReq forbids.
+            i = cmd.index("--nets")
+            named = set()
+            for a in cmd[i + 1 :]:
+                if a.startswith("--"):
+                    break
+                named.add(a)
+            produced.write_text(lock_copper(produced.read_text(), named))
         last = produced
     if last is None:
         result["error"] = "nothing to route"
@@ -256,7 +390,56 @@ def route_job(design: Design, placed: Path, *, out: Path, name: str = "board") -
     result["segments"] = len(re.findall(r"\n\t\(segment\b", text))
     result["vias"] = len(re.findall(r"\n\t\(via\b", text))
     result["zones"] = len(re.findall(r"\n\t\(zone\b", text))
-    result["unrouted"] = opens
+    # KRT says a net "failed" when it could not reach every pad even though the net has copper;
+    # pcbc's own open-net check sees copper and would say nothing. Both are the same failure.
+    for net in failed:
+        if net not in opens:
+            opens.append(net)
+    result["unrouted"] = sorted(opens)
     if opens:
-        result["error"] = "unrouted " + ", ".join(opens) + " - the router found no path; move the parts on those nets closer or give them a free side"
+        result["error"] = "unrouted: " + "; ".join(_unrouted_move(job, design, n, unreached.get(n)) for n in sorted(opens))
     return result
+
+
+_UNREACHED = re.compile(r"unconnected pad (\S+) on '([^']+)' at \(([-0-9.]+), ([-0-9.]+)\)")
+
+
+def _unreached_pads(log: str) -> list[tuple[str, str, str, str]]:
+    """route_planes.py names each pad its pour could not tap: (ref, net, x, y)."""
+    return [(m.group(1), m.group(2), m.group(3), m.group(4)) for m in _UNREACHED.finditer(log)]
+
+
+_SUMMARY = re.compile(r"JSON_SUMMARY_MIN:\s*(\{.*\})")
+
+
+def _krt_summary(log: str) -> dict:
+    """The last JSON_SUMMARY_MIN line a KRT step printed: failed nets, deficits, vias."""
+    import json
+
+    hits = _SUMMARY.findall(log)
+    if not hits:
+        return {}
+    try:
+        d = json.loads(hits[-1])
+    except ValueError:
+        return {}
+    return {k: d.get(k) for k in ("failed", "failed_single", "multipoint_deficit", "open_single", "pad_pairs_open", "routed", "vias") if k in d}
+
+
+def _unrouted_move(job: CompiledJob, design: Design, net: str, unreached: list[str] | None = None) -> str:
+    """An unrouted net as a move: who is on it, what constrained it, and which pad KRT named."""
+    from fnmatch import fnmatch
+
+    from .netcheck import expected_nets
+
+    pads = sorted(expected_nets(design).get(net, set()))
+    refs = ", ".join(f"{r}.{p}" for r, p in pads[:6]) + (", ..." if len(pads) > 6 else "")
+    rule = next((cn for cn in job.nets if any(fnmatch(net, p) for p in cn.patterns)), None)
+    if rule and (rule.vias is False or len(rule.layers) == 1):
+        how = f"on {', '.join(rule.layers[:1] if rule.vias is False else rule.layers)} without vias (NetReq kind={rule.kind!r})"
+        fix = f"line its parts up on that side of the board, or allow vias with NetReq({net!r}, kind={rule.kind!r}, vias=True)"
+    else:
+        how = "on any layer"
+        fix = "move its parts closer together or out from between others"
+    where = f"; the pour could not reach {', '.join(unreached[:6])}{', ...' if len(unreached) > 6 else ''}" if unreached else ""
+    return f"{net} ({refs}) found no path {how}{where}: {fix}"

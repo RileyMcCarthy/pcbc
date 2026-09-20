@@ -76,11 +76,15 @@ Place("D1", to="R_LED.2", toward="right", gap=0.5)           # toward= picks the
 
 Rules the tool applies, so you do not have to:
 - The tool picks pose, distance and side. Give a number only for an anchor.
-- On one pin, the smallest capacitance goes nearest. Across pins, **file order decides**: the
-  first `Place()` on a pin gets the closest spot, so list decoupling caps before bigger parts.
+- **File order decides, and nothing else**: the first `Place()` written gets the closest spot.
+  List the small decoupling cap before the bulk one, and the decoupling before bigger parts.
 - A part with no clear spot stays where the collision is and is reported; move a neighbour
   or give it `toward=`. Nothing is silently shoved out of the way.
 - Fiducials are placed by the tool in free corners after the anchors. Leave the corners.
+- A fine-pitch row (0.65 mm TSSOP, 0.5 mm QFN) keeps a fanout lane outside it (about 1.3 mm
+  on two layers) where the tool drops an escape via on every pin before routing; parts placed
+  `to=` its pins settle straight out past the lane, never beside the row, and a decoupling cap
+  there is allowed that much further. Do not fight it with `gap=` or `toward=`.
 - One `Place()` and one `SchPlace()` per ref. A second one is refused, not an override.
 
 ## Reading the reports
@@ -88,9 +92,9 @@ Rules the tool applies, so you do not have to:
 Each line is a move: what collides, and the `Place()`/`SchPlace()` edit that fixes it.
 - `pcbc sch`: overlaps, wires through text, a part that had to slide far, a symbol boxed in.
   `style:` notes (a supply symbol that had to point down) are legal and not counted.
-- `pcbc pcb`: courtyard overlaps, a part off the board, a decoupling cap farther than 2.5 mm
-  (the next one 5 mm), a connector off every edge, copper within 0.3 mm of the edge, a net
-  past its `max_mm`.
+- `pcbc pcb`: courtyard overlaps, a part off the board, a part in a fine-pitch row's fanout
+  lane, a decoupling cap farther than 2.5 mm (the next one 5 mm; plus the lane on a fine-pitch
+  row), a connector off every edge, copper within 0.3 mm of the edge, a net past its `max_mm`.
 - `pcbc build`: the copper gate is KiCad's own DRC with nothing unconnected, plus the pads
   bound exactly as `board.py` says. A routing failure names the nets; move the parts on them
   closer or give them a free side. Do not tune router flags.

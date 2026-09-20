@@ -26,7 +26,9 @@ class Stackup:
     via_drill: float = 0.3  # the standard via, no extra cost
     via_diameter: float = 0.5
     annular_min: float = 0.1
-    hole_clearance: float = 0.254  # copper to a hole's edge
+    # Copper to a hole's edge. JLC quotes 10 mil (0.254); KRT keeps tracks off an NPTH by this on
+    # its 0.05 mm grid and lands at 0.25, so the gate holds 0.25 (4 um under any fab's tolerance).
+    hole_clearance: float = 0.25
     hole_to_hole: float = 0.5
     edge_clearance: float = 0.3  # copper to the board edge
 
@@ -59,6 +61,25 @@ STACKUPS: dict[str, Stackup] = {
 def hole_floor(stack: Stackup) -> float:
     """The copper clearance at which a track next to a via's ring also clears its hole."""
     return round(stack.hole_clearance - stack.annular_min + 0.005, 4)
+
+
+def pass_mm(stack: Stackup) -> float:
+    """The narrowest gap between two pads that the thinnest track can still pass through."""
+    return round(stack.track_min + 2 * stack.clearance_min, 4)
+
+
+def fanout_stagger(stack: Stackup, clearance: float, pitch: float) -> float:
+    """How far past its neighbour's a via must step on a row of this pitch: two holes keep the
+    fab's hole-to-hole, two rings keep the class clearance. 0.47 mm on a 0.65 mm row at JLC 2L."""
+    need = max(stack.via_drill + stack.hole_to_hole, stack.via_diameter + max(clearance, stack.clearance_min))
+    return round(math.sqrt(max(0.0, need * need - pitch * pitch)), 4)
+
+
+def fanout_lane(stack: Stackup, clearance: float, pitch: float) -> float:
+    """The free lane a closed pad row needs outside it: the router keeps a via `clearance_min` off
+    its own pad, then the via, then the next row's stagger, then clearance to whatever sits
+    beyond. `clearance` is the widest class's. 1.29 mm on a 0.65 mm row at JLC's 2-layer rung."""
+    return round(stack.clearance_min + stack.via_diameter + max(clearance, stack.clearance_min) + fanout_stagger(stack, clearance, pitch), 4)
 
 
 def board_rules(stack: Stackup) -> dict[str, float]:

@@ -12,11 +12,17 @@ SHARE = Path(__file__).resolve().parent / "share" / "footprints"
 _GENERIC = {
     ("R", "0402"): "R_0402_1005Metric.kicad_mod",
     ("R", "0603"): "R_0603_1608Metric.kicad_mod",
+    ("R", "0805"): "R_0805_2012Metric.kicad_mod",
+    ("R", "1206"): "R_1206_3216Metric.kicad_mod",
     ("C", "0402"): "C_0402_1005Metric.kicad_mod",
     ("C", "0603"): "C_0603_1608Metric.kicad_mod",
+    ("C", "0805"): "C_0805_2012Metric.kicad_mod",
+    ("C", "1206"): "C_1206_3216Metric.kicad_mod",
     ("D", "0603"): "LED_0603_1608Metric.kicad_mod",
+    ("D", "0805"): "LED_0805_2012Metric.kicad_mod",
     ("L", "0402"): "R_0402_1005Metric.kicad_mod",
-    ("L", "0603"): "R_0603_1608Metric.kicad_mod",
+    ("L", "0603"): "L_0603_1608Metric.kicad_mod",
+    ("L", "0805"): "L_0805_2012Metric.kicad_mod",
 }
 
 

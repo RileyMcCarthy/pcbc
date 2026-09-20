@@ -6,7 +6,7 @@ from dataclasses import asdict, dataclass, field, replace
 
 from .layout import resolve_keepout, resolve_regions
 from .model import Design, KeepoutSpec, PlaceSpec, RegionSpec
-from .stackup import diff_pair_geometry, get_stackup, ipc2221_width_mm, width_for_z0
+from .stackup import diff_pair_geometry, get_stackup, hole_floor, ipc2221_width_mm, width_for_z0
 
 
 @dataclass
@@ -104,17 +104,28 @@ def compile_design(design: Design) -> CompiledJob:
     board = design.board
     stack = get_stackup(board.stackup)
 
+    # Every class clears at least what a via's hole needs from the copper beside it: KiCad checks
+    # copper-to-hole, the router keeps copper-to-ring, and the difference is the annular ring.
+    floor_clear = max(stack.clearance_min, hole_floor(stack))
     classes: dict[str, CompiledClass] = {
-        "Default": CompiledClass("Default", 0.16, 0.16, 0.45, 0.20),
+        "Default": CompiledClass("Default", max(0.16, stack.track_min), max(0.16, floor_clear), stack.via_diameter, stack.via_drill),
     }
     compiled_nets: list[CompiledNet] = []
-    dru: list[DruRule] = []
+    dru: list[DruRule] = [
+        # A connector's own pads sit closer than a power class asks (USB-C: 0.1 mm); that is the
+        # land, not a routing choice. Inside one footprint only the fab floor applies.
+        DruRule(
+            name="pads_of_one_footprint",
+            constraint="(constraint clearance (min 0.1mm))",
+            condition="A.Type == 'Pad' && B.Type == 'Pad' && A.Reference == B.Reference",
+        )
+    ]
     skip: list[str] = []
 
     for req in design.netreqs:
         cls_name = req.class_name or _KIND_CLASS.get(req.kind, req.kind.title().replace(" ", ""))
-        width, clearance = 0.16, 0.16
-        via_d, via_h = 0.45, 0.20
+        width, clearance = max(0.16, stack.track_min), max(0.16, floor_clear)
+        via_d, via_h = stack.via_diameter, stack.via_drill
         dp_w = dp_g = None
         autoroute: bool | str = True
         vias = True
@@ -161,6 +172,12 @@ def compile_design(design: Design) -> CompiledJob:
             width = width_for_z0(req.z_se_ohm, stack)
             clearance = 0.16
 
+        via_d, via_h = max(via_d, stack.via_diameter), max(via_h, stack.via_drill)
+        width, clearance = max(width, stack.track_min), max(clearance, floor_clear)
+        if dp_w is not None:
+            dp_w = max(dp_w, stack.track_min)  # a 90 ohm pair on 1.6 mm FR4 wants less than the fab can etch
+        if dp_g is not None:
+            dp_g = max(dp_g, stack.clearance_min)
         if req.autoroute is not None:
             autoroute = req.autoroute
         if req.vias is not None:

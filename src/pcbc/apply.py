@@ -15,10 +15,10 @@ from .model import BoardSpec, PlaceSpec
 from .refs import build_alias_index, resolve_ref
 from .sexp import (
     board_footprint_spans,
+    footprint_at,
     footprint_reference,
     has_edge_cuts_shape,
     matching_paren,
-    new_uuid,
     stable_uuid,
 )
 
@@ -101,10 +101,29 @@ def _apply_places(text: str, job: CompiledJob) -> tuple[str, list[str], list]:
     return "".join(pieces), missing, resolved_places
 
 
+_PAD_AT = re.compile(r"(\(pad\s+\"[^\"]*\"\s+\w+\s+\w+\s*\(at\s+[0-9.+-]+\s+[0-9.+-]+)(?:\s+([0-9.+-]+))?\)")
+
+
+def _turn_pads(block: str, delta: float) -> str:
+    """KiCad stores a pad's angle as footprint angle + pad angle (a board-file quirk, unlike the
+    library file); turning the footprint must turn every pad's angle with it, or the pads
+    render unrotated - the ESP32 module's 0.8 mm pitch pads then touch."""
+    if abs(delta) < 1e-9:
+        return block
+
+    def fix(m: re.Match) -> str:
+        a = (float(m.group(2) or 0) + delta) % 360
+        return f"{m.group(1)}{'' if abs(a) < 1e-9 else f' {a:g}'})"
+
+    return _PAD_AT.sub(fix, block)
+
+
 def _rewrite_footprint(block: str, place) -> str:
     if place.at is None:
         return block
     layer = "F.Cu" if place.side == "F" else "B.Cu"
+    was = footprint_at(block)
+    block = _turn_pads(block, float(place.rot) - (was[2] if was else 0.0))
     at = f"(at {place.at[0]:.4f} {place.at[1]:.4f} {place.rot:g})"
     block, n = re.subn(
         r"\n\t\t\(at [0-9.+-]+ [0-9.+-]+(?: [0-9.+-]+)?\)",

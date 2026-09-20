@@ -9,6 +9,7 @@ from pathlib import Path
 from .compile import compile_design
 from .footprints import footprint_path
 from .model import Design, Instance
+from .stackup import board_rules, get_stackup
 from .sexp import matching_paren, stable_uuid
 
 _PROP_VAL = re.compile(r'(\(property "([^"]+)" )"[^"]*"')
@@ -248,7 +249,7 @@ def emit_pro(design: Design, *, name: str) -> str:
         "board": {
             "design_settings": {
                 "defaults": {},
-                "rules": {"min_clearance": 0.09, "min_track_width": 0.09},
+                "rules": board_rules(get_stackup(job.stackup)),
             }
         },
         "meta": {"filename": f"{name}.kicad_pcb", "version": 1},

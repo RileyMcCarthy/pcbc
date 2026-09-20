@@ -164,6 +164,34 @@ def upgrade_footprint(src: Path, dst: Path, cli: Path | None) -> bool:
     return False
 
 
+_PAD_BLOCK_HEAD = re.compile(r'\(pad\s+""\s+thru_hole\b')
+_DRILL = re.compile(r"\(drill\s+([0-9.]+)\)")
+
+
+def repair_footprint(text: str) -> tuple[str, list[str]]:
+    """Fixes a fetched land can take without judgement. Returns (text, notes)."""
+    notes: list[str] = []
+    out: list[str] = []
+    pos = 0
+    n = 0
+    for pad in _iter_tagged(text, "pad"):
+        j = text.find(pad, pos)
+        out.append(text[pos:j])
+        fixed = pad
+        if _PAD_BLOCK_HEAD.match(pad):
+            sz = _PAD_SIZE.search(pad)
+            dr = _DRILL.search(pad)
+            if sz and dr and float(dr.group(1)) + 1e-6 >= min(float(sz.group(1)), float(sz.group(2))):
+                fixed = _PAD_BLOCK_HEAD.sub('(pad "" np_thru_hole', pad, count=1)
+                n += 1
+        out.append(fixed)
+        pos = j + len(pad)
+    out.append(text[pos:])
+    if n:
+        notes.append(f"{n} unnumbered plated hole(s) with no annular ring made np_thru_hole (mounting holes; KiCad DRC rejects a ring of 0)")
+    return "".join(out), notes
+
+
 def _relink_model(mod_text: str, model_name: str | None) -> str:
     """Point `(model …)` at a file beside the footprint; seed resolves it from the part dir."""
     if model_name is None:
@@ -217,9 +245,12 @@ def fetch_lcsc(
             model_name = mod_src.stem + src3d.suffix
             shutil.copyfile(src3d, dest / model_name)
         mod_path = dest / mod_name
-        mod_path.write_text(_relink_model(mod_path.read_text(), model_name))
+        repaired, repairs = repair_footprint(mod_path.read_text())
+        mod_path.write_text(_relink_model(repaired, model_name))
 
     report = score_part(dest, symbol=sym_name, footprint=mod_name)
+    for note in repairs:
+        report["findings"].append(("info", f"repaired: {note}"))
     part_py = dest / "part.py"
     wrote = False
     if force or not part_py.exists():
@@ -416,6 +447,22 @@ def score_footprint(text: str) -> dict:
         return {"findings": findings, "pads": [], "penalty": penalty, "legacy": legacy}
     if zero:
         add("fail", 20, f"pads with no size: {_some(zero)}")
+    touching = _touching_pads(text)
+    if touching:
+        add("fail", 40, f"pads of different numbers touch or sit closer than 0.1 mm: {_some(touching)}; the land shorts them")
+    else:
+        tight = _touching_pads(text, floor=0.127)
+        if tight:
+            add("warn", 3, f"pads closer than JLC's 0.127 mm two-layer spacing: {_some(tight)}; the fab may query it")
+    ringless = 0
+    for pad in _iter_tagged(text, "pad"):
+        if _PAD_BLOCK_HEAD.match(pad):
+            sz = _PAD_SIZE.search(pad)
+            dr = _DRILL.search(pad)
+            if sz and dr and float(dr.group(1)) + 1e-6 >= min(float(sz.group(1)), float(sz.group(2))):
+                ringless += 1
+    if ringless:
+        add("fail", 20, f"{ringless} plated hole(s) with no annular ring: KiCad DRC rejects them; mounting holes want np_thru_hole (pcbc fetch repairs this)")
     if _graphics_bbox(text, "CrtYd") is None:
         add("warn", 10, "no courtyard: placement cannot keep parts apart")
     if _graphics_bbox(text, ".Fab") is None:
@@ -441,6 +488,38 @@ def score_footprint(text: str) -> dict:
         "th": th,
         "body_mm": body_box(text),
     }
+
+
+_PAD_AT_RE = re.compile(r"\(at\s+([0-9.+-]+)\s+([0-9.+-]+)(?:\s+([0-9.+-]+))?\)")
+
+
+def _touching_pads(text: str, floor: float = 0.1) -> list[str]:
+    """Pairs of pads (different numbers) whose copper is closer than the fab floor. Axis-aligned; rotated pads use their AABB."""
+    import itertools
+    import math
+
+    from .css import rotate_local_bounds
+
+    boxes: list[tuple[str, tuple[float, float, float, float]]] = []
+    for pad in _iter_tagged(text, "pad"):
+        m = _PAD_NUM.match(pad)
+        at = _PAD_AT_RE.search(pad)
+        sz = _PAD_SIZE.search(pad)
+        if not m or not m.group(1) or not at or not sz:
+            continue
+        w, h = float(sz.group(1)) / 2, float(sz.group(2)) / 2
+        x0, y0, x1, y1 = rotate_local_bounds(-w, -h, w, h, float(at.group(3) or 0))
+        x, y = float(at.group(1)), float(at.group(2))
+        boxes.append((m.group(1), (x + x0, y + y0, x + x1, y + y1)))
+    out: list[str] = []
+    for (na, a), (nb, b) in itertools.combinations(boxes, 2):
+        if na == nb:
+            continue
+        dx = max(b[0] - a[2], a[0] - b[2], 0.0)
+        dy = max(b[1] - a[3], a[1] - b[3], 0.0)
+        if math.hypot(dx, dy) < floor - 1e-9:
+            out.append(f"{na}/{nb}")
+    return out
 
 
 def body_box(text: str) -> tuple[float, float] | None:

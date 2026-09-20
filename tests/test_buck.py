@@ -6,7 +6,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import pytest
 
 from pcbc.language import check_board, load_board
 from pcbc.sch_emit import _parts_from_design, emit_from_design

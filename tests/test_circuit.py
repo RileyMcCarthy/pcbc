@@ -87,7 +87,6 @@ SchPlace("U1", left=10, top=10)
 def test_missing_board():
     reset()
     from pcbc.language import Ground, Power, Resistor
-    from pcbc.circuit import check_design
     from pcbc.language import _doc
 
     VCC = Power("VCC")

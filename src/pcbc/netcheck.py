@@ -145,15 +145,20 @@ def copper_nets(text: str) -> dict[str, set[Pad]]:
     return nets
 
 
-def kicad_drc(pcb: Path, cli: Path | None = None) -> dict:
-    """kicad-cli pcb drc as parsed JSON (violations, unconnected_items)."""
+def kicad_drc(pcb: Path, cli: Path | None = None, *, refill: bool = True) -> dict:
+    """kicad-cli pcb drc as parsed JSON (violations, unconnected_items).
+
+    The router writes pours without fills; KiCad judges an unfilled zone as no copper, so
+    every plane-fed pad reads unconnected and the Gerbers would carry no plane. DRC refills
+    the zones and saves the board, so what the gate judged is what the fab gets."""
     cli = cli or kicad_cli()
     if not cli.exists() and shutil.which(str(cli)) is None:
         raise KicadMissing(f"kicad-cli not found ({cli})")
     with tempfile.TemporaryDirectory() as td:
         out = Path(td) / "drc.json"
+        fill = ["--refill-zones", "--save-board"] if refill else []
         run = subprocess.run(
-            [str(cli), "pcb", "drc", "--format", "json", "--all-track-errors", "-o", str(out), str(pcb)],
+            [str(cli), "pcb", "drc", "--format", "json", "--all-track-errors", *fill, "-o", str(out), str(pcb)],
             capture_output=True,
             text=True,
         )
@@ -174,7 +179,9 @@ def check_copper(design: Design, pcb: Path, cli: Path | None = None, floor_mm: f
     fails += nets
     doc = kicad_drc(pcb, cli)
     if floor_mm is None:
-        floor_mm = 0.10 if compile_design(design).layers <= 2 else 0.16
+        from .stackup import get_stackup
+
+        floor_mm = get_stackup(compile_design(design).stackup).clearance_min
     errors = [
         f"{v.get('type')}: {v.get('description')}"
         for v in copper_drc_errors(doc, floor_mm=floor_mm)

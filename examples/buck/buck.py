@@ -35,17 +35,6 @@ Resistor("R_EN", "100k", mpn="0402WGF1003TCE", lcsc="C25741", p1=VIN, p2=EN, **r
 # PCB: 40 x 25 mm, 2 layers. Input on the left edge, output on the right.
 Board(width=40, height=25, layers=2, stackup="jlcpcb_2l_1oz")
 Place("U1", position="absolute", left=15, top=8, locked=True, reason="buck IC in the middle")
-Place("L1", position="absolute", left=24, top=6, locked=True, reason="inductor on SW, right of the IC")
-Place("J_IN", position="absolute", left=1, top=9, rotate=90, locked=True, reason="input on the left edge")
-Place("J_OUT", position="absolute", right=1, top=9, rotate=270, locked=True, reason="output on the right edge")
-Place("C_IN1", position="absolute", left=9, top=5, locked=True, reason="input caps at VIN")
-Place("C_IN2", position="absolute", left=9, top=12, locked=True, reason="input caps at VIN")
-Place("C_OUT1", position="absolute", left=32, top=5, locked=True, reason="output caps at the inductor")
-Place("C_OUT2", position="absolute", left=32, top=12, locked=True, reason="output caps at the inductor")
-Place("C_BOOT", position="absolute", left=15, top=15, locked=True, reason="bootstrap cap by the IC")
-Place("R_FB_TOP", position="absolute", left=21, top=17, locked=True, reason="feedback divider near FB")
-Place("R_FB_BOT", position="absolute", left=21, top=20, locked=True, reason="feedback divider near FB")
-Place("R_EN", position="absolute", left=15, top=2, locked=True, reason="EN pull-up by the IC")
 
 # Schematic. This symbol has SW and VIN both on the left, so the output rail
 # runs left from the inductor and the input stage sits under the IC.
@@ -66,3 +55,17 @@ SchPlace("R_FB_BOT", along="R_FB_TOP.2", side="bottom")
 NetReq("VIN", "5V", "GND", kind="power", volts=12, amps=2)
 NetReq("SW", kind="switch_node", max_mm=6)
 NetReq("FB", kind="analog")
+
+# Copper. Input on the west edge, output on the east; the regulator in the middle and
+# every passive says which pin it serves. `pcbc pcb buck.py` lists what to move.
+Place("J_IN", edge="left", reason="input connector")
+Place("J_OUT", edge="right", reason="output connector")
+Place("C_IN1", to="U1.VIN")
+Place("C_IN2", to="U1.VIN")
+Place("L1", to="U1.SW")
+Place("C_OUT1", to="L1.2")
+Place("C_OUT2", to="L1.2")
+Place("C_BOOT", to="U1.BOOT")
+Place("R_EN", to="U1.EN")
+Place("R_FB_TOP", to="U1.FB")
+Place("R_FB_BOT", to="U1.FB")

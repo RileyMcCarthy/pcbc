@@ -21,7 +21,7 @@ from .sch_place import (
     text_zone,
     world_aabb,
 )
-from .sexp import matching_paren, new_uuid, stable_uuid
+from .sexp import new_uuid, stable_uuid
 from .symbol import extract_main_symbol, parse_symbol_layout, parse_symbol_pins_geom
 
 
@@ -48,27 +48,6 @@ def _fmt(n: float) -> str:
 
 def _text_w(name: str) -> float:
     return max(len(name), 1) * _FONT * _CHAR_W
-
-
-def parse_components_rich(text: str) -> list[dict]:
-    comps, _nets = parse_netlist(text)
-    by_ref = {c["ref"]: dict(c) for c in comps}
-    pos = 0
-    while True:
-        j = text.find("(comp ", pos)
-        if j < 0:
-            break
-        k = matching_paren(text, j)
-        block = text[j : k + 1]
-        pos = k + 1
-        rm = re.search(r'\(ref "([^"]+)"\)', block)
-        if not rm or rm.group(1) not in by_ref:
-            continue
-        rec = by_ref[rm.group(1)]
-        props = dict(_PROP.findall(block))
-        rec["display"] = props.get("value") or props.get("description") or rec["value"]
-        rec["libpart"] = rec["value"]
-    return list(by_ref.values())
 
 
 @dataclass
@@ -556,66 +535,6 @@ def _rotate(x: float, y: float, deg: float) -> tuple[float, float]:
     rad = math.radians(deg)
     c, s = math.cos(rad), math.sin(rad)
     return x * c - y * s, x * s + y * c
-
-
-def _build_parts(
-    net_text: str,
-    pin_maps: list[tuple[str, dict[str, str]]] | None = None,
-    pkgs: list[PkgLib] | None = None,
-) -> list[Part]:
-    comps = parse_components_rich(net_text)
-    _c, nets = parse_netlist(net_text)
-    lookup = pin_to_net(nets)
-    pins_by_ref: dict[str, dict[str, str]] = defaultdict(dict)
-    for (ref, pin), net in lookup.items():
-        pins_by_ref[ref][pin] = net
-    maps = pin_maps or []
-    pkgs = pkgs or []
-    parts: list[Part] = []
-    for c in comps:
-        ref = c["ref"]
-        kind = _kind(ref)
-        pnets = pins_by_ref.get(ref, {})
-        lib_sexp = None
-        if kind in ("r", "c", "l"):
-            pins = _passive_pins(kind, pnets)
-            # Keep netlist pin numbers if present.
-            for p in pins:
-                if p.number in pnets:
-                    p.net = pnets[p.number]
-            lib_id = kind.upper()
-            hw, hh = 2.0, 4.0
-        else:
-            if not pnets:
-                pnets = {"1": ""}
-            pkg = _pkg_for(c, pkgs)
-            if pkg and pkg.pins:
-                pins = [
-                    PinDef(p.number, p.name, p.lx, p.ly, p.rot, pnets.get(p.number, ""))
-                    for p in pkg.pins
-                ]
-                lib_id = pkg.lib_id or re.sub(r"[^A-Za-z0-9_.-]", "_", c["libpart"] or ref)[:40]
-                lib_sexp = pkg.sexp
-            else:
-                pins = _box_pins(pnets, _pin_map_for(c, maps))
-                lib_id = re.sub(r"[^A-Za-z0-9_.-]", "_", c["libpart"] or ref)[:40]
-            xs = [abs(p.lx) for p in pins]
-            ys = [abs(p.ly) for p in pins]
-            hw = (max(xs) if xs else 16.0) + 2.0
-            hh = (max(ys) if ys else 8.0) + 2.0
-        parts.append(
-            Part(
-                ref=ref,
-                lib_id=lib_id,
-                display=c.get("display") or c["value"],
-                kind=kind,
-                pins=pins,
-                hw=hw,
-                hh=hh,
-                lib_sexp=lib_sexp,
-            )
-        )
-    return parts
 
 
 _GRID = 2.54
@@ -2449,11 +2368,11 @@ def _emit(design: Design, *, title: str, report: dict | None) -> str:
         + "".join(libs)
         + "\t)\n"
         + body_text
-        + f'\t(sheet_instances\n'
-        f'\t\t(path "/" (page "1"))\n'
-        f'\t)\n'
-        f'\t(embedded_fonts no)\n'
-        f")\n"
+        + '\t(sheet_instances\n'
+        '\t\t(path "/" (page "1"))\n'
+        '\t)\n'
+        '\t(embedded_fonts no)\n'
+        ")\n"
     )
 
 

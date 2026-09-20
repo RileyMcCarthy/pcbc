@@ -70,7 +70,7 @@ def test_to_puts_the_pad_next_to_the_pin_outside_the_target(tmp_path: Path):
     result, poses = _placed(board)
     design = load_board(board)
     job = compile_design(design)
-    places, moves = resolve_places(design, job, Path(result["placed"]).read_text())
+    places, moves, _fids = resolve_places(design, job, Path(result["placed"]).read_text())
     assert moves == []
     from pcbc.layout import footprints_by_ref
     from pcbc.pcb_place import parse_foot

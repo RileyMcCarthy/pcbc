@@ -259,7 +259,6 @@ def test_wire_label_sits_mid_wire_not_at_the_pin():
 
 
 def test_the_same_board_gives_the_same_file():
-    import hashlib
     import os
     import subprocess
     import sys

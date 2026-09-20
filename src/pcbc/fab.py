@@ -22,7 +22,6 @@ from .sexp import (
     board_footprint_spans,
     footprint_at,
     footprint_reference,
-    new_uuid,
     stable_uuid,
 )
 
@@ -334,7 +333,9 @@ def _fid_hits_courtyard(text: str, x: float, y: float, radius: float = 1.35) -> 
     return False
 
 
-def insert_fiducials(text: str, size_mm: tuple[float, float], inset: float = 4.0) -> tuple[str, list[tuple[str, float, float]]]:
+def insert_fiducials(
+    text: str, size_mm: tuple[float, float], inset: float = 4.0, spots: list[tuple[str, float, float]] | None = None
+) -> tuple[str, list[tuple[str, float, float]]]:
     existing = [footprint_reference(text[s:e]) for s, e in board_footprint_spans(text)]
     if any(r and r.startswith("FID") for r in existing):
         placed = []
@@ -346,6 +347,8 @@ def insert_fiducials(text: str, size_mm: tuple[float, float], inset: float = 4.0
                 placed.append((r, at[0], at[1]))
         return text, placed
     w, h = size_mm
+    if spots is not None:
+        return _append_fiducials(text, list(spots)), list(spots)
     # Prefer NE/SE/SW; fall back to NW if a courtyard eats a corner.
     candidates = [
         (w - inset, inset),
@@ -365,11 +368,15 @@ def insert_fiducials(text: str, size_mm: tuple[float, float], inset: float = 4.0
             ("FID2", w - inset, h - inset),
             ("FID3", inset, h - inset),
         ]
+    return _append_fiducials(text, spots), spots
+
+
+def _append_fiducials(text: str, spots: list[tuple[str, float, float]]) -> str:
     if not text.rstrip().endswith(")"):
         raise ValueError("board file does not end with )")
     stripped = text.rstrip()
     chunk = "".join(_fiducial_sexp(n, x, y) for n, x, y in spots)
-    return stripped[:-1] + chunk + ")\n", spots
+    return stripped[:-1] + chunk + ")\n"
 
 
 def _run(cmd: list[str]) -> dict:
@@ -537,6 +544,10 @@ def fab_job(
         ]
     )
     steps.append(drc_step)
+    from .sexp import pin_all_uuids
+
+    if work.exists():
+        work.write_text(pin_all_uuids(work.read_text(), work.parent.name, "fab"))
     drc_doc: dict = {}
     if drc_json.exists():
         try:
@@ -554,7 +565,9 @@ def fab_job(
     # 2-layer USB floor is 0.10. 4-layer JLCPCB standard is 0.127 mm (5 mil);
     # 0.16 was a house comfort value that flagged 0.15 mm via-seg scrapes the
     # fab will build.
-    floor = 0.10 if job.layers <= 2 else 0.127
+    from .stackup import get_stackup
+
+    floor = get_stackup(job.stackup).clearance_min
     copper_err = copper_drc_errors(drc_doc, floor_mm=floor)
     result["drc_floor_mm"] = floor
     result["drc_copper_errors"] = len(copper_err)

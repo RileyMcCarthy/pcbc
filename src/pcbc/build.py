@@ -164,6 +164,9 @@ def build_job(
             gate = check_copper(design, routed)
             entry["copper"] = "verified" if gate["ok"] else gate["fails"]
             entry["drc_warnings"] = gate["drc_warnings"]
+            from .sexp import pin_all_uuids
+
+            routed.write_text(pin_all_uuids(routed.read_text(), name, "routed"))  # KiCad's save invented ids
         except KicadMissing as exc:
             gate = {"ok": True, "fails": []}
             entry["copper"] = f"unchecked: {exc}"

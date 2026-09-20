@@ -8,12 +8,27 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class Stackup:
+    """A named fab stackup: geometry for impedance, and the fab's limits.
+
+    The limits are the one source for the board's constraints (`.kicad_pro`), the net
+    classes' vias, the router's floor, and the copper gate. KiCad's own defaults were
+    judging the copper before these were written.
+    """
+
     name: str
     layers: int
     h_mm: float  # dielectric under F.Cu (microstrip height)
     t_mm: float  # outer copper thickness
     er: float
     copper_oz: float = 1.0
+    track_min: float = 0.127  # mm; JLC 1-2 layer 5 mil
+    clearance_min: float = 0.127
+    via_drill: float = 0.3  # the standard via, no extra cost
+    via_diameter: float = 0.5
+    annular_min: float = 0.1
+    hole_clearance: float = 0.254  # copper to a hole's edge
+    hole_to_hole: float = 0.5
+    edge_clearance: float = 0.3  # copper to the board edge
 
 
 STACKUPS: dict[str, Stackup] = {
@@ -24,6 +39,11 @@ STACKUPS: dict[str, Stackup] = {
         t_mm=0.035,
         er=4.5,
         copper_oz=1.0,
+        track_min=0.0889,  # 3.5 mil on 4+ layers
+        clearance_min=0.0889,
+        via_drill=0.2,
+        via_diameter=0.35,
+        annular_min=0.075,
     ),
     "jlcpcb_2l_1oz": Stackup(
         name="jlcpcb_2l_1oz",
@@ -34,6 +54,25 @@ STACKUPS: dict[str, Stackup] = {
         copper_oz=1.0,
     ),
 }
+
+
+def hole_floor(stack: Stackup) -> float:
+    """The copper clearance at which a track next to a via's ring also clears its hole."""
+    return round(stack.hole_clearance - stack.annular_min + 0.005, 4)
+
+
+def board_rules(stack: Stackup) -> dict[str, float]:
+    """The `.kicad_pro` design_settings.rules block."""
+    return {
+        "min_clearance": stack.clearance_min,
+        "min_track_width": stack.track_min,
+        "min_via_diameter": stack.via_diameter,
+        "min_via_annular_width": stack.annular_min,
+        "min_through_hole_diameter": stack.via_drill,
+        "min_hole_clearance": stack.hole_clearance,
+        "min_hole_to_hole": stack.hole_to_hole,
+        "min_copper_edge_clearance": stack.edge_clearance,
+    }
 
 
 def get_stackup(name: str) -> Stackup:

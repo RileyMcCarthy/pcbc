@@ -95,3 +95,18 @@ def test_blinky_routes_clean_and_the_same_twice(tmp_path: Path):
     design = load_board(tmp_path / "b1" / "blinky.py")
     text = outs[0].decode()
     assert copper_nets(text) == expected_nets(design)
+
+
+def test_route_starts_from_a_clean_work_dir(tmp_path: Path, monkeypatch):
+    """A killed build left 01_analog_nets.kicad_pro behind; KRT read it as the next step's
+    project and routed FB twice, shorting it into the JST's GND pad."""
+    monkeypatch.setenv("KRT_HOME", str(tmp_path / "nowhere"))
+    design = load_board(BLINKY)
+    src = tmp_path / "in.kicad_pcb"
+    src.write_text("(kicad_pcb)\n")
+    work = tmp_path / "routed"
+    work.mkdir()
+    for name in ("01_analog_nets.kicad_pcb", "01_analog_nets.kicad_pro", "03_signals.kicad_pcb"):
+        (work / name).write_text("stale")
+    route_job(design, src, out=work / "layout.kicad_pcb")
+    assert sorted(p.name for p in work.iterdir()) == ["layout.kicad_pcb"]

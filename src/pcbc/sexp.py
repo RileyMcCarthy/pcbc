@@ -98,3 +98,20 @@ _NS = uuid.UUID("7c9e6679-7425-40de-944b-e07fc1f90ae7")
 def stable_uuid(*parts: object) -> str:
     """Deterministic UUIDv5 so rebuilds do not churn git."""
     return str(uuid.uuid5(_NS, "|".join(str(p) for p in parts)))
+
+
+_ANY_UUID = re.compile(r'\(uuid\s+"[^"]*"\)')
+
+
+def pin_all_uuids(text: str, *key: object) -> str:
+    """Every uuid in file order, keyed by position. KiCad invents random ids for items that
+    have none when it saves a board (pads, footprint fields, graphics); after the copper gate
+    refills and saves, this puts the file back on a deterministic footing."""
+    n = 0
+
+    def sub(m: re.Match) -> str:
+        nonlocal n
+        n += 1
+        return f'(uuid "{stable_uuid(*key, "id", n)}")'
+
+    return _ANY_UUID.sub(sub, text)

@@ -26,6 +26,7 @@ _PAD_NUM = re.compile(r'\(pad\s+"([^"]*)"')
 _PAD_NET = re.compile(r'\(net\s+(?:\d+\s+)?"([^"]*)"\)')
 
 GAP = 0.2  # courtyard to courtyard, mm
+EDGE_CLEAR = 0.3  # copper to board edge (JLC asks 0.2; routing wants a lane)
 DECAP_MM = 2.5  # the first decoupling cap on a pin belongs this close to it
 DECAP_NEXT_MM = 5.0  # the bulk cap behind it, this close
 EDGE_MM = 1.0  # a connector this far from every edge is not on one
@@ -34,6 +35,7 @@ _REACH = 8.0
 _DIRS = {"right": (1.0, 0.0), "left": (-1.0, 0.0), "down": (0.0, 1.0), "up": (0.0, -1.0)}
 _EDGE_OUT = {"right": (1.0, 0.0), "left": (-1.0, 0.0), "bottom": (0.0, 1.0), "top": (0.0, -1.0)}
 _ROTS = (0.0, 90.0, 180.0, 270.0)
+_TRACE = __import__("os").environ.get("PCBC_TRACE_PLACE", "")  # a ref: print every candidate it scored
 
 
 @dataclass
@@ -80,9 +82,10 @@ def parse_foot(ref: str, block: str) -> Foot:
         if not num or not at or not size:
             continue
         net = _PAD_NET.search(pad)
-        pads.append(
-            Pad(num.group(1), float(at.group(1)), float(at.group(2)), float(size.group(1)), float(size.group(2)), net.group(1) if net else "")
-        )
+        w, h = float(size.group(1)), float(size.group(2))
+        if round(float(at.group(3) or 0)) % 180 == 90:
+            w, h = h, w
+        pads.append(Pad(num.group(1), float(at.group(1)), float(at.group(2)), w, h, net.group(1) if net else ""))
     crt = footprint_box_local(block, "courtyard")
     pb = footprint_box_local(block, "pads")
     box = (min(crt[0], pb[0]), min(crt[1], pb[1]), max(crt[2], pb[2]), max(crt[3], pb[3]))
@@ -200,8 +203,29 @@ def _edge_css(spec: PlaceSpec, foot: Foot) -> PlaceSpec:
     return replace(spec, **css)
 
 
-def resolve_places(design: Design, job, pcb_text: str) -> tuple[list[PlaceSpec], list[str]]:
-    """Every Place() as an absolute (at, rot). Anchors by CSS, then relations. Returns (places, moves)."""
+FID_INSET = 4.0
+FID_HALF = 1.25  # Fiducial_1mm_Mask2mm courtyard
+
+
+def fiducial_spots(size_mm: tuple[float, float], taken: list[Foot], want: int = 3) -> list[tuple[str, float, float]]:
+    """Three fiducials, corners first then edge middles, wherever no anchor sits. The AI never places these."""
+    w, h = size_mm
+    i = FID_INSET
+    candidates = [(w - i, i), (w - i, h - i), (i, h - i), (i, i), (w / 2, i), (w / 2, h - i), (i, h / 2), (w - i, h / 2)]
+    spots: list[tuple[str, float, float]] = []
+    for x, y in candidates:
+        box = (x - FID_HALF, y - FID_HALF, x + FID_HALF, y + FID_HALF)
+        if any(_overlap(box, f.world_box(), GAP) for f in taken if f.at is not None):
+            continue
+        spots.append((f"FID{len(spots) + 1}", x, y))
+        if len(spots) == want:
+            break
+    return spots
+
+
+def resolve_places(design: Design, job, pcb_text: str) -> tuple[list[PlaceSpec], list[str], list[tuple[str, float, float]]]:
+    """Every Place() as an absolute (at, rot). Anchors by CSS, then fiducials in the free corners,
+    then relations. Returns (places, moves, fiducial spots)."""
     board = _board_of(job)
     regions = resolve_regions(board, job.regions)
     content = content_rect(board)
@@ -213,6 +237,11 @@ def resolve_places(design: Design, job, pcb_text: str) -> tuple[list[PlaceSpec],
             pad.net = nets_of.get(ref, {}).get(pad.num, pad.net)
     keepouts = [resolve_keepout(ko, board, regions) for ko in job.keepouts]
     values = {inst.ref: (inst.value or inst.part.value or "") for inst in design.instances}
+    order = {p.ref: i for i, p in enumerate(job.places)}  # file order: the first Place() on a pin gets the closest spot
+    first_on: dict[tuple[str, str], int] = {}
+    for p in job.places:
+        if p.to:
+            first_on.setdefault(parse_refpin(p.to), order[p.ref])
     moves: list[str] = []
     resolved: dict[str, PlaceSpec] = {}
     placed: list[Foot] = []
@@ -226,6 +255,16 @@ def resolve_places(design: Design, job, pcb_text: str) -> tuple[list[PlaceSpec],
         resolved[spec.ref] = done
         return done
 
+    from .sexp import footprint_at
+
+    specced = {p.ref for p in job.places}
+    for ref, foot in sorted(feet.items()):
+        if ref in specced:
+            continue
+        at = footprint_at(blocks[ref])
+        if at is not None:
+            foot.at, foot.rot = (at[0], at[1]), at[2]
+            placed.append(foot)  # a fiducial, or anything the seed put down: keep off it
     pending: list[PlaceSpec] = []
     for spec in job.places:
         if spec.ref not in feet:
@@ -239,6 +278,13 @@ def resolve_places(design: Design, job, pcb_text: str) -> tuple[list[PlaceSpec],
             continue
         settle(rp, rp.at, rp.rot)
 
+    # Fiducials take the free corners once the anchors are down; relations keep off them.
+    spots = fiducial_spots(board.size_mm, placed) if not any(r.startswith("FID") for r in feet) else []
+    for ref, x, y in spots:
+        placed.append(Foot(ref, (-FID_HALF, -FID_HALF, FID_HALF, FID_HALF), [Pad("", 0.0, 0.0, 1.0, 1.0, "")], at=(x, y), rot=0.0))
+    if 0 < len(spots) < 3:
+        moves.append(f"only {len(spots)} fiducial spot(s) are free: the anchors cover the other corners and edge middles; JLC wants 3")
+
     # Relations in dependency order: a part attached to a pending part waits for it.
     guard = 0
     while pending:
@@ -247,7 +293,7 @@ def resolve_places(design: Design, job, pcb_text: str) -> tuple[list[PlaceSpec],
         if not ready or guard > 64:
             names = ", ".join(sorted(p.ref for p in pending))
             raise ValueError(f"Place(to=...) cycle or missing target among {names}")
-        ready.sort(key=lambda p: (parse_refpin(p.to), _farads(values.get(p.ref, "")), _area(feet[p.ref].box), p.ref))
+        ready.sort(key=lambda p: (first_on[parse_refpin(p.to)], _farads(values.get(p.ref, "")), _area(feet[p.ref].box), order[p.ref]))
         spec = ready[0]
         pending.remove(spec)
         tref, tpin = parse_refpin(spec.to)
@@ -258,7 +304,7 @@ def resolve_places(design: Design, job, pcb_text: str) -> tuple[list[PlaceSpec],
         settle(spec, at, rot)
         if note:
             moves.append(note)
-    return [resolved.get(p.ref, p) for p in job.places], moves
+    return [resolved.get(p.ref, p) for p in job.places], moves, spots
 
 
 def _area(box) -> float:
@@ -284,7 +330,7 @@ def _attach(spec: PlaceSpec, part: Foot, target: Foot, net: str, placed: list[Fo
         raise ValueError(f"Place({spec.ref!r}, to={spec.to!r}): no pad on net {net!r} on both parts")
     gap = GAP if spec.gap is None else float(spec.gap)
     tc = target.center()
-    limit = regions[spec.parent] if spec.parent else content
+    limit = regions[spec.parent] if spec.parent else Rect(content.x0 + EDGE_CLEAR, content.y0 + EDGE_CLEAR, content.x1 - EDGE_CLEAR, content.y1 - EDGE_CLEAR)
     others = [f for f in placed if f.ref != part.ref]
     # World pads of everything placed, by net, for the "lean toward your other nets" score.
     known: dict[str, list[tuple[float, float]]] = {}
@@ -347,6 +393,8 @@ def _attach(spec: PlaceSpec, part: Foot, target: Foot, net: str, placed: list[Fo
                         if sites:
                             lean += min(math.hypot(pw[0] - s[0], pw[1] - s[1]) for s in sites)
                     score = (d + 0.5 * lean + 0.02 * ri + 0.5 * di, at, rot)
+                    if _TRACE == spec.ref:
+                        print(f"  {spec.ref} dir={e} rot={rot:g} pad={ap.num} d={d:.2f} lean={lean:.2f} score={score[0]:.2f} at=({at[0]:.2f},{at[1]:.2f})")
                     if best is None or score < best:
                         best = score
     if best is not None:
@@ -452,7 +500,47 @@ def layout_report(design: Design, job, pcb_text: str) -> list[str]:
                 issues.append(
                     f"{ref} is {dmm:.1f} mm from {ic}.{pin}: {what} belongs within {limit:g} mm; Place({ref!r}, to=\"{ic}.{pin}\")"
                 )
+    from fnmatch import fnmatch
+
+    pads_on: dict[str, list[tuple[str, str, float, float]]] = {}
+    for ref in refs:
+        f = feet[ref]
+        for p in f.pads:
+            if p.net and p.num:
+                x, y = f.pad_world(p)
+                pads_on.setdefault(p.net, []).append((ref, p.num, x, y))
+    for cn in job.nets:
+        if not cn.max_length_mm:
+            continue
+        for net in sorted(pads_on):
+            if not any(fnmatch(net, pat) for pat in cn.patterns):
+                continue
+            sites = pads_on[net]
+            worst = None
+            for ref, num, x, y in sites:
+                near = min((math.hypot(x - x2, y - y2), r2, n2) for r2, n2, x2, y2 in sites if r2 != ref) if any(r2 != ref for r2, *_ in sites) else None
+                if near and (worst is None or near[0] > worst[0]):
+                    worst = (near[0], ref, num, near[1], near[2])
+            if worst and worst[0] > cn.max_length_mm:
+                dmm, ref, num, r2, n2 = worst
+                pin = _pin_name(inst_by[ref], num) if ref in inst_by else num
+                pin2 = _pin_name(inst_by[r2], n2) if r2 in inst_by else n2
+                issues.append(f"{net}: {ref}.{pin} is {dmm:.1f} mm from {r2}.{pin2}, its nearest pad on the net; NetReq max_mm={cn.max_length_mm:g}: Place({ref!r}, to=\"{r2}.{pin2}\") or bring them together")
     w, h = board.size_mm
+    for ref in refs:
+        if _placed_on_edge(ref, job):
+            continue
+        f = feet[ref]
+        near = 0.0
+        for p in f.pads:
+            if not p.num:
+                continue
+            px, py = f.pad_world(p)
+            hw, hh = (p.h, p.w) if f.rot % 180 == 90 else (p.w, p.h)
+            over = max(EDGE_CLEAR - (px - hw / 2), EDGE_CLEAR - (py - hh / 2), (px + hw / 2) - (w - EDGE_CLEAR), (py + hh / 2) - (h - EDGE_CLEAR), 0.0)
+            near = max(near, over)
+        if near > 1e-3:
+            issues.append(f"{ref}'s pads come within {EDGE_CLEAR:g} mm of the board edge: copper needs {EDGE_CLEAR:g} mm; move it in, or Place({ref!r}, edge=...) if it is a connector")
     for ref in refs:
         if not ref.startswith("J"):
             continue

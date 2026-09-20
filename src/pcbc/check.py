@@ -46,6 +46,8 @@ def check_job(job: CompiledJob, pcb_path: Path, tol_mm: float = 0.05) -> list[st
     aliases = build_alias_index(text)
 
     for place in job.places:
+        if (place.to or place.edge) and place.at is None:
+            continue  # placed by relation in the place stage and checked there; a fresh compile has no pose for it
         kref = resolve_ref(place.ref, aliases) or place.ref
         block = by_ref.get(kref)
         if block is None:
@@ -81,7 +83,9 @@ def check_job(job: CompiledJob, pcb_path: Path, tol_mm: float = 0.05) -> list[st
     if job.dru and not dru.exists():
         failures.append(f"missing {dru.name}")
     failures.extend(sensitive_airwire_failures(job, text))
-    floor = 0.10 if job.layers <= 2 else 0.16
+    from .stackup import get_stackup
+
+    floor = get_stackup(job.stackup).clearance_min
     failures.extend(pad_clearance_failures(text, clearance=floor))
     return failures
 

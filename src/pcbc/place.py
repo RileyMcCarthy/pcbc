@@ -17,7 +17,18 @@ def place_job(design: Design, seed: Path, *, out: Path) -> dict:
     seed = Path(seed)
     out = Path(out)
     copy_with_siblings(seed, out)
-    job.places, moves = resolve_places(design, job, out.read_text())
+    job.places, moves, fids = resolve_places(design, job, out.read_text())
+    if fids:
+        from .fab import insert_fiducials
+        from .model import KeepoutSpec
+        from .pcb_place import FID_HALF
+
+        text, _ = insert_fiducials(out.read_text(), job.board_size_mm, spots=fids)
+        out.write_text(text)
+        # The router keeps off a fiducial's copper dot, not its 2 mm mask opening: a track
+        # through the opening is a solder-mask bridge. A keepout the size of its courtyard.
+        for ref, x, y in fids:
+            job.keepouts.append(KeepoutSpec(name=f"{ref}_mask", box=(x - FID_HALF, y - FID_HALF, x + FID_HALF, y + FID_HALF), no=("copper", "via")))
     applied = apply_job(job, out, backup=False)
     fails = check_job(job, out)
     report = moves + layout_report(design, job, out.read_text())

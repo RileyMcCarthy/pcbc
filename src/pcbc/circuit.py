@@ -70,9 +70,23 @@ def check_design(design: Design, pcb: bool = True) -> list[str]:
         if inst.part.origin:
             for msg in _library_fails(inst.part):
                 fails.append(f"{inst.ref}: library {msg}")
+        elif pcb and inst.part.kind in ("generic", "led"):
+            from .footprints import generic_mod
+
+            try:
+                generic_mod(inst.part.prefix, inst.part.package)
+            except FileNotFoundError as exc:
+                fails.append(f"{inst.ref}: {exc}")
 
     placed = {p.ref for p in design.places}
     sch_placed = {p.ref for p in design.sch_places}
+    for what, specs in (("Place", design.places), ("SchPlace", design.sch_places)):
+        seen: dict[str, int] = {}
+        for p in specs:
+            seen[p.ref] = seen.get(p.ref, 0) + 1
+        for ref, n in sorted(seen.items()):
+            if n > 1 and (pcb or what == "SchPlace"):
+                fails.append(f"{ref}: {what}() {n} times; keep one (the last one does not win, the check does)")
     for inst in design.instances:
         if pcb and inst.ref not in placed:
             fails.append(f"{inst.ref}: no Place() — every part is CSS-placed")

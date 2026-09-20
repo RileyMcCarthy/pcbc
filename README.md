@@ -139,11 +139,15 @@ Place("D1", to="R_LED.2", toward="right")     # toward= overrides the side; gap=
 | A boxed-in part is reported, never hidden | `test_a_boxed_in_part_is_reported_not_hidden` |
 | Courtyards never overlap; nothing sits outside the board; the first decoupling cap on a pin is within 2.5 mm and the next within 5; a connector is on an edge, or the report says so | `test_report_reads_a_hand_placed_board` |
 | The same `board.py` places the same, byte for byte | `test_the_same_board_places_the_same` |
-| The examples stay under the bar: c3_usb 0, node 0 | `test_c3_usb_layout_bar`, `test_node.py::test_node_layout_bar` |
+| The first `Place()` on a pin gets the closest spot (file order); on one pin the smallest capacitance goes nearest | `test_copper_rules.py::test_the_first_place_on_a_pin_gets_the_closest_spot` |
+| Copper stays 0.3 mm off the board edge; a net with `NetReq(max_mm=)` has no pad farther than that from its nearest neighbour | `test_copper_rules.py::test_report_holds_copper_off_the_edge_and_nets_to_their_max_mm` |
+| Turning a footprint turns its pads (KiCad stores pad angles as footprint + pad angle in a board file) | `test_copper_rules.py::test_turning_a_footprint_turns_its_pads` |
+| A footprint's own pads are held to the fab floor, not the net class; ringless mounting holes are repaired at fetch; touching pads fail the score; every generic has a vendored land | `test_copper_rules.py` |
+| The examples stay under the bar: c3_usb 0, buck 0, node 0 | `test_c3_usb_layout_bar`, `test_node.py::test_node_layout_bar`, `test_copper_rules.py::test_the_first_place_on_a_pin_gets_the_closest_spot` |
 
 ### Copper rules
 
-The AI never draws a track. KRT routes the placed board; the gate is KiCad's own verdict plus the netlist:
+The AI never draws a track. The route stage compiles `NetReq` into an ordered KRT plan and runs it: nets that may not carry vias, or live on one layer (`kind="switch_node"`, `kind="analog"`, `vias=False`, `layers=`), go first on their layers while the board is empty; differential pairs (`pair=True`) as coupled pairs; on four layers the declared `planes=` pours with via taps; then everything else with power nets at the width their `amps` ask for; on two layers a GND pour on the back and one more pass. The plan is a pure function of `board.py` (`tests/test_route_plan.py`). The gate is KiCad's own verdict plus the netlist:
 
 | Rule | Test |
 |---|---|
@@ -151,6 +155,9 @@ The AI never draws a track. KRT routes the placed board; the gate is KiCad's own
 | The routed board passes `kicad-cli pcb drc` with nothing unconnected, and its pads are bound exactly as `board.py` says | `test_route.py::test_blinky_routes_clean_and_the_same_twice`, `test_placed_board_fails_the_copper_gate_as_unconnected` |
 | The same `board.py` gives the same copper, byte for byte (KRT's ids are re-keyed by order) | `test_route.py::test_blinky_routes_clean_and_the_same_twice` |
 | Without KRT the route stage stops and says how to get it | `test_route.py::test_route_without_krt_says_how_to_get_it` |
+| The `Stackup` is the one source of the fab's limits: the project's constraints, the net classes' vias, the router's clearances and the gate all read it | `test_copper_rules.py::test_the_stackup_is_the_one_source_of_fab_limits` |
+| The gate judges filled pours and saves them, so what it judged is what the fab gets; fiducials carry a keepout so no track crosses their mask opening | `test_route.py::test_blinky_routes_clean_and_the_same_twice`, `test_copper_rules.py::test_fiducials_take_free_corners_and_are_kept_clear` |
+| Every route starts from a clean work dir; a killed build's step files are never inherited | `test_route.py::test_route_starts_from_a_clean_work_dir` |
 
 Placement language and the routing plan compiled from `NetReq` are the next phases: see `docs/copper-plan.md`.
 

@@ -80,6 +80,33 @@ silkscreen references on top of each other (Phase 3), crowding without overlap.
 Not yet: `side="B"` by relation, hot-loop and in-line rules, airwire crossings, the
 KRT floorplan grader as a second opinion.
 
+**Every board through the whole pipeline (2026-09-19).** What broke, and what the tool
+now does about it, so the next AI never meets it:
+
+| Seen | Now |
+|---|---|
+| `pcbc pcb buck.py` died with a traceback: no vendored 0805 land | 0805/1206 lands vendored (R, C, L, LED); `check` reports a generic with no land |
+| ESP32 module pads "actual 0.0000 mm" in DRC after U1 was turned 90° | KiCad stores pad angles as footprint + pad angle in a board file; `apply` turns the pads with the footprint |
+| KiCad DRC: USB-C mounting holes have no annular ring | EasyEDA draws them as plated pads with drill = size; `fetch` repairs them to `np_thru_hole`, the scorer fails what is left |
+| KiCad applied the Power class clearance (0.2) between the USB-C's own pads (0.1 apart) | a generated rule holds a footprint's own pads to the 0.1 mm fab floor |
+| SW_BOOT's pad on the board edge (copper_edge_clearance) | relations keep 0.3 mm off the edge; the report names pads within it |
+| the input caps of the buck ended 3.6 mm from VIN because the inductor and output caps, listed later, took the free side first | file order decides: the first `Place()` on a pin gets the closest spot |
+| `NetReq("SW", max_mm=6)` was never checked on the copper | the report names the pad farthest from its nearest neighbour on such a net |
+| the fab stage re-checked placements from a fresh compile and saw `edge=` parts "moved" | the fab check skips relations it has no pose for; the place stage already verified them |
+| buck carried its old hand grid under the new relational lines; every part was placed twice and the fab check saw them all "moved" | `check` refuses a ref with two `Place()` (or `SchPlace()`) lines |
+| fab dropped fiducials onto the finished node board: FID1 on U4's pad and the 3V3 tracks (11 DRC errors after a clean route) | fiducials are placed in the place stage after the anchors, in the free corners (then edge middles); relations keep off them; the router routes around them; the report says when fewer than 3 corners are free |
+| the router put vias on the switch node and the analog nets (`NetReq vias=False`), and routed the USB pair single-ended | the route stage compiles a plan from `NetReq`: constrained nets first on their layer, pairs as pairs, planes, then the rest at power widths, GND pour on two layers (`tests/test_route_plan.py`) |
+| KRT quietly rewrote the board's minimum clearance ("FAB FLOOR RELAXED 0.16 → 0.1517") to make its own copper read clean | every step runs with `--no-fix-drc-settings`; pcbc's rules are what KiCad judges by |
+| once KRT stopped rewriting them, KiCad's defaults judged the vias: 0.2 mm drills on a 2-layer board (min 0.3), 0.075 mm rings (min 0.1), tracks 0.236 from holes (min 0.25); pcbc had only ever written min clearance and track width into the project | the `Stackup` carries the fab's limits (track, clearance, via drill/diameter, annular ring, hole clearance, hole-to-hole, edge) and is the one source for the project's constraints, the net classes' vias, the router's clearances, and the copper gate |
+| KRT keeps a track `clearance` from a via's ring; the fab wants `hole_clearance` from the hole itself, so tracks sat 0.24 mm from holes that need 0.254 | every routing step's `--clearance` is at least `hole_clearance - annular_ring` |
+| the 90 Ω pair geometry on 1.6 mm FR4 came out at 0.10 mm, under the fab's 0.127 mm trace | pair width and gap are floored at the stackup, like every class |
+| KRT writes pours without fills; KiCad judged the unfilled planes as no copper (17 unconnected items on node) and the Gerbers would have carried no plane | the copper gate runs DRC with `--refill-zones --save-board`: what it judged is what the fab gets |
+| a track ran through a fiducial's 2 mm mask opening (solder-mask bridge) | each fiducial gets a keepout the size of its courtyard before routing |
+| at the ESP32's 0.8 mm pitch pads KRT escalated to "advanced" vias (0.25/0.15) and 0.0889 mm tracks; the board's own constraints then rejected them | every step reads a `fab_overrides.txt` written from the stackup, which pins KRT's floor and disables the escalation; the 4-layer track and clearance floor is 3.5 mil exactly (0.0889) |
+| `--clearance` is a ceiling: passing the hole floor capped the Power class from 0.2 to 0.184 and KiCad then flagged Power pads 0.17 from other nets' vias | every net class's clearance is at least `hole_clearance - annular ring`, the classes carry the numbers, and the signals step names no ceiling |
+| once the gate saved the refilled board, two builds of one `board.py` differed: KiCad invents random ids for pads, fields and graphics that have none when it saves | every uuid is re-keyed by position after KiCad's save, in the route stage and in fab; `test_blinky_routes_clean_and_the_same_twice` holds |
+| a build killed mid-route left `01_analog_nets.kicad_pro` behind; KRT records settings in a step's sibling project file and the next build's step inherited a stale one: FB routed twice, shorted into the JST's GND pad, 83 clearance errors | the route stage deletes every step file in its work dir before it starts |
+
 - **Anchors keep CSS.** `Place("J1", edge="left")` puts a connector on an edge with its
   overhang; `Place("U1", parent="mcu", left=…, top=…)`; `Region`, `Keepout` as now.
 - **Everything else is relational.** `Place("C_VIN", to="U1.VIN")` (decap),
@@ -101,7 +128,14 @@ KRT floorplan grader as a second opinion.
   (Regions → zones, `edge=` → edge_connectors, `to=` → decaps, Keepouts → keepouts) and run
   `check_floorplan.py` in the tests. Same philosophy, independent grader. Not the placer.
 
-### Phase 2. Routing as a compiled plan, `pcbc route` (about a week)
+### Phase 2. Routing as a compiled plan, `pcbc route` (about a week) — first cut 2026-09-19
+
+Landed: `route.krt_plan` compiles `NetReq` into the ordered KRT chain (constrained nets,
+pairs, planes, signals at power widths, GND pour + finalize on two layers), every step
+pinned to the stackup's fab rung, the copper gate judging filled pours, and all four
+examples building to a JLC package (`tests/test_examples_fab.py`, CI). Failures still
+come back as KRT's own log rather than as part moves; that, and the second-opinion
+graders, are what is left of this phase.
 
 - pcbc emits an ordered KRT plan from `NetReq` and the `krt` dict, never a hand-drawn
   track: fanout for fine-pitch connectors and QFNs; differential pairs; sensitive and

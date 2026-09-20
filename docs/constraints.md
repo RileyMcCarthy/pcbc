@@ -30,7 +30,7 @@ one of `hj_microstrip`, `hj_coupled_microstrip`, `wadell_stripline`, `wadell_str
 line prints the value, the unit, the formula, what it was evaluated against, and the note:
 
 ```
-USB_DP: pair with USB_DN, 0.2291 mm wide, gap 0.15 mm on F.Cu over In1.Cu (GND): 90 ohm (hj_coupled_microstrip x 0.85 JLC04161H-7628; JLC row 0.2332/0.15; target 90 +-15 %; NetReq line 143)
+USB_DP: pair with USB_DN, 0.2288 mm wide, gap 0.15 mm on F.Cu over In1.Cu (GND): 90 ohm (hj_coupled_microstrip x 0.85 JLC04161H-7628; JLC row 0.2332/0.15; target 90 +-15 %; NetReq line 143)
 VBUS: width 0.4 mm (pcbc_floor amps >= 0.2; ipc2221_ext 1 A 10 C 1 oz 0.300; ipc2152_fit x board 1.099 x plane 0.430 at 0.2104 mm In1.Cu 0.134)
 VBUS: via 0.8/0.4 mm (preset power), 2 per layer change (via_barrel 0.4/0.018 mm 0.871 A at 10 C) [report only in R1]
 ```
@@ -92,9 +92,12 @@ Reference: E. Hammerstad, O. Jensen, "Accurate models for microstrip computer-ai
 IEEE MTT-S Digest 1980, eqs. 1-8 and the thickness correction; KiCad 10
 `common/transline_calculations/microstrip.cpp` (same equations). Valid 0.01 <= u <= 100,
 1 <= er <= 128, 0.2 %. The `(Z01(u1)/Z01(ur))^2` factor is the one that is easy to drop:
-without it the 7628 row reads 53.86 ohm, with it 55.165, which is what KiCad's calculator
-gives. Vectors 1-5: alumina 49.289 ohm / eeff 6.579; 7628 55.165; 1080 56.111; the 2-layer
-core 83.495 at 1 mm and 2.8097 mm for 50 ohm; 0.3244 mm for 50 ohm on 7628 with the bias.
+the assembly is KiCad 10.0.6's `microstrip_Z0()` exactly (its `q_t` thickness term included,
+and the `(Z01(u1)/Z01(ur))^2` factor in the *reported* permittivity, not in Z0), measured
+against a harness compiled from KiCad's own source: 54.660 ohm at JLC's 7628 50 ohm width,
+where bare H&J gives 53.858. R1 shipped with that factor in Z0 and no `q_t`, reading 55.165,
+which was neither; corrected 2026-09-20. Vectors 1-5: alumina 49.289 ohm / eeff 6.579; 7628 54.660; 1080 55.754; the 2-layer
+core 83.033 at 1 mm and 2.7966 mm for 50 ohm; 0.3244 mm for 50 ohm on 7628 with the bias.
 
 ### Coupled microstrip, edge-coupled (C.3): Hammerstad and Jensen 1980 even / odd, static
 
@@ -123,7 +126,7 @@ Reference: Hammerstad and Jensen 1980, "Coupled microstrip" (Q1..Q10 are theirs;
 and Jansen 1984 is the dispersion model and is not used); KiCad 10 `coupled_microstrip.cpp`
 (separate even / odd thickness widths, under 1 ohm from this single-`du` treatment in the
 fitted range). Valid 0.1 <= u <= 10, 0.1 <= g <= 10. Feeding `ur` into the Q terms gives
-104.15 ohm at vector 6 instead of 105.09 and 133.1 at the 2L clamp instead of 140.1, which is
+103.67 ohm at vector 6 instead of 104.635 and 133.08 at the 2L clamp instead of 140.1, which is
 what the vectors are there to catch. Vectors 6-10.
 
 Gap policy: `gap = max(0.15, clearance_min)` (JLC's own 4-layer pair gap), `Pair(gap_mm=)`
@@ -281,7 +284,7 @@ groove rule at PD2, KiCad `GetMinGrooveWidth`); clearance still applies to the g
 `i2c_max_mm(pf_max, pins, c_pf_per_mm) = (pf_max - 10 pins) / c_pf_per_mm` at the class
 width on the outer layer (bias applied to `z0`, `eeff / z_bias^2` as the consistent
 velocity). Reference: I2C-bus specification UM10204 rev 7, section 7.1 (Cb <= 400 pF, 10 pF
-per device pin). On 2L at 0.16 mm (145 ohm, 0.0391 pF/mm) a 2-device bus is bounded at 9.7 m:
+per device pin). On 2L at 0.16 mm (142.9 ohm, 0.0404 pF/mm) a 2-device bus is bounded at 9.4 m:
 it binds only on long buses on thin prepregs, which is the point of printing it. Vector 25.
 
 ## Calibration to JLC (C.2): the per-stackup fab bias
@@ -302,17 +305,17 @@ width synthesis: solve Z_bare(w) = Z_target / z_bias
 
 | code | z_bias_se (fit) | z_bias_diff (fit) | residuals at JLC's rows | source string |
 |---|---|---|---|---|
-| 7628 | 0.9064 (= 50 / 55.165) | 0.85 (geometric mean of 90/105.09 = 0.8564 and 100/118.69 = 0.8426) | 90 row -> 89.3 ohm (-0.8 %), 100 row -> 100.9 (+0.9 %) | `fitted to JLC04161H-7628 rows (JITX), 2026-09-19` |
-| 1080 | 0.8911 (= 50 / 56.111) | 0.827 (mean of 0.8054, 0.85) | 90 row -> 92.4 (+2.7 %), 100 row -> 97.3 (-2.7 %) | same, 1080 |
-| 3313, 2116 | 0.899 | 0.838 | none: interpolated (mean of the two fits) | `interpolated between 7628 and 1080 fits; capture JLC rows to replace` |
+| 7628 | 0.9147 (= 50 / 54.660) | 0.8532 (geometric mean of 90/104.635 and 100/118.170) | 90 row -> 89.3 ohm (-0.8 %), 100 row -> 100.9 (+0.9 %) | `fitted to JLC04161H-7628 rows (JITX), 2026-09-19` |
+| 1080 | 0.8968 (= 50 / 55.754) | 0.8308 (geometric mean of 90/111.331 and 100/117.114) | 90 row -> 92.4 (+2.7 %), 100 row -> 97.3 (-2.7 %) | same, 1080 |
+| 3313, 2116 | 0.9058 | 0.842 | none: interpolated (mean of the two fits) | `interpolated between 7628 and 1080 fits; capture JLC rows to replace` |
 | 2L | 1.0 | 1.0 | none; c/h = 0.02, the mask barely matters | `uncalibrated: formula only` |
 
 Synthesised widths with the bias against JLC's rows:
 
 | code | 50 ohm SE | 90 ohm pair (gap) | 100 ohm pair (gap) |
 |---|---|---|---|
-| 7628 | 0.3244 (row 0.3244, by construction) | 0.2291 at 0.15 (row 0.2332, -1.8 %) | 0.1762 at 0.15 (row 0.1722, +2.3 %) |
-| 1080 | 0.1176 (row 0.1176) | 0.0956 at 0.09 (row 0.09, +6 %) | 0.0846 at 0.137 (row 0.09, -6 %) |
+| 7628 | 0.3244 (row 0.3244, by construction) | 0.2288 at 0.15 (row 0.2332, -1.8 %) | 0.1759 at 0.15 (row 0.1722, +2.3 %) |
+| 1080 | 0.1176 (row 0.1176) | 0.0958 at 0.09 (row 0.09, +6 %) | 0.0846 at 0.137 (row 0.09, -6 %) |
 
 Stated accuracy: **+-3 % impedance / +-3 % width on 7628, +-3 % / +-6 % on 1080**, inside
 USB 2.0's +-15 % and 100 ohm Ethernet's +-10 %; off-row stackups and 2L print `uncalibrated`
@@ -367,7 +370,7 @@ The README's Constraints table maps each to its test.
 |---|---|
 | `NetReq(*nets, kind, **kwargs)` dropped an unknown kwarg silently (`amp=2` was a 0.2 A net) | exact signature; `NetReq("VBUS") line 144: unexpected keyword 'amp'; did you mean amps=?`; a kind-foreign kwarg lists what the kind takes |
 | `microstrip_z0` was IPC-2141, valid 0.1 < w/h < 2, out of range at every practical width on the JLC prepregs (w/h 2.6 at 0.2 mm on 1080) | Hammerstad-Jensen with thickness, H&J coupled, Wadell stripline, Ghione-Naldi CPWG; IPC-2141 as the cross-check column only |
-| `jlcpcb_4l_1oz` was `h_mm 0.12, er 4.5`, no JLC build | five JLC stackups by code; `jlcpcb_4l_1oz` = JLC04161H-7628; node's pair 0.1554 / 0.12 -> 0.2291 / 0.15 (JLC row 0.2332 / 0.15) |
+| `jlcpcb_4l_1oz` was `h_mm 0.12, er 4.5`, no JLC build | five JLC stackups by code; `jlcpcb_4l_1oz` = JLC04161H-7628; node's pair 0.1554 / 0.12 -> 0.2288 / 0.15 (JLC row 0.2332 / 0.15) |
 | the closed forms miss JLC's solver by 5 to 12 % (mask fill, etch) | per-stackup fab bias fitted to JLC's rows, printed on every number, +-3 % on 7628 |
 | c3_usb's report said 90 ohm while the 2L pair was floored to 0.127 / 0.127 | the clamp is a printed note with the real 140.1 ohm and the fix; `controlled=False` |
 | a later `NetReq` overwrote an earlier class's numbers silently | identical numbers share the class; different numbers get `Power_2` and the report says so |

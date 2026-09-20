@@ -154,7 +154,7 @@ def test_check_constraints_exit_code_is_checks_and_a_caveat_is_not_a_failure(tmp
     assert main(["check", str(EXAMPLES / "c3_usb" / "c3_usb.py"), "--constraints"]) == 0, "S5 acceptance: the 2L USB note is not a failure"
     out = capsys.readouterr().out.splitlines()
     assert (
-        'USB_DP/USB_DN: 90 ohm needs 0.7764 mm members at gap 0.15 on jlcpcb_2l_1oz (formula only); pair written at the fab floor 0.127/0.127 = 140.1 ohm; '
+        'USB_DP/USB_DN: 90 ohm needs 0.7746 mm members at gap 0.15 on jlcpcb_2l_1oz (formula only); pair written at the fab floor 0.127/0.127 = 140.1 ohm; '
         'fine for USB full speed, use Board(stackup="jlcpcb_4l_1oz") for high speed'
     ) in out, "C.10 vector 10: the pair-fit clamp's note"
     assert out[-1].startswith("rules: ") and out[-1].endswith(", canary on net 3V3")

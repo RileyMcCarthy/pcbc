@@ -100,10 +100,21 @@ def rules(cs: ConstraintSet) -> list[DruRule]:
             )
 
     # E.6: creepage by volts (classes at >= CREEPAGE_FROM_V); the class row carries the clearance (E.5).
+    # `B.NetName != ''` keeps the rule off items with no net: pcbc's own fiducial-mask rule areas
+    # were reported at 0.05 mm ("Rule area 'FID3_mask'"), and `B.Type != 'Rule Area'` does not
+    # exclude them. KiCad resolves creepage per NET PAIR, so a part whose two pads span this class
+    # and another net (a divider resistor off a 250 V rail) is reported at its own pad pitch and no
+    # A.Reference exemption can silence it: that is a real finding about the footprint's rating.
     for cls in cs.classes:
         creep = [c.voltage.creepage_mm.value for c in by_class.get(cls.name, []) if c.voltage is not None and c.voltage.creepage_mm is not None]
         if creep:
-            out.append(DruRule(f"creepage_{slug(cls.name)}", f"(constraint creepage (min {_mm(max(creep))}))", f"A.hasNetclass('{cls.name}') && !B.hasNetclass('{cls.name}')"))
+            out.append(
+                DruRule(
+                    f"creepage_{slug(cls.name)}",
+                    f"(constraint creepage (min {_mm(max(creep))}))",
+                    f"A.hasNetclass('{cls.name}') && !B.hasNetclass('{cls.name}') && B.NetName != ''",
+                )
+            )
 
     # E.13, E.14: isolation clearance and creepage between the two sides' nets (C.8 numbers).
     for spec in cs.isolation_specs:
@@ -113,7 +124,22 @@ def rules(cs: ConstraintSet) -> list[DruRule]:
         cond = f"({_names('A', spec.nets_a)}) && ({_names('B', spec.nets_b)}) && {NOT_OWN_PADS}"
         out.append(DruRule(f"iso_{slug(a)}_{slug(b)}_clearance", f"(constraint clearance (min {_mm(spec.clearance_mm.value)}))", cond))
         if not spec.req.slot:  # with slot=True the contour through the slot satisfies the creepage (C.8)
-            out.append(DruRule(f"iso_{slug(a)}_{slug(b)}_creepage", f"(constraint creepage (min {_mm(spec.creepage_mm.value)}))", cond))
+            # KiCad resolves creepage per NET PAIR, not per item: `!(A.Type == 'Pad' && ...
+            # A.Reference == B.Reference)` never suppresses anything (measured: the optocoupler's
+            # own two pads at 0.85 mm were still reported, so every non-slot Isolation failed the
+            # gate on the isolator itself). The nets an `across=` part carries are left out of the
+            # condition instead: the barrier inside that part is its own rating, as E.13 says.
+            across = set(spec.across_nets)
+            creep_a = tuple(n for n in spec.nets_a if n not in across)
+            creep_b = tuple(n for n in spec.nets_b if n not in across)
+            if creep_a and creep_b:
+                out.append(
+                    DruRule(
+                        f"iso_{slug(a)}_{slug(b)}_creepage",
+                        f"(constraint creepage (min {_mm(spec.creepage_mm.value)}))",
+                        f"({_names('A', creep_a)}) && ({_names('B', creep_b)})",
+                    )
+                )
 
     # E.7: routed length, one rule per net (from length_mm=, i2c, or Bus(length_mm=)); never from max_mm.
     for c in cs.constraints:

@@ -113,13 +113,13 @@ def test_every_row_of_e_is_pinned_on_two_layers(tmp_path: Path):
         ("feedback_away_from_sw", "(constraint clearance (min 3mm))", f"A.hasNetclass('Feedback') && B.NetName == 'SW' && {NOT_OWN}", "error"),
         ("analog_away_from_sw", "(constraint clearance (min 3mm))", f"A.hasNetclass('Analog') && B.NetName == 'SW' && {NOT_OWN}", "error"),
         # E.6 creepage by volts (R-V1): the 250 V class only (C.8: IEC 60664-1 F.5 row 250 V IIIa PD2 = 2.5); 48 V gets none
-        ("creepage_power_2", "(constraint creepage (min 2.5mm))", "A.hasNetclass('Power_2') && !B.hasNetclass('Power_2')", "error"),
-        # E.7 routed length (R-L1): length_mm= on spi, C.9 on i2c ((400 - 30) / 0.0391 pF/mm), never from max_mm
+        ("creepage_power_2", "(constraint creepage (min 2.5mm))", "A.hasNetclass('Power_2') && !B.hasNetclass('Power_2') && B.NetName != ''", "error"),
+        # E.7 routed length (R-L1): length_mm= on spi, C.9 on i2c ((400 - 20) / 0.0404 pF/mm), never from max_mm
         ("length_miso", "(constraint length (max 80mm))", "A.NetName == 'MISO'", "error"),
         ("length_mosi", "(constraint length (max 80mm))", "A.NetName == 'MOSI'", "error"),
         ("length_sck", "(constraint length (max 80mm))", "A.NetName == 'SCK'", "error"),
-        ("length_scl", "(constraint length (max 9462.92mm))", "A.NetName == 'SCL'", "error"),
-        ("length_sda", "(constraint length (max 9462.92mm))", "A.NetName == 'SDA'", "error"),
+        ("length_scl", "(constraint length (max 9405.94mm))", "A.NetName == 'SCL'", "error"),
+        ("length_sda", "(constraint length (max 9405.94mm))", "A.NetName == 'SDA'", "error"),
         # E.9 no vias (R-D3, R-A1), per net: analog, feedback, sense, switch_node
         ("novia_ain0", "(constraint via_count (max 0))", "A.NetName == 'AIN0'", "error"),
         ("novia_fb", "(constraint via_count (max 0))", "A.NetName == 'FB'", "error"),
@@ -146,23 +146,28 @@ def test_every_row_of_e_is_pinned_on_two_layers(tmp_path: Path):
 def test_every_row_of_e_is_pinned_on_four_layers(tmp_path: Path):
     got = _rules(tmp_path, "four", HEAD + FOUR + EVERY_KIND + TAIL)
     names = [g[0] for g in got]
-    assert ("width_usb", "(constraint track_width (min 0.2291mm))", "A.hasNetclass('USB')", "warning") in got, "E.3: the 7628 pair (C.2 vector 9) is wider than track_min, so its class gets the soft width rule"
+    assert ("width_usb", "(constraint track_width (min 0.2288mm))", "A.hasNetclass('USB')", "warning") in got, "E.3: the 7628 pair (C.2 vector 9) is wider than track_min, so its class gets the soft width rule"
     assert ("width_z50", "(constraint track_width (min 0.3244mm))", "A.hasNetclass('Z50')", "warning") in got, "C.2 vector 5: 50 ohm on 7628 = 0.3244"
     assert ("usb_pair_gap", "(constraint diff_pair_gap (min 0.12mm) (opt 0.15mm))", "A.hasNetclass('USB')", "error") in got, "E.11: max(0.1, 0.15 - 0.03) / 0.15 at 2 dp"
-    assert ("length_sda", "(constraint length (max 4106.55mm))", "A.NetName == 'SDA'", "error") in got, "C.9 on 7628 at the 0.16 mm floor"
+    assert ("length_sda", "(constraint length (max 4175.82mm))", "A.NetName == 'SDA'", "error") in got, "C.9 on 7628 at the 0.16 mm floor"
     assert names[:2] == ["pcbc_geometry_segments", "pcbc_geometry_angles"] and names[-2:] == ["pads_of_one_footprint", "pcbc_canary"]
     assert names.index("width_usb") < names.index("analog_away_from_sw") < names.index("creepage_power_2") < names.index("length_miso") < names.index("novia_ain0") < names.index("vias_clk") < names.index("skew_d_n_d_p") < names.index("usb_pair_gap") < names.index("uncoupled_usb"), "E: general to specific, KiCad applies the last matching rule of a type"
 
 
 def test_isolation_rows_e13_to_e15_are_pinned(tmp_path: Path):
     both = "(A.NetName == 'GND' || A.NetName == 'LED_A' || A.NetName == 'VCC') && (B.NetName == 'GS' || B.NetName == 'OUT' || B.NetName == 'VS')"
+    # LED_A and OUT are U7's own two nets: it is the `across=` part, so they leave the creepage rule.
+    sides_only = "(A.NetName == 'GND' || A.NetName == 'VCC') && (B.NetName == 'GS' || B.NetName == 'VS')"
     got = _rules(tmp_path, "iso", ISO_HEAD + ISO + ISO_TAIL)
     assert got[3:6] == [
         # C.8: 250 V -> max(IPC-2221B B2 1.25, IEC 60664-1 F.2 1.5) = 1.5; F.5 row 250 V IIIa PD2 = 2.5
         ("iso_primary_secondary_clearance", "(constraint clearance (min 1.5mm))", f"{both} && {NOT_OWN}", "error"),
-        ("iso_primary_secondary_creepage", "(constraint creepage (min 2.5mm))", f"{both} && {NOT_OWN}", "error"),
+        # KiCad resolves creepage per NET PAIR, so NOT_OWN cannot suppress the isolator's own two
+        # pads (measured: 0.85 mm, the gate failed on U7 itself). The across= part's nets are left
+        # out of the condition instead; the barrier inside that part is its own rating.
+        ("iso_primary_secondary_creepage", "(constraint creepage (min 2.5mm))", sides_only, "error"),
         ("iso_primary_secondary_area", "(constraint disallow track via zone)", "A.intersectsArea('ISO_primary_secondary')", "error"),
-    ], "E.13-E.15: sides sorted, the bridging part's own pads exempt, the corridor a rule area"
+    ], "E.13-E.15: sides sorted, the bridging part exempt (clearance by item, creepage by net), the corridor a rule area"
     slot = _rules(tmp_path, "iso_slot", ISO_HEAD + ISO_SLOT + ISO_TAIL)
     assert [g[0] for g in slot] == ["pcbc_geometry_segments", "pcbc_geometry_angles", "width_power", "iso_primary_secondary_clearance", "iso_primary_secondary_area", "pads_of_one_footprint", "pcbc_canary"], "E.14: with slot=True the slot satisfies the creepage and no creepage rule is written"
 
@@ -191,8 +196,8 @@ def test_todays_rules_are_still_written_unchanged_and_the_examples_lists_are_pin
     c3 = {r.name: r for r in compile_design(load_board(EXAMPLES / "c3_usb" / "c3_usb.py")).dru}
     assert (c3["usb_pair_gap"].constraint, c3["usb_pair_gap"].condition) == ("(constraint diff_pair_gap (min 0.10mm) (opt 0.13mm))", "A.hasNetclass('USB')"), "E.11: today's numbers, the condition rewritten from A.NetClass =="
     node = {r.name: r for r in compile_design(load_board(EXAMPLES / "node" / "node.py")).dru}
-    assert node["usb_pair_gap"].constraint == "(constraint diff_pair_gap (min 0.12mm) (opt 0.15mm))", "H.2: node's pair at 0.2291 / 0.15"
-    assert node["width_usb"].constraint == "(constraint track_width (min 0.2291mm))"
+    assert node["usb_pair_gap"].constraint == "(constraint diff_pair_gap (min 0.12mm) (opt 0.15mm))", "H.2: node's pair at 0.2288 / 0.15"
+    assert node["width_usb"].constraint == "(constraint track_width (min 0.2288mm))"
 
 
 def test_soft_rule_kinds_are_the_four_of_h3():
@@ -274,8 +279,8 @@ def test_project_classes_are_ordered_like_todays_files_and_seed_and_apply_agree(
         {"name": "Default", "clearance": 0.18, "track_width": 0.16, "via_diameter": 0.35, "via_drill": 0.2},
         {"name": "Analog", "clearance": 0.2, "track_width": 0.2, "via_diameter": 0.6, "via_drill": 0.3},
         {"name": "Power", "clearance": 0.2, "track_width": 0.4, "via_diameter": 0.8, "via_drill": 0.4},
-        {"name": "USB", "clearance": 0.18, "track_width": 0.2291, "via_diameter": 0.35, "via_drill": 0.2, "diff_pair_gap": 0.15, "diff_pair_width": 0.2291},
-    ], "node's rows: H.2 pair 0.2291 / 0.15; everything else today's"
+        {"name": "USB", "clearance": 0.18, "track_width": 0.2288, "via_diameter": 0.35, "via_drill": 0.2, "diff_pair_gap": 0.15, "diff_pair_width": 0.2288},
+    ], "node's rows: H.2 pair 0.2288 / 0.15; everything else today's"
 
 
 def test_apply_pro_keeps_what_kicad_added_to_a_row(tmp_path: Path):
@@ -387,7 +392,7 @@ def test_fab_notes_print_the_constraint_lines_and_the_rule_count(tmp_path: Path)
     notes = (tmp_path / "FAB_NOTES.md").read_text()
     assert "\n## Constraints\n\n- 3V3: width 0.4 mm (pcbc_floor amps >= 0.2; ipc2221_ext 1 A 10 C 1 oz 0.300; ipc2152_fit x board 1.099 x plane 0.430 at 0.2104 mm In1.Cu 0.134)\n" in notes
     assert "- USB_DP: skew 0.5 mm (preset usb_hs; TI usb_layout_basics) [soft: warning in R1]\n" in notes
-    assert notes.endswith("- classes: Default 0.16/0.18, USB 0.2291/0.18 pair 0.2291/0.15, Power 0.4/0.2 via 0.8/0.4, Analog 0.2/0.2 via 0.6/0.3\n- rules: 13 written (4 error, 6 soft), canary on net 3V3\n"), "node: 13 rules; error: novia x2, usb_pair_gap, pads_of_one_footprint; soft: width x2, vias x2, skew, uncoupled; the geometry rules and the canary are warnings of neither kind"
+    assert notes.endswith("- classes: Default 0.16/0.18, USB 0.2288/0.18 pair 0.2288/0.15, Power 0.4/0.2 via 0.8/0.4, Analog 0.2/0.2 via 0.6/0.3\n- rules: 13 written (4 error, 6 soft), canary on net 3V3\n"), "node: 13 rules; error: novia x2, usb_pair_gap, pads_of_one_footprint; soft: width x2, vias x2, skew, uncoupled; the geometry rules and the canary are warnings of neither kind"
 
 
 def test_power_ampacity_reads_the_constraints_width():
@@ -612,3 +617,50 @@ def test_the_gate_reports_soft_and_rule_counts_on_the_routed_ds2_board(ds2_route
     assert set(gate["rules"]) == {"pcbc_geometry_segments", "pcbc_geometry_angles", "width_power", "novia_ain0", "novia_ain1", "novia_ain2", "novia_ain3", "novia_refn_f", "novia_refp_f", "pads_of_one_footprint", "pcbc_canary"}
     assert gate["rules"]["pcbc_canary"] == 1 and all(gate["rules"][n] == 0 for n in gate["rules"] if n.startswith("novia_"))
     assert gate["rules"]["pcbc_geometry_segments"] == gate["geometry"]["segments"] and gate["rules"]["pcbc_geometry_angles"] == gate["geometry"]["angles"]
+
+
+@pytest.mark.kicad
+def test_kicad_resolves_creepage_per_net_pair_so_the_own_pads_exemption_is_dead(tmp_path: Path):
+    """Why E.14 leaves the `across=` part's nets out of the condition instead of exempting its pads.
+
+    Measured on KiCad 10.0.6: with `!(A.Type == 'Pad' && B.Type == 'Pad' && A.Reference ==
+    B.Reference)` on a creepage rule, the optocoupler's own two pads are still reported (0.85 mm
+    against the 2.5 mm barrier), so every non-slot `Isolation` failed its own gate on the part
+    whose internal barrier IS the rating. `creepage` resolves per net pair; no item-level
+    exemption reaches it. The rule pcbc writes today names only the two sides' own nets.
+    """
+    from pcbc.build import build_job
+    from pcbc.netcheck import kicad_drc
+
+    board = _board(tmp_path, "iso_gate", ISO_HEAD + ISO + ISO_TAIL)
+    result = build_job(board, upto="place", force=True)
+    assert result.get("error") is None, result.get("error")
+    placed = tmp_path / "layout" / "iso_gate" / "placed" / "layout.kicad_pcb"
+    dru_path = placed.with_suffix(".kicad_dru")
+    dru = dru_path.read_text()
+    assert "iso_primary_secondary_creepage" in dru
+    rule = [r for r in dru.split("\n(rule ") if r.startswith('"iso_primary_secondary_creepage"')][0]
+    assert "LED_A" not in rule and "OUT" not in rule, "U7's own nets are out of the creepage condition"
+
+    def creepage_hits(text: str) -> list[str]:
+        # No canary here: it is a `length` rule and a placed board has no tracks for it to measure.
+        # The old-condition run below is its own witness that the file is live.
+        dru_path.write_text(text)
+        doc = kicad_drc(placed, refill=False)
+        return [
+            v["description"] + " | " + "; ".join(i.get("description", "") for i in v.get("items") or [])
+            for v in doc.get("violations") or []
+            if "iso_primary_secondary_creepage" in (v.get("description") or "")
+        ]
+
+    old = dru.replace(
+        "(A.NetName == 'GND' || A.NetName == 'VCC') && (B.NetName == 'GS' || B.NetName == 'VS')",
+        "(A.NetName == 'GND' || A.NetName == 'LED_A' || A.NetName == 'VCC') && (B.NetName == 'GS' || B.NetName == 'OUT' || B.NetName == 'VS') && "
+        "!(A.Type == 'Pad' && B.Type == 'Pad' && A.Reference == B.Reference)",
+        1,
+    )
+    hits = creepage_hits(old)
+    assert hits, "with the across part's nets in the condition the exemption does not save it: KiCad reports U7's own pads"
+    assert any("of U7" in h for h in hits) and any("0.8500" in h for h in hits), hits  # U7's own two pads, at its 0603 pitch
+    assert creepage_hits(dru) == [], "as written (the across part's nets left out), the isolation creepage rule passes"
+    dru_path.write_text(dru)

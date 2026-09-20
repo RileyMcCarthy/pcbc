@@ -96,9 +96,9 @@ def test_the_five_boards_keep_todays_classes_nets_and_krt(tmp_path: Path):
             assert now[key] == was[key], (name, key)
         classes = [{k: v for k, v in c.items() if k != "lane_clearance_mm"} for c in now["classes"]]
         if name == "node":
-            # H.2: jlcpcb_4l_1oz is JLC04161H-7628, so the 90 ohm pair is 0.2291 / 0.15 (was 0.1554 / 0.12).
+            # H.2: jlcpcb_4l_1oz is JLC04161H-7628, so the 90 ohm pair is 0.2288 / 0.15 (was 0.1554 / 0.12).
             usb = next(c for c in classes if c["name"] == "USB")
-            assert (usb["track_width_mm"], usb["diff_pair_width_mm"], usb["diff_pair_gap_mm"]) == (0.2291, 0.2291, 0.15), "C.2 vector 9: JLC row 0.2332 within 2.3 %"
+            assert (usb["track_width_mm"], usb["diff_pair_width_mm"], usb["diff_pair_gap_mm"]) == (0.2288, 0.2288, 0.15), "C.2 vector 9: JLC row 0.2332 within 2.3 %"
             classes = [c for c in classes if c["name"] != "USB"]
             was["classes"] = [c for c in was["classes"] if c["name"] != "USB"]
         assert classes == was["classes"], name
@@ -241,8 +241,8 @@ def test_every_kind_compiles_on_two_layers_and_its_lines_are_pinned(tmp_path: Pa
         ("CLK: via 0.6/0.3 mm (preset clock), at most 2 (preset clock) [soft: warning in R1]", "D clock: 0.6/0.3, budget 2 (soft via_budget)"),
         ("CLK: spacing 5W (preset clock)", "D: 5W"),
         # usb_hs on 2L: the pair-fit clamp (C.3), stated
-        ("D_P: pair with D_N, 0.127 mm wide, gap 0.127 mm on F.Cu over the B.Cu pour: 140.11 ohm (hj_coupled_microstrip x 1 jlcpcb_2l_1oz; formula only; target 90 +-15 %; uncontrolled; preset usb_hs)", "C.10 vector 10: zdiff(0.127, 0.127, 1.53, 0.035, 4.6) = 140.11; bias 1.0 (uncalibrated)"),
-        ('D_P/D_N: 90 ohm needs 0.7764 mm members at gap 0.15 on jlcpcb_2l_1oz (formula only); pair written at the fab floor 0.127/0.127 = 140.1 ohm; fine for USB full speed, use Board(stackup="jlcpcb_4l_1oz") for high speed', "C.3 pair-fit clamp note: solved member 0.7764 > PAIR_FIT_MM 0.25 (vector 10)"),
+        ("D_P: pair with D_N, 0.127 mm wide, gap 0.127 mm on F.Cu over the B.Cu pour: 140.05 ohm (hj_coupled_microstrip x 1 jlcpcb_2l_1oz; formula only; target 90 +-15 %; uncontrolled; preset usb_hs)", "C.10 vector 10: zdiff(0.127, 0.127, 1.53, 0.035, 4.6) = 140.05; bias 1.0 (uncalibrated)"),
+        ('D_P/D_N: 90 ohm needs 0.7746 mm members at gap 0.15 on jlcpcb_2l_1oz (formula only); pair written at the fab floor 0.127/0.127 = 140.1 ohm; fine for USB full speed, use Board(stackup="jlcpcb_4l_1oz") for high speed', "C.3 pair-fit clamp note: solved member 0.7746 > PAIR_FIT_MM 0.25 (vector 10)"),
         ("D_P: clearance 0.155 mm (class_floor 0.16 over hole_clearance 0.25 - ring 0.1 + 0.005 = 0.155)", "D usb_hs: min(0.16, w) then the floor: 0.155 on 2L"),
         ("D_P: via 0.5/0.3 mm (stackup jlcpcb_2l_1oz), at most 2 (preset usb_hs) [soft: warning in R1]", "D usb_hs: stackup via, budget 2"),
         ("D_P: skew 0.5 mm (preset usb_hs; TI usb_layout_basics) [soft: warning in R1]", "R-Z5: skew 0.5 (TI usb_layout_basics, the tight number)"),
@@ -254,7 +254,7 @@ def test_every_kind_compiles_on_two_layers_and_its_lines_are_pinned(tmp_path: Pa
         ("MISO: clearance 0.2 mm (preset spi)", "D spi: 0.20"),
         ("MISO: width 0.16 mm (class_floor max(0.16, track_min 0.127))", "D: floor max(0.16, track_min)"),
         # i2c: length from capacitance at the class width on the outer layer
-        ("SDA: length 9462.92 mm (i2c_capacitance 400 pF (NetReq line 22) - 10 pF x 3 pins at 0.0391 pF/mm (0.16 mm F.Cu))", "C.9: 0.16 mm on 2L is 0.0391 pF/mm (vector 25); (400 - 30) / 0.0391"),
+        ("SDA: length 9405.94 mm (i2c_capacitance 400 pF (NetReq line 22) - 10 pF x 2 pins on the busiest line at 0.0404 pF/mm (0.16 mm F.Cu))", "C.9: 0.16 mm on 2L is 0.0391 pF/mm (vector 25); (400 - 30) / 0.0391"),
         # generic with volts=48: B2 row 0.6 over the floor, no creepage under 60 V
         ("SIG: clearance 0.6 mm (ipc2221_6_1 IPC-2221B 6-1 row 31-50 V B2; over class_floor 0.16)", "C.8 Table 6-1 31-50 V B2 = 0.6 (vector 22)"),
         ("SIG: width 0.16 mm (class_floor max(0.16, track_min 0.127))", "D generic: floor"),
@@ -284,18 +284,18 @@ def test_every_kind_compiles_on_four_layers_and_its_lines_are_pinned(tmp_path: P
     _expect(cs.lines, [
         ("VCC: width 0.4 mm (pcbc_floor amps >= 0.2; ipc2221_ext 1 A 10 C 1 oz 0.300; ipc2152_fit x board 1.099 x plane 0.430 at 0.2104 mm In1.Cu 0.134)", "C.6 node case: 1 A over In1.Cu at 0.2104 -> plane mod 0.430; board mod 1.099 on the 1.5862 mm literal stack (S1: not the 1.6 nominal's 1.092)"),
         ("VCC: via 0.8/0.4 mm (preset power), 2 per layer change (via_barrel 0.4/0.018 mm 0.871 A at 10 C) [report only in R1]", "C.7 on the power class's 0.4 drill"),
-        ("D_P: pair with D_N, 0.2291 mm wide, gap 0.15 mm on F.Cu over In1.Cu (GND): 90 ohm (hj_coupled_microstrip x 0.85 JLC04161H-7628; JLC row 0.2332/0.15; target 90 +-15 %; preset usb_hs)", "C.10 vector 9: (0.2291, 0.15) on 7628 with bias 0.85; JLC row 0.2332/0.15; diff_pair_z rounds to 90.0"),
+        ("D_P: pair with D_N, 0.2288 mm wide, gap 0.15 mm on F.Cu over In1.Cu (GND): 90 ohm (hj_coupled_microstrip x 0.8532 JLC04161H-7628; JLC row 0.2332/0.15; target 90 +-15 %; preset usb_hs)", "C.10 vector 9: (0.2288, 0.15) on 7628 with bias 0.8532; JLC row 0.2332/0.15; diff_pair_z rounds to 90.0"),
         ("D_P: clearance 0.18 mm (class_floor hole_clearance 0.25 - ring 0.075 + 0.005)", "D usb_hs: the floor is 0.18 on 4L"),
         ("D_P: via 0.35/0.2 mm (stackup jlcpcb_4l_1oz), at most 2 (preset usb_hs) [soft: warning in R1]", "B.2 4L via 0.35/0.2"),
-        ("Z50: width 0.3244 mm (hj_microstrip x 0.9064 JLC04161H-7628; fitted to JLC04161H-7628 rows (JITX), 2026-09-19)", "C.10 vector 5: width_for_z0(50, jlcpcb_4l_1oz) = 0.3244 (the JLC row, by construction of the bias)"),
-        ("Z50: 0.3244 mm on F.Cu over In1.Cu (GND): 50 ohm (hj_microstrip x 0.9064 JLC04161H-7628; fitted to JLC04161H-7628 rows (JITX), 2026-09-19; target 50)", "D: reference plane_below(F.Cu) = In1.Cu (GND) when declared"),
+        ("Z50: width 0.3244 mm (hj_microstrip x 0.9147 JLC04161H-7628; fitted to JLC04161H-7628 rows (JITX), 2026-09-19)", "C.10 vector 5: width_for_z0(50, jlcpcb_4l_1oz) = 0.3244 (the JLC row, by construction of the bias)"),
+        ("Z50: 0.3244 mm on F.Cu over In1.Cu (GND): 50 ohm (hj_microstrip x 0.9147 JLC04161H-7628; fitted to JLC04161H-7628 rows (JITX), 2026-09-19; target 50)", "D: reference plane_below(F.Cu) = In1.Cu (GND) when declared"),
         ("MISO: width 0.16 mm (class_floor max(0.16, track_min 0.0889))", "D: floor max(0.16, 4L track_min 0.0889)"),
-        ("SDA: length 4106.55 mm (i2c_capacitance 400 pF (NetReq line 22) - 10 pF x 3 pins at 0.0901 pF/mm (0.16 mm F.Cu))", "C.9 on 7628: 0.16 mm at 0.2104 mm Dk 4.4 with bias 0.9064"),
+        ("SDA: length 4175.82 mm (i2c_capacitance 400 pF (NetReq line 22) - 10 pF x 2 pins on the busiest line at 0.091 pF/mm (0.16 mm F.Cu))", "C.9 on 7628: 0.16 mm at 0.2104 mm Dk 4.4 with bias 0.9064"),
         ("SIG: clearance 0.6 mm (ipc2221_6_1 IPC-2221B 6-1 row 31-50 V B2; over class_floor 0.18)", "C.8 31-50 V B2 = 0.6 over the 4L floor 0.18"),
         ("class Default_2 (Default is the class floor at 0.16/0.18 mm)", "A.3 collision on the 4L floor"),
     ])
     z50 = cs.by_net("Z50")
-    assert z50 is not None and z50.reference == "In1.Cu" and z50.class_name == "Z50" and z50.z_se == (50.0, Derived(50.0, "ohm", Source("hj_microstrip", "x 0.9064 JLC04161H-7628", "fitted to JLC04161H-7628 rows (JITX), 2026-09-19; target 50")))
+    assert z50 is not None and z50.reference == "In1.Cu" and z50.class_name == "Z50" and z50.z_se == (50.0, Derived(50.0, "ohm", Source("hj_microstrip", "x 0.9147 JLC04161H-7628", "fitted to JLC04161H-7628 rows (JITX), 2026-09-19; target 50")))
     d_p = cs.by_net("D_P")
     assert d_p is not None and d_p.pair is not None and d_p.pair.controlled and d_p.reference == "In1.Cu"
     assert d_p.pair.z_computed.value == 90.0 and d_p.pair.tolerance_pct == 15.0
@@ -334,10 +334,10 @@ Guard("AIN0", stitch_mm=2.0)
     cs = compile_constraints(design)
     assert cs.refusals == ()
     _expect(cs.lines, [
-        ("D_P: pair with D_N, 0.201 mm wide, gap 0.2 mm on F.Cu over In1.Cu (GND): 100.01 ohm (hj_coupled_microstrip x 0.85 JLC04161H-7628; JLC row 0.1722/0.15; target 100 +-15 %; Pair line 17)", "A.4 precedence: Pair overrides z_diff_ohm and gap_mm on the usb_hs NetReq; C.3 solved at gap 0.2"),
+        ("D_P: pair with D_N, 0.2004 mm wide, gap 0.2 mm on F.Cu over In1.Cu (GND): 100 ohm (hj_coupled_microstrip x 0.8532 JLC04161H-7628; JLC row 0.1722/0.15; target 100 +-15 %; Pair line 17)", "A.4 precedence: Pair overrides z_diff_ohm and gap_mm on the usb_hs NetReq; C.3 solved at gap 0.2"),
         ("D_P: skew 0.3 mm (Pair line 17; overrides preset usb_hs 0.5) [soft: warning in R1]", "A.4: never silent"),
         ("D_P: uncoupled 2 mm (Pair line 17; overrides preset usb_hs 2) [soft: warning in R1]", "A.4: the Pair's own field, printed"),
-        ("SENSE_P: pair with SENSE_N, 0.1762 mm wide, gap 0.15 mm on F.Cu over In1.Cu (GND): 100 ohm (hj_coupled_microstrip x 0.85 JLC04161H-7628; JLC row 0.1722/0.15; target 100 +-10 %; Pair line 18)", "C.10 vector 9: 100 ohm on 7628 = 0.1762/0.15 (JLC row 0.1722); a bare Pair is +-10 %"),
+        ("SENSE_P: pair with SENSE_N, 0.1759 mm wide, gap 0.15 mm on F.Cu over In1.Cu (GND): 100.01 ohm (hj_coupled_microstrip x 0.8532 JLC04161H-7628; JLC row 0.1722/0.15; target 100 +-10 %; Pair line 18)", "C.10 vector 9: 100 ohm on 7628 = 0.1762/0.15 (JLC row 0.1722); a bare Pair is +-10 %"),
         ("SENSE_P: skew 0.5 mm (Pair line 18) [soft: warning in R1]", "D: a bare Pair carries its own numbers"),
         ("MISO: bus SCK, MOSI, MISO matched to SCK within 1 mm (Bus line 19) [soft: warning in R1]", "D: Bus() sets the group on generic constraints"),
         ("MISO: length 60 mm (Bus line 19)", "A.2 BusReq.length_mm"),
@@ -436,7 +436,7 @@ def test_node_lines_are_pinned():
     cs = compile_constraints(load_board(EXAMPLES / "node" / "node.py"))
     assert cs.refusals == ()
     _expect(cs.lines, [
-        ("USB_DP: pair with USB_DN, 0.2291 mm wide, gap 0.15 mm on F.Cu over In1.Cu (GND): 90 ohm (hj_coupled_microstrip x 0.85 JLC04161H-7628; JLC row 0.2332/0.15; target 90 +-15 %; NetReq line 143)", "H.2 / C.2: node's pair is 0.2291 / 0.15 on 7628 (JLC row 0.2332, -1.8 %)"),
+        ("USB_DP: pair with USB_DN, 0.2288 mm wide, gap 0.15 mm on F.Cu over In1.Cu (GND): 90 ohm (hj_coupled_microstrip x 0.8532 JLC04161H-7628; JLC row 0.2332/0.15; target 90 +-15 %; NetReq line 143)", "H.2 / C.2: node's pair is 0.2288 / 0.15 on 7628 (JLC row 0.2332, -1.8 %)"),
         ("USB_DP: clearance 0.18 mm (class_floor hole_clearance 0.25 - ring 0.075 + 0.005)", "D: hole_floor 0.25 - 0.075 + 0.005 = 0.18 on 4L"),
         ("USB_DP: via 0.35/0.2 mm (stackup jlcpcb_4l_1oz), at most 2 (preset usb_hs) [soft: warning in R1]", "B.2 4L via; D usb_hs budget 2"),
         ("USB_DP: skew 0.5 mm (preset usb_hs; TI usb_layout_basics) [soft: warning in R1]", "R-Z5"),
@@ -452,7 +452,7 @@ def test_node_lines_are_pinned():
         ("T_DIV: airwire 25 mm (preset analog)", "D analog: 25 (today)"),
         ("T_DIV: keep_clear_of none", "D notes: keep-away is explicit; node has no switch_node net, so no hint"),
         ("T_DIV: spacing 5W (preset analog)", "D: 5W"),
-        ("classes: Default 0.16/0.18, USB 0.2291/0.18 pair 0.2291/0.15, Power 0.4/0.2 via 0.8/0.4, Analog 0.2/0.2 via 0.6/0.3", "the class summary line of the spec's node report"),
+        ("classes: Default 0.16/0.18, USB 0.2288/0.18 pair 0.2288/0.15, Power 0.4/0.2 via 0.8/0.4, Analog 0.2/0.2 via 0.6/0.3", "the class summary line of the spec's node report"),
     ])
     assert cs.lines[-1].startswith("classes: ")
 
@@ -461,8 +461,8 @@ def test_c3_usb_keeps_its_two_layer_pair_and_its_report_stops_lying():
     cs = compile_constraints(load_board(EXAMPLES / "c3_usb" / "c3_usb.py"))
     usb = cs.by_net("USB_DP")
     assert usb is not None and usb.pair is not None and (usb.pair.width_mm.value, usb.pair.gap_mm.value, usb.pair.controlled) == (0.127, 0.127, False), "C.3: the pair-fit clamp writes (track_min, clearance_min), controlled False"
-    assert usb.pair.z_computed.value == 140.11 and usb.clearance_mm.value == 0.155, "C.10 vector 10; D: 0.155 on 2L"
-    assert 'USB_DP/USB_DN: 90 ohm needs 0.7764 mm members at gap 0.15 on jlcpcb_2l_1oz (formula only); pair written at the fab floor 0.127/0.127 = 140.1 ohm; fine for USB full speed, use Board(stackup="jlcpcb_4l_1oz") for high speed' in cs.lines
+    assert usb.pair.z_computed.value == 140.05 and usb.clearance_mm.value == 0.155, "C.10 vector 10; D: 0.155 on 2L"
+    assert 'USB_DP/USB_DN: 90 ohm needs 0.7746 mm members at gap 0.15 on jlcpcb_2l_1oz (formula only); pair written at the fab floor 0.127/0.127 = 140.1 ohm; fine for USB full speed, use Board(stackup="jlcpcb_4l_1oz") for high speed' in cs.lines
     assert sum(1 for l in cs.lines if l.startswith("USB_DP/USB_DN:")) == 1, "the note is printed once, not per member"
 
 

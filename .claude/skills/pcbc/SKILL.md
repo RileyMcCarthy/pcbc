@@ -121,7 +121,7 @@ Rules the tool applies, so you do not have to:
 Each line is a move: what collides, and the `Place()`/`SchPlace()` edit that fixes it.
 - `pcbc check --constraints`: one number per line, sorted by net, the source in parentheses:
   `VBUS: width 0.4 mm (pcbc_floor amps >= 0.2; ipc2221_ext 1 A 10 C 1 oz 0.300; ipc2152_fit ...)`,
-  `USB_DP: pair with USB_DN, 0.2291 mm wide, gap 0.15 mm on F.Cu over In1.Cu (GND): 90 ohm (hj_coupled_microstrip x 0.85 JLC04161H-7628; ...)`.
+  `USB_DP: pair with USB_DN, 0.2288 mm wide, gap 0.15 mm on F.Cu over In1.Cu (GND): 90 ohm (hj_coupled_microstrip x 0.85 JLC04161H-7628; ...)`.
   `pcbc default` is a number with no standard behind it; `uncalibrated` / `formula only` is a
   formula off JLC's published rows; `[soft: warning in R1]` is a rule KiCad reports as a
   warning, counted by the copper bar; `[report only in R1]` (vias per layer change) is
@@ -158,7 +158,7 @@ The examples stay at zero moves; hold a new board to the same bar before `build`
   creepage distance: `NetReq(kind=, amps=, volts=)` and the stackup decide them and
   `pcbc check --constraints` prints them. If the printed number is wrong, the fix is in
   `stackup.py` / `constraints.py` with a test vector and its reference, not a literal in
-  `board.py`. `class_name=` and `layers=` are intent; `z_diff_ohm=90` is intent; `0.2291` is not.
+  `board.py`. `class_name=` and `layers=` are intent; `z_diff_ohm=90` is intent; `0.2288` is not.
 - Decide from a render. Renders are for a human at the end (`pcbc review`); the reports and
   the tests decide. If a report misses something a render shows, that is a missing rule in
   the tool: add the rule and its test, do not hand-place around it.

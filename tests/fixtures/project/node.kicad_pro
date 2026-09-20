@@ -47,11 +47,11 @@
       {
         "name": "USB",
         "clearance": 0.18,
-        "track_width": 0.2291,
+        "track_width": 0.2288,
         "via_diameter": 0.35,
         "via_drill": 0.2,
         "diff_pair_gap": 0.15,
-        "diff_pair_width": 0.2291
+        "diff_pair_width": 0.2288
       }
     ],
     "netclass_patterns": [

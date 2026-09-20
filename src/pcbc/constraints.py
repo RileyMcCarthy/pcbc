@@ -216,6 +216,7 @@ class IsolationSpec:
     creepage_mm: Derived  # IEC 60664-1 F.5 (reinforced doubles); satisfied by the slot when slot=True
     gap_min_mm: float  # what the Regions must keep apart along their separating axis
     axis: str  # "x" | "y"
+    across_nets: tuple[str, ...] = ()  # nets an `across=` part carries: its own pad pitch is its rating
 
 
 @dataclass
@@ -577,6 +578,16 @@ def compile_constraints(design: Design) -> ConstraintSet:
             if kw not in allowed:
                 refusals.append(f'NetReq("{first}") line {req.line}: kind="{kind}" does not take {kw}=; it takes {", ".join(allowed)}')
         nets = req_nets[i]
+        if kind == "usb_hs" and req.z_se_ohm is not None:
+            refusals.append(
+                f'NetReq("{first}") line {req.line}: kind="usb_hs" does not take z_se_ohm=; '
+                "a pair is sized by z_diff_ohm= (the single-ended number follows from it)"
+            )
+        if kind == "usb_hs" and req.layers and not any(is_outer(lay) for lay in req.layers):
+            refusals.append(
+                f'NetReq("{first}") line {req.line}: kind="usb_hs" on {", ".join(req.layers)}: R1 sizes coupled pairs on outer '
+                'layers only (C.3 is edge-coupled microstrip); layers=["F.Cu"] or ["B.Cu"]'
+            )
         if kind == "usb_hs" and len(nets) != 2:
             refusals.append(f'NetReq("{first}") line {req.line}: kind="usb_hs" pairs exactly two nets; got {len(nets)}')
         if kind == "usb_hs" and len(nets) == 2 and not _kicad_pairs(nets[0], nets[1]):
@@ -998,17 +1009,30 @@ def _compile_req(
             uncoupled = Derived(pair_req.uncoupled_mm, "mm", Source("Pair", f"line {pair_req.line}"))  # type: ignore[union-attr]
         pair_geometry = (w_d, g_d, z_target, z_d, tol, skew, uncoupled, controlled)
         width = Derived(w, "mm", src)
-        clearance = Derived(max(min(0.16, w), floor_clear), "mm", floor_clear_src if floor_clear >= min(0.16, w) else Source("preset", kind, "min(0.16, pair width)"))
-        lane = clearance.value
+        pair_clear = max(min(0.16, w), floor_clear)
+        clearance = Derived(pair_clear, "mm", floor_clear_src if floor_clear >= min(0.16, w) else Source("preset", kind, "min(0.16, pair width)"))
+        lane = pair_clear  # the kind number: a voltage row never widens a fanout lane
+        if voltage is not None and voltage.clearance_mm.value > pair_clear:
+            # D, "volts on any kind": the class clearance is max(kind number, IPC-2221B 6-1 row).
+            # This block used to overwrite the row the voltage block had already applied.
+            clearance = replace(voltage.clearance_mm, source=replace(voltage.clearance_mm.source, note=f"over preset {kind} {_g(pair_clear)}"))
         over = f" over {reference_name}" if reference_name else ""
         extra = "" if controlled else "; uncontrolled"
         width_line = f"{_g(w)} mm wide, gap {_g(g)} mm on {pair_layer}{over}: {_g(z)} ohm ({z_d.source.formula} {z_d.source.ref}; {z_d.source.note}{extra}; {z_src_who})"
         if not controlled:
             a, b = (nets[0], nets[1]) if len(nets) == 2 else (first, "")
+            # The calibration state, not a slice of its sentence: rows -> fitted, a code without
+            # rows -> interpolated, neither -> formula only (the 2-layer case).
+            cal_word = "fitted" if stack.rows else ("interpolated" if stack.jlc_code else "formula only")
+            advice = (
+                'fine for USB full speed, use Board(stackup="jlcpcb_4l_1oz") for high speed'
+                if stack.layers <= 2
+                else f"widen the gap (Pair(gap_mm=)) or take a thinner prepreg "
+                f'(Board(stackup="jlcpcb_4l_1oz_1080")) to reach {_g(z_target)} ohm within {_g(PAIR_FIT_MM)} mm members'
+            )
             notes.append(
                 f"{a}/{b}: {_g(z_target)} ohm needs {_g(solved)} mm members at gap {_g(pair_gap_mm(stack, gap_given))} on {stack.name} "
-                f"({'formula only' if not stack.jlc_code else 'uncalibrated'}); pair written at the fab floor {_g(stack.track_min)}/{_g(stack.clearance_min)} = {z:.1f} ohm; "
-                'fine for USB full speed, use Board(stackup="jlcpcb_4l_1oz") for high speed'
+                f"({cal_word}); pair written at the fab floor {_g(stack.track_min)}/{_g(stack.clearance_min)} = {z:.1f} ohm; {advice}"
             )
         soft += ["track_width", "skew", "via_budget", "diff_pair_uncoupled"]
     elif req.z_se_ohm is not None:
@@ -1046,11 +1070,14 @@ def _compile_req(
     if kind == "i2c":
         pf_max = req.pf_max if req.pf_max is not None else I2C_PF_MAX
         pf_src = f"NetReq line {line}" if req.pf_max is not None else "UM10204 7.1"
-        pins = sum(len(pads_by_net.get(n, ())) for n in nets)
+        # UM10204 7.1: Cb is per bus line. Summing SDA's and SCL's pads charged every line for
+        # the other's devices (10 pF each). Every net of one NetReq shares one number, so take
+        # the busiest line: the shorter, safer length of the two.
+        pins = max((len(pads_by_net.get(n, ())) for n in nets), default=0)
         z0, eeff = microstrip(width.value, stack.h_mm, stack.copper_t("F.Cu"), stack.er)
         c = capacitance_pf_per_mm(z0 * stack.z_bias_se, eeff / stack.z_bias_se**2)
         mm = i2c_max_mm(pf_max, pins, c)
-        length = Derived(mm, "mm", Source("i2c_capacitance", f"{_g(pf_max)} pF ({pf_src}) - 10 pF x {pins} pins at {_g(c)} pF/mm ({_g(width.value)} mm F.Cu)"))
+        length = Derived(mm, "mm", Source("i2c_capacitance", f"{_g(pf_max)} pF ({pf_src}) - 10 pF x {pins} pins on the busiest line at {_g(c)} pF/mm ({_g(width.value)} mm F.Cu)"))
 
     # keep-away
     keep: list[KeepAway] = []
@@ -1229,7 +1256,8 @@ def _compile_isolation(
     if box is not None:
         layers = ("F&B.Cu",) if stack.layers == 2 else ("F&B.Cu",) + tuple(lay for lay in stack.copper_layers() if not is_outer(lay))
         area = RuleArea(f"ISO_{iso.a}_{iso.b}", box, layers, ("track", "via", "zone"), f"{tag} {_g(iso.volts)} V line {iso.line}")
-    spec = IsolationSpec(iso, tuple(nets_a), tuple(nets_b), clearance, creep, gap_min, axis)
+    across_nets = sorted({net for net, sites in pads_by_net.items() for ref, _pad in sites if side_of.get(ref) == "both"})
+    spec = IsolationSpec(iso, tuple(nets_a), tuple(nets_b), clearance, creep, gap_min, axis, tuple(across_nets))
     return spec, area
 
 

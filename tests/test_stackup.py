@@ -40,6 +40,7 @@ from pcbc.stackup import (
     ipc2221_clearance_mm,
     ipc2221_width_mm,
     microstrip,
+    microstrip_reported_eeff,
     microstrip_z0,
     solve_width,
     stripline,
@@ -130,11 +131,11 @@ def test_the_fab_limits_are_todays_and_jlcs_own_are_for_the_report():
 
 def test_the_bias_and_the_published_rows():
     """C.2: the fab bias per stackup, fitted to JLC's rows as JITX records them."""
-    assert (L4.z_bias_se, L4.z_bias_diff) == (0.9064, 0.85), "7628: 50 / 55.165; geometric mean of 90/105.09 and 100/118.69"
-    assert (L1080.z_bias_se, L1080.z_bias_diff) == (0.8911, 0.827), "1080: 50 / 56.111; mean of 0.8054 and 0.85"
+    assert (L4.z_bias_se, L4.z_bias_diff) == (0.9147, 0.8532), "7628: 50 / 54.660; geometric mean of 90/104.635 and 100/118.170"
+    assert (L1080.z_bias_se, L1080.z_bias_diff) == (0.8968, 0.8308), "1080: 50 / 55.754; geometric mean of 90/111.331 and 100/117.114"
     for name in ("jlcpcb_4l_1oz_3313", "jlcpcb_4l_1oz_2116"):
         s = STACKUPS[name]
-        assert (s.z_bias_se, s.z_bias_diff, s.rows) == (0.899, 0.838, ()), f"{name}: interpolated between the 7628 and 1080 fits"
+        assert (s.z_bias_se, s.z_bias_diff, s.rows) == (0.9058, 0.842, ()), f"{name}: interpolated between the 7628 and 1080 fits"
         assert s.z_bias_source == "interpolated between 7628 and 1080 fits; capture JLC rows to replace"
     assert (L2.z_bias_se, L2.z_bias_diff, L2.rows, L2.z_bias_source) == (1.0, 1.0, (), "uncalibrated: formula only")
     assert L4.z_bias_source == "fitted to JLC04161H-7628 rows (JITX), 2026-09-19"
@@ -155,77 +156,81 @@ def test_vector_1_hj_textbook_alumina_line():
     assert abs(eeff - 6.579) <= 0.005, f"C.10 #1: eeff 6.579 (H&J 1980); got {eeff}"
 
 
-def test_vector_2_hj_with_thickness_keeps_the_z01_ratio_factor():
+def test_vector_2_hj_with_thickness_is_assembled_as_kicad_assembles_it():
+    """Measured against a harness compiled from KiCad 10.0.6's own transline code: 54.66016 ohm.
+    An earlier pcbc put the (Z01(u1)/Z01(ur))^2 factor into Z0 and dropped KiCad's q_t term,
+    reading 55.165, which is neither KiCad nor bare H&J (53.858)."""
     z0, eeff = microstrip(0.3244, 0.2104, 0.035, 4.4)
-    assert abs(z0 - 55.165) <= 0.02, f"C.10 #2: H&J as KiCad at JLC's 7628 50 ohm width is 55.165 ohm (the dropped (Z01(u1)/Z01(ur))^2 factor gives 53.858); got {z0}"
-    assert abs(eeff - 3.1417) <= 0.002, f"C.10 #2: eeff_t 3.1417 (H&J thickness-corrected); got {eeff}"
+    assert abs(z0 - 54.6602) <= 0.02, f"C.10 #2: KiCad 10.0.6 microstrip_Z0() at JLC's 7628 50 ohm width is 54.660 ohm; got {z0}"
+    assert abs(eeff - 3.1999) <= 0.002, f"C.10 #2: eeff_t 3.1999, the permittivity Z0 is built from; got {eeff}"
+    assert abs(microstrip_reported_eeff(0.3244, 0.2104, 0.035, 4.4) - 3.0501) <= 0.002, "C.10 #2: KiCad displays eeff_t (Z01(u1)/Z01(ur))^2 = 3.0501"
 
 
 def test_vector_3_hj_on_1080():
     z0, _ = microstrip(0.1176, 0.0764, 0.035, 3.91)
-    assert abs(z0 - 56.111) <= 0.02, f"C.10 #3: H&J at JLC's 1080 50 ohm width is 56.111 ohm; got {z0}"
+    assert abs(z0 - 55.7539) <= 0.02, f"C.10 #3: KiCad's form at JLC's 1080 50 ohm width is 55.754 ohm (measured from the compiled KiCad harness); got {z0}"
 
 
 def test_vector_4_hj_on_the_two_layer_core_and_its_50_ohm_width():
     z0, _ = microstrip(1.0, 1.53, 0.035, 4.6)
-    assert abs(z0 - 83.495) <= 0.02, f"C.10 #4: H&J 1.0 mm on 1.53 mm FR-4 is 83.495 ohm; got {z0}"
+    assert abs(z0 - 83.033) <= 0.02, f"C.10 #4: 1.0 mm on 1.53 mm FR-4 is 83.033 ohm (compiled KiCad harness: 83.033); got {z0}"
     w = width_for_z0(50, L2)
-    assert abs(w - 2.8097) <= 0.0005, f"C.10 #4: 50 ohm on jlcpcb_2l_1oz (bias 1.0) is 2.8097 mm (H&J); got {w}"
+    assert abs(w - 2.7966) <= 0.0005, f"C.10 #4: 50 ohm on jlcpcb_2l_1oz (bias 1.0) is 2.7966 mm; got {w}"
 
 
 def test_vector_5_the_bias_reproduces_jlcs_50_ohm_row():
     w = width_for_z0(50, L4)
-    assert abs(w - 0.3244) <= 0.0005, f"C.10 #5: 50 ohm on 7628 with bias 0.9064 is JLC's row 0.3244 mm (by construction); got {w}"
+    assert abs(w - 0.3244) <= 0.0005, f"C.10 #5: 50 ohm on 7628 with bias 0.9147 is JLC's row 0.3244 mm (by construction); got {w}"
     assert microstrip_z0(0.3244, L4) == 50.0, "C.2: z_bias_se x Z_bare at JLC's row reads JLC's 50 ohm"
 
 
 def test_vector_6_coupled_hj_at_jlcs_90_ohm_row():
     ze, zo, _, _ = coupled_microstrip(0.2332, 0.15, 0.2104, 0.035, 4.4)
-    assert abs(2 * zo - 105.09) <= 0.05, f"C.10 #6: H&J coupled at JLC's 7628 90 ohm row is Zdiff 105.09 (x 0.85 = 89.3 vs JLC 90); got {2 * zo}"
+    assert abs(2 * zo - 104.635) <= 0.05, f"C.10 #6: H&J coupled at JLC's 7628 90 ohm row is Zdiff 104.635 (x 0.8532 = 89.3 vs JLC 90); got {2 * zo}"
     assert abs(ze - 73.93) <= 0.05, f"C.10 #6: Ze 73.93 (H&J even mode); got {ze}"
-    assert abs(zo - 52.54) <= 0.05, f"C.10 #6: Zo 52.54 (H&J odd mode); got {zo}"
+    assert abs(zo - 52.318) <= 0.05, f"C.10 #6: Zo 52.318 (H&J odd mode); got {zo}"
 
 
 def test_vector_7_coupled_hj_at_jlcs_100_ohm_row():
     _, zo, _, _ = coupled_microstrip(0.1722, 0.15, 0.2104, 0.035, 4.4)
-    assert abs(2 * zo - 118.69) <= 0.05, f"C.10 #7: H&J coupled at JLC's 7628 100 ohm row is 118.69 (x 0.85 = 100.9 vs JLC 100); got {2 * zo}"
+    assert abs(2 * zo - 118.17) <= 0.05, f"C.10 #7: H&J coupled at JLC's 7628 100 ohm row is 118.17 (x 0.8532 = 100.8 vs JLC 100); got {2 * zo}"
 
 
 def test_vector_8_coupled_hj_at_the_1080_rows():
     z90 = 2 * coupled_microstrip(0.09, 0.09, 0.0764, 0.035, 3.91)[1]
     z100 = 2 * coupled_microstrip(0.09, 0.137, 0.0764, 0.035, 3.91)[1]
-    assert abs(z90 - 111.74) <= 0.05, f"C.10 #8: 1080 90 ohm row (0.09/0.09) is 111.74 (x 0.827 = 92.4, the worst residual +2.7 %); got {z90}"
-    assert abs(z100 - 117.65) <= 0.05, f"C.10 #8: 1080 100 ohm row (0.09/0.137) is 117.65 (x 0.827 = 97.3, -2.7 %); got {z100}"
+    assert abs(z90 - 111.331) <= 0.05, f"C.10 #8: 1080 90 ohm row (0.09/0.09) is 111.331 (x 0.8308 = 92.5, the worst residual +2.8 %); got {z90}"
+    assert abs(z100 - 117.114) <= 0.05, f"C.10 #8: 1080 100 ohm row (0.09/0.137) is 117.114 (x 0.8308 = 97.3, -2.7 %); got {z100}"
 
 
 def test_vector_9_pair_synthesis_with_the_bias_on_7628():
     w90, g90 = diff_pair_geometry(90, L4)
     w100, g100 = diff_pair_geometry(100, L4)
-    assert abs(w90 - 0.2291) <= 0.0005 and g90 == 0.15, f"C.10 #9: 90 ohm on 7628 at gap 0.15 is 0.2291 mm (JLC row 0.2332, -1.8 %); got {(w90, g90)}"
-    assert abs(w100 - 0.1762) <= 0.0005 and g100 == 0.15, f"C.10 #9: 100 ohm on 7628 is 0.1762 mm (JLC row 0.1722, +2.3 %); got {(w100, g100)}"
-    assert diff_pair_z(0.2291, 0.15, L4) == 90.0, "C.2: z_bias_diff x 2 Zo at the synthesised geometry reads the target"
-    assert diff_pair_z(0.2332, 0.15, L4) == 89.32, "C.2 residual: JLC's own 90 ohm row reads 89.3 (-0.8 %)"
-    assert diff_pair_z(0.1722, 0.15, L4) == 100.88, "C.2 residual: JLC's own 100 ohm row reads 100.9 (+0.9 %)"
+    assert abs(w90 - 0.2288) <= 0.0005 and g90 == 0.15, f"C.10 #9: 90 ohm on 7628 at gap 0.15 is 0.2288 mm (JLC row 0.2332, -1.9 %); got {(w90, g90)}"
+    assert abs(w100 - 0.1759) <= 0.0005 and g100 == 0.15, f"C.10 #9: 100 ohm on 7628 is 0.1759 mm (JLC row 0.1722, +2.1 %); got {(w100, g100)}"
+    assert diff_pair_z(0.2288, 0.15, L4) == 90.0, "C.2: z_bias_diff x 2 Zo at the synthesised geometry reads the target"
+    assert diff_pair_z(0.2332, 0.15, L4) == 89.27, "C.2 residual: JLC's own 90 ohm row reads 89.3 (-0.8 %)"
+    assert diff_pair_z(0.1722, 0.15, L4) == 100.82, "C.2 residual: JLC's own 100 ohm row reads 100.8 (+0.8 %)"
     # The other calibrated stackup and the interpolated one.
     assert abs(width_for_z0(50, L1080) - 0.1176) <= 0.0005, "C.2: 1080 50 ohm lands on JLC's row 0.1176"
-    assert abs(diff_pair_width_mm(90, L1080, gap=0.09) - 0.0956) <= 0.0005, "C.2: 1080 90 ohm at gap 0.09 is 0.0956 (row 0.09, +6 %)"
+    assert abs(diff_pair_width_mm(90, L1080, gap=0.09) - 0.0958) <= 0.0005, "C.2: 1080 90 ohm at gap 0.09 is 0.0958 (row 0.09, +6 %)"
     # C.2 says 0.0846 for 1080's 100 ohm pair at gap 0.137 (row 0.09, -6 %); that is under the
     # 4L track_min, and the solver's floor is track_min (section C), so it saturates at 0.0889.
     assert diff_pair_width_mm(100, L1080, gap=0.137) == 0.0889, "C.2 / C: the 0.0846 solve is under the fab floor 0.0889, where the bisection starts"
     assert diff_pair_geometry(100, L1080, gap=0.137) == (0.0889, 0.137), "a member under the fab's track_min is written at it"
-    assert diff_pair_geometry(90, get_stackup("jlcpcb_4l_1oz_3313")) == (0.1353, 0.15), "B.3: 3313 would keep the pair near today's width"
+    assert diff_pair_geometry(90, get_stackup("jlcpcb_4l_1oz_3313")) == (0.1351, 0.15), "B.3: 3313 would keep the pair near today's width"
 
 
 def test_vector_10_the_pair_fit_clamp_on_two_layers():
     assert diff_pair_geometry(90, L2) == (0.127, 0.127), "C.10 #10: a 90 ohm member on 1.53 mm FR-4 is over PAIR_FIT_MM, so the pair is written at the fab floor (track_min, clearance_min)"
     assert PAIR_FIT_MM == 0.25, "A.1: a member wider than 0.25 cannot leave a USB-C's 0.3 mm pads at 0.5 mm pitch"
     w = diff_pair_width_mm(90, L2)
-    assert abs(w - 0.7764) <= 0.0005, f"C.10 #10: the solved member before the clamp is 0.7764 mm (H&J coupled, gap 0.127); got {w}"
+    assert abs(w - 0.7746) <= 0.0005, f"C.10 #10: the solved member before the clamp is 0.7746 mm (H&J coupled, gap 0.127); got {w}"
     z = 2 * coupled_microstrip(0.127, 0.127, 1.53, 0.035, 4.6)[1]
-    assert abs(z - 140.11) <= 0.05, f"C.10 #10: the clamped pair at 0.127/0.127 on 1.53 mm reads 140.11 ohm (feeding ur into the Q-terms gives 133.1); got {z}"
-    assert diff_pair_z(0.127, 0.127, L2) == 140.11, "C.3: the 2L note's 140.1 ohm"
+    assert abs(z - 140.053) <= 0.05, f"C.10 #10: the clamped pair at 0.127/0.127 on 1.53 mm reads 140.05 ohm (feeding ur into the Q-terms gives 133.08); got {z}"
+    assert diff_pair_z(0.127, 0.127, L2) == 140.05, "C.3: the 2L note's 140.1 ohm"
     sanity = 2 * coupled_microstrip(0.9, 0.127, 1.53, 0.035, 4.6)[1]
-    assert abs(sanity - 83.43) <= 0.05, f"C.10 #10 sanity row: 0.9 mm at 5 mil gap on 1.52 mm FR-4 is 83.43 (a Polar-solver forum figure gives 0.93 mm for 90 ohm); got {sanity}"
+    assert abs(sanity - 83.376) <= 0.05, f"C.10 #10 sanity row: 0.9 mm at 5 mil gap on 1.52 mm FR-4 is 83.38 (a Polar-solver forum figure gives 0.93 mm for 90 ohm); got {sanity}"
 
 
 def test_vector_11_wadell_stripline_with_thickness():
@@ -257,8 +262,8 @@ def test_vector_13_asymmetric_stripline_on_in1_of_7628():
 
 def test_vector_14_ghione_naldi_cpwg():
     z, eeff = cpwg(0.5, 0.3, 1.53, 4.6)
-    assert abs(z - 73.79) <= 0.02, f"C.10 #14: Ghione-Naldi 1987 conductor-backed CPW as KiCad (t = 0) cpwg(0.5, 0.3, 1.53, 4.6) is 73.79 ohm; got {z}"
-    assert abs(eeff - 2.838) <= 0.002, f"C.10 #14: eeff 2.838; got {eeff}"
+    assert abs(z - 73.786) <= 0.02, f"C.10 #14: Ghione-Naldi 1987 conductor-backed CPW as KiCad (t = 0) cpwg(0.5, 0.3, 1.53, 4.6) is 73.79 ohm; got {z}"
+    assert abs(eeff - 2.8382) <= 0.002, f"C.10 #14: eeff 2.8382; got {eeff}"
     z_wide, _ = cpwg(1.5, 0.3, 1.53, 4.6)
     assert abs(z_wide - 50.47) <= 0.02, f"C.10 #14: cpwg(1.5, 0.3, 1.53, 4.6) is 50.47; got {z_wide}"
     w = width_for_z0(50, L2, pour_gap=0.2)
@@ -266,7 +271,7 @@ def test_vector_14_ghione_naldi_cpwg():
     assert abs(elliptic_k(0.0) - math.pi / 2) < 1e-12, "K(0) = pi/2 (AGM)"
     assert abs(elliptic_k(0.5) - 1.6857503548125960) < 1e-9, "K(0.5) = 1.68575 (Abramowitz and Stegun 17.3)"
     # C.5 validity: past s/h = 1 the wide-gap limit overestimates a plain microstrip, so pcbc takes the smaller.
-    assert microstrip_z0(1.0, L2, pour_gap=5.0) == microstrip_z0(1.0, L2) == 83.49, "C.5: min(cpwg, microstrip) beyond s/h = 1: cpwg reads 88.10 at s = 5, the H&J microstrip 83.495"
+    assert microstrip_z0(1.0, L2, pour_gap=5.0) == microstrip_z0(1.0, L2) == 83.03, "C.5: min(cpwg, microstrip) beyond s/h = 1: cpwg reads 88.10 at s = 5, the microstrip 83.033"
     assert microstrip_z0(1.0, L2, pour_gap=2.0) == 82.64, "C.5: at s/h = 1.31 the CPWG form (82.64) is still under the microstrip and is what min() keeps"
 
 
@@ -364,9 +369,9 @@ def test_vector_24_iec_60664_impulse_clearance():
 def test_vector_25_i2c_length_from_capacitance():
     z0, eeff = microstrip(0.16, 1.53, 0.035, 4.6)
     c = capacitance_pf_per_mm(z0, eeff)
-    assert abs(c - 0.0391) <= 0.0002, f"C.10 #25: sqrt(eeff)/(c z0) at 0.16 mm on 2L (145 ohm) is 0.0391 pF/mm; got {c}"
+    assert abs(c - 0.0404) <= 0.0002, f"C.10 #25: sqrt(eeff)/(c z0) at 0.16 mm on 2L (142.9 ohm) is 0.0404 pF/mm; got {c}"
     length = i2c_max_mm(400, 2, c)
-    assert abs(length - 9719) / 9719 <= 0.01, f"C.10 #25: (400 pF - 10 pF x 2 pins) / 0.0391 = 9719 mm (UM10204 rev 7 section 7.1); got {length}"
+    assert abs(length - 9406) / 9406 <= 0.01, f"C.10 #25: (400 pF - 10 pF x 2 pins) / 0.0404 = 9406 mm (UM10204 rev 7 section 7.1); got {length}"
 
 
 def test_vector_26_existing_pins_unchanged():
@@ -399,6 +404,6 @@ def test_the_solver_is_bisection_from_the_fab_floor_and_deterministic():
 def test_thickness_enters_the_coupled_line_only_through_z0_and_eeff():
     """C.3: u = w/h is the bare ratio. Feeding ur into the Q-terms reads 104.15 at vector 6 and 133.1 at the 2L clamp."""
     z6 = 2 * coupled_microstrip(0.2332, 0.15, 0.2104, 0.035, 4.4)[1]
-    assert abs(z6 - 104.15) > 0.5 and abs(z6 - 105.09) <= 0.05, "C.3: the ur trap (104.15) is not what the bare-u form gives (105.09)"
+    assert abs(z6 - 103.67) > 0.5 and abs(z6 - 104.635) <= 0.05, "C.3: the ur trap (103.67) is not what the bare-u form gives (104.635)"
     zc = 2 * coupled_microstrip(0.127, 0.127, 1.53, 0.035, 4.6)[1]
-    assert abs(zc - 133.1) > 5 and abs(zc - 140.11) <= 0.05, "C.3: the ur trap (133.1) is not what the bare-u form gives (140.11)"
+    assert abs(zc - 133.08) > 5 and abs(zc - 140.053) <= 0.05, "C.3: the ur trap (133.08) is not what the bare-u form gives (140.05)"

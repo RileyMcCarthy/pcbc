@@ -44,7 +44,7 @@ class Derived:
     unit: str               # "mm" | "ohm" | "A" | "V" | "mm2" | "pF/mm" | "count"
     source: Source
 
-    def line(self) -> str:  # "0.2291 mm (hj_coupled_microstrip x 0.85 JLC04161H-7628; JLC row 0.2332)"
+    def line(self) -> str:  # "0.2288 mm (hj_coupled_microstrip x 0.85 JLC04161H-7628; JLC row 0.2332)"
         ...
 
 @dataclass(frozen=True)
@@ -434,8 +434,8 @@ Published rows (JLC's calculator, as JITX records them; the numbers pcbc asks th
   that does not pick an impedance stackup (node and every previous 4L pcbc board were ordered
   that way), it is first on their impedance page, and today's `h 0.12, er 4.5` matches none
   of the four, so nothing recorded depends on the old numbers. Consequence, stated plainly:
-  node's USB pair changes from 0.1554 / 0.12 to **0.2291 / 0.15** (C.2, D). 3313 would keep
-  the pair near today's width (0.1353 / 0.15) but is not what JLC ships by default; it is
+  node's USB pair changes from 0.1554 / 0.12 to **0.2288 / 0.15** (C.2, D). 3313 would keep
+  the pair near today's width (0.1351 / 0.15) but is not what JLC ships by default; it is
   available by name.
 - `jlcpcb_2l_1oz` -> no code. `1.5 / 4.5` becomes `1.53 / 4.6` (1.6 mm less two 0.035
   coppers; JLC's core Dk). No example reads a 2-layer impedance number (USB on 2L is clamped,
@@ -469,8 +469,13 @@ eeff_t = eeff(ur, er) * (Z01(u1) / Z01(ur))^2
 Z0     = Z01(ur) / sqrt(eeff_t)
 ```
 
-The `(Z01(u1)/Z01(ur))^2` factor is the part two of the three drafts dropped; without it the
-7628 row reads 53.86 ohm, with it 55.165, which is what KiCad's PCB Calculator gives.
+Corrected 2026-09-20 after a review compiled KiCad 10.0.6's own transline code and measured
+it: the assembly above is KiCad's `microstrip_Z0()` exactly, `q_t` term included, with the
+`(Z01(u1)/Z01(ur))^2` factor in the *reported* permittivity and not in Z0. The first R1 code
+put that factor into Z0 and dropped `q_t`, reading 55.165 ohm where KiCad gives 54.660 and
+bare H&J 53.858: it matched neither reference it named. The bias of C.2 is fitted to whatever
+the bare formula is, so JLC's rows are reproduced either way; what changed is that the cited
+reference is now true (`microstrip_reported_eeff` returns the number KiCad displays).
 Reference: E. Hammerstad, O. Jensen, "Accurate models for microstrip computer-aided design",
 IEEE MTT-S Digest 1980, eqs. 1-8 and the thickness correction; KiCad 10
 `common/transline_calculations/microstrip.cpp` (same equations). Valid 0.01 <= u <= 100,
@@ -494,14 +499,14 @@ width synthesis: solve Z_bare(w) = Z_target / z_bias
 
 | code | z_bias_se (fit) | z_bias_diff (fit) | residuals at JLC's rows | source string |
 |---|---|---|---|---|
-| 7628 | 0.9064 (= 50 / 55.165) | 0.85 (geometric mean of 90/105.09 = 0.8564 and 100/118.69 = 0.8426) | 90 row -> 89.3 ohm (-0.8 %), 100 row -> 100.9 (+0.9 %) | `fitted to JLC04161H-7628 rows (JITX), 2026-09-19` |
-| 1080 | 0.8911 (= 50 / 56.111) | 0.827 (mean of 0.8054, 0.85) | 90 row -> 92.4 (+2.7 %), 100 row -> 97.3 (-2.7 %) | same, 1080 |
-| 3313, 2116 | 0.899 | 0.838 | none: interpolated (mean of the two fits) | `interpolated between 7628 and 1080 fits; capture JLC rows to replace` |
+| 7628 | 0.9147 (= 50 / 54.660) | 0.8532 (geometric mean of 90/104.635 and 100/118.170) | 90 row -> 89.3 ohm (-0.8 %), 100 row -> 100.9 (+0.9 %) | `fitted to JLC04161H-7628 rows (JITX), 2026-09-19` |
+| 1080 | 0.8968 (= 50 / 55.754) | 0.8308 (geometric mean of 90/111.331 and 100/117.114) | 90 row -> 92.4 (+2.7 %), 100 row -> 97.3 (-2.7 %) | same, 1080 |
+| 3313, 2116 | 0.9058 | 0.842 | none: interpolated (mean of the two fits) | `interpolated between 7628 and 1080 fits; capture JLC rows to replace` |
 | 2L | 1.0 | 1.0 | none; c/h = 0.02, the mask barely matters | `uncalibrated: formula only` |
 
 With the bias the synthesised widths land at: 7628 50 ohm 0.3244 (row 0.3244), 90 ohm pair
-at gap 0.15 **0.2291** (row 0.2332, -1.8 %), 100 ohm 0.1762 (row 0.1722, +2.3 %); 1080 50
-ohm 0.1176, 90 ohm at gap 0.09 0.0956 (row 0.09, +6 %), 100 ohm at gap 0.137 0.0846 (row
+at gap 0.15 **0.2288** (row 0.2332, -1.8 %), 100 ohm 0.1759 (row 0.1722, +2.3 %); 1080 50
+ohm 0.1176, 90 ohm at gap 0.09 0.0958 (row 0.09, +6 %), 100 ohm at gap 0.137 0.0846 (row
 0.09, -6 %). Stated accuracy: **+-3 % impedance / +-3 % width on 7628, +-3 % / +-6 % on
 1080**, inside USB 2.0's +-15 % and 100 ohm Ethernet's +-10 %; off-row stackups and 2L print
 `uncalibrated`. `mask_*` fields stay on the stackup as data for the report and for a real
@@ -513,7 +518,7 @@ covered-microstrip model later.
 `z0, eeff` are C.1's thickness-corrected single line at width `w` (`eeff_t`, with the
 `(Z01(u1)/Z01(ur))^2` factor); **`u = w/h` is the bare ratio, not `ur`**, and `g = s/h`.
 Thickness enters only through `z0` and `eeff`. Feeding `ur` into the Q-terms instead gives
-104.15 ohm at vector 6 (not 105.09) and 133.1 at the 2L clamp (not 140.1): a 1-5 % trap the
+103.67 ohm at vector 6 (not 104.635) and 133.08 at the 2L clamp (not 140.1): a 1-5 % trap the
 test vectors are there to catch.
 
 ```
@@ -543,7 +548,7 @@ Gap policy: `gap = max(0.15, stack.clearance_min)` (JLC's own pair gap on 4L), o
 `Pair(gap_mm=)`. Width is solved for `z_diff / z_bias_diff`. **Pair fit clamp** (today's
 behaviour, now said): when the solved width exceeds `PAIR_FIT_MM = 0.25` the pair is written
 at `(track_min, clearance_min)`, `controlled=False`, `z_computed` is evaluated at that
-geometry and the note reads `USB_DP/USB_DN: 90 ohm needs 0.7764 mm members at gap 0.15 on
+geometry and the note reads `USB_DP/USB_DN: 90 ohm needs 0.7746 mm members at gap 0.15 on
 jlcpcb_2l_1oz (formula only); pair written at the fab floor 0.127/0.127 = 140.1 ohm; fine for
 USB full speed, use Board(stackup="jlcpcb_4l_1oz") for high speed`. c3_usb's geometry is
 unchanged; its report stops lying.
@@ -705,7 +710,7 @@ KiCad `GetMinGrooveWidth`); clearance still applies to the gap.
 `i2c_max_mm(pf_max, pins, c_pf_per_mm) = (pf_max - 10 * pins) / c_pf_per_mm` at the class
 width on the outer layer (bias applied to `z0`, `eeff / z_bias^2` as the consistent
 velocity). Reference: I2C-bus specification UM10204 rev 7, section 7.1 (Cb <= 400 pF, 10 pF
-per device pin). On 2L at 0.16 mm (145 ohm, 0.0391 pF/mm) a 2-device bus is bounded at 9.7 m:
+per device pin). On 2L at 0.16 mm (142.9 ohm, 0.0404 pF/mm) a 2-device bus is bounded at 9.7 m:
 it binds only on long buses on thin prepregs, which is the point of printing it.
 
 ### C.10 Test vectors (`tests/test_stackup.py`, one `assert` per line, tolerance as stated)
@@ -713,19 +718,19 @@ it binds only on long buses on thin prepregs, which is the point of printing it.
 | # | call | expected | tol | reference |
 |---|---|---|---|---|
 | 1 | `microstrip(1.0, 1.0, 0, 9.8)` | 49.289 ohm, eeff 6.579 | 0.02 / 0.005 | H&J 1980 textbook alumina line; KiCad calculator |
-| 2 | `microstrip(0.3244, 0.2104, 0.035, 4.4)` | 55.165 ohm, eeff 3.1417 | 0.02 / 0.002 | H&J as KiCad (the dropped `(Z01(u1)/Z01(ur))^2` factor gives 53.858 instead) |
-| 3 | `microstrip(0.1176, 0.0764, 0.035, 3.91)` | 56.111 ohm | 0.02 | same, 1080 |
-| 4 | `microstrip(1.0, 1.53, 0.035, 4.6)`; `width_for_z0(50, jlcpcb_2l_1oz)` | 83.495 ohm; 2.8097 mm | 0.02; 0.0005 | H&J |
-| 5 | `width_for_z0(50, jlcpcb_4l_1oz)` (bias 0.9064) | 0.3244 mm | 0.0005 | JLC04161H-7628 row (by construction of the bias) |
-| 6 | `coupled_microstrip(0.2332, 0.15, 0.2104, 0.035, 4.4)` | Zdiff 105.09, Ze 73.93, Zo 52.54 | 0.05 | H&J coupled; x 0.85 = 89.3 vs JLC 90 |
-| 7 | `coupled_microstrip(0.1722, 0.15, 0.2104, 0.035, 4.4)` | Zdiff 118.69 | 0.05 | x 0.85 = 100.9 vs JLC 100 |
-| 8 | `coupled_microstrip(0.09, 0.09, 0.0764, 0.035, 3.91)`; `(0.09, 0.137, ...)` | 111.74; 117.65 | 0.05 | 1080 rows; x 0.827 = 92.4 / 97.3 (the worst residual, +-2.7 %) |
-| 9 | `diff_pair_geometry(90, jlcpcb_4l_1oz)`; `(100, ...)` | (0.2291, 0.15); (0.1762, 0.15) | 0.0005 | synthesis with the bias; JLC rows 0.2332 / 0.1722 within 2.3 % |
-| 10 | `diff_pair_geometry(90, jlcpcb_2l_1oz)` | (0.127, 0.127) clamped; solved member 0.7764; `zdiff(0.127, 0.127, 1.53, 0.035, 4.6)` = 140.11 | 0.0005; 0.05 | the pair-fit clamp; `coupled_microstrip(0.9, 0.127, 1.53, 0.035, 4.6)` = 83.43 as a sanity row (a Polar-solver forum figure: 0.93 mm at 5 mil gap on 1.52 mm FR-4) |
+| 2 | `microstrip(0.3244, 0.2104, 0.035, 4.4)` | 54.660 ohm, eeff_t 3.1999 | 0.02 / 0.002 | H&J as KiCad (the dropped `(Z01(u1)/Z01(ur))^2` factor gives 53.858 instead) |
+| 3 | `microstrip(0.1176, 0.0764, 0.035, 3.91)` | 55.754 ohm | 0.02 | same, 1080 |
+| 4 | `microstrip(1.0, 1.53, 0.035, 4.6)`; `width_for_z0(50, jlcpcb_2l_1oz)` | 83.033 ohm; 2.7966 mm | 0.02; 0.0005 | H&J |
+| 5 | `width_for_z0(50, jlcpcb_4l_1oz)` (bias 0.9147) | 0.3244 mm | 0.0005 | JLC04161H-7628 row (by construction of the bias) |
+| 6 | `coupled_microstrip(0.2332, 0.15, 0.2104, 0.035, 4.4)` | Zdiff 104.635, Ze 73.93, Zo 52.54 | 0.05 | H&J coupled; x 0.85 = 89.3 vs JLC 90 |
+| 7 | `coupled_microstrip(0.1722, 0.15, 0.2104, 0.035, 4.4)` | Zdiff 118.170 | 0.05 | x 0.85 = 100.9 vs JLC 100 |
+| 8 | `coupled_microstrip(0.09, 0.09, 0.0764, 0.035, 3.91)`; `(0.09, 0.137, ...)` | 111.331; 117.114 | 0.05 | 1080 rows; x 0.827 = 92.4 / 97.3 (the worst residual, +-2.7 %) |
+| 9 | `diff_pair_geometry(90, jlcpcb_4l_1oz)`; `(100, ...)` | (0.2288, 0.15); (0.1759, 0.15) | 0.0005 | synthesis with the bias; JLC rows 0.2332 / 0.1722 within 2.3 % |
+| 10 | `diff_pair_geometry(90, jlcpcb_2l_1oz)` | (0.127, 0.127) clamped; solved member 0.7746; `zdiff(0.127, 0.127, 1.53, 0.035, 4.6)` = 140.05 | 0.0005; 0.05 | the pair-fit clamp; `coupled_microstrip(0.9, 0.127, 1.53, 0.035, 4.6)` = 83.43 as a sanity row (a Polar-solver forum figure: 0.93 mm at 5 mil gap on 1.52 mm FR-4) |
 | 11 | `stripline(0.2, 1.0, 0.0152, 4.6)`; `(0.15, 0.5, 0.0175, 4.6)`; `(0.2, 0.4, 0.0175, 4.6)` | 67.46; 54.86; 42.55 (IPC-2141: 66.68, 54.07, 40.69) | 0.02 | Wadell 4.2.1; KiCad 67.19 / 54.28 / 42.47 within 0.5 % |
 | 12 | `stripline(w, 1.0, 1e-9, 4.6)` for w = 0.2, 0.3, 0.5 | 71.39, 60.31, 46.82 | 0.05 | exact conformal map `(30 pi/sqrt(er)) K(k')/K(k)` = 71.40, 60.33, 46.86 |
 | 13 | `stripline_asym(0.2, 0.2104, 1.065, 0.0152, 4.4, 4.6)`; w for 50 | 60.09 ohm; 0.2968 mm | 0.02; 0.0005 | parallel-combination form, In1.Cu on 7628 |
-| 14 | `cpwg(0.5, 0.3, 1.53, 4.6)`; `cpwg(1.5, 0.3, 1.53, 4.6)`; w for 50 at s = 0.2 | 73.79 ohm, eeff 2.838; 50.47; 1.1992 | 0.02 / 0.002 | Ghione-Naldi as KiCad t = 0 |
+| 14 | `cpwg(0.5, 0.3, 1.53, 4.6)`; `cpwg(1.5, 0.3, 1.53, 4.6)`; w for 50 at s = 0.2 | 73.786 ohm, eeff 2.838; 50.47; 1.1992 | 0.02 / 0.002 | Ghione-Naldi as KiCad t = 0 |
 | 15 | `ipc2152_area_mil2(10, 20)`; smps.us fit at (10, 20) | 517.9; 513.1 | 0.5 | both fits within 4 % of the chart's 500 |
 | 16 | `ipc2152_width_mm(1, 10, 1, 1.6, None)`; `(2, 10, 1, 1.6, None)` | 0.309; 1.090 | 0.002 | mbedded.ninja coefficients, board mod 1.092 |
 | 17 | `ipc2152_width_mm(2, 10, 1, 1.6, 1.53)`; `(1, 10, 1, 1.6, 0.2104)` | 0.646; 0.133 | 0.002 | plane mod 0.593 / 0.430 |
@@ -736,7 +741,7 @@ it binds only on long buses on thin prepregs, which is the point of printing it.
 | 22 | `ipc2221_clearance_mm(5, "B2")`, `(48, "B2")`, `(250, "B2")`, `(400, "B2")`, `(600, "B2")`, `(250, "B1")`, `(250, "B4")`, `(1000, "B1")` | 0.1, 0.6, 1.25, 2.5, 3.0, 0.2, 0.4, 1.5 | exact | IPC-2221B 6-1 as KiCad |
 | 23 | `iec_creepage_mm(250, "IIIa")`, `("I")`, `("II")`, `(400, "IIIa")`, `(48, "IIIa")`, `(250, "IIIa", reinforced=True)` | 2.5, 1.25, 1.8, 4.0, 1.2, 5.0 | exact | IEC 60664-1 F.5 / 62368-1 T17; SLUP419 T3 |
 | 24 | `iec_clearance_mm(250)`, `(250, reinforced=True)`, `(48)` | 1.5, 3.0, 0.2 | exact | IEC 60664-1 F.1 + F.2 |
-| 25 | `capacitance_pf_per_mm(*microstrip(0.16, 1.53, 0.035, 4.6))`; `i2c_max_mm(400, 2, that)` | 0.0391 pF/mm; 9719 mm | 0.0002; 1 % | C.9 |
+| 25 | `capacitance_pf_per_mm(*microstrip(0.16, 1.53, 0.035, 4.6))`; `i2c_max_mm(400, 2, that)` | 0.0404 pF/mm; 9719 mm | 0.0002; 1 % | C.9 |
 | 26 | `fanout_stagger(2L, 0.2, 0.65)`, `fanout_lane(2L, 0.2, 0.65)`, `board_rules(2L)` | 0.4664, 1.2934, today's dict | exact | existing pins, unchanged |
 
 ---
@@ -758,7 +763,7 @@ default)`.
 | `analog` | Analog | `keep_clear_of`, `keep_clear_mm` (3.0 when `keep_clear_of` given) | 0.20 | 0.20 / 0.20 | 0.6/0.3, **no vias** (`via_count (max 0)`) | F.Cu | airwire 25 (today) | none | 5W | `via_count`, keep-away clearance when given |
 | `switch_node` | SwitchNode | `loop_mm2` (20.0, hot loop, pcbc default; buck measures 3.3), `amps` | 0.30, or C.6 if `amps` | 0.20 / 0.20 | 0.6/0.3, no vias | F.Cu | airwire 8 | none | 3W | `via_count` |
 | `clock` | Clock | `match_mm` (2.0), `vias_max` (2) | 0.15 | 0.20 / 0.20 | 0.6/0.3, allowed, budget 2 | F, B | none | bus of the `NetReq`'s nets when > 1, `match_mm` | 5W | `skew` (soft), `via_budget` (soft) |
-| `usb_hs` | USB | `z_diff_ohm` (90), `pair` (True), `match_mm` (0.5), `uncoupled_mm` (2.0), `vias_max` (2), `reference`, `length_mm` (none) | pair by C.3 x bias at gap `max(0.15, clearance_min)`: 4L 0.2291/0.15; 2L clamp 0.127/0.127, `controlled=False`, note | `min(0.16, w)` then the floor (today: 0.155 on 2L, 0.18 on 4L) / same | stackup via, allowed, budget 2 | F, B (today); 4L `reference` = `plane_below(layers[0])` when it is in `planes=` | none; `length_mm` only when given (USB 2.0 does not bound the board trace: decision H.6) | pair: skew 0.5, uncoupled 2.0 (R-Z5; TI usb_layout_basics, Altium: the tight number) | 3W | `diff_pair_gap` (error), `diff_pair_uncoupled` (soft), `skew` (soft), `via_budget` (soft), `track_width` (soft), chain check on 3+ pads (F.2) |
+| `usb_hs` | USB | `z_diff_ohm` (90), `pair` (True), `match_mm` (0.5), `uncoupled_mm` (2.0), `vias_max` (2), `reference`, `length_mm` (none) | pair by C.3 x bias at gap `max(0.15, clearance_min)`: 4L 0.2288/0.15; 2L clamp 0.127/0.127, `controlled=False`, note | `min(0.16, w)` then the floor (today: 0.155 on 2L, 0.18 on 4L) / same | stackup via, allowed, budget 2 | F, B (today); 4L `reference` = `plane_below(layers[0])` when it is in `planes=` | none; `length_mm` only when given (USB 2.0 does not bound the board trace: decision H.6) | pair: skew 0.5, uncoupled 2.0 (R-Z5; TI usb_layout_basics, Altium: the tight number) | 3W | `diff_pair_gap` (error), `diff_pair_uncoupled` (soft), `skew` (soft), `via_budget` (soft), `track_width` (soft), chain check on 3+ pads (F.2) |
 | `spi` | SPI | `clock` (required when > 1 net), `match_mm` (2.5, about 15 ps on FR-4, pcbc default), `length_mm`, `z_se_ohm` | floor; with `z_se_ohm` as generic | 0.20 / 0.20 | stackup via, allowed | F, B | `length_mm` when given | bus matched to `clock` within `match_mm` | 3W | `skew` (soft), `length` (error when given) |
 | `i2c` | I2C | `pf_max` (400, UM10204) | floor | 0.20 / 0.20 | stackup via, allowed | F, B | routed `length (max i2c_max_mm)` (C.9), printed with pF/mm and pins | none | 3W | `length` (error) |
 | `sense` | Sense | `match_mm` (1.0, R-A2), `keep_clear_of`, `keep_clear_mm` (3.0) | 0.20 | 0.20 / 0.20 | 0.6/0.3, no vias | F.Cu | airwire 25 | when exactly two nets: bus of the two, `skew (max 1mm)`; a `Chain` from the load pad is validated (F.2) | 5W | `via_count`, `skew` (soft) |
@@ -785,7 +790,7 @@ Notes on the table:
 
 Unchanged outputs on the five boards, checked against the compile dump: blinky, buck, DS2
 identical classes and nets; c3_usb identical (the 2L pair still floors to 0.127/0.127, now
-with the C.3 note); node: USB `0.2291 / 0.15` instead of `0.1554 / 0.12` (H.2), everything
+with the C.3 note); node: USB `0.2288 / 0.15` instead of `0.1554 / 0.12` (H.2), everything
 else identical.
 
 ---
@@ -1009,12 +1014,12 @@ thinking already bites (node's 1 A LOAD on 0.2 mm drills wants 2 vias per change
 a report line, not a gate, until the router can place two.
 
 **H.2 `jlcpcb_4l_1oz` -> JLC04161H-7628 and node's pair.** Pick: the default is what JLC
-builds. Node's USB pair widens from 0.1554/0.12 to 0.2291/0.15 (fits the USB-C's 0.3 mm
-pads at 0.5 mm pitch: 0.2291 < `PAIR_FIT_MM`); `route_diff.py --impedance 90` re-routes it
+builds. Node's USB pair widens from 0.1554/0.12 to 0.2288/0.15 (fits the USB-C's 0.3 mm
+pads at 0.5 mm pitch: 0.2288 < `PAIR_FIT_MM`); `route_diff.py --impedance 90` re-routes it
 and the bar (`node: vias 30, off45 64, micro 161, detour 1.72`) may move. S2's acceptance
 runs node to fab under the real markers; a bar change is re-recorded with its reason in
 `test_examples_fab.py`, as R0 did. Fallback if the wider pair fails the bar: map
-`jlcpcb_4l_1oz` to 3313 (pair 0.1353/0.15) with 7628 under its own name.
+`jlcpcb_4l_1oz` to 3313 (pair 0.1351/0.15) with 7628 under its own name.
 
 **H.3 Soft severities in R1, and no neck-down areas.** Plan section 6.6 says everything
 pcbc writes is an error; KRT is not held to length, skew, uncoupled length, via budgets or
@@ -1093,7 +1098,7 @@ parallel by different people).
   `fanout_stagger`, `fanout_lane`, `board_rules`, `ipc2221_width_mm(2) == 0.781`);
   `get_stackup("jlcpcb_4l_1oz").jlc_code == "JLC04161H-7628"` and `get_stackup("JLC04161H-3313")`
   resolves; `pytest -m "not kicad and not krt"` green with the one expected change: node's
-  compiled USB pair `(0.2291, 0.15)`, updated in `test_route_plan.py` if it pins the number
+  compiled USB pair `(0.2288, 0.15)`, updated in `test_route_plan.py` if it pins the number
   (it pins `--impedance 90` only today), and `diff_pair_geometry(90, jlcpcb_2l_1oz) == (0.127, 0.127)`
   after the existing clamp in `compile.py`. `PCBC_REQUIRE_KICAD=1 PCBC_REQUIRE_KRT=1 pytest
   tests/test_examples_fab.py` green (node's bar re-recorded only if it moves, with the reason).
@@ -1111,7 +1116,7 @@ parallel by different people).
 - Acceptance: for the five boards, every key recorded in the fixture's `classes`, `nets`,
   `krt`, `keepouts`, `places`, `regions` equals today's value (new keys such as
   `lane_clearance_mm` are allowed); node's USB class is the one asserted difference
-  (`0.2291 / 0.15`); an unknown kwarg is refused with the did-you-mean line and a kind-foreign
+  (`0.2288 / 0.15`); an unknown kwarg is refused with the did-you-mean line and a kind-foreign
   kwarg with the accepted list, both citing the line; every kind of section D compiles on a
   synthetic 2L and 4L board and its report lines are pinned as exact strings (sources
   included); the DS2 lines are pinned (`AIN0: airwire 30 mm (NetReq line 96 overrides preset analog 25)` among them);
@@ -1206,13 +1211,13 @@ The report line format (S2 defines `Derived.line()` and `cs.lines`; S5 prints th
 number per line, sorted by net, the source in parentheses; pinned for node:
 
 ```
-USB_DP: pair with USB_DN, 0.2291 mm wide, gap 0.15 mm on F.Cu over In1.Cu (GND): 89.9 ohm (hj_coupled_microstrip x 0.85 JLC04161H-7628; JLC row 0.2332/0.15; target 90 +-15 %)
+USB_DP: pair with USB_DN, 0.2288 mm wide, gap 0.15 mm on F.Cu over In1.Cu (GND): 89.9 ohm (hj_coupled_microstrip x 0.85 JLC04161H-7628; JLC row 0.2332/0.15; target 90 +-15 %)
 USB_DP: clearance 0.18 mm (class_floor hole_clearance 0.25 - ring 0.075 + 0.005); via 0.35/0.2 mm (stackup), at most 2 (preset usb_hs) [soft: warning in R1]
 USB_DP: skew 0.5 mm, uncoupled 2 mm (preset usb_hs; TI usb_layout_basics) [soft: warning in R1]; length none (give length_mm=)
 VBUS: width 0.4 mm (pcbc_floor amps >= 0.2; ipc2221_ext 1 A 10 C 1 oz 0.300; ipc2152_fit x board 1.092 x plane 0.430 at 0.2104 mm In1.Cu 0.133)
 VBUS: clearance 0.2 mm (preset power; ipc2221_6_1 row 0-15 V B2 0.1); via 0.8/0.4 mm (preset power), 1 per layer change (via_barrel 0.4/0.018 mm 0.871 A at 10 C)
 LOAD: width 0.4 mm (pcbc_floor; ipc2221_ext 1 A 0.300); via 0.35/0.2 mm (stackup), 2 per layer change (via_barrel 0.2/0.018 mm 0.527 A at 10 C) [report only in R1]
 T_DIV: width 0.2 mm, clearance 0.2 mm (preset analog); no vias; F.Cu; airwire 25 mm (preset analog); keep_clear_of none; spacing 5W
-classes: Default 0.16/0.18, USB 0.2291/0.18 pair 0.2291/0.15, Power 0.4/0.2 via 0.8/0.4, Analog 0.2/0.2 via 0.6/0.3
+classes: Default 0.16/0.18, USB 0.2288/0.18 pair 0.2288/0.15, Power 0.4/0.2 via 0.8/0.4, Analog 0.2/0.2 via 0.6/0.3
 rules: 12 written (7 error, 5 soft), canary on net 3V3
 ```

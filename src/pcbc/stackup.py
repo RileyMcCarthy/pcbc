@@ -259,8 +259,8 @@ STACKUPS: dict[str, Stackup] = {
         layers=4,
         jlc_code="JLC04161H-7628",
         stack=_four_layer("7628", 0.2104, 4.4, 1.065),
-        z_bias_se=0.9064,
-        z_bias_diff=0.85,
+        z_bias_se=0.9147,
+        z_bias_diff=0.8532,
         z_bias_source=_FITTED.format(code="7628"),
         rows=_ROWS_7628,
         **_FOUR_LAYER_LIMITS,
@@ -270,8 +270,8 @@ STACKUPS: dict[str, Stackup] = {
         layers=4,
         jlc_code="JLC04161H-3313",
         stack=_four_layer("3313", 0.0994, 4.1, 1.265),
-        z_bias_se=0.899,
-        z_bias_diff=0.838,
+        z_bias_se=0.9058,
+        z_bias_diff=0.842,
         z_bias_source=_INTERPOLATED,
         **_FOUR_LAYER_LIMITS,
     ),
@@ -280,8 +280,8 @@ STACKUPS: dict[str, Stackup] = {
         layers=4,
         jlc_code="JLC04161H-2116",
         stack=_four_layer("2116", 0.1164, 4.16, 1.265),
-        z_bias_se=0.899,
-        z_bias_diff=0.838,
+        z_bias_se=0.9058,
+        z_bias_diff=0.842,
         z_bias_source=_INTERPOLATED,
         **_FOUR_LAYER_LIMITS,
     ),
@@ -290,8 +290,8 @@ STACKUPS: dict[str, Stackup] = {
         layers=4,
         jlc_code="JLC04161H-1080",
         stack=_four_layer("1080", 0.0764, 3.91, 1.265),
-        z_bias_se=0.8911,
-        z_bias_diff=0.827,
+        z_bias_se=0.8968,
+        z_bias_diff=0.8308,
         z_bias_source=_FITTED.format(code="1080"),
         rows=_ROWS_1080,
         **_FOUR_LAYER_LIMITS,
@@ -390,28 +390,53 @@ def _hj_eeff(u: float, er: float) -> float:
     return (er + 1.0) / 2.0 + (er - 1.0) / 2.0 * (1.0 + 10.0 / u) ** (-_hj_a(u) * _hj_b(er))
 
 
+def _hj_du(u: float, th: float, er: float) -> float:
+    """Hammerstad and Jensen's strip-thickness widening of u, for a medium of Dk `er`."""
+    if th <= 0:
+        return 0.0
+    d = (th / math.pi) * math.log(1.0 + (4.0 * math.e) * math.tanh(math.sqrt(6.517 * u)) ** 2 / th)
+    return 0.5 * d * (1.0 + 1.0 / math.cosh(math.sqrt(er - 1.0)))
+
+
 def microstrip(w: float, h: float, t: float, er: float) -> tuple[float, float]:
     """(Z0, eeff) of a microstrip of width `w` over dielectric `h`, strip thickness `t`, Dk `er`.
 
-    Hammerstad and Jensen 1980 eqs. 1-8 with the thickness correction, as KiCad 10's
-    `microstrip.cpp`: the thickness-corrected `eeff_t = eeff(ur) * (Z01(u1)/Z01(ur))^2` and
-    `Z0 = Z01(ur) / sqrt(eeff_t)`. Valid 0.01 <= w/h <= 100, 1 <= er <= 128, 0.2 %.
+    Hammerstad and Jensen 1980 eqs. 1-8 with the thickness corrections, assembled exactly as
+    KiCad 10.0.6's `pcb_calculator/transline/microstrip.cpp::microstrip_Z0()` with no cover:
+
+        du1 = du(u, t/h, er=1);  ur = u + du(u, t/h, er)
+        q   = q_inf(ur, er) - q_t,  q_t = (2 ln2 / pi) (t/h) / sqrt(ur)     [delta_q_thickness]
+        eeff_t = (er + 1)/2 + q (er - 1)/2
+        Z0     = Z01(ur) / sqrt(eeff_t)
+
+    The returned `eeff` is `eeff_t`, the permittivity Z0 is built from, so the pair is
+    self-consistent for the coupled model. KiCad additionally *reports* `eeff_t *
+    (Z01(u1)/Z01(ur))^2`, which is a different number (3.0501 against 3.1999 on the 7628 row).
+    An earlier pcbc put that ratio factor into Z0 instead and matched neither this nor pure
+    H&J (55.165 ohm where KiCad gives 54.660 and bare H&J 53.858); the calibration in C.2 is
+    fitted to whatever the bare formula is, so the synthesised widths were and remain JLC's.
+    Valid 0.01 <= w/h <= 100, 1 <= er <= 128, 0.2 % (H&J).
     """
     if w <= 0 or h <= 0 or er < 1:
         raise ValueError(f"microstrip needs w > 0, h > 0, er >= 1; got w={w}, h={h}, er={er}")
     u = w / h
-    if t > 0:
-        th = t / h
-        coth = math.cosh(math.sqrt(6.517 * u)) / math.sinh(math.sqrt(6.517 * u))
-        du1 = (th / math.pi) * math.log(1.0 + 4.0 * math.e / (th * coth * coth))
-        dur = 0.5 * (1.0 + 1.0 / math.cosh(math.sqrt(er - 1.0))) * du1
-        u1 = u + du1
-        ur = u + dur
-    else:
-        u1 = ur = u
-    eeff_t = _hj_eeff(ur, er) * (_hj_z01(u1) / _hj_z01(ur)) ** 2
+    th = t / h if t > 0 else 0.0
+    ur = u + _hj_du(u, th, er)
+    q_t = (2.0 * math.log(2.0) / math.pi) * (th / math.sqrt(ur)) if th > 0 else 0.0
+    q = (1.0 + 10.0 / ur) ** (-_hj_a(ur) * _hj_b(er)) - q_t
+    eeff_t = (er + 1.0) / 2.0 + q * (er - 1.0) / 2.0
     z0 = _hj_z01(ur) / math.sqrt(eeff_t)
     return z0, eeff_t
+
+
+def microstrip_reported_eeff(w: float, h: float, t: float, er: float) -> float:
+    """The effective permittivity KiCad's calculator *displays*: `eeff_t (Z01(u1)/Z01(ur))^2`.
+    Not what Z0 is built from; kept so a number can be checked against the calculator's screen."""
+    u = w / h
+    th = t / h if t > 0 else 0.0
+    u1 = u + _hj_du(u, th, 1.0)
+    ur = u + _hj_du(u, th, er)
+    return microstrip(w, h, t, er)[1] * (_hj_z01(u1) / _hj_z01(ur)) ** 2
 
 
 # ---------------------------------------------------------------------------------------------
@@ -533,6 +558,12 @@ def cpwg(w: float, s: float, h: float, er: float) -> tuple[float, float]:
         raise ValueError(f"cpwg needs w, s, h > 0; got w={w}, s={s}, h={h}")
     k1 = w / (w + 2.0 * s)
     k3 = math.tanh(math.pi * w / (4.0 * h)) / math.tanh(math.pi * (w + 2.0 * s) / (4.0 * h))
+    if k3 >= 1.0 - 1e-12:
+        # Both tanh arguments saturate (w + 2s >= about 24 h): the flanking pour is electrically
+        # far in units of h and the plane below dominates, so the structure IS a microstrip.
+        # Left to K(k3) this raised ValueError, and the bisection in `solve_width` probes
+        # 3.04 mm on its first step, so every CPWG width solve on a thin prepreg crashed.
+        return microstrip(w, h, 0.0, er)
     q1 = _k_ratio(k1)
     q3 = _k_ratio(k3)
     eeff = 1.0 + q3 * (er - 1.0) / (q1 + q3)

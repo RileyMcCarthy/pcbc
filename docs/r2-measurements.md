@@ -76,3 +76,44 @@ c3_usb and ds2 do not route at all.
 Placement did not move: the pads were always inside their footprints' courtyards, so what changed
 is only what the checks and the fanout can see. The two regressions (c3_usb's off-45 and its
 pair's detour) are the honest cost of that, and the pair is KRT's until R2 gives it a pattern.
+
+## S2 — the geometry core, and nothing on any board
+
+`src/pcbc/route_geom.py` is one shape (`hull(pts) + disc(r)`), one distance (`hull_dist2`, squared
+so the accept path has no square root) and one path form (0/45/90 by construction). Nothing
+imports it yet, so **every board is byte-identical to S1b** and no copper-bar number moves; the
+ceilings in `tests/test_examples_fab.py` and `test_copper_bar.py` are unchanged.
+
+What was measured rather than assumed:
+
+- **The USB-C shield pad's real outline.** `J1.A4B9` on c3_usb draws an eight-point concave
+  `gr_poly` spanning **0.599974 x 1.299997 mm** with a `(width 0.1)` stroke — 0.7 x 1.4 mm of
+  copper against the `(size 0.005 0.005)` the pad declares. Its hull is **six** points, not four:
+  the export's own 25 nm wiggles are real hull vertices. Pinned in
+  `test_a_custom_primitive_is_the_hull_of_its_points_plus_half_its_stroke`.
+- **The random corpus the property tests run on.** 2000 seeded shape pairs, placed so the answer
+  is a decision and not a foregone conclusion: **614 overlap, 293 sit within 0.2 mm of each other
+  and 445 more between 0.2 and 0.5 mm**; 1132 of the 2000 clear their requirement. A corpus
+  scattered at random over a board answers "obviously yes" nine times in ten, so the generator
+  targets the gap and the test asserts the shape of the distribution it got.
+- **The 16-point ceiling, and what reducing to it costs.** An outline with more hull vertices
+  than `Shape` holds is reduced by deleting the edge that adds the least area and extending its
+  neighbours to meet — never by dropping a vertex, which would make the shape a subset. Rounding
+  that meeting point to the nearest nanometre puts the two vertices it replaces a hair *outside*
+  the new edges, and the containment backstop then sent every reduction to the bounding box: a
+  32-point ring came back as its 4.0 mm2 box instead of a 3.16 mm2 hexadecagon. The new vertex is
+  now searched outward from the rounded point with exact integer predicates, at most 8 nm. Over
+  ~800 000 calls on seeded rings and ellipses of 17 to 999 points, **46 % need no push, 53 % need
+  one nanometre and 1.9 % need 2 to 8**; the 0.03 % that find nothing simply lose that edge to
+  another one. A 200-gon of area 3.1411 reduces to **3.1897**, against 4.0 for the box.
+- **The quantisation cost.** Rounding a coordinate to the nearest nanometre can leave a shape up
+  to 0.5 nm inside its true copper when the input was not already on the grid. `EPS_MM` is 100 nm
+  of one-sided margin on top — two hundred times the worst case — and everything read out of a
+  board file is already on the grid, where `q` is the identity.
+
+`tests/fixtures/geom_vectors.json` holds 2000 shape pairs with their exact squared distances,
+gaps and verdicts (468 KB, one case per line). R3's Rust port replays it unchanged; regenerate it
+with `PCBC_WRITE_GEOM_VECTORS=1 pytest tests/test_route_geom.py -k vectors`.
+
+`free_intervals` (A.8) is named in A.1's module surface but takes a `Scene`, which S3 owns, so it
+lands with `route_scene.py` rather than here.

@@ -446,16 +446,20 @@ PRE = ("hop",)
 step, run **after** the hops so `fanout._excluded` can drop the nets the hops claimed — a closed
 row's lane is better spent on the hop that needed it than on a via the hop then has to start from."""
 
-POST = ()
-"""The post stage — `tap` (B.3), then `guard` and `stitch` (B.6). Empty in S4, and `route.py` does not
-call it yet: C.1 puts it between KRT's `planes` and `signals` steps, which is S5's file to change.
-`pattern_copper` already takes the argument, so S5 adds `tap` here and one call there."""
+POST = ("tap",)
+"""The post stage, in C.1's order. `tap` (B.3) is S5's; `guard` and `stitch` (B.6) are S8's and are
+fixture-only, because no example declares `Guard()`.
+
+It runs between KRT's `planes` and `signals` steps in both stackups, which is a measured choice and
+not a tidy one: of the four orderings the design tried on node, taps before KRT boxed the USB pair in
+(detour 1.72 -> 1.83) and taps after the signals left **21 unconnected** pads, because the signals had
+taken every tap site. C.1's table has all four."""
 
 
 def _modules() -> dict:
-    from . import hop
+    from . import hop, tap
 
-    return {"hop": hop}
+    return {"hop": hop, "tap": tap}
 
 
 def pattern_copper(

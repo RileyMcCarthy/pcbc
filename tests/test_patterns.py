@@ -35,11 +35,13 @@ from pcbc.patterns import (
     terminals,
 )
 from pcbc.patterns.hop import DETOUR_MAX, HOP_MM, specs as hop_specs
+from pcbc.patterns.tap import TAP_REACH_MM, anchor, specs as tap_specs, tap_via
 from pcbc.route import bar_key, krt_plan, pin_copper_ids, write_fab_overrides
-from pcbc.route_emit import piece_key
+from pcbc.route_emit import piece_key, seg_piece, via_piece, write_pieces
 from pcbc.route_geom import MICRO_MM, is_octilinear, legs_ok, q, seg_lengths, turn_ok
-from pcbc.route_scene import Exit, blocked, build_scene, pad_exits
-from pcbc.route_verify import paths_of, verify_copper
+from pcbc.route_geom import track_shape
+from pcbc.route_scene import Exit, Item, blocked, build_scene, pad_exits
+from pcbc.route_verify import POUR_CELL_MM, in_zone, paths_of, plane_checks, plane_islands, pour_raster, verify_copper, zones
 
 ROOT = Path(__file__).resolve().parent.parent
 EXAMPLES = ROOT / "examples"
@@ -67,6 +69,26 @@ def _plan(name: str):
     job = compile_design(design)
     text = _placed(name).read_text()
     return pattern_copper(design, job, job.constraints, text, _uuid_name(name)), design, job, text
+
+
+def _post(name: str):
+    """The post stage over the **placed** board.
+
+    On a real build the post stage reads the board KRT has routed as far as its `planes` step (C.1),
+    which is why the tap counts here and the ones `test_examples_fab.py` pins are not the same number:
+    on node 64 pads are tappable on the bare placed board and 62 once the pair and the constrained
+    nets are down. The placed board is the deterministic input a unit test can pin, and the build
+    numbers are pinned where they are measured, each with its own reference.
+    """
+    design = load_board(_board(name))
+    job = compile_design(design)
+    text = _placed(name).read_text()
+    return pattern_copper(design, job, job.constraints, text, _uuid_name(name), stage="post"), design, job, text
+
+
+def _ctx(name: str, stage: str = "post"):
+    scene, design, job, _t = _scene(name)
+    return PatternCtx(scene=scene, design=design, job=job, cs=job.constraints, board=name, stage=stage)
 
 
 def _scene(name: str):
@@ -518,11 +540,18 @@ def test_the_stage_is_fast_enough_to_run_on_every_build():
 
 # --- the DS2 Addon's own bar, recorded for the first time -----------------------------------------
 
-DS2_BAR = {"segments": 340, "vias": 28, "off45": 11, "micro": 118, "mm": 509.9, "detour": 3.23}
+DS2_BAR = {"segments": 310, "vias": 19, "off45": 11, "micro": 91, "mm": 507.4, "detour": 3.23}
 """The only board here drawn for a real order, and the only one `test_examples_fab.py` cannot hold:
 it lives outside this repo. S1 said its ceilings would be recorded and they never were, so they are
-recorded here — measured 2026-09-20 from a fresh build, `docs/r2-measurements.md` S4. Every number is
-a ceiling except the census and the refusals, which are exact."""
+recorded here — measured 2026-09-20 from a fresh build, `docs/r2-measurements.md` S5. Every number is
+a ceiling except the census and the refusals, which are exact, and `vias` is now `vias_leftover`
+(D.4's split: a tap via is the point of the pattern, so pinning the total pins the wrong thing).
+
+Every one of them improves at S5 or holds, and every one is tightened here in the same commit:
+340 -> 310 segments, 118 -> 91 micro segments, 509.9 -> 507.4 mm, off-45 and the detour held, and the
+ceiling is now the leftover router's 19 vias rather than the board's 28 total. ds2's `GND` carries
+only five pads — its ground is mostly `VSS`, which has no pour — so two
+taps do all of that by taking `C5.2` and `C6.2` off KRT's list."""
 
 
 @pytest.mark.kicad
@@ -542,12 +571,25 @@ def test_the_ds2_addon_builds_to_fab_with_its_hops_in_it(tmp_path: Path):
     route = next(s for s in result["steps"] if s.get("stage") == "route")
     assert route["unrouted"] == [] and route["copper"] == "verified", route["unrouted"]
     t = route["copper_bar"]["totals"]
-    for key, want in (("segments", "segments"), ("vias", "vias"), ("off45", "off45"), ("micro", "micro")):
-        assert t[key] <= DS2_BAR[want], (key, t[key], DS2_BAR[want], route["copper_bar"]["lines"])
+    for key, got in (("segments", t["segments"]), ("vias", t["vias_leftover"]), ("off45", t["off45"]), ("micro", t["micro"])):
+        assert got <= DS2_BAR[key], (key, got, DS2_BAR[key], route["copper_bar"]["lines"])
     assert t["routed_mm"] <= DS2_BAR["mm"] and t["worst_detour"][1] <= DS2_BAR["detour"] + 0.05, (t["worst_detour"], t["routed_mm"])
     assert route["refused"] == {"hop": 5}, route["refused"]
+    assert t["vias_pattern"] == {"fanout": 9, "tap": 2}, (t["vias_pattern"], "D.4: exact per reason")
     owns = {r: (v["segments"], v["vias"]) for r, v in t["by_reason"].items() if r != "leftover"}
-    assert owns == {"fanout": (9, 9), "hop": (10, 0)}, (owns, route["copper_bar"]["lines"])
+    assert owns == {"fanout": (9, 9), "hop": (10, 0), "tap": (2, 2)}, (owns, route["copper_bar"]["lines"])
+    # D.5 on the one board here drawn for a real order: the pour is still one island, every tap via
+    # is inside it, and there is not a via in a pad anywhere.
+    from pcbc.fab import via_in_pad, via_in_pad_blockers
+    from pcbc.route_emit import read_sidecar, via_piece
+    from pcbc.route_verify import plane_checks, plane_islands
+
+    routed = (tmp_path / "ds2" / "layout" / "ds2_addon" / "routed" / "layout.kicad_pcb").read_text()
+    doc = read_sidecar(tmp_path / "ds2" / "layout" / "ds2_addon" / "routed" / "copper.json")
+    vias = [via_piece(i["net"], i["reason"], tuple(i["key"][1]), 0.0, 0.1, owner=i["owner"]) for i in doc.items if i["key"][0] == "via"]
+    assert plane_islands(routed) == {("GND", "B.Cu"): 1}, plane_islands(routed)
+    assert plane_checks(routed, vias) == [] and via_in_pad_blockers(via_in_pad(routed)) == []
+    assert sorted(i["owner"] for i in doc.items if i["reason"] == "tap" and i["key"][0] == "via") == ["C5.2", "C6.2"], doc.items
 
 
 def test_strict_patterns_makes_every_refusal_fatal(monkeypatch):
@@ -561,3 +603,377 @@ def test_strict_patterns_makes_every_refusal_fatal(monkeypatch):
     monkeypatch.setenv("PCBC_STRICT_PATTERNS", "1")
     assert hard_refusals(plan) == plan.refusals(), "under --strict-patterns every refusal is fatal"
     assert plan.counts() == {"hop": 2}, plan.counts()
+
+
+# --- B.3: the tap ---------------------------------------------------------------------------------
+#
+# S5. Every number below was measured on 2026-09-20 and is recorded in `docs/r2-measurements.md`
+# (S5); each assertion carries its reference, so a drift names the rule it left rather than a bare
+# number that moved.
+
+TAPS = {"blinky": 1, "buck": 6, "c3_usb": 38, "node": 64, "ds2": 3}
+"""How many SMD plane pads each board's post stage taps on the **placed** board (`_post`'s note on
+why that is not the build's number). node's 64 is the corrected census: `docs/r2-design.md` B.3 says
+72, counted per `(pad ...)` block, and KiCad writes `U1`'s QFN thermal pad as nine separate blocks
+all numbered 49 and each USB-C shield as several `gr_poly` primitives — so the board has 69 plane
+**pads** (64 SMD, 5 through-hole), not 77."""
+
+SKIPPED = {"blinky": 0, "buck": 2, "c3_usb": 4, "node": 5, "ds2": 2}
+"""Through-hole plane pads, skipped with a printed reason (B.3). The barrel already reaches every
+copper layer, so the zone connects it and a tap would be a second hole for nothing."""
+
+
+def test_every_smd_pad_on_a_plane_net_gets_a_via_of_its_own():
+    """B.3, and H.2's decision: one via per pad, not per component and not clustered.
+
+    It is the electrical answer a four-layer board exists for — every SMD ground pad over a ground
+    plane gets its own via — and the via *count* objection is answered by splitting the copper bar
+    (D.4), not by holding forty-seven ground pads off the ground plane. `TAP_JOIN_MM` clustering is a
+    named non-goal with no measurement behind its constant (H.2).
+    """
+    for name in ALL:
+        plan, _d, _j, _t = _post(name)
+        vias = [p for p in plan.pieces if p.kind == "via" and p.reason == "tap"]
+        stubs = [p for p in plan.pieces if p.kind == "seg" and p.reason == "tap"]
+        assert len(vias) == len(stubs) == TAPS[name], (name, len(vias), TAPS[name], "docs/r2-measurements.md S5")
+        assert len({v.owner for v in vias}) == len(vias), (name, "one via per pad: two vias on one pad is clustering by accident")
+
+
+def test_a_through_hole_plane_pad_is_skipped_and_the_report_says_why():
+    """B.3: a through-hole pad's barrel already reaches every copper layer, so the zone connects it.
+    It is a printed note and not an omission — "there is no via on J1.1" is the kind of silence the
+    gate turns into an unconnected item nobody expected."""
+    plan, _d, _j, _t = _post("c3_usb")
+    notes = [n for n in plan.notes if "through-hole" in n]
+    assert len(notes) == SKIPPED["c3_usb"], (notes, "docs/r2-measurements.md S5")
+    assert notes[0] == (
+        "style: tap GND: J1.1 has no via of its own - a through-hole pad: its barrel already reaches "
+        "B.Cu, so the zone connects it and a tap would be a second hole for nothing"
+    ), notes[0]
+    for name in ALL:
+        plan, _d, _j, _t = _post(name)
+        assert len([n for n in plan.notes if "through-hole" in n]) == SKIPPED[name], (name, plan.notes)
+
+
+def test_a_pad_already_welded_to_the_plane_is_not_tapped_twice():
+    """B.3: a closed row's escape via is a tap that has already happened — it spans F.Cu to B.Cu, so
+    it lands in the plane on the way. Asked of the copper (`_welded` is `route_scene.components`'
+    union-find turned round), never declared, so it is true of whatever copper is down."""
+    design = load_board(_board("c3_usb"))
+    job = compile_design(design)
+    text = _placed("c3_usb").read_text()
+    bare = pattern_copper(design, job, job.constraints, text, "c3_usb", stage="post")
+    pre = pattern_copper(design, job, job.constraints, text, "c3_usb", stage="pre")
+    fan, _n = fanout_pieces(design, job, pre.text, "c3_usb", pre.scene, claimed=pre.claimed)
+    withfan = pattern_copper(design, job, job.constraints, write_pieces(pre.text, fan), "c3_usb", stage="post")
+    tapped = {p.owner for p in withfan.pieces if p.kind == "via"}
+    assert {p.owner for p in bare.pieces if p.kind == "via"} - tapped == {"U2.2", "U3.2"}, (
+        "U2.2 and U3.2 carry an escape via once the fanout has run, and a second hole beside it welds nothing new"
+    )
+    assert [n for n in withfan.notes if "already welded" in n] == [
+        "style: tap GND: U2.2 has no via of its own - already welded to B.Cu by copper that is down (an escape via is a tap that has happened)",
+        "style: tap GND: U3.2 has no via of its own - already welded to B.Cu by copper that is down (an escape via is a tap that has happened)",
+    ], withfan.notes
+
+
+def test_a_tap_via_is_the_smallest_via_that_carries_one_pads_share():
+    """The owner's stand-in overruled B.0's branch rule and H.1 with the arithmetic R1 compiled: the
+    smallest via whose current rating covers **one pad's share** of the net's current, capped at the
+    net's class via.
+
+    Measured, and the margin is why it matters: node's `GND` asks 1 A across 47 SMD pads, so a pad's
+    share is 0.0213 A against the 0.527 A one 0.2 mm barrel carries at 10 C — a factor of 24. The cap
+    is what keeps node routable: at the Power class's 0.8 mm ring two taps need 1.0 mm between
+    centres and node's pads are not 1.0 mm apart.
+
+    The middle branch — the class via chosen because it *covers* where the stackup via does not — is
+    unreachable on all five boards, and that is arithmetic rather than luck: it needs a share in
+    (0.527, 0.871] A on four layers or (0.707, 0.871] on two, and no board's amps divided by a whole
+    number of pads lands there (buck's 2 A over 2 pads is 1.0, over 3 is 0.667). Swept below so a
+    board that does reach it is not a surprise.
+    """
+    from pcbc.stackup import via_amps
+
+    want = {"blinky": (0.5, 0.3), "buck": (0.5, 0.3), "c3_usb": (0.5, 0.3), "node": (0.35, 0.2), "ds2": (0.5, 0.3)}
+    for name in ALL:
+        ctx = _ctx(name)
+        stack = ctx.scene.stack
+        for net in sorted(ctx.scene.plane_of):
+            c = ctx.cs.by_net(net)
+            cap = (c.via.diameter_mm, c.via.drill_mm)
+            pads = len([s for s in tap_specs(ctx) if not s.skip and s.pad.net == net])
+            size, why, share = tap_via(ctx.scene, ctx.cs, net, max(pads, 1))
+            assert size == want[name], (name, net, size, want[name], "docs/r2-measurements.md S5")
+            assert size[1] <= cap[1], (name, net, size, cap, "the class via is the cap, never exceeded")
+            assert why.startswith("the fab's standard via"), (name, net, why)
+            # The rule itself, over every pad count these nets could have: the smallest covering size,
+            # and the cap when nothing covers.
+            for n in range(1, 120):
+                got, _w, sh = tap_via(ctx.scene, ctx.cs, net, n)
+                smaller = [s for s in ((stack.via_diameter, stack.via_drill), cap) if s[1] < got[1]]
+                assert all(via_amps(s[1], stack.via_plating_mm) + 1e-9 < sh for s in smaller), (name, net, n, got)
+                assert via_amps(got[1], stack.via_plating_mm) + 1e-9 >= sh or got == cap, (name, net, n, got, sh)
+
+
+def test_a_tap_leaves_its_pad_by_fanouts_own_distance_and_is_exactly_axis_aligned():
+    """B.3's geometry is `fanout.py`'s, to the digit: half the pad, the fab's `clearance_min`, half
+    the via. The two have to agree — an escape via and a tap are the same via in the same place for
+    the same reason — and the stub keeps the pad centre's other coordinate **exactly**, which is what
+    A.5 rule 1 is about and what S1 fixed for the escapes."""
+    for name in ALL:
+        plan, _d, _j, _t = _post(name)
+        scene = plan.scene
+        specs = {s.pad.owner: s for s in tap_specs(_ctx(name))}
+        for stub in [p for p in plan.pieces if p.kind == "seg" and p.reason == "tap"]:
+            assert stub.a[0] == stub.b[0] or stub.a[1] == stub.b[1], (name, stub, "A.5: a tap stub is an axis and nothing else")
+            spec = specs[stub.owner]
+            box = spec.pad.item.box()
+            horizontal = stub.a[1] == stub.b[1]
+            half = (box[2] - box[0]) / 2.0 if horizontal else (box[3] - box[1]) / 2.0
+            via = next(p for p in plan.pieces if p.kind == "via" and p.owner == stub.owner)
+            d = abs((stub.b[0] - stub.a[0]) if horizontal else (stub.b[1] - stub.a[1]))
+            first = half + scene.stack.clearance_min + via.w / 2.0
+            steps = round((d - first) / scene.grid, 6)
+            assert d + 1e-9 >= first and abs(steps - round(steps)) < 1e-6 and 0 <= round(steps) <= TAP_REACH_MM / scene.grid + 1e-9, (
+                name, stub.owner, d, first, "B.3: the first site is fanout's distance and every other is a whole grid step further out"
+            )
+            # The stub starts at the centre of the ONE primitive it leaves from, which is copper, and
+            # the half extent above is that primitive's. `Terminal.at` — the centre of everything the
+            # owner draws — is a different point for the two pads that draw more than one shape, and
+            # taking it emitted `(10.275,10.8139) -> (12.25,7.85)` on node: a diagonal, which is what
+            # the self-check refused. c3_usb's `U1.49` is the same case, nine blocks 3.95 mm apart.
+            assert stub.a == anchor(spec) == spec.pad.item.at(), (name, stub.owner, anchor(spec), spec.pad.at)
+            inside = spec.pad.item.box()
+            assert inside[0] <= stub.a[0] <= inside[2] and inside[1] <= stub.a[1] <= inside[3], (name, stub.owner, "and it is on that primitive")
+
+
+def test_a_tap_is_tried_outward_first_and_one_step_further_only_when_it_has_to_be():
+    """B.3's candidate order, and it is not cosmetic: with distance first the first candidate for a
+    passive's pad sits **between** the passive's own two pads (`C_VBUS.2` blocked by `C_VBUS.1`,
+    `R_CC1.2` by `R_CC1.1`), so the cheap site is the one that cannot work. The count is bounded and
+    declared: `4 x (1 + floor(TAP_REACH_MM / grid))` — 64 on four layers, 124 on two."""
+    from pcbc.patterns.tap import _sites
+
+    for name, want in (("node", 64), ("c3_usb", 124)):
+        ctx = _ctx(name)
+        spec = next(s for s in tap_specs(ctx) if not s.skip)
+        sites = _sites(ctx, spec)
+        assert len(sites) == want, (name, len(sites), want, "B.3: 4 sides x (1 + floor(TAP_REACH_MM / grid)) sites")
+        sides = [s[0] for s in sites]
+        assert sides[: want // 4] == [sides[0]] * (want // 4), "every step of one side before the next side: outward first, distance second"
+        assert [s[2] for s in sites[: want // 4]] == list(range(want // 4)), "and the steps out in order"
+        assert sorted(set(sides)) == ["down", "left", "right", "up"], sides
+
+
+def test_no_tap_via_sits_inside_a_pad():
+    """The fab stage refuses a via whose copper sits inside a passive's pad outright — it wicks the
+    joint — and A.4 rule 1 does not ask the question, because it skips a same-net pair. So the tap
+    asks it itself, of every pad of its own net, at the number `route.py` already hands KRT as
+    `--same-net-pad-clearance` (`docs/copper-plan.md`, and `fab.via_in_pad_blockers`)."""
+    from pcbc.fab import via_in_pad, via_in_pad_blockers
+    from pcbc.route_geom import clears
+
+    for name in ALL:
+        plan, _d, _j, _t = _post(name)
+        text = write_pieces(_placed(name).read_text(), plan.pieces)
+        assert via_in_pad(text) == [] and via_in_pad_blockers(via_in_pad(text)) == [], (name, via_in_pad(text))
+        need = plan.scene.table.via_to_same_net_smd_pad()
+        for via in [p for p in plan.pieces if p.kind == "via"]:
+            ring = plan.scene.item_of(via).copper
+            for it in plan.scene.items:
+                if it.kind == "pad" and it.net == via.net and it.owner != via.owner and it.copper is not None:
+                    assert clears(ring, it.copper, need), (name, via.owner, it.owner, "a tap clears every other pad of its own net")
+
+
+def test_two_taps_keep_the_fabs_hole_to_hole_and_so_does_a_mounting_hole():
+    """A.4 rule 3, which does **not** skip a same-net pair: two holes are a drilling constraint
+    whatever they are connected to, and `rule_severities.hole_to_hole` is `error` in every example
+    `.kicad_pro` where KiCad's own default is a warning. Edge to edge, so two 0.2 mm drills need
+    0.7 mm between centres on four layers and two 0.3 mm drills need 0.8 mm on two.
+
+    With 64 taps on node this is the binding constraint, and `J1`'s four NPTH mounting holes on the
+    USB-C boards are in it: they have no pad number and no copper at all, so every caller that walks
+    `foot.pads` drops them — the scene carries them as `hole` items precisely so this check sees them.
+    """
+    import math
+
+    for name in ALL:
+        plan, _d, _j, _t = _post(name)
+        scene = plan.scene
+        h2h = scene.table.hole_to_hole()
+        vias = [p for p in plan.pieces if p.kind == "via"]
+        for i, a in enumerate(vias):
+            for b in vias[i + 1 :]:
+                gap = math.dist(a.a, b.a) - a.drill / 2 - b.drill / 2
+                assert gap >= h2h, (name, a.owner, b.owner, round(gap, 4), h2h, "A.4 rule 3, edge to edge")
+        holes = [it for it in scene.items if it.kind == "hole" and it.hole is not None]
+        assert not holes or name in ("c3_usb", "node", "ds2", "buck"), name
+        for via in vias:
+            for it in holes:
+                b = it.box()
+                r = (b[2] - b[0]) / 2.0
+                gap = math.dist(via.a, ((b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0)) - r - via.drill / 2
+                assert gap >= h2h - 1e-9, (name, via.owner, it.owner, round(gap, 4), h2h)
+
+
+def test_the_post_stage_runs_between_the_planes_and_the_signals():
+    """C.1, and the order is measured rather than tidy: of the four orderings the design tried on
+    node, taps before KRT boxed the USB pair in (1.72 -> 1.83) and taps after the signals left 21
+    pads unconnected, because the signals had taken every tap site. It is a step of the plan, in the
+    same shape as a KRT step, so the chain, the step files and `blocking.step_boards` all work on it
+    unchanged."""
+    from pcbc.route import PCBC_STEP
+
+    for name, want in (
+        ("node", ["local_hops", "analog_nets", "pair_usb_dn", "planes", "patterns_post", "plane_taps", "signals"]),
+        ("c3_usb", ["local_hops", "pair_usb_dn", "patterns_post", "signals", "gnd_pour", "finalize"]),
+    ):
+        design = load_board(_board(name))
+        job = compile_design(design)
+        plan, _d, _j, _t = _plan(name)
+        steps = krt_plan(job, design, _placed(name), Path("work"), Path("/krt"), plan, post=True)
+        assert [n for n, _ in steps] == want, (name, [n for n, _ in steps])
+        post = dict(steps)["patterns_post"]
+        assert post[0] == PCBC_STEP and post[4].endswith(("planes.kicad_pcb", "pair_usb_dn.kicad_pcb")) and post[5].endswith("patterns_post.kicad_pcb"), post
+        prev = str(_placed(name))
+        for n, cmd in steps:
+            assert cmd[4] == prev, (name, n, cmd[4], prev)
+            prev = cmd[5]
+    plain = [n for n, _ in krt_plan(compile_design(load_board(_board("node"))), load_board(_board("node")), _placed("node"), Path("w"), Path("/krt"))]
+    assert "patterns_post" not in plain, "`PCBC_PATTERNS=off` passes post=False, and the plan is then the pre-R2 one exactly (C.6)"
+
+
+def test_krts_tap_step_runs_only_for_the_nets_the_pattern_refused():
+    """C.4: KRT's `plane_taps` welds the pads pcbc could not, and does not run at all when there are
+    none. A pad the tap pattern **skipped** is not a refusal — a through-hole pad's barrel already
+    reaches the plane — so a skip never brings the step back."""
+    from pcbc.route import _with_nets
+
+    design = load_board(_board("node"))
+    job = compile_design(design)
+    plan, _d, _j, _t = _plan("node")
+    taps = dict(krt_plan(job, design, _placed("node"), Path("work"), Path("/krt"), plan, post=True))["plane_taps"]
+    i = taps.index("--nets")
+    assert taps[i + 1 : i + 3] == ["GND", "3V3"], taps
+    cut = _with_nets(taps, ["GND"])
+    j = cut.index("--nets")
+    assert cut[j : j + 3] == ["--nets", "GND", "--layers"], cut
+    assert cut[:j] == taps[:i] and cut[j + 2 :] == taps[i + 3 :], "only the net list changes; every other flag is the plan's"
+
+
+def test_a_tap_the_pour_cannot_reach_is_refused_before_it_is_written():
+    """D.5, and it is what makes the two-layer order safe at all: `krt_plan` writes the back pour as
+    `gnd_pour`, **after** the signals, so a tap is placed into a board whose pour has not been poured.
+    A via the fill retreats from connects nothing, and under `island_removal_mode 0` the fragment is
+    deleted rather than kept, so the pad it was welding becomes an unconnected item the gate fails on.
+
+    The raster is built from the copper already down, with every foreign item dilated by what the
+    pour owes it, and the pour is the largest free region. A cell counts as blocked when an obstacle
+    touches any part of it, so a coarser cell blocks more and the error refuses a tap that would have
+    worked rather than accepting one that would not.
+    """
+    scene, _d, _j, _t = _scene("blinky")
+    outer = pour_raster(scene, "GND", "B.Cu")
+    assert outer.cell == POUR_CELL_MM and outer.free, "the board is mostly free copper before anything is routed"
+    assert outer.reaches((20.0, 12.5), 0.25), "the middle of an empty board is reachable"
+    ring = []
+    for a, b in (((18.0, 10.0), (22.0, 10.0)), ((22.0, 10.0), (22.0, 15.0)), ((22.0, 15.0), (18.0, 15.0)), ((18.0, 15.0), (18.0, 10.0))):
+        ring.append(Item(0, "track", "VCC", frozenset({"B.Cu"}), track_shape(a, b, 0.5), None, None, "VCC fence"))
+    scene.add(ring)
+    delattr(scene, "_pour_cache")
+    fenced = pour_raster(scene, "GND", "B.Cu")
+    assert not fenced.reaches((20.0, 12.5), 0.25), "a closed fence of foreign copper is a pocket the pour never floods"
+    assert fenced.reaches((5.0, 5.0), 0.25), "and the rest of the board is untouched"
+
+
+def test_the_plane_a_tap_lands_in_is_still_one_island():
+    """D.5's first half, asked of the arbiter's own answer. KiCad writes one `(filled_polygon ...)`
+    per island, so the count is the number that matters: a plane that was one island and is now two
+    has had a fragment cut off, and `island_removal_mode 0` deletes it rather than keeping it — which
+    turns a pad whose only connection was that fragment into an unconnected item.
+
+    The check runs once per plane layer a via **crosses**, not once for the tapped net: every R2 via
+    is a through via, so a GND tap punches a clearance hole in the 3V3 plane on In2.Cu as well as
+    landing in the GND plane on In1.Cu, and it is the foreign plane a tap can quietly cut in two.
+    """
+    text = (
+        '(kicad_pcb\n\t(zone\n\t\t(net "GND")\n\t\t(layer "In1.Cu")\n'
+        "\t\t(filled_polygon\n\t\t\t(layer \"In1.Cu\")\n\t\t\t(pts\n\t\t\t\t(xy 0 0) (xy 10 0) (xy 10 10) (xy 0 10)\n\t\t\t)\n\t\t)\n"
+        "\t\t(filled_polygon\n\t\t\t(layer \"In1.Cu\")\n\t\t\t(pts\n\t\t\t\t(xy 20 0) (xy 30 0) (xy 30 10) (xy 20 10)\n\t\t\t)\n\t\t)\n\t)\n)\n"
+    )
+    assert plane_islands(text) == {("GND", "In1.Cu"): 2}, "two filled polygons are two islands"
+    z = zones(text)[0]
+    assert in_zone(z, (5.0, 5.0)) and in_zone(z, (25.0, 5.0)) and not in_zone(z, (15.0, 5.0))
+    via = seg_piece("GND", "tap", "F.Cu", (0.0, 0.0), (1.0, 0.0), 0.2)  # a seg is never checked
+    assert plane_checks(text, [via]) == []
+    assert plane_checks(text, [via_piece("GND", "tap", (15.0, 5.0), 0.35, 0.2, owner="U1.1")]) == [
+        "tap GND: the via at (15,5) for U1.1 is not inside the GND plane on In1.Cu"
+    ]
+    assert plane_checks(text, [via_piece("GND", "tap", (5.0, 5.0), 0.35, 0.2, owner="U1.1")]) == []
+
+
+def test_a_tap_refusal_is_a_move():
+    """C.6 and B.3: soft, because the fall-through is exact — `route.py` runs KRT's own `plane_taps`
+    for the nets a pad of which was refused. The sentence names the blockers worst first (the second
+    is usually the reason the first cannot simply be moved), the rule of A.4 that decided each, the
+    number it measured against the number it needed, what it tried, and two `board.py` edits.
+
+    Pinned verbatim from the build, not from the placed board: on the placed board every pad of node
+    still has a site, and this refusal exists because the USB pair and the constrained nets are down
+    by the time the post stage runs (`docs/r2-measurements.md` S5).
+    """
+    ctx = _ctx("node")
+    spec = next(s for s in tap_specs(ctx) if s.pad.owner == "C_VBUS.2")
+    # A fixture, and it says so: the walls are wide enough to cover every one of the 64 sites, which
+    # is what the real board does to this pad by the time the post stage runs. The build's own
+    # sentence for the same pad is pinned in `test_node_builds_with_its_taps_in_the_plane`.
+    cx, cy = spec.pad.at
+    fence = [
+        Item(0, "track", "USB_DN", frozenset({"F.Cu"}), track_shape((cx - 1.3, cy - 3.0), (cx - 1.3, cy + 3.0), 2.0), None, None, "USB_DN track on F.Cu"),
+        Item(0, "track", "USB_DN", frozenset({"F.Cu"}), track_shape((cx + 1.3, cy - 3.0), (cx + 1.3, cy + 3.0), 2.0), None, None, "USB_DN track on F.Cu"),
+        Item(0, "track", "USB_DP", frozenset({"F.Cu"}), track_shape((cx - 3.0, cy - 1.3), (cx + 3.0, cy - 1.3), 2.0), None, None, "USB_DP track on F.Cu"),
+        Item(0, "track", "USB_DP", frozenset({"F.Cu"}), track_shape((cx - 3.0, cy + 1.3), (cx + 3.0, cy + 1.3), 2.0), None, None, "USB_DP track on F.Cu"),
+    ]
+    ctx.scene.add(fence)
+    from pcbc.patterns import tap as tap_mod
+
+    res = tap_mod.run(ctx, spec)
+    assert res.pieces == () and res.refusal is not None and not res.refusal.hard, res
+    assert res.refusal.move.splitlines()[0] == (
+        "tap GND: C_VBUS.2 at (23.545,29.85) cannot reach the GND plane on In1.Cu with a 0.35/0.2 via "
+        "(the fab's standard via: 0.527 A carries this pad's 0.0213 A of GND's 1 A across 47 pads)."
+    ), res.refusal.move
+    assert res.refusal.move.splitlines()[-1].startswith("  Moves: Place(\"C_VBUS\", toward="), res.refusal.move
+    assert "Tried 64 sites (4 sides, 16 distances 0.1 mm apart)" in res.refusal.move, res.refusal.move
+    assert "(rule: copper)" in res.refusal.move and "worst first" in res.refusal.move, res.refusal.move
+
+
+def test_a_tap_of_the_wrong_size_fails_the_self_check():
+    """D.1 item 5, now that the rule is the arithmetic and not "the stackup's": the checker asks
+    `patterns.tap.tap_via` the same question the pattern asked, so the two cannot drift apart. The
+    divisor is the vias actually emitted, which can only be fewer than the pads the pattern set out
+    to tap — so a via that passes here would have passed there too."""
+    plan, _d, job, _t = _post("node")
+    assert verify_copper(plan.scene, plan.pieces, job.constraints, ids=plan.ids) == [], "node's own taps"
+    bad = via_piece("GND", "tap", (30.0, 22.0), 0.8, 0.4, owner="U1.1")
+    out = verify_copper(plan.scene, list(plan.pieces) + [bad], job.constraints, ids=plan.ids)
+    assert [line for line in out if "branch rule" in line] == [
+        "tap GND: a 0.8/0.4 via where B.0's branch rule says 0.35/0.2 (the fab's standard via: 0.527 A "
+        "carries this pad's 0.0208 A of GND's 1 A across 48 pads)"
+    ], out
+    alone = verify_copper(plan.scene, [bad], job.constraints)
+    assert [line for line in alone if "branch rule" in line] == [], (
+        "one via on the net is one via carrying the whole 1 A, which is past the 0.871 A a class via "
+        "carries: the cap is then the answer and 0.8/0.4 is it"
+    )
+
+
+def test_the_post_stage_checks_its_own_copper_and_is_fast_enough():
+    """D.1 runs unconditionally at the end of **each** stage, and F.3 item 8's budget is the two
+    stages together: at most 2.0 s on node and ds2, 0.3 s on blinky. The two-layer boards pay for the
+    pour raster and are the ones to watch."""
+    budget = {"blinky": 300, "buck": 2000, "c3_usb": 2000, "node": 2000, "ds2": 2000}
+    for name in ALL:
+        plan, _d, job, _t = _post(name)
+        assert verify_copper(plan.scene, plan.pieces, job.constraints, ids=plan.ids) == [], name
+        assert plan.wall_ms <= budget[name], (name, plan.wall_ms, budget[name])

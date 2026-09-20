@@ -36,6 +36,14 @@ if TYPE_CHECKING:  # `patterns` sits on top of `route_scene`/`route_emit`, never
 KRT_REPO = "https://github.com/drandyhaas/KiCadRoutingTools.git"
 KRT_SHA = "3244726b2c15668fb109a0bb24384750a054af40"
 
+PCBC_STEP = "pcbc"
+"""What stands in a step command's first slot when the step is pcbc's own and not a KRT process.
+
+The rest of the command keeps every position a KRT step keeps: the board it reads in slot 4, the
+board it writes in slot 5. So the plan stays one list of steps, `test_route_plan.py`'s chain
+assertion reads it unchanged, the step files number and sort in run order, and `blocking.step_boards`
+names `patterns_post` as the step that placed a tap without knowing anything about patterns."""
+
 _UUID = re.compile(r'\(uuid\s+"([^"]*)"\)')
 _COPPER_ITEM = re.compile(r"\n\t\((segment|via|zone|arc)\b")
 
@@ -147,7 +155,7 @@ def lock_copper(text: str, nets: set[str]) -> str:
     return "".join(out)
 
 
-def krt_plan(job: CompiledJob, design: Design, placed: Path, work: Path, home: Path, plan: "PatternPlan | None" = None) -> list[tuple[str, list[str]]]:
+def krt_plan(job: CompiledJob, design: Design, placed: Path, work: Path, home: Path, plan: "PatternPlan | None" = None, post: bool = False) -> list[tuple[str, list[str]]]:
     """(step name, command) pairs. Pure: the same board.py gives the same plan.
 
     `plan` is the `PatternPlan` the pattern stage handed back (C.4). What it changes: `local_hops` is
@@ -155,6 +163,12 @@ def krt_plan(job: CompiledJob, design: Design, placed: Path, work: Path, home: P
     `{class}_nets` step drops the nets patterns finished; and `signals` gains a `!NET` for every one
     of them, belt and braces, since KRT would skip them anyway. Everything else is untouched, so a
     board where patterns fit nothing routes exactly as it did before R2.
+
+    `post` reserves pcbc's own second stage as a step of the plan (C.1): it sits after `planes` and
+    before `plane_taps` and `signals`, on both stackups, and it is a step file like any other so
+    `blocking.step_boards` can name it as the step that placed a piece. It is not a KRT command —
+    `route_job` runs it in process — and it is marked by `PCBC_STEP` in the command's first slot,
+    with the board it reads and the board it writes in the two slots every step keeps them in.
     """
     done = set(plan.done) if plan is not None else set()
     py = str(krt_python(home))
@@ -194,6 +208,15 @@ def krt_plan(job: CompiledJob, design: Design, placed: Path, work: Path, home: P
         if tool != "route_planes.py":
             common.append("--keep-input-copper")  # planes keep it regardless
         steps.append((name, [py, "-X", "utf8", str(router / tool), str(prev), str(out), *args, *common]))
+        prev = out
+
+    def pcbc_step(name: str) -> None:
+        """One of pcbc's own stages, in the same shape as a KRT step: the board it reads in slot 4,
+        the board it writes in slot 5, so the chain, the step files and the stale-file sweep all work
+        on it unchanged. `route_job` runs it in process; nothing is spawned."""
+        nonlocal prev
+        out = work / f"{len(steps) + 1:02d}_{name}.kicad_pcb"
+        steps.append((name, [PCBC_STEP, "-X", "utf8", "patterns", str(prev), str(out), "--stage", "post"]))
         prev = out
 
     # The constrained nets: no vias, or a single layer. Grouped by (layers, class), named nets only.
@@ -274,15 +297,27 @@ def krt_plan(job: CompiledJob, design: Design, placed: Path, work: Path, home: P
     plane_nets = [n for n, _ in job.planes] if job.planes and job.layers > 2 else []
     if plane_nets:
         step("planes", "route_planes.py", ["--nets", *plane_nets, "--plane-layers", *[layer for _, layer in job.planes], "--clearance", _fmt(default_clear)])
-        # The pour placed no tap vias; this welds every pad on a plane net to its plane, alone,
-        # so the same-net keepout the signals step needs never sees these nets.
+
+    # 4. pcbc's post stage: every SMD pad on a plane net welded to its plane by a tap of its own
+    # (B.3), between `planes` and `signals` on both stackups. The order is measured, not tidy: of
+    # the four orderings the design tried on node, taps before KRT boxed the USB pair in and taps
+    # after the signals left 21 pads unconnected, because the signals had taken every tap site
+    # (C.1). On two layers there is no `planes` step and the pour comes last, so the taps go down
+    # before the pour exists and `route_verify.pour_raster` is what makes that safe.
+    if post:
+        pcbc_step("patterns_post")
+
+    if plane_nets:
+        # What the tap pattern refused, and nothing else. KRT's pour places no tap vias; this welds
+        # the pads pcbc could not, alone, so the same-net keepout the signals step needs never sees
+        # these nets. `route_job` skips the step outright when there are no refusals (C.4).
         step("plane_taps", "route.py", ["--nets", *plane_nets, "--layers", *layers, "--track-width", _fmt(stack.track_min), "--max-ripup", "5", "--no-bga-zones", *at_width])
 
-    # 4. Everything else. Power nets at their width.
+    # 5. Everything else. Power nets at their width.
     signals = ["--nets", "*", *[f"!{n}" for n in constrained], *[f"!{n}" for n in plane_nets], *[f"!{n}" for n in sorted(done) if n not in constrained and n not in plane_nets], "--layers", *layers, "--track-width", _fmt(stack.track_min), "--max-ripup", "5", "--no-bga-zones", *at_width]
     step("signals", "route.py", signals)
 
-    # 5. Two layers: pour GND on the back and tie what the pour could not reach.
+    # 6. Two layers: pour GND on the back and tie what the pour could not reach.
     if job.layers <= 2 and "GND" in power:
         step("gnd_pour", "route_planes.py", ["--nets", "GND", "--plane-layers", "B.Cu", "--clearance", _fmt(default_clear)])
         step("finalize", "route.py", signals)
@@ -384,7 +419,7 @@ def route_job(design: Design, placed: Path, *, out: Path, name: str = "board") -
         start = work / "00_patterns_pre.kicad_pcb"
         copy_with_siblings(placed, start)
         start.write_text(write_pieces(plan.text, fan_pieces))
-    steps = krt_plan(job, design, start, work, home, plan)
+    steps = krt_plan(job, design, start, work, home, plan, post=not patterns_off())
     result: dict = {
         "pcb": str(out),
         "router": "krt",
@@ -410,13 +445,72 @@ def route_job(design: Design, placed: Path, *, out: Path, name: str = "board") -
     last: Path | None = None
     failed: dict[str, str] = {}
     unreached: dict[str, list[str]] = {}
+    nets_run: list[str] | None = None  # a step whose net list the run narrowed, for the report
+    # Everything pcbc owns on this board, in emission order: the pre stage plus the post stage once
+    # it has run. It is what `_lost` checks for survival after every KRT step, what keeps its own
+    # uuids through `pin_copper_ids`, and what the copper bar reads a reason off.
+    owned: list = list(pre)
+    post_plan = None
+    current = start
     for step_name, cmd in steps:
+        # The chain is the boards that were actually written, not the ones the plan predicted: a
+        # skipped `plane_taps` leaves a gap, and the next step has to read the board before it.
+        cmd = [*cmd[:4], str(current), *cmd[5:]]
+        produced = Path(cmd[5])
+        if cmd[0] == PCBC_STEP:
+            # The siblings come from the **placed** board, not from the step before it: KRT lowers
+            # the output project's `min_hole_clearance` to the floor it actually routed to (its
+            # `INRUN_FLOOR_SYNC`, 0.25 -> 0.0889 on the first step) and every later step then reads
+            # the lowered one, so by the signals step the router is routing to rules `board.py`
+            # never declared. The gate judges the board at the declared rules, so pcbc's own step
+            # hands the next step the project pcbc compiled. Measured: without it KRT routed c3_usb's
+            # VBUS 0.2365 mm from `J1`'s NPTH against the 0.25 the board declares, four times.
+            copy_with_siblings(placed, produced)
+            post_plan = pattern_copper(design, job, job.constraints, current.read_text(), name, stage="post")
+            produced.write_text(post_plan.text)
+            owned += list(post_plan.pieces)
+            result["patterns"] = _census(owned)
+            result["pattern_moves"] += list(post_plan.moves)
+            result["notes"] += list(post_plan.notes)
+            result["refusals"] += [r.to_dict() for r in post_plan.refusals()]
+            merged = dict(result["refused"])
+            for pattern, n in post_plan.counts().items():
+                merged[pattern] = merged.get(pattern, 0) + n
+            result["refused"] = {k: merged[k] for k in sorted(merged)}
+            result["pattern_ms"] += post_plan.wall_ms
+            result["steps"].append(
+                {"step": step_name, "returncode": 0, "log": "", "summary": {"pieces": len(post_plan.pieces), "refused": post_plan.counts(), "ms": post_plan.wall_ms}}
+            )
+            fatal = hard_refusals(post_plan)
+            if fatal:
+                result["error"] = "pattern refused:\n" + "\n".join(r.move for r in fatal)
+                return result
+            current = produced
+            last = produced
+            continue
+        if step_name == "plane_taps" and post_plan is not None:
+            # C.4: KRT's tap step runs for the plane nets whose pads pcbc could not tap, and not at
+            # all when there are none. A pad the tap pattern skipped is not a refusal: a through-hole
+            # pad's barrel already reaches the plane and the zone connects it (B.3).
+            #
+            # `post_plan is not None` is the whole of `PCBC_PATTERNS=off`'s safety here: with the
+            # patterns off there are no taps, so every plane pad still needs KRT's step, and skipping
+            # it left node with 72 unconnected items — the rollback has to be a rollback (C.6).
+            left = sorted({r.net for r in post_plan.refusals() if r.pattern == "tap"})
+            if not left:
+                result["steps"].append({"step": step_name, "returncode": 0, "log": "skipped: pcbc tapped every plane pad it owns", "summary": {"skipped": True}})
+                continue
+            cmd = _with_nets(cmd, left)
+            nets_run = left
         proc = subprocess.run(cmd, capture_output=True, text=True, cwd=str(home))
         full = (proc.stdout or "") + (proc.stderr or "")
         log = full[-3000:]
-        produced = Path(cmd[5])
         summary = _krt_summary(full)
-        result["steps"].append({"step": step_name, "returncode": proc.returncode, "log": log[-1200:], "summary": summary})
+        entry = {"step": step_name, "returncode": proc.returncode, "log": log[-1200:], "summary": summary}
+        if nets_run is not None:
+            entry["nets"] = nets_run
+            nets_run = None
+        result["steps"].append(entry)
         if proc.returncode != 0 or not produced.exists():
             result["error"] = f"KRT {step_name} failed ({proc.returncode}): {log.strip()[-600:]}"
             return result
@@ -438,28 +532,32 @@ def route_job(design: Design, placed: Path, *, out: Path, name: str = "board") -
                     break
                 named.add(a)
             produced.write_text(lock_copper(produced.read_text(), named))
-        missing = _lost(produced.read_text(), pre)
+        missing = _lost(produced.read_text(), owned)
         if missing:
             # C.3's guard on the promise that `(locked yes)` holds. R2 writes ten times more locked
             # copper than the fanout did and puts it in KRT's way, so the promise is checked rather
             # than trusted: a step that moved or dropped a piece names itself here.
             result["error"] = f"KRT {step_name} moved or dropped {len(missing)} piece(s) of pcbc's own locked copper: {'; '.join(missing[:3])}"
             return result
+        current = produced
         last = produced
     if last is None:
         result["error"] = "nothing to route"
         return result
-    text = pin_copper_ids(last.read_text(), name, frozenset(p.uuid for p in pre if p.uuid))
+    text = pin_copper_ids(last.read_text(), name, frozenset(p.uuid for p in owned if p.uuid))
     out.write_text(text)
     from .copper_bar import copper_bar
 
-    reasons = {bar_key(p): p.reason for p in pre}
+    reasons = {bar_key(p): p.reason for p in owned}
     result["copper_bar"] = copper_bar(text, reasons)
     result["leftover"] = result["copper_bar"]["totals"]["by_reason"].get("leftover", {})
-    write_sidecar(
-        out.parent / "copper.json",
-        sidecar(pre, step="patterns_pre", refusals=[r.to_dict() for r in plan.refusals()], notes=plan.notes, leftover=result["leftover"]),
-    )
+    doc = sidecar(pre, step="patterns_pre", refusals=result["refusals"], notes=result["notes"], leftover=result["leftover"])
+    if post_plan is not None and post_plan.pieces:
+        # One sidecar, two stages: a piece carries the step that wrote it, so `copper.json` says
+        # which of pcbc's stages a via came from and the census is the whole board's (D.4).
+        doc.items += sidecar(post_plan.pieces, step="patterns_post").items
+        doc.census = _census(owned, leftover=result["leftover"])
+    write_sidecar(out.parent / "copper.json", doc)
     opens = unrouted_nets(text)
     result["segments"] = len(re.findall(r"\n\t\(segment\b", text))
     result["vias"] = len(re.findall(r"\n\t\(via\b", text))
@@ -478,6 +576,16 @@ def route_job(design: Design, placed: Path, *, out: Path, name: str = "board") -
         moves = [_unrouted_move(job, design, n, unreached.get(n)) for n in sorted(opens)]
         result["error"] = "unrouted: " + "; ".join(moves) + "".join(f"\n  {line}" for n in sorted(opens) for line in blocking[n])
     return result
+
+
+def _with_nets(cmd: list[str], nets: list[str]) -> list[str]:
+    """The same command with its `--nets` list replaced. Used once: KRT's `plane_taps` step runs for
+    the plane nets pcbc's own tap pattern refused a pad of, and for no others (C.4)."""
+    i = cmd.index("--nets")
+    j = i + 1
+    while j < len(cmd) and not cmd[j].startswith("--"):
+        j += 1
+    return [*cmd[: i + 1], *nets, *cmd[j:]]
 
 
 def bar_key(p) -> tuple:

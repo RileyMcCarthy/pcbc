@@ -383,6 +383,165 @@ S5's owned files, so S4 leaves `POST` empty and `pattern_copper(stage=...)` taki
 S5 adds `tap` to the list and one call. A.4 rule 4 (the mask dam) is still advisory and still counts
 zero, because the hop places no vias and a track's mask opening is its own copper.
 
+## S5 — the tap, the post stage, and the plane checks
+
+pcbc now welds the copper to the planes as well as drawing it. `src/pcbc/patterns/tap.py` is B.3;
+`route.py` runs the post stage as a step of its own plan, between KRT's `planes` and `signals` steps
+on four layers and immediately before `signals` on two, and KRT's `plane_taps` step then runs for the
+plane nets pcbc refused a pad of and is skipped outright when there are none (C.4);
+`route_verify.pour_raster`, `plane_islands` and `plane_checks` are D.5.
+
+**Three decisions the project owner's stand-in took, which override `docs/r2-design.md` H.1 where
+they differ.** They are implemented as taken, and each carries its arithmetic:
+
+1. **A tap via is the smallest via whose current rating covers one pad's share of the net's current,
+   capped at the net's class via** — not the class via by default, and not B.0's flat "a branch takes
+   the fab's standard via". The arithmetic is R1's, already compiled: `Constraint.current.amps` is
+   what the net carries and `via_amps` is the curve `Constraint.via.amps` and `per_change` come from.
+   On every board here the answer is the fab's standard via, with room to spare — node's `GND` asks
+   1 A across 47 SMD pads, so 0.0213 A a pad against the 0.527 A one 0.2 mm barrel carries at 10 C.
+   The cap is what keeps node routable: at the Power class's 0.8 mm ring two taps need 1.0 mm between
+   centres against 0.7 mm, and node's pads are not 1.0 mm apart. The middle case — the class via
+   chosen because it *covers* where the standard one does not — is unreachable on all five boards,
+   and that is arithmetic and not luck: it needs a share in (0.527, 0.871] A on four layers, and no
+   board's amps over a whole number of pads lands there (buck's 2 A over 2 pads is 1.0, over 3 is
+   0.667). The rule is swept over every pad count from 1 to 119 on every plane net of all five
+   boards, so a board that does reach it is not a surprise.
+2. **The copper bar's via ceiling splits.** `vias_leftover` stays a ceiling; `vias_pattern` is exact
+   per reason, like `SOFT` and the refusal counts. node goes from 28 vias to 76 and that is allowed:
+   62 are taps, and holding node to 28 means holding forty-seven ground pads off the ground plane.
+3. **Where a pattern makes a neighbour worse, the number is recorded.** Two do; both are below.
+
+**The census, corrected.** B.3 says node carries 77 plane pads (GND 55 smd + 4 thru, 3V3 17 + 1).
+Counted as **pads** rather than as `(pad ...)` blocks it is **69** — GND 47 smd + 4 thru, 3V3 17 smd
++ 1 thru — because KiCad writes `U1`'s QFN thermal pad as nine blocks all numbered 49 and each USB-C
+shield pad as several `gr_poly` primitives. So every acceptance below is against **64 SMD pads**, not
+72, and S5's ">= 66 of 72" is read as ">= 60 of 64"; 62 of them are tapped on the built board.
+
+**Before and after, every board, fresh builds** (`pcbc build --force` into a temp copy). The "before"
+column is S4 as landed. `PCBC_PATTERNS=off` on this same source reproduces the **S1b** row exactly on
+all five boards — blinky 6/0/0/2/22.5/1.03, buck 96/4/3/26/142.5/2.09, c3_usb 342/13/7/139/312.8/1.92,
+node 437/28/63/181/512.8/1.72, ds2 337/32/13/113/514.6/3.23 — so the rollback is still a rollback and
+every move below is the taps and nothing else:
+
+| board | leftover share | segments | vias\_leftover | vias\_pattern | off 0/45/90 | under 0.2 mm | routed mm | worst detour | refusals | route wall |
+|---|---|---|---|---|---|---|---|---|---|---|
+| blinky | 0 % → 0 % | 5 → 6 | 0 → 0 | — → `{tap: 1}` | 0 → 0 | 0 → 0 | 22.8 → 23.6 | 1.04 → 1.04 | 0 | 5.4 → **5.3 s** |
+| buck | 100 % → **96.6 %** | 96 → 114 | 4 → **1** | — → `{tap: 6}` | 3 → **2** | 26 → 37 | 142.5 → **139.4** | VIN 2.09 | 2 hop | 16.2 → **9.5 s** |
+| c3_usb | 95.2 % → **86.3 %** | 377 → 453 | 9 → **8** | `{fanout: 5}` → `{fanout: 5, tap: 34}` | 7 → 11 | 168 → 204 | 312.9 → 355.8 | USB\_DN 1.81 | 1 hop, **2 tap** | 18.1 → 20.2 s |
+| node | 97.0 % → **85.8 %** | 411 → **335** | 28 → **14** | — → `{tap: 62}` | 57 → **31** | 154 → **67** | 513.1 → **400.8** | T\_OUT 1.72 | 1 hop, **2 tap** | 32.8 → 36.6 s |
+| ds2 | 92.7 % → **92.3 %** | 340 → **310** | 19 → 19 | `{fanout: 9}` → `{fanout: 9, tap: 2}` | 11 → 11 | 118 → **91** | 509.9 → **507.4** | REFP\_F 3.23 | 5 hop | 18.8 → 20.5 s |
+
+The gate is verified on all five (KiCad DRC clean, zero unconnected items, canary fired);
+`verify_copper` is empty on all five; two builds of node and c3_usb into two directories give an
+identical `copper.json` and a routed `.kicad_pcb` differing in exactly the five and one absolute
+`(model ...)` paths, which is the caveat `docs/constraints.md` already records and the same result S4
+measured; the two pattern stages together cost 26 ms on blinky, 46 on buck,
+147 on ds2, 765 on node and 867 on c3_usb, against F.3's 2.0 s (the two-layer boards pay for the pour
+raster).
+
+What pcbc owns now, exact per board (`copper.json`'s census, and `test_examples_fab.py::OWNS`):
+
+| board | fanout | hop | tap | leftover |
+|---|---|---|---|---|
+| blinky | — | 5 seg / 22.8 mm | 1 seg / 1 via / 0.8 mm | 0 |
+| buck | — | — | 6 seg / 6 vias / 4.8 mm | 108 seg / 134.6 mm / 1 via |
+| c3_usb | 5 seg / 5 vias / 5.3 mm | 11 seg / 9.8 mm | 34 seg / 34 vias / 33.7 mm | 403 seg / 307.0 mm / 8 vias |
+| node | — | 11 seg / 15.4 mm | 62 seg / 62 vias / 41.5 mm | 262 seg / 343.9 mm / 14 vias |
+| ds2 | 9 seg / 9 vias / 13.5 mm | 10 seg / 23.7 mm | 2 seg / 2 vias / 1.7 mm | 289 seg / 468.5 mm / 19 vias |
+
+`vias_pattern` per reason, exact: blinky `{tap: 1}`; buck `{tap: 6}`; c3_usb `{fanout: 5, tap: 34}`;
+node `{tap: 62}`; ds2 `{fanout: 9, tap: 2}`.
+
+### What each board taps, and what it does not
+
+| board | plane pads | tapped | through-hole, skipped | already welded, skipped | refused |
+|---|---|---|---|---|---|
+| blinky | 1 | 1 | 0 | 0 | 0 |
+| buck | 8 | 6 | 2 | 0 | 0 |
+| c3_usb | 42 | 34 | 4 | 2 | **2** |
+| node | 69 | 62 | 5 | 0 | **2** |
+| ds2 | 5 | 2 | 2 | 1 | 0 |
+
+The refusal count by rule, across the five boards: **3 `copper`** (`C_EN.2` and `R_CC1.2` on c3_usb,
+`C_VBUS.2` on node — a passive's pad boxed in by its own partner and a neighbouring track) and
+**1 `edge`** (`U1.51` on node, 1.06 mm from the board edge with the USB pair on its other side).
+Nothing was refused for `hole_to_hole`, `via_in_pad`, `lane` or `pour_reach` on any board. Every
+refused pad is welded by KRT's `plane_taps` step instead: node's `06_plane_taps.kicad_pcb` adds
+exactly two vias to the post stage's 62, and runs for `GND` alone because both refusals are GND's.
+No other board has a `plane_taps` step at all — it is a four-layer step and the other four boards are
+two-layer — so the "skipped when there are no refusals" path is exercised by a board that refuses
+nothing only when a four-layer board does, and `test_krts_tap_step_runs_only_for_the_nets_the_pattern_
+refused` is what pins the rule itself.
+
+`docs/r2-design.md` F.3's node targets are met: `vias_leftover` 28 → 14 (≤ 15), off45 57 → 31
+(≤ 32), micro 154 → 67 (≤ 90), 513.1 → 400.8 mm (≤ 420), detour 1.72 held, zero unconnected. The
+count target reads ">= 66 of 72" against the corrected census as ">= 60 of 64", and 62 are tapped.
+
+### The pour a two-layer board does not have yet
+
+C.1 puts the post stage immediately before `signals` on both stackups, so on c3_usb and ds2 the taps
+go down **before** `gnd_pour` has run — the pour is written near the end of the plan. D.5's raster is
+what makes that safe: every foreign item on the pour's layer is dilated by what the pour owes it, the
+free cells are labelled 4-connected, and the pour is the largest region. A cell counts as blocked when
+an obstacle touches any part of it, so a coarser cell blocks more and the error refuses a tap that
+would have worked rather than accepting one that would not.
+
+The cell is **0.2 mm and not `scene.grid`**, which is the one place this slice departs from the
+design's letter. At 0.05 mm c3_usb is 576 000 cells against a whole-stage budget of 2.0 s; at 0.2 mm
+it is 36 000, the raster costs about a tenth of a second, and it is still four times finer than the
+0.5 mm hole-to-hole that decides whether two taps can sit side by side at all. It refused nothing on
+either board, which is the honest reading: at post time the signals are not down yet, so the raster
+sees an emptier board than the pour will, and it can only catch the gross case. The check that
+actually bites is the one taken after the fact — on all five boards every plane is still **one
+island** after the taps and every tap via lands inside its own net's plane, measured on the gate's own
+refilled copper (`plane_islands`, `plane_checks`), and there is not one via inside a pad anywhere
+(`fab.via_in_pad`).
+
+### One KRT patch, and why it is not the third workaround C.5 forbids
+
+With the taps down, KRT routed c3_usb's `VBUS` **0.2365 mm from `J1`'s NPTH mounting hole** against
+the 0.25 the board declares, four times, and the gate failed the board. The cause is not the taps:
+KRT lowers its output project's `min_hole_clearance` to the floor it actually routed to (its own
+`INRUN_FLOOR_SYNC`, 0.25 → 0.0889 on the first step) and every later step reads the lowered one, so
+by the signals step the router is routing to rules `board.py` never declared. A.4 rule 2's own table
+already records this class of error (`hole_clearance (actual 0.1845 mm)`, a via against `J1`'s NPTH);
+the taps only moved `VBUS` into it.
+
+The fix is one line in the post stage: **its step board's siblings are copied from the placed board**,
+not from the step before it, so the next KRT step reads the project pcbc compiled. That is not a
+patch on KRT's geometry and it raises no floor — it restores the rules the gate judges the board
+against. With it, c3_usb is verified; without it, four errors. `fab_overrides.txt` has no
+hole-clearance key, so there is nothing to write there instead.
+
+### What got worse, board by board, and why it is recorded rather than fixed
+
+**c3_usb: `micro` 168 → 204, `segments` 377 → 453, `routed mm` 312.9 → 355.8, and the soft
+`width_power` 36 → 49.** Thirty-four new locked vias sit between the connector and the MCU, and KRT
+answers by staircasing the leftover `GND` and `VBUS` around them. Against that: `vias_leftover` 9 →
+8, the leftover share 95.2 % → 86.3 %, and the board's ground is now welded pad by pad to the back
+pour instead of relying on whatever KRT could reach. F.3 item 7 says soft-rule hits must not rise, and
+`width_power` does; it is in the open issues.
+
+**buck: `micro` 26 → 37 and `segments` 96 → 114**, against `vias_leftover` 4 → **1**, off45 3 → 2,
+142.5 → **139.4 mm** and `width_power` 40 → 39. Six taps on a board with eight ground pads, and the
+same staircase answer at a much smaller scale.
+
+**node: the soft `width_usb` 57 → 58.** One more necked segment on the USB pair, which R2 does not
+touch and R4 owns. Its `width_power` falls 44 → **20** in the same build, because the taps carry GND
+and 3V3 to their planes at the class width and KRT has far less power copper left to neck.
+
+### What is not measured here
+
+`bus`, `guard` and `stitch` still read zero on every board (S8). The decap loop-area note D.5 asks the
+tap stage for is **not** written: `route_checks._loop_area` needs the IC-and-cap pairing its own
+checker builds, and reproducing that inside a pattern for a `style:` line is work S5 did not do — the
+loop is still reported by `check_decoupling` where it always was. A.4 rule 4 (the mask dam) is still
+advisory and still counts zero: a tap's mask opening is its own ring, and no tap came within 0.10 mm
+of a foreign one. The leftover share does **not** reach F.3 item 5's 70 % on any board, and it was
+never going to at S5: the census says a hop is 5.7 % of the copper and a plane tap 12 %, so 82 % is
+the arithmetic. The 45 % target needs the spine (37 %), which is S7.
+
 ## Verification of S2 to S4, independent of the agents that wrote them
 
 Re-run on a clean checkout of the committed tree, not taken on trust:

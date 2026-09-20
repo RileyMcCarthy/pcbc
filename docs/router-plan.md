@@ -437,7 +437,12 @@ voltage rows; `dru.py` writing every rule KiCad can check; `pcbc check --constra
 route-aware placement checks (section 6.3). Tests pin the numbers (`test_stackup.py`,
 `test_constraints.py`, `test_dru.py`, `test_route_checks.py`, `test_cli.py`).
 
-**R2. Patterns (1 to 2 weeks).** Hops, chains, taps, spines, buses as patterns in Python with
+**R2. Patterns (1 to 2 weeks).** Measured before starting (2026-09-20, every routed segment on
+the five boards classified by the pattern that would own it, as a share of routed millimetres):
+power spine 37.0 %, general signal 31.0 %, differential pair 14.3 %, plane tap 12.0 %, short hop
+5.7 %. So the patterns are two thirds of the copper and the maze router's real job is the
+remaining third: blinky is all signal (one net), buck 86 % power, c3_usb 66 % power and 27 %
+pair, node 36 % plane tap, ds2 57 % signal (its analog filter runs) and 38 % power. Hops, chains, taps, spines, buses as patterns in Python with
 exact geometry checks; KRT routes only what is left; measure the leftover on the six boards.
 Expect the leftover to be the long signals, under a quarter of the copper.
 

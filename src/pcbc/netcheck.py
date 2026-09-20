@@ -167,7 +167,7 @@ def kicad_drc(pcb: Path, cli: Path | None = None, *, refill: bool = True) -> dic
         return json.loads(out.read_text())
 
 
-def check_copper(design: Design, pcb: Path, cli: Path | None = None, floor_mm: float | None = None) -> dict:
+def check_copper(design: Design, pcb: Path, cli: Path | None = None, floor_mm: float | None = None, *, refill: bool = True) -> dict:
     """The copper gate: KiCad DRC clean, nothing unconnected, pads bound exactly as board.py says."""
     from .compile import compile_design
     from .fab import copper_drc_errors
@@ -177,7 +177,7 @@ def check_copper(design: Design, pcb: Path, cli: Path | None = None, floor_mm: f
     fails: list[str] = []
     nets = compare(expected_nets(design), copper_nets(text), what="copper")
     fails += nets
-    doc = kicad_drc(pcb, cli)
+    doc = kicad_drc(pcb, cli, refill=refill)
     if floor_mm is None:
         from .stackup import get_stackup
 

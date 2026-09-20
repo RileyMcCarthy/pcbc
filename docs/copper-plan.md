@@ -150,7 +150,14 @@ graders, are what is left of this phase.
   the uuids are pinned; the KRT SHA is pinned and checked.
 - Tests: blinky, buck, c3_usb (a USB pair), node fab-clean.
 
-### Phase 3. Silk, fab, review (days)
+### Phase 3. Silk, fab, review (days) — landed 2026-09-19
+
+References are placed at the place stage (`silk.legalize_silk`): 16 spots around the part
+including four turned 90°, and on the body of a part 8 mm or bigger away from its pads;
+a reference with no room comes back as a move, and `place_job` first re-places that part
+with 0.6 mm more gap (two rounds). `pcbc review` shows the fab board (filled pours, silk)
+and a copper note from the gate. What the node render had shown (cramped C_EN, the
+module's reference nowhere) is what the report now says and the tool now fixes.
 
 - References placed like labels were (`silk.py` exists), reported as moves.
 - CPL rotation check against the JLC convention, the review page's copper and 3D

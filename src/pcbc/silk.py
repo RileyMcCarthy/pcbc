@@ -79,24 +79,61 @@ def _candidates(
     tw: float,
     th: float,
     gap: float,
-) -> list[tuple[float, float]]:
+) -> list[tuple[float, float, float]]:
+    """(x, y, text rotation): above, below, beside, the corners, then turned 90 beside the
+    part for the narrow slot between two neighbours (the schematic's rotated-text spots)."""
     x0, y0, x1, y1 = keep
     cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
     g = gap
     return [
-        (cx, y0 - g - th / 2),
-        (cx, y1 + g + th / 2),
-        (x0 - g - tw / 2, cy),
-        (x1 + g + tw / 2, cy),
-        (x0 - g - tw / 2, y0 - g - th / 2),
-        (x1 + g + tw / 2, y0 - g - th / 2),
-        (x0 - g - tw / 2, y1 + g + th / 2),
-        (x1 + g + tw / 2, y1 + g + th / 2),
-        (cx - tw, y0 - g - th / 2),
-        (cx + tw, y0 - g - th / 2),
-        (cx - tw, y1 + g + th / 2),
-        (cx + tw, y1 + g + th / 2),
+        (cx, y0 - g - th / 2, 0.0),
+        (cx, y1 + g + th / 2, 0.0),
+        (x0 - g - tw / 2, cy, 0.0),
+        (x1 + g + tw / 2, cy, 0.0),
+        (x0 - g - tw / 2, y0 - g - th / 2, 0.0),
+        (x1 + g + tw / 2, y0 - g - th / 2, 0.0),
+        (x0 - g - tw / 2, y1 + g + th / 2, 0.0),
+        (x1 + g + tw / 2, y1 + g + th / 2, 0.0),
+        (cx - tw, y0 - g - th / 2, 0.0),
+        (cx + tw, y0 - g - th / 2, 0.0),
+        (cx - tw, y1 + g + th / 2, 0.0),
+        (cx + tw, y1 + g + th / 2, 0.0),
+        (x0 - g - th / 2, cy, 90.0),
+        (x1 + g + th / 2, cy, 90.0),
+        (cx, y0 - g - tw / 2, 90.0),
+        (cx, y1 + g + tw / 2, 90.0),
     ]
+
+
+_PAD_RE = re.compile(r'\(pad\s+"[^"]*"[^()]*\(at\s+([0-9.+-]+)\s+([0-9.+-]+)(?:\s+([0-9.+-]+))?\)\s*\(size\s+([0-9.+-]+)\s+([0-9.+-]+)\)')
+
+
+def _pad_boxes(block: str, at: tuple[float, float, float]) -> list[tuple[float, float, float, float]]:
+    """World AABBs of a footprint's pads (a pad's file angle already includes the footprint's)."""
+    from .css import rotate_local_bounds
+
+    fx, fy, frot = at
+    out = []
+    for m in _PAD_RE.finditer(block):
+        px, py, prot = float(m.group(1)), float(m.group(2)), float(m.group(3) or 0)
+        w, h = float(m.group(4)) / 2, float(m.group(5)) / 2
+        x0, y0, x1, y1 = rotate_local_bounds(-w, -h, w, h, prot)
+        cx, cy = _rot_pt(px, py, frot)
+        out.append((fx + cx + x0, fy + cy + y0, fx + cx + x1, fy + cy + y1))
+    return out
+
+
+def _inside_candidates(keep, tw: float, th: float) -> list[tuple[float, float, float]]:
+    """On a big part (a module, a connector body) the reference can sit on the body itself,
+    away from its pads: the centre, then a little off-centre, both ways."""
+    x0, y0, x1, y1 = keep
+    cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+    out = []
+    for trot in (0.0, 90.0):
+        w, h = (tw, th) if trot == 0 else (th, tw)
+        for dx, dy in ((0, 0), (0, -h), (0, h), (-w, 0), (w, 0), (-w, -h), (w, -h), (-w, h), (w, h)):
+            out.append((cx + dx, cy + dy, trot))
+    return out
 
 
 def _set_reference(
@@ -171,7 +208,8 @@ def legalize_silk(text: str, board_mm: tuple[float, float]) -> tuple[str, dict]:
     parts.sort(key=lambda p: p["span"])
     occupied: list[tuple[float, float, float, float]] = []
     bodies = [p["keep"] for p in parts]
-    report = {"moved": [], "hidden": [], "sized": []}
+    report = {"moved": [], "hidden": [], "sized": [], "issues": []}
+    names = {id(p["keep"]): p["ref"] for p in parts}
 
     new_blocks: dict[int, str] = {}
     for p in parts:
@@ -187,22 +225,28 @@ def legalize_silk(text: str, board_mm: tuple[float, float]) -> tuple[str, dict]:
         thick = round(min(0.12, size * 0.2), 3)
         tw, th = 0.72 * size * max(len(ref), 1), size
         placed = False
+        big = p["span"] >= 8.0
+        own_pads = _pad_boxes(p["block"], p["at"]) if big else []
         for attempt in (size, 0.5, 0.4):
             size = attempt
             thick = round(min(0.12, size * 0.2), 3)
             tw, th = 0.72 * size * max(len(ref), 1), size
             gap = 0.2 + size * 0.15
-            for wx, wy in _candidates(p["keep"], tw, th, gap):
-                box = _text_aabb(wx, wy, tw, th)
+            spots = _candidates(p["keep"], tw, th, gap) + (_inside_candidates(p["keep"], tw, th) if big else [])
+            for wx, wy, trot in spots:
+                box = _text_aabb(wx, wy, tw, th) if trot == 0 else _text_aabb(wx, wy, th, tw)
                 if box[0] < edge[0] or box[1] < edge[1] or box[2] > edge[2] or box[3] > edge[3]:
                     continue
                 if any(_overlap(box, o) for o in occupied):
                     continue
+                inside = _overlap(box, p["keep"], pad=0.0)
+                if inside and any(_overlap(box, pb, pad=0.2) for pb in own_pads):
+                    continue  # on the body is fine, on a pad is not
                 if any(_overlap(box, b, pad=0.05) for b in bodies if b is not p["keep"]):
                     continue
                 dx, dy = wx - fx, wy - fy
                 lx, ly = _rot_pt(dx, dy, -frot)
-                prot = (-frot) % 360
+                prot = (trot - frot) % 360
                 new_blocks[p["start"]] = _set_reference(
                     p["block"], lx=lx, ly=ly, prot=prot, size=size, thick=thick, hide=False
                 )
@@ -219,6 +263,14 @@ def legalize_silk(text: str, board_mm: tuple[float, float]) -> tuple[str, dict]:
                 size=0.4, thick=0.08, hide=False,
             )
             report["moved"].append({"ref": ref, "at": "fallback", "size": 0.4})
+            tw, th = 0.72 * 0.4 * max(len(ref), 1), 0.4
+            over = _text_aabb(fx, fy - (p["span"] / 2 + 0.6), tw, th)
+            hit = sorted({names[id(b)] for b in bodies if b is not p["keep"] and _overlap(over, b, pad=0.05)})
+            what = ", ".join(hit) if hit else "another reference or the board edge"
+            report["issues"].append(
+                f"{ref}: no clear spot for its silkscreen reference around the part (0.8 to 0.4 mm text, both ways); "
+                f"it prints above it over {what}: give {ref} room or move {hit[0] if hit else 'its neighbour'}"
+            )
 
     # Rebuild from the original text using original spans (not mutated).
     pieces: list[str] = []

@@ -147,7 +147,8 @@ Place("D1", to="R_LED.2", toward="right")     # toward= overrides the side; gap=
 | Copper stays 0.3 mm off the board edge; a net with `NetReq(max_mm=)` has no pad farther than that from its nearest neighbour | `test_copper_rules.py::test_report_holds_copper_off_the_edge_and_nets_to_their_max_mm` |
 | Turning a footprint turns its pads (KiCad stores pad angles as footprint + pad angle in a board file) | `test_copper_rules.py::test_turning_a_footprint_turns_its_pads` |
 | A footprint's own pads are held to the fab floor, not the net class; ringless mounting holes are repaired at fetch; touching pads fail the score; every generic has a vendored land | `test_copper_rules.py` |
-| The examples stay under the bar: c3_usb 0, buck 0, node 0 | `test_c3_usb_layout_bar`, `test_node.py::test_node_layout_bar`, `test_copper_rules.py::test_the_first_place_on_a_pin_gets_the_closest_spot` |
+| Silkscreen references are placed by the tool: beside the part, turned to fit a narrow slot, on the body of a big part away from its pads; a reference with no room re-places its part with more gap, then is reported | `test_silk.py` |
+| The examples stay under the bar: c3_usb 0, buck 0, node 0, silk included | `test_c3_usb_layout_bar`, `test_node.py::test_node_layout_bar`, `test_silk.py::test_the_examples_references_all_fit` |
 
 ### Copper rules
 

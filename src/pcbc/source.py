@@ -391,7 +391,7 @@ def score_symbol(text: str) -> dict:
         add("warn", 10, f"pins closer than 2.54 mm on one edge: {_some(close)}; names collide and labels have no room")
 
     unnamed = [p["number"] for p in pins if p["name"] in ("", "~") or p["name"] == p["number"]]
-    if unnamed and len(pins) > 2:
+    if unnamed and len(pins) > 2 and not _is_connector(text):
         add("warn", 10, f"pins without names: {_some(unnamed)}; board.py binds pins by name")
 
     types = [p["type"] for p in pins]
@@ -414,6 +414,15 @@ def score_symbol(text: str) -> dict:
         add("info", 2, f"mixed pin lengths {', '.join(f'{v:g}' for v in lengths)}")
 
     return {"findings": findings, "pins": pins, "penalty": penalty, "units": units, "size_mm": (round(bw, 2), round(bh, 2))}
+
+
+def _is_connector(text: str) -> bool:
+    """A header's pins are its numbers; that is their name."""
+    try:
+        cat = (symbol_props(text).get("ki_keywords") or "").lower()
+    except ValueError:
+        return False
+    return any(w in cat for w in ("connector", "header", "socket", "terminal"))
 
 
 def score_footprint(text: str) -> dict:

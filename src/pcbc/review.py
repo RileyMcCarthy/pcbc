@@ -145,12 +145,29 @@ def crop_svg_to_content(svg: str, *, pad_mm: float = 10.0, px_per_mm: float = 10
 
 
 def _best_pcb(layout: Path) -> Path | None:
-    # CSS Place() is the layout. Segment-tree "route" is not a review surface.
-    for rel in ("placed/layout.kicad_pcb", "routed/layout.kicad_pcb", "layout.kicad_pcb"):
+    # The most finished board there is: fab (filled pours, silk), routed, placed, seed.
+    for rel in ("fab/layout.kicad_pcb", "routed/layout.kicad_pcb", "placed/layout.kicad_pcb", "layout.kicad_pcb"):
         p = layout / rel
         if p.exists():
             return p
     return None
+
+
+def _copper_note(design, pcb: Path) -> str:
+    text = pcb.read_text()
+    if "\n\t(segment" not in text and "\n\t(zone" not in text:
+        return "Copper: not routed yet (pcbc build routes it and judges it)."
+    try:
+        from .netcheck import KicadMissing, check_copper
+
+        gate = check_copper(design, pcb, refill=False)
+    except KicadMissing as exc:
+        return f"Copper: unchecked ({exc})."
+    n_seg = text.count("\n\t(segment")
+    n_via = text.count("\n\t(via")
+    if gate["ok"]:
+        return f"Copper: {n_seg} tracks, {n_via} vias; KiCad DRC clean, nothing unconnected, pads bound as board.py says."
+    return f"COPPER FAILS the gate ({len(gate['fails'])}): " + "; ".join(gate["fails"][:5])
 
 
 def render_html(
@@ -406,8 +423,8 @@ def review_job(board: Path, *, open_html: bool = True) -> dict:
             else f"Schematic readability, {len(result['readability'])} to fix by moving parts: "
             + "; ".join(result["readability"])
         ),
+        _copper_note(design, pcb),
         "3D is kicad-cli pcb export glb (tracks, pads, silk, mask).",
-        "Vendored chip lands have no STEP — copper still shows.",
     ]
     if any(s.get("returncode") not in (0, None) for s in steps):
         notes.append("One or more kicad-cli export steps returned non-zero — see report.json.")

@@ -14,6 +14,7 @@ import tempfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
+from .dru import soft_kind
 from .fab import kicad_cli
 from .model import Design
 from .sexp import matching_paren
@@ -145,6 +146,13 @@ def copper_nets(text: str) -> dict[str, set[Pad]]:
     return nets
 
 
+def names_rule(description: str, rule: str) -> bool:
+    """Whether a KiCad DRC violation came from the custom rule `rule`. Most checks say
+    `(rule 'name' ...)`; the diff-pair checks say `(name minimum gap ...)` / `(name maximum
+    uncoupled length ...)` with no `rule` word (KiCad 10.0.6, probed in tests/test_dru.py)."""
+    return f"rule '{rule}'" in description or f"({rule} " in description
+
+
 def kicad_drc(pcb: Path, cli: Path | None = None, *, refill: bool = True) -> dict:
     """kicad-cli pcb drc as parsed JSON (violations, unconnected_items).
 
@@ -195,6 +203,11 @@ def check_copper(design: Design, pcb: Path, cli: Path | None = None, floor_mm: f
         "segments": sum(1 for v in violations if v.get("type") == "track_segment_length"),
         "angles": sum(1 for v in violations if v.get("type") == "track_angle"),
     }
+    # Every pcbc rule's hits (the description names the rule, as the canary check reads it) and, of
+    # those, the soft rules (E, H.3): warnings the bar counts and test_examples_fab pins per example.
+    rule_hits = {r.name: sum(1 for v in violations if names_rule(str(v.get("description", "")), r.name)) for r in job.dru}
+    soft = {r.name: rule_hits[r.name] for r in job.dru if r.severity == "warning" and soft_kind(r.name) is not None}
+    pcbc_warning_rules = [r.name for r in job.dru if r.severity == "warning"]  # soft rules, the geometry rules, the canary
     errors = [
         f"{v.get('type')}: {v.get('description')}"
         for v in copper_drc_errors(doc, floor_mm=floor_mm)
@@ -213,10 +226,14 @@ def check_copper(design: Design, pcb: Path, cli: Path | None = None, floor_mm: f
         "drc_warnings": sum(
             1
             for v in violations
-            if (v.get("severity") or "").lower() == "warning" and v.get("type") not in ("track_segment_length", "track_angle", "length_out_of_range")
+            if (v.get("severity") or "").lower() == "warning"
+            and v.get("type") not in ("track_segment_length", "track_angle")
+            and not any(names_rule(str(v.get("description", "")), name) for name in pcbc_warning_rules)
         ),
         "geometry": geometry,  # KiCad's own count of staircases and 90 degree corners
         "canary": canary_fired,
+        "soft": soft,  # {rule name: hits} for pcbc's soft rules (track_width, skew, via budget, uncoupled)
+        "rules": rule_hits,  # {rule name: hits} for every pcbc rule
     }
 
 

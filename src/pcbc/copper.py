@@ -257,6 +257,16 @@ def vias_on_no_via_nets(job: CompiledJob, text: str) -> list[str]:
     return fails
 
 
+def _ipc2221_need(job: CompiledJob, name: str, amps: float) -> float:
+    """The IPC-2221 external width the constraint already derived (one source, A.3 item 7); the
+    same formula and the same default rise, so the number and the gate are unchanged."""
+    cs = job.constraints
+    c = cs.by_net(name) if cs is not None else None
+    if c is not None and c.current is not None:
+        return c.current.width_ipc2221.value
+    return ipc2221_width_mm(amps)
+
+
 def power_ampacity_failures(job: CompiledJob, text: str) -> list[str]:
     """Fail when a power net's copper is narrower than IPC-2221 for its amps."""
     copper = copper_by_net(text)
@@ -265,10 +275,11 @@ def power_ampacity_failures(job: CompiledJob, text: str) -> list[str]:
     for net in job.nets:
         if net.kind != "power" or not net.amps or net.amps < 0.2:
             continue
-        need = ipc2221_width_mm(float(net.amps))
+        need = _ipc2221_need(job, net.patterns[0], float(net.amps))
         for name in [n for n in (list(copper) + list(plane_nets)) if _match(n, net.patterns)]:
             if name in plane_nets:
                 continue
+            need = _ipc2221_need(job, name, float(net.amps))
             have = (copper.get(name) or {}).get("width") or 0.0
             if have + 1e-6 < need * 0.85:
                 fails.append(

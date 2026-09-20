@@ -1,0 +1,57 @@
+{
+  "board": {
+    "design_settings": {
+      "defaults": {},
+      "rules": {
+        "min_clearance": 0.127,
+        "min_track_width": 0.127,
+        "min_via_diameter": 0.5,
+        "min_via_annular_width": 0.1,
+        "min_through_hole_diameter": 0.3,
+        "min_hole_clearance": 0.25,
+        "min_hole_to_hole": 0.5,
+        "min_copper_edge_clearance": 0.3
+      },
+      "rule_severities": {
+        "hole_to_hole": "error"
+      }
+    }
+  },
+  "meta": {
+    "filename": "blinky.kicad_pcb",
+    "version": 1
+  },
+  "net_settings": {
+    "classes": [
+      {
+        "name": "Default",
+        "clearance": 0.16,
+        "track_width": 0.16,
+        "via_diameter": 0.5,
+        "via_drill": 0.3
+      },
+      {
+        "name": "Power",
+        "clearance": 0.2,
+        "track_width": 0.25,
+        "via_diameter": 0.8,
+        "via_drill": 0.4
+      }
+    ],
+    "netclass_patterns": [
+      {
+        "netclass": "Default",
+        "pattern": "LED"
+      },
+      {
+        "netclass": "Power",
+        "pattern": "VCC"
+      },
+      {
+        "netclass": "Power",
+        "pattern": "GND"
+      }
+    ]
+  },
+  "text_variables": {}
+}

@@ -78,6 +78,10 @@ def check_job(job: CompiledJob, pcb_path: Path, tol_mm: float = 0.05) -> list[st
     for ko in job.keepouts:
         if f'(name "{ko.name}")' not in text:
             failures.append(f"missing keepout zone {ko.name}")
+    if job.constraints is not None:
+        for area in job.constraints.rule_areas:
+            if f'(name "{area.name}")' not in text:
+                failures.append(f"missing rule area {area.name}")
 
     dru = pcb_path.with_suffix(".kicad_dru")
     if job.dru and not dru.exists():

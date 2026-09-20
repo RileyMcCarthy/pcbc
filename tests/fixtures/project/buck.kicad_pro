@@ -1,0 +1,79 @@
+{
+  "board": {
+    "design_settings": {
+      "defaults": {},
+      "rules": {
+        "min_clearance": 0.127,
+        "min_track_width": 0.127,
+        "min_via_diameter": 0.5,
+        "min_via_annular_width": 0.1,
+        "min_through_hole_diameter": 0.3,
+        "min_hole_clearance": 0.25,
+        "min_hole_to_hole": 0.5,
+        "min_copper_edge_clearance": 0.3
+      },
+      "rule_severities": {
+        "hole_to_hole": "error"
+      }
+    }
+  },
+  "meta": {
+    "filename": "buck.kicad_pcb",
+    "version": 1
+  },
+  "net_settings": {
+    "classes": [
+      {
+        "name": "Default",
+        "clearance": 0.16,
+        "track_width": 0.16,
+        "via_diameter": 0.5,
+        "via_drill": 0.3
+      },
+      {
+        "name": "Analog",
+        "clearance": 0.2,
+        "track_width": 0.2,
+        "via_diameter": 0.6,
+        "via_drill": 0.3
+      },
+      {
+        "name": "Power",
+        "clearance": 0.2,
+        "track_width": 0.781,
+        "via_diameter": 0.8,
+        "via_drill": 0.4
+      },
+      {
+        "name": "SwitchNode",
+        "clearance": 0.2,
+        "track_width": 0.3,
+        "via_diameter": 0.6,
+        "via_drill": 0.3
+      }
+    ],
+    "netclass_patterns": [
+      {
+        "netclass": "Power",
+        "pattern": "VIN"
+      },
+      {
+        "netclass": "Power",
+        "pattern": "5V"
+      },
+      {
+        "netclass": "Power",
+        "pattern": "GND"
+      },
+      {
+        "netclass": "SwitchNode",
+        "pattern": "SW"
+      },
+      {
+        "netclass": "Analog",
+        "pattern": "FB"
+      }
+    ]
+  },
+  "text_variables": {}
+}

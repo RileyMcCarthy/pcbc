@@ -105,20 +105,6 @@ def test_the_five_boards_keep_todays_classes_nets_and_krt(tmp_path: Path):
         assert "constraints" in now and "rule_areas" in now
 
 
-def test_the_dru_stub_rebuilds_todays_rules(tmp_path: Path):
-    """dru.rules(cs) is today's list (S3 rewrites it): identical on four boards; node's pair gap follows its pair."""
-    for name, path in _boards(tmp_path).items():
-        was = json.loads((FIXTURES / f"{name}.json").read_text())["dru"]
-        now = [r.__dict__ for r in compile_design(load_board(path)).dru]
-        if name == "node":
-            gap = next(r for r in now if r["name"] == "usb_pair_gap")
-            assert gap["constraint"] == "(constraint diff_pair_gap (min 0.12mm) (opt 0.15mm))", "E.11: max(0.1, 0.15 - 0.03) / 0.15 at 2 dp"
-            assert gap["condition"] == "A.NetClass == 'USB'"
-            now = [r for r in now if r["name"] != "usb_pair_gap"]
-            was = [r for r in was if r["name"] != "usb_pair_gap"]
-        assert now == was, name
-
-
 def test_to_dict_round_trips_identically_on_two_compiles(tmp_path: Path):
     for name, path in _boards(tmp_path).items():
         a = json.dumps(compile_constraints(load_board(path)).to_dict(), sort_keys=True)

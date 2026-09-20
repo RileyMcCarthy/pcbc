@@ -1,0 +1,93 @@
+{
+  "board": {
+    "design_settings": {
+      "defaults": {},
+      "rules": {
+        "min_clearance": 0.0889,
+        "min_track_width": 0.0889,
+        "min_via_diameter": 0.35,
+        "min_via_annular_width": 0.075,
+        "min_through_hole_diameter": 0.2,
+        "min_hole_clearance": 0.25,
+        "min_hole_to_hole": 0.5,
+        "min_copper_edge_clearance": 0.3
+      },
+      "rule_severities": {
+        "hole_to_hole": "error"
+      }
+    }
+  },
+  "meta": {
+    "filename": "node.kicad_pcb",
+    "version": 1
+  },
+  "net_settings": {
+    "classes": [
+      {
+        "name": "Default",
+        "clearance": 0.18,
+        "track_width": 0.16,
+        "via_diameter": 0.35,
+        "via_drill": 0.2
+      },
+      {
+        "name": "Analog",
+        "clearance": 0.2,
+        "track_width": 0.2,
+        "via_diameter": 0.6,
+        "via_drill": 0.3
+      },
+      {
+        "name": "Power",
+        "clearance": 0.2,
+        "track_width": 0.4,
+        "via_diameter": 0.8,
+        "via_drill": 0.4
+      },
+      {
+        "name": "USB",
+        "clearance": 0.18,
+        "track_width": 0.2291,
+        "via_diameter": 0.35,
+        "via_drill": 0.2,
+        "diff_pair_gap": 0.15,
+        "diff_pair_width": 0.2291
+      }
+    ],
+    "netclass_patterns": [
+      {
+        "netclass": "USB",
+        "pattern": "USB_DP"
+      },
+      {
+        "netclass": "USB",
+        "pattern": "USB_DN"
+      },
+      {
+        "netclass": "Power",
+        "pattern": "VBUS"
+      },
+      {
+        "netclass": "Power",
+        "pattern": "3V3"
+      },
+      {
+        "netclass": "Power",
+        "pattern": "GND"
+      },
+      {
+        "netclass": "Power",
+        "pattern": "LOAD"
+      },
+      {
+        "netclass": "Analog",
+        "pattern": "T_DIV"
+      },
+      {
+        "netclass": "Analog",
+        "pattern": "T_OUT"
+      }
+    ]
+  },
+  "text_variables": {}
+}

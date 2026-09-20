@@ -15,6 +15,7 @@ from .apply import write_dru
 from .check import check_job
 from .compile import CompiledJob
 from .copper import power_ampacity_failures, unrouted_nets, vias_on_no_via_nets
+from .dru import soft_kind
 from .project import copy_with_siblings
 from .silk import silk_job
 from .geom import footprint_box_local
@@ -399,9 +400,11 @@ _IGNORE_DRC = {
     "silk_mask_clearance",
     "via_dangling",
     "track_dangling",
+    # KRT rewrites the 2-layer pair gap; removing this is an R4 item (docs/r1-design.md E).
     "diff_pair_gap_out_of_range",
-    # NetReq max_mm is an airwire/cluster budget, not routed maze length.
-    "length_out_of_range",
+    # length_out_of_range is not ignored: NetReq max_mm is an airwire budget and never becomes a
+    # length rule, the canary is a warning and never reaches the error gate, and an explicit
+    # length_mm= (or an i2c bus) must gate.
 }
 
 
@@ -738,6 +741,14 @@ def _write_notes(out_dir: Path, job: CompiledJob, result: dict) -> None:
         "- Re-run seed on `fab/`.",
         "",
     ]
+    if job.constraints is not None:
+        # The numbers the board was routed to, each with its source (`pcbc check --constraints`).
+        lines += ["## Constraints", ""]
+        lines += [f"- {line}" for line in job.constraints.lines]
+        errors = sum(1 for r in job.dru if r.severity == "error")
+        soft = sum(1 for r in job.dru if r.severity == "warning" and soft_kind(r.name) is not None)
+        canary = f", canary on net {job.constraints.canary_net}" if job.constraints.canary_net else ""
+        lines += [f"- rules: {len(job.dru)} written ({errors} error, {soft} soft){canary}", ""]
     if result.get("error"):
         lines += ["## Error", "", result["error"], ""]
     (out_dir / "FAB_NOTES.md").write_text("\n".join(lines))

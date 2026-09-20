@@ -8,6 +8,8 @@ from pathlib import Path
 import pytest
 
 from pcbc.build import build_job
+from pcbc.language import load_board
+from pcbc.netcheck import check_copper
 
 EXAMPLES = Path(__file__).resolve().parent.parent / "examples"
 
@@ -17,6 +19,22 @@ BAR = {
     "buck": {"vias": 4, "off45": 3, "micro": 26, "detour": 2.09},
     "c3_usb": {"vias": 16, "off45": 7, "micro": 182, "detour": 1.81},
     "node": {"vias": 30, "off45": 64, "micro": 161, "detour": 1.72},
+}
+
+# R1 (docs/r1-design.md E, H.3): the soft rules' hits per example, {rule name: KiCad warnings}, recorded
+# 2026-09-20 with KRT 0.21.4 and KiCad 10.0.6. Exact, not a ceiling: a soft rule that hits zero on the
+# four examples and the DS2 Addon is promoted to an error in the PR that shows the zeros; the rest wait
+# for R4's tuning pass. A number going up here is a regression; going down is a candidate for promotion.
+#
+# What the numbers say: `width_*` hits are KRT's fanout stubs and pad necks at track_min on power nets
+# (and node's whole USB pair, which KRT routes narrower than the 0.2291 mm class: an R4 item); the one
+# skew hit per USB pair is KRT's untuned pair (c3_usb: DN 46.6 vs DP 35.0 mm against the 0.5 mm budget);
+# the one uncoupled hit is the same pair's 42 mm of uncoupled length against 2 mm; c3_usb's USB_DP
+# carries 3 vias against the budget of 2. No soft rule is at zero everywhere, so none is promoted yet.
+SOFT = {
+    "buck": {"width_power": 40},
+    "c3_usb": {"width_power": 36, "vias_usb_dn": 0, "vias_usb_dp": 1, "skew_usb_dn_usb_dp": 1, "uncoupled_usb": 1},
+    "node": {"width_usb": 52, "width_power": 33, "vias_usb_dn": 0, "vias_usb_dp": 0, "skew_usb_dn_usb_dp": 1, "uncoupled_usb": 1},
 }
 
 
@@ -46,5 +64,10 @@ def test_example_builds_to_fab(tmp_path: Path, name: str):
     fab = tmp_path / "layout" / name / "fab"
     assert (fab / "bom.csv").exists() and (fab / "cpl.csv").exists()
     assert any((fab / "gerbers").glob("*")), "no gerbers"
-    routed = (tmp_path / "layout" / name / "routed" / "layout.kicad_pcb").read_text()
+    routed_pcb = tmp_path / "layout" / name / "routed" / "layout.kicad_pcb"
+    routed = routed_pcb.read_text()
     assert "filled_polygon" in routed, "the gate judged unfilled pours"
+    # The soft rules (E, H.3) beside the bar: warnings KiCad raised from pcbc's own soft rules, pinned per example.
+    gate = check_copper(load_board(board), routed_pcb, refill=False)
+    assert gate["canary"], "the canary rule must fire on every board with copper"
+    assert gate["soft"] == SOFT[name], (name, gate["soft"], gate["rules"])

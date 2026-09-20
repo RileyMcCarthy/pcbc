@@ -7,6 +7,7 @@ import re
 from pathlib import Path
 
 from .compile import compile_design
+from .dru import netclass_patterns, project_classes
 from .footprints import footprint_path
 from .model import Design, Instance
 from .stackup import board_rules, get_stackup
@@ -227,24 +228,10 @@ def emit_pcb(design: Design, *, name: str) -> str:
 
 def emit_pro(design: Design, *, name: str) -> str:
     job = compile_design(design)
-    classes = []
-    for cls in job.classes:
-        row = {
-            "name": cls.name,
-            "clearance": cls.clearance_mm,
-            "track_width": cls.track_width_mm,
-            "via_diameter": cls.via_diameter_mm,
-            "via_drill": cls.via_drill_mm,
-        }
-        if cls.diff_pair_gap_mm is not None:
-            row["diff_pair_gap"] = cls.diff_pair_gap_mm
-            row["diff_pair_width"] = cls.diff_pair_width_mm
-        classes.append(row)
-    patterns = [
-        {"netclass": c.name, "pattern": p}
-        for c in job.classes
-        for p in c.patterns
-    ]
+    # One writer for the class rows: `apply._apply_pro` reads the same two functions (E).
+    cs = job.constraints if job.constraints is not None else job
+    classes = project_classes(cs)
+    patterns = netclass_patterns(cs)
     doc = {
         "board": {
             "design_settings": {

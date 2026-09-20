@@ -62,8 +62,9 @@ def test_design_rules_exempt_a_footprints_own_pads_down_to_the_floor():
     """KiCad applied the Power class clearance (0.2 mm) between a USB-C receptacle's own pads,
     which sit 0.1 mm apart; that is the land, not a routing choice."""
     job = compile_design(load_board(EXAMPLES / "c3_usb" / "c3_usb.py"))
-    rule = job.dru[0]
-    assert rule.name == "pads_of_one_footprint"
+    # Since R1 (docs/r1-design.md E.16) the exemption sits after every clearance rule, so it wins.
+    rule = next(r for r in job.dru if r.name == "pads_of_one_footprint")
+    assert [r.name for r in job.dru].index("pads_of_one_footprint") == len(job.dru) - 2  # before the canary only
     assert "A.Reference == B.Reference" in rule.condition and "A.Type == 'Pad'" in rule.condition
     assert "min 0.1mm" in rule.constraint
 

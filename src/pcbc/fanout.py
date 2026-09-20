@@ -93,6 +93,15 @@ def fanout_copper(design: Design, job: CompiledJob, text: str, board: str = "boa
         foot.lane(stack, clearance)
         if not foot.closed:
             continue
+        if any(pl.ref == ref and (pl.edge or pl.overhang) for pl in job.places):
+            # A part standing on a board edge is the board's entry: the parts it feeds are placed
+            # around it and its pads already face inward, so an escape via buys nothing and costs
+            # room in front of it. This is a policy, not a geometric truth, and it is the measured
+            # one: reading the USB-C's shield pads truthfully (they declare 5 um and draw 0.7 x
+            # 1.4 mm) brought them into the closed rows, and escaping them cost c3_usb 8 vias and
+            # 16.6 mm and pushed the USB pair's detour from 1.81 to 2.04. An IC's supply pins
+            # still get their escapes: without those, c3_usb and ds2 do not route at all.
+            continue
         lm = _LAYER.search(block)
         layer = lm.group(1) if lm else "F.Cu"
         for side in sorted(set(foot.escape.values())):

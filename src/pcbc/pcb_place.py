@@ -163,6 +163,13 @@ def parse_foot(ref: str, block: str) -> Foot:
             continue
         net = _PAD_NET.search(pad)
         w, h = float(size.group(1)), float(size.group(2))
+        cw, ch = _custom_size(pad)
+        if cw is not None:
+            # A custom pad's `(size ...)` is its anchor, not its copper: the USB-C's shield pads
+            # declare 0.005 x 0.005 while their `(primitives (gr_poly ...))` span 0.6 x 1.3 plus a
+            # 0.1 stroke. Every check that reads pads was blind to 0.7 x 1.4 mm of copper on four
+            # pads of c3_usb and node.
+            w, h = max(w, cw), max(h, ch)
         if round(float(at.group(3) or 0) - frot) % 180 == 90:
             w, h = h, w
         pads.append(Pad(num.group(1), float(at.group(1)), float(at.group(2)), w, h, net.group(1) if net else ""))
@@ -170,6 +177,27 @@ def parse_foot(ref: str, block: str) -> Foot:
     pb = footprint_box_local(block, "pads")
     box = (min(crt[0], pb[0]), min(crt[1], pb[1]), max(crt[2], pb[2]), max(crt[3], pb[3]))
     return Foot(ref, box, pads)
+
+
+_PRIM_XY = re.compile(r"\(xy\s+([-0-9.]+)\s+([-0-9.]+)\)")
+_PRIM_WIDTH = re.compile(r"\(width\s+([0-9.]+)\)")
+
+
+def _custom_size(pad: str) -> tuple[float | None, float | None]:
+    """(width, height) of a custom pad's real copper: the bounding box of its primitives' points
+    grown by the stroke, in the pad's own frame. (None, None) for every other pad type."""
+    i = pad.find("(primitives")
+    if i < 0:
+        return (None, None)
+    body = pad[i:]
+    pts = [(float(a), float(b)) for a, b in _PRIM_XY.findall(body)]
+    if not pts:
+        return (None, None)
+    strokes = [float(w) for w in _PRIM_WIDTH.findall(body)]
+    grow = max(strokes) if strokes else 0.0
+    xs = [x for x, _y in pts]
+    ys = [y for _x, y in pts]
+    return (round(max(xs) - min(xs) + grow, 6), round(max(ys) - min(ys) + grow, 6))
 
 
 def parse_refpin(spec: str) -> tuple[str, str]:

@@ -242,3 +242,26 @@ def test_pcbc_writes_the_geometry_rules_and_a_canary_that_must_fire():
     assert '(rule "pcbc_canary"\n\t(severity warning)\n\t(constraint length (max 0.001mm))' in rendered
     assert '(rule "pads_of_one_footprint"\n\t(constraint' in rendered  # an error rule carries no severity line
 
+
+
+def test_a_custom_pads_size_is_its_anchor_not_its_copper():
+    """A `custom` pad's `(size ...)` is the anchor KiCad snaps to, not the copper it draws: the
+    USB-C shield pads declare 0.005 x 0.005 while their `(primitives (gr_poly ...))` span
+    0.6 x 1.3 mm plus a 0.1 mm stroke. Every check that reads pads (placement, corridors,
+    keep-away, the fanout lanes) was blind to 0.7 x 1.4 mm of copper on four pads of c3_usb and
+    node until the pad reader learned to read the primitives."""
+    from pcbc.pcb_place import _custom_size, parse_foot
+
+    pad = (
+        '(pad "A4B9" smd custom\n\t\t\t(at -2.4 -2.47)\n\t\t\t(size 0.005 0.005)\n'
+        '\t\t\t(layers "F.Cu")\n\t\t\t(primitives\n\t\t\t\t(gr_poly\n\t\t\t\t\t(pts\n'
+        "\t\t\t\t\t\t(xy 0.300076 0.650037) (xy 0.300076 -0.649935) (xy -0.299898 -0.64991) (xy -0.299898 0.650062)\n"
+        "\t\t\t\t\t)\n\t\t\t\t\t(width 0.1)\n\t\t\t\t)\n\t\t\t)\n\t\t\t(net \"VBUS\")\n\t\t)"
+    )
+    assert _custom_size(pad) == (0.699974, 1.399997), "the primitives' span plus the stroke"
+    block = '(footprint "X"\n\t\t(at 10 10 0)\n\t\t(property "Reference" "J1"\n\t\t\t(at 0 0 0)\n\t\t)\n\t\t' + pad + "\n\t)"
+    foot = parse_foot("J1", block)
+    assert (round(foot.pads[0].w, 4), round(foot.pads[0].h, 4)) == (0.7, 1.4)
+    # A pad that is not custom is unchanged: its (size ...) is its copper.
+    plain = '(pad "1" smd rect\n\t\t\t(at 0 0)\n\t\t\t(size 1.2 0.8)\n\t\t\t(layers "F.Cu")\n\t\t\t(net "GND")\n\t\t)'
+    assert _custom_size(plain) == (None, None)

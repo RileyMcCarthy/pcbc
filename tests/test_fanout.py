@@ -36,7 +36,7 @@ def test_closed_rows_get_staggered_escape_vias_and_pairs_keep_their_pads(tmp_pat
     on a 0.65 mm row; JLC wants 0.5) and hunted past the decaps with 3.5 mm stubs when the
     second row did not fit: the DS2 Addon failed KiCad's clearance check on the stub."""
     design, job, placed, text, out, notes = _fanned(tmp_path, "c3_usb")
-    assert {n["ref"] for n in notes} == {"J1", "U2", "U3"}, notes
+    assert {n["ref"] for n in notes} == {"U2", "U3"}, notes  # J1 stands on an edge: no escapes
     assert not any(n["net"] in ("USB_DP", "USB_DN") for n in notes)
     stack = get_stackup(job.stackup)
     vias = [n["via"] for n in notes]
@@ -85,7 +85,7 @@ def test_every_escape_stub_is_axis_aligned(tmp_path: Path):
     obstacle and never has to land on it."""
     from pcbc.copper_bar import off_45, segments
 
-    for name in ("c3_usb", "node"):
+    for name in ("c3_usb",):  # the only example with escapes now that edge-placed parts are out
         design, job, placed, text, out, notes = _fanned(tmp_path / name, name)
         assert notes, name
         stubs = [s for s in segments(out) if s["locked"]]
@@ -94,3 +94,16 @@ def test_every_escape_stub_is_axis_aligned(tmp_path: Path):
         for s in stubs:
             (x1, y1), (x2, y2) = s["start"], s["end"]
             assert abs(x1 - x2) < 1e-9 or abs(y1 - y2) < 1e-9, f"{name}: a stub leaves its pad square"
+
+
+def test_a_part_on_a_board_edge_gets_no_escape_vias(tmp_path: Path):
+    """A connector standing on an edge is the board's entry: the parts it feeds are placed around
+    it and its pads already face inward, so an escape via buys nothing and costs room in front of
+    it. Measured when the USB-C's shield pads stopped reading as 5 um dots: escaping them cost
+    c3_usb 8 vias and 16.6 mm and pushed the USB pair's detour from 1.81 to 2.04. An IC's supply
+    pins still get theirs (without those, c3_usb and ds2 do not route at all)."""
+    _design, job, _placed, _text, _out, notes = _fanned(tmp_path / "c3", "c3_usb")
+    edge = {p.ref for p in job.places if p.edge or p.overhang}
+    assert "J1" in edge, "c3_usb's USB-C is placed on an edge"
+    assert edge & {n["ref"] for n in notes} == set(), f"no escape via on an edge-placed part: {sorted({n['ref'] for n in notes})}"
+    assert {n["ref"] for n in notes} == {"U2", "U3"}, "the LDO's and the ESD diode's supply pins keep theirs"

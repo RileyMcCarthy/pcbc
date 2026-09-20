@@ -1,0 +1,184 @@
+{
+ "board_size_mm": [
+  40.0,
+  25.0
+ ],
+ "classes": [
+  {
+   "clearance_mm": 0.16,
+   "diff_pair_gap_mm": null,
+   "diff_pair_width_mm": null,
+   "name": "Default",
+   "patterns": [
+    "LED"
+   ],
+   "track_width_mm": 0.16,
+   "via_diameter_mm": 0.5,
+   "via_drill_mm": 0.3
+  },
+  {
+   "clearance_mm": 0.2,
+   "diff_pair_gap_mm": null,
+   "diff_pair_width_mm": null,
+   "name": "Power",
+   "patterns": [
+    "VCC",
+    "GND"
+   ],
+   "track_width_mm": 0.25,
+   "via_diameter_mm": 0.8,
+   "via_drill_mm": 0.4
+  }
+ ],
+ "dru": [
+  {
+   "condition": "A.Type == 'Pad' && B.Type == 'Pad' && A.Reference == B.Reference",
+   "constraint": "(constraint clearance (min 0.1mm))",
+   "name": "pads_of_one_footprint",
+   "severity": "error"
+  },
+  {
+   "condition": "A.Type == 'Track'",
+   "constraint": "(constraint track_segment_length (min 0.2mm))",
+   "name": "pcbc_geometry_segments",
+   "severity": "warning"
+  },
+  {
+   "condition": "A.Type == 'Track'",
+   "constraint": "(constraint track_angle (min 135))",
+   "name": "pcbc_geometry_angles",
+   "severity": "warning"
+  },
+  {
+   "condition": "A.NetName == 'LED'",
+   "constraint": "(constraint length (max 0.001mm))",
+   "name": "pcbc_canary",
+   "severity": "warning"
+  }
+ ],
+ "keepouts": [],
+ "krt": {
+  "length_match": [],
+  "planes": [],
+  "power_nets": [
+   "VCC",
+   "GND"
+  ],
+  "sensitive": [],
+  "skip_patterns": [],
+  "usb_pairs": []
+ },
+ "layers": 2,
+ "nets": [
+  {
+   "amps": 0.05,
+   "autoroute": true,
+   "class_name": "Power",
+   "keep_clear_mm": null,
+   "keep_clear_of": null,
+   "kind": "power",
+   "layers": [
+    "F.Cu",
+    "B.Cu",
+    "In1.Cu",
+    "In2.Cu"
+   ],
+   "match_group": null,
+   "max_length_mm": null,
+   "patterns": [
+    "VCC",
+    "GND"
+   ],
+   "vias": true
+  },
+  {
+   "amps": null,
+   "autoroute": true,
+   "class_name": "Default",
+   "keep_clear_mm": null,
+   "keep_clear_of": null,
+   "kind": "digital",
+   "layers": [
+    "F.Cu",
+    "B.Cu"
+   ],
+   "match_group": null,
+   "max_length_mm": null,
+   "patterns": [
+    "LED"
+   ],
+   "vias": true
+  }
+ ],
+ "padding": [
+  0.0,
+  0.0,
+  0.0,
+  0.0
+ ],
+ "pcb": null,
+ "places": [
+  {
+   "at": null,
+   "bottom": 0,
+   "edge": null,
+   "from_box": "courtyard",
+   "gap": null,
+   "height": null,
+   "left": 8,
+   "locked": true,
+   "margin_bottom": "auto",
+   "margin_left": 0,
+   "margin_right": 0,
+   "margin_top": "auto",
+   "overhang": 0.0,
+   "parent": null,
+   "position": "absolute",
+   "reason": "resistor west of LED",
+   "ref": "R1",
+   "right": null,
+   "rot": 0.0,
+   "rot_set": false,
+   "side": "F",
+   "to": null,
+   "top": 0,
+   "toward": null,
+   "translate_x": null,
+   "translate_y": null,
+   "width": null
+  },
+  {
+   "at": null,
+   "bottom": 0,
+   "edge": null,
+   "from_box": "courtyard",
+   "gap": null,
+   "height": null,
+   "left": null,
+   "locked": true,
+   "margin_bottom": "auto",
+   "margin_left": 0,
+   "margin_right": 0,
+   "margin_top": "auto",
+   "overhang": 0.0,
+   "parent": null,
+   "position": "absolute",
+   "reason": "LED at east edge",
+   "ref": "D1",
+   "right": 8,
+   "rot": 0.0,
+   "rot_set": false,
+   "side": "F",
+   "to": null,
+   "top": 0,
+   "toward": null,
+   "translate_x": null,
+   "translate_y": null,
+   "width": null
+  }
+ ],
+ "planes": [],
+ "regions": [],
+ "skip_autoroute_patterns": [],
+ "stackup": "jlcpcb_2l_1oz"
+}

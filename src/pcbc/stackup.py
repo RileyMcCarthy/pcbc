@@ -116,6 +116,13 @@ class Stackup:
     hole_clearance: float = 0.25
     hole_to_hole: float = 0.5
     edge_clearance: float = 0.3  # copper to the board edge
+    # The solder-mask dam a fab will still print between two openings (JLC's published minimum on
+    # its 1 oz rungs). Read by nothing but A.4 rule 4, which is **advisory in R2**: a candidate that
+    # fails only the mask rule is accepted and emits a `style:` note, because KiCad's own
+    # `solder_mask_bridge` check is what gates the build and pcbc has not yet measured what 0.10
+    # costs in tap sites (docs/r2-design.md A.4). No compiled number reads it, so no
+    # `tests/fixtures/compiled/*.json` moves.
+    mask_bridge_min: float = 0.0
     mask_over_substrate_mm: float = 0.0305  # JLC impedance page: 1.2 mil
     mask_over_trace_mm: float = 0.0152  # 0.6 mil
     mask_dk: float = 3.8
@@ -249,7 +256,7 @@ def _four_layer(prepreg: str, h: float, dk: float, core: float) -> tuple[Copper 
     )
 
 
-_FOUR_LAYER_LIMITS = dict(track_min=0.0889, clearance_min=0.0889, via_drill=0.2, via_diameter=0.35, annular_min=0.075)
+_FOUR_LAYER_LIMITS = dict(track_min=0.0889, clearance_min=0.0889, via_drill=0.2, via_diameter=0.35, annular_min=0.075, mask_bridge_min=0.10)
 _FITTED = "fitted to JLC04161H-{code} rows (JITX), 2026-09-19"
 _INTERPOLATED = "interpolated between 7628 and 1080 fits; capture JLC rows to replace"
 
@@ -304,6 +311,7 @@ STACKUPS: dict[str, Stackup] = {
         z_bias_se=1.0,
         z_bias_diff=1.0,
         z_bias_source="uncalibrated: formula only",
+        mask_bridge_min=0.10,
     ),
 }
 

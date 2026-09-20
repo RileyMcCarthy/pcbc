@@ -728,25 +728,17 @@ class _Grid:
 
 
 def _lane_strips(f: Foot) -> dict[str, tuple[float, float, float, float]]:
-    """A closed row's fanout lanes as world strips, by side."""
-    if not f.closed or f.keep is None:
-        return {}
-    b, k = f.world_box(), f.world_keep()
-    strips: dict[str, tuple[float, float, float, float]] = {}
-    for side in sorted(set(f.escape.values())):
-        # the local side, turned by the footprint's rotation, is where the strip lies in the world
-        lx, ly = {"top": (0.0, -1.0), "bottom": (0.0, 1.0), "left": (-1.0, 0.0), "right": (1.0, 0.0)}[side]
-        wx, wy = _rotate(lx, ly, f.rot)
-        wside = _quantise(wx, wy)
-        if wside == "up" and k[1] < b[1] - 1e-9:
-            strips[side] = (k[0], k[1], k[2], b[1])
-        elif wside == "down" and k[3] > b[3] + 1e-9:
-            strips[side] = (k[0], b[3], k[2], k[3])
-        elif wside == "left" and k[0] < b[0] - 1e-9:
-            strips[side] = (k[0], k[1], b[0], k[3])
-        elif wside == "right" and k[2] > b[2] + 1e-9:
-            strips[side] = (b[2], k[1], k[2], k[3])
-    return strips
+    """A closed row's fanout lanes as world strips, by side.
+
+    One owner, two questions (`docs/r2-design.md` A.7): this raster asks "does a channel exist end
+    to end for this net's trunk" and fills the whole strip unless the net owns an escape in it,
+    while the router asks about one piece — may it cross a lane (yes) or run along it (no). The
+    rectangle they argue about has to be the same one, so it lives in `route_scene` and both
+    callers import it.
+    """
+    from .route_scene import lane_strips
+
+    return lane_strips(f)
 
 
 def check_corridors(ctx: Ctx) -> list[str]:

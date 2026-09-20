@@ -55,6 +55,7 @@ __all__ = [
     "PAIR_FIT_MM",
     "PRESETS",
     "SOFT_RULES",
+    "ClearanceTable",
     "CompiledClass",
     "Constraint",
     "ConstraintSet",
@@ -69,6 +70,7 @@ __all__ = [
     "Source",
     "ViaSpec",
     "VoltageSpec",
+    "clearance_table",
     "compile_constraints",
     "slug",
 ]
@@ -1462,3 +1464,141 @@ def _class_summary(c: CompiledClass, stack: Stackup) -> str:
         s += f" via {_g(c.via_diameter_mm)}/{_g(c.via_drill_mm)}"
     return s
 
+
+
+# ---------------------------------------------------------------------------------------------
+# A.3 the clearance table: every distance requirement the router asks for, from one place
+# ---------------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ClearanceTable:
+    """Every number a routing decision needs, so the router cannot drift from the rules KiCad is
+    handed (`docs/r2-design.md` A.3).
+
+    `between(a, b)` is a **max** over the requirements that apply to the pair, and the winner names
+    itself in the `why` string, so a refusal can say which rule it came from rather than a bare
+    number. It is deliberately at least every `clearance` and `creepage` rule `dru.py` writes for
+    that pair — `test_clearance_table_covers_every_written_rule` walks `dru.rules(cs)` on every
+    board and asserts exactly that — with one exemption, named here because it is the only rule in
+    the file that exists to **lower** a number: `pads_of_one_footprint` is written last, after every
+    clearance rule, precisely so a connector's own 0.1 mm land beats the 0.155-0.2 class clearances,
+    and KiCad's later-rule-wins precedence makes it stick. Taking the max cannot model a lowering
+    rule and does not need to: it is pad to pad, and pcbc never draws a pad.
+
+    Being the max also means the table ignores the `NOT_OWN_PADS` exemption the written rules carry.
+    That is the safe direction — a candidate refused near a footprint's own two pads costs a fit and
+    prints a move, and never the other way round.
+    """
+
+    cs: ConstraintSet
+    _by_net: dict = field(default_factory=dict, repr=False, compare=False)
+    _class_away: dict = field(default_factory=dict, repr=False, compare=False)
+    _class_creepage: dict = field(default_factory=dict, repr=False, compare=False)
+    _default_clearance: float = 0.0
+
+    # -- the pair question ---------------------------------------------------------------------
+
+    def between(self, net_a: str, net_b: str) -> tuple[float, str]:
+        """(mm, why) for copper on `net_a` against copper on `net_b`."""
+        if net_a and net_a == net_b:
+            return (0.0, "same net")
+        # KiCad resolves a clearance from the two items' own net classes and gives an unassigned
+        # net the Default class, so the baseline is the fab floor and each net contributes its own
+        # class — not Default. Starting from Default instead reads two USB nets (0.155) as 0.16 and
+        # refuses c3_usb's own routed pair at 0.159, which KiCad passes.
+        best = (self.cs.stackup.clearance_min, "stackup floor")
+        for net in (net_a, net_b):
+            c = self._by_net.get(net)
+            if c is not None:
+                v = max(c.clearance_mm.value, self.cs.stackup.clearance_min)
+                if v > best[0]:
+                    best = (v, f"class {c.class_name}")
+            elif self._default_clearance > best[0]:
+                best = (self._default_clearance, "Default class")
+        # Keep-aways are written per class in `dru.py` (E.4), so they apply to every net of the
+        # class, not only to the net whose NetReq carried the line.
+        for a, b in ((net_a, net_b), (net_b, net_a)):
+            ca = self._by_net.get(a)
+            if ca is None:
+                continue
+            v = self._class_away.get((ca.class_name, b))
+            if v is not None and v > best[0]:
+                best = (v, f"{ca.class_name} keep-away from {b}")
+        # Class creepage (E.6): the written rule is "this class against any other net", not "against
+        # another class that also carries creepage", and the table has to cover what is written.
+        # Enforcing a creepage as a straight-line distance is conservative: the surface path between
+        # two pieces of copper is never shorter than the air between them.
+        for a, b in ((net_a, net_b), (net_b, net_a)):
+            ca = self._by_net.get(a)
+            cb = self._by_net.get(b)
+            if ca is None or not b:
+                continue
+            if cb is not None and cb.class_name == ca.class_name:
+                continue
+            v = self._class_creepage.get(ca.class_name)
+            if v is not None and v > best[0]:
+                best = (v, f"creepage {ca.class_name}")
+        for spec in self.cs.isolation_specs:
+            sides = ((spec.nets_a, spec.nets_b), (spec.nets_b, spec.nets_a))
+            if any(net_a in x and net_b in y for x, y in sides):
+                tag = f"isolation {spec.req.a}/{spec.req.b}"
+                if spec.clearance_mm.value > best[0]:
+                    best = (spec.clearance_mm.value, tag)
+                across = set(spec.across_nets)
+                if not spec.req.slot and net_a not in across and net_b not in across and spec.creepage_mm.value > best[0]:
+                    best = (spec.creepage_mm.value, f"{tag} creepage")
+        return (round(best[0], 4), best[1])
+
+    # -- the board-wide numbers ----------------------------------------------------------------
+
+    def edge(self) -> float:
+        """Copper to the nominal Edge.Cuts line. KiCad ignores the outline's stroke (A.4 rule 5)."""
+        return self.cs.stackup.edge_clearance
+
+    def hole_to_copper(self) -> float:
+        return self.cs.stackup.hole_clearance
+
+    def hole_to_hole(self) -> float:
+        """Edge to edge, the way KiCad measures it, which is why two 0.3 mm drills need 0.8 mm
+        centre to centre and `clears(hole, hole, hole_to_hole())` gets that for free (A.4 rule 3)."""
+        return self.cs.stackup.hole_to_hole
+
+    def via_to_same_net_smd_pad(self) -> float:
+        """A via in a passive's own pad wicks solder and the fab stage refuses it; `route.py` passes
+        this same number to KRT as `--same-net-pad-clearance` on the steps that may place one."""
+        return self.cs.stackup.clearance_min
+
+    def mask_bridge(self) -> float:
+        """A.4 rule 4, advisory in R2: a candidate that fails only this is accepted with a note."""
+        return self.cs.stackup.mask_bridge_min
+
+    def via_pitch(self, net_a: str, net_b: str, drill_a: float, dia_a: float, drill_b: float, dia_b: float) -> float:
+        """Centre to centre for two vias: the holes keep `hole_to_hole` edge to edge and the rings
+        keep `between`, whichever is larger. `stackup.fanout_stagger` is this same arithmetic on a
+        row of a given pitch, and it is the number the fanout's staggered rows already obey."""
+        holes = self.hole_to_hole() + (drill_a + drill_b) / 2.0
+        rings = self.between(net_a, net_b)[0] + (dia_a + dia_b) / 2.0
+        return round(max(holes, rings), 4)
+
+
+def clearance_table(cs: ConstraintSet) -> ClearanceTable:
+    """Build the table once per board. Pure; every lookup below is a dict built here, in sorted
+    order, so nothing in a decision path iterates a dict whose order could move."""
+    by_net = {c.net: c for c in cs.constraints}
+    away: dict[tuple[str, str], float] = {}
+    creepage: dict[str, float] = {}
+    for c in sorted(cs.constraints, key=lambda c: c.net):
+        for k in c.keep_away:
+            key = (c.class_name, k.other)
+            away[key] = max(away.get(key, 0.0), k.mm)
+        if c.voltage is not None and c.voltage.creepage_mm is not None:
+            creepage[c.class_name] = max(creepage.get(c.class_name, 0.0), c.voltage.creepage_mm.value)
+    default = next((c.clearance_mm for c in cs.classes if c.name == "Default"), cs.stackup.clearance_min)
+    return ClearanceTable(
+        cs=cs,
+        _by_net=by_net,
+        _class_away=away,
+        _class_creepage=creepage,
+        _default_clearance=max(default, cs.stackup.clearance_min),
+    )

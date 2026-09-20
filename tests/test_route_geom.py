@@ -38,6 +38,7 @@ from pcbc.route_geom import (
     hull,
     hull_dist2,
     is_octilinear,
+    legs_ok,
     octant,
     octile_corner,
     octile_path,
@@ -786,6 +787,34 @@ def test_property_a_reduced_hull_still_holds_every_point_it_came_from():
     assert boxed == 0, f"{boxed} of 400 outlines fell back to their bounding box"
 
 
+def test_q_is_a_fixed_point_of_the_text_format_and_not_the_format_itself():
+    """A.2 property 1, corrected. `q` is KiCad's 1 nm grid and `f"{q(v):.6f}"` round-trips exactly;
+    `q` is *not* `float(f"{v:.6f}")`, because it rounds the already-rounded product `v * 1e6` while
+    the format rounds the exact value of the double. They differ by a nanometre on 38 % of the
+    midpoints a pattern computes, which is why the house rule is `f"{q(v):.6f}"` and never
+    `f"{v:.6f}"` of a raw computed coordinate."""
+    a, b = 21.732048, 21.734519  # both on the grid, an odd number of nanometres apart
+    mid = (a + b) / 2.0
+    assert q(mid) == 21.733284, "q rounds the product: 21733283.4999... nm goes to 21733284"
+    assert f"{mid:.6f}" == "21.733283", (
+        "and the text format rounds the double itself, one nanometre the other way: writing a raw "
+        "computed coordinate is the 'we rounded on the way out' bug the module claims cannot happen"
+    )
+    assert float(f"{q(mid):.6f}") == q(mid), "what the house rule guarantees, and all it guarantees"
+    rng = random.Random(SEED + 11)
+    differ = 0
+    for _ in range(2000):
+        x = q(rng.uniform(0.0, 60.0))
+        y = q(x + (2 * rng.randrange(1, 2000) + 1) * NM)  # an odd number of nanometres away
+        m = (x + y) / 2.0  # exactly a half nanometre off the grid
+        assert float(f"{q(m):.6f}") == q(m), f"{m!r} does not survive its own text"
+        differ += q(m) != float(f"{m:.6f}")
+    assert differ > 500, (
+        f"only {differ} of 2000 half-nanometre midpoints disagreed with a raw f-string; the rule "
+        "this test exists to pin has stopped mattering, which means q changed"
+    )
+
+
 def test_property_quantisation_is_idempotent_and_survives_the_text_kicad_writes():
     """D.3, and A.2 property 1: `q` is a fixed point, and `f"{v:.6f}"` — the format the board file
     is written with — parses back to the same double. The geometry pcbc checks is the geometry
@@ -838,6 +867,302 @@ def test_property_the_module_is_deterministic():
         assert hull_dist2(a.pts, b.pts) == hull_dist2(a.pts, b.pts)
         assert clears(a, b, need) == clears(a, b, need)
         assert gap(a, b) == gap(a, b)
+        # ...and the answers do not depend on which argument is which. Asserting a call against
+        # itself is a tautology; this is the assertion that has content, and it is the one that
+        # failed: `clears` summed the radii in call order and flipped 286 of 3240 realistic
+        # (clearance, radius, radius) triples, `gap` printed two different 4-dp numbers for 422 of
+        # 400 000 pairs (docs/r2-measurements.md, S3).
+        assert hull_dist2(a.pts, b.pts) == hull_dist2(b.pts, a.pts), "distance is symmetric"
+        assert clears(a, b, need) == clears(b, a, need), "so is the verdict"
+        assert gap(a, b) == gap(b, a), "and so is the number the report prints"
+
+
+# --- what the attacks on the core found (the review of S2) -----------------------------------------
+
+
+def test_a_star_wound_point_list_is_not_a_hull_even_though_every_triple_turns_left():
+    """A.1's invariant is "these points ARE their own hull, in hull order", not "every consecutive
+    triple turns left". A pentagram winds through 720 degrees, so every triple turns left; the old
+    check accepted it, and `_in_hull` — which every overlap decision rests on — was then wrong by
+    0.678 mm on the very first probe."""
+    circle = tuple(
+        (5.0 + 2.0 * math.cos(math.radians(-90 + 72 * i)), 5.0 + 2.0 * math.sin(math.radians(-90 + 72 * i)))
+        for i in range(5)
+    )
+    star = tuple(qp(circle[(2 * i) % 5]) for i in range(5))
+    for i in range(5):  # the necessary-but-not-sufficient test the old validator ran, still true
+        o, a, b = star[i], star[(i + 1) % 5], star[(i + 2) % 5]
+        cross = (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+        assert cross > 0, "every consecutive triple of a pentagram turns the same way"
+    with pytest.raises(ValueError, match="strictly convex CCW hull"):
+        Shape(star, 0.0)
+    honest = Shape(hull(star), 0.0)
+    probe = via_shape((5.0, 3.398146), 0.5)
+    assert gap(honest, probe) == -0.25, (
+        "the truth for those five points, hulled: the via sits a quarter of a millimetre inside "
+        "the copper. Read star-wound, the module answered +0.427893 and cleared it at every "
+        "clearance the five boards compile (docs/r2-design.md A.3 tops out at 0.25)"
+    )
+    assert not clears(honest, probe, 0.0)
+    mirrored = tuple((-x, y) for x, y in hull(star))  # the neighbouring case, already caught
+    with pytest.raises(ValueError, match="strictly convex CCW hull"):
+        Shape(mirrored, 0.0)
+
+
+def test_the_three_judges_agree_about_a_doubled_point():
+    """A.5: `is_octilinear`, `turn_ok` and `Path` judge the same path, so they may not disagree
+    about it. A doubled point is a degenerate leg with no direction — `octant` raises on it — and
+    chaining two `octile_path` pieces end to end is exactly how one appears at the join."""
+    p1 = octile_path((0.0, 0.0), (3.0, 1.0))
+    p2 = octile_path((3.0, 1.0), (6.0, 1.0))
+    joined = p1 + p2
+    assert joined == ((0.0, 0.0), (1.0, 1.0), (3.0, 1.0), (3.0, 1.0), (6.0, 1.0)), "the real join"
+    assert is_octilinear(joined) is False, "a zero-length leg is not octilinear: it has no angle"
+    assert turn_ok(joined) is False, "and it is not a 45-degree turn either; it used to raise here"
+    with pytest.raises(ValueError, match="zero length"):
+        GeomPath(joined, 0.2, "F.Cu")
+    assert p1 + p2[1:] == ((0.0, 0.0), (1.0, 1.0), (3.0, 1.0), (6.0, 1.0)), "the idiom that is right"
+    assert is_octilinear(p1 + p2[1:]) and turn_ok(p1 + p2[1:])
+    with pytest.raises(ValueError, match="two distinct points"):
+        octile_path((10.0, 10.0), (10.0, 10.0))
+    with pytest.raises(ValueError, match="two distinct points"):
+        octile_path((10.0, 10.0), (10.0000004, 10.0)), "half a nanometre apart is the same point"
+
+
+def test_turn_ok_refuses_the_right_angle_an_off_axis_leg_hides():
+    """A.5 rule 1. `octant` classifies an off-axis leg by the signs of its deltas alone, so two
+    nearly perpendicular legs land in adjacent octants and a 90-degree corner passes the turn test.
+    The legs that do it are the tilted escape stubs S1 straightened, measured on the placed boards
+    (docs/r2-measurements.md S1), so the precondition is folded into `turn_ok` itself."""
+    c3_gnd = ((20.75, 18.6385), (21.8, 18.65), (21.8, 21.0))
+    ds2_gpio1 = ((20.22, 15.07), (20.2, 16.35), (18.0, 16.35))
+    for pts, deg in ((c3_gnd, 90.6275), (ds2_gpio1, 90.8952)):
+        a = math.degrees(math.atan2(pts[0][1] - pts[1][1], pts[0][0] - pts[1][0]))
+        b = math.degrees(math.atan2(pts[2][1] - pts[1][1], pts[2][0] - pts[1][0]))
+        turn = abs((b - a) % 360.0)
+        assert round(min(turn, 360.0 - turn), 4) == deg, "the true interior angle of the S1 stub"
+        assert octant(pts[0], pts[1]) != octant(pts[1], pts[2]), "adjacent octants, so d = 1"
+        assert is_octilinear(pts) is False, "which is the only thing that catches it"
+        assert turn_ok(pts) is False, (
+            f"a {deg} degree corner is not a 45-degree turn (docs/r2-design.md A.5 rule 1); "
+            "turn_ok alone used to sign it off"
+        )
+    assert turn_ok(((0.0, 0.0), (1.0, 0.0), (2.0, 1.0))) is True, "a real 45 still passes"
+
+
+# The 11 legs under MICRO_MM that KiCad drew `track_segment_length` violations on, from 72 octile
+# segments over 36 isolated nets judged by pcbc's own rule text (docs/r2-measurements.md, S3).
+KICAD_SHORT_LEGS = (0.0262, 0.0886, 0.0928, 0.1082, 0.1176, 0.1209, 0.1315, 0.1540, 0.1590, 0.1827, 0.1832)
+
+
+def test_legs_ok_is_the_third_judge_and_refuses_exactly_what_kicad_counts():
+    """A.5 gains `legs_ok` beside `is_octilinear` and `turn_ok`: `MICRO_MM` was defined and
+    documented as KiCad's rule and then used by nothing, while `octile_path` manufactured legs
+    under it (2.15 % of random endpoint pairs, 31.20 % of hops under 2 mm). The path stays exact —
+    collapsing the short leg would move an endpoint, which A.5 forbids — so this is a refusal a
+    pattern reports as a move."""
+    from pcbc.dru import rules as dru_rules
+
+    for length in KICAD_SHORT_LEGS:
+        assert length < MICRO_MM, f"{length} is one of the 11 KiCad faulted"
+        assert legs_ok(((0.0, 0.0), (length, 0.0), (length + 5.0, 0.0))) is False, (
+            f"a {length} mm leg is copper pcbc's own pcbc_geometry_segments rule refuses"
+        )
+    assert legs_ok(((0.0, 0.0), (MICRO_MM, 0.0))) is True, "exactly 0.2 mm is the rule's own (min)"
+    assert legs_ok(octile_path((0.0, 0.0), (5.0, 5.0))) is True
+    short = octile_path((0.0, 0.0), (5.0, 0.1))
+    assert len(short) == 3 and legs_ok(short) is False, "the two-leg form is where they come from"
+    assert is_octilinear(short) and turn_ok(short), "and it is exact copper, just too short a leg"
+    assert ("pcbc_geometry_segments", f"(constraint track_segment_length (min {MICRO_MM:g}mm))") in [
+        (r.name, r.constraint) for r in dru_rules(_a_constraint_set())
+    ], "MICRO_MM is the number of pcbc's own rule, not a second copy of it (dru.py E.1)"
+
+
+def _a_constraint_set():
+    """The compiled blinky, for the one test that needs a real `.kicad_dru` rule list."""
+    from pcbc.compile import compile_design
+    from pcbc.language import load_board
+
+    return compile_design(load_board(Path(__file__).resolve().parent.parent / "examples" / "blinky" / "blinky.py")).constraints
+
+
+def test_clears_and_gap_do_not_care_which_argument_is_which():
+    """The determinism contract this module opens with, pinned on the two cases that broke it: a
+    pattern asking `clears(candidate, obstacle)` and a self-check asking `clears(obstacle,
+    candidate)` have to agree about the same board."""
+    a = circle_shape(0.0, 0.0, 0.10)
+    b = circle_shape(0.214, 0.0, 0.15)
+    need = 0.0889  # node's 4-layer Default clearance (docs/r2-design.md A.3)
+    assert clears(a, b, need) == clears(b, a, need), (
+        "0.0889 + 0.05 + 0.075 + EPS_MM against an exact 0.214 mm separation: summing the radii in "
+        "call order gave 0.21400000000000002 one way and 0.21399999999999997 the other, and the "
+        "two orders disagreed (286 of 3240 realistic triples flipped)"
+    )
+    big = circle_shape(0.0, 0.0, 1.0)
+    small = circle_shape(0.73425, 0.0, 0.15)
+    assert gap(big, small) == gap(small, big) == 0.1593, (
+        "0.73425 - 0.5 - 0.075 is 0.15925 exactly, which rounds to 0.1593; subtracting the radii "
+        "one at a time lost the last bit off the top and printed 0.1592 in one argument order"
+    )
+
+
+def test_gap_never_prints_a_negative_zero_for_shapes_that_touch():
+    """`q`'s own rule, applied to the module's one reporting function: 88 010 of 400 000 exactly
+    touching pairs underflowed to `-0.0`, and an f-string renders that as a different byte string
+    for the same geometry."""
+    for ra, rb, sep in ((0.45, 0.1016, 0.5516), (0.4, 0.0889, 0.4889), (0.1, 0.25, 0.35), (0.125, 0.05, 0.175)):
+        g = gap(circle_shape(0.0, 0.0, 2 * ra), circle_shape(sep, 0.0, 2 * rb))
+        assert g == 0.0 and math.copysign(1.0, g) > 0.0, f"{ra}/{rb} at {sep} printed {g!r}"
+        assert f"{g:.4f}" == "0.0000", "which is the byte string a report line is asserted against"
+
+
+def test_clears_answers_a_requirement_the_shapes_offsets_already_meet():
+    """Squaring discards the sign, so a requirement more negative than -(a.r + b.r + EPS_MM) used to
+    mean the opposite of what it said. `between()` is a max over non-negative clearances floored at
+    `stackup.clearance_min` (docs/r2-design.md A.3), so `need` is never negative today; `clears`
+    answers correctly if one ever is, rather than inverting silently in R3's port."""
+    a, b = via_shape((0.0, 0.0), 0.5), via_shape((0.2, 0.0), 0.5)
+    for need in (-0.4999, -0.5001, -1.0, -5.0):
+        assert clears(a, b, need) is True, f"need={need} is met by the shapes' own offsets"
+    assert not clears(a, b, 0.0), "and a real requirement on two overlapping vias still refuses"
+
+
+def test_octile_corner_quantises_its_own_endpoints():
+    """A.5 rule 2. The docstring's "already quantised" was a precondition the signature did not
+    show: all 50 000 deliberately off-grid pairs came back with a leg that was not 0/45/90 against
+    the caller's own points, which is the S1 fanout bug in a second place."""
+    a, b = (4e-07, 0.0), (5.0000004, 2.0000004)
+    assert octile_corner(a, b) == (2.0, 2.0)
+    assert is_octilinear((qp(a), octile_corner(a, b), qp(b))), "exact against the quantised points"
+    rng = random.Random(SEED + 12)
+    for _ in range(500):
+        a = (q(rng.uniform(0.0, 60.0)) + 4e-10, q(rng.uniform(0.0, 45.0)) - 4e-10)
+        b = (q(rng.uniform(0.0, 60.0)) - 4e-10, q(rng.uniform(0.0, 45.0)) + 4e-10)
+        if qp(a) == qp(b):
+            continue
+        legs = (qp(a), octile_corner(a, b), qp(b))
+        assert is_octilinear(legs), f"{a} -> {b} left 0/45/90 (docs/r2-design.md A.5 rule 2)"
+        assert octile_corner(a, b) == octile_corner(qp(a), qp(b)), "qp is idempotent, so this is free"
+
+
+def test_the_measurement_functions_refuse_a_non_finite_coordinate():
+    """`q` raises, `octant` raises — and `clip_len_in_box` returned nan while `path_mm` returned inf.
+    A nan loses every comparison it takes part in, so a cost that went non-finite would sort as "not
+    worse than anything" instead of failing loudly."""
+    for bad in (math.inf, math.nan):
+        with pytest.raises(ValueError, match="not finite"):
+            clip_len_in_box((0.0, 0.0), (bad, 0.0), (0.0, 0.0, 1.0, 1.0))
+        with pytest.raises(ValueError, match="not finite"):
+            clip_len_in_box((0.0, 0.0), (1.0, 0.0), (0.0, 0.0, bad, 1.0))
+        with pytest.raises(ValueError, match="not finite"):
+            path_mm(((0.0, 0.0), (bad, 0.0)))
+        with pytest.raises(ValueError, match="not finite"):
+            seg_lengths(((0.0, 0.0), (0.0, bad)))
+
+
+# --- A.1 against the arbiter: the probe ring on real board pads -------------------------------------
+
+PROBE_PADS = (
+    ("c3_usb", "J1", "A4B9", "custom gr_poly, concave: the hull is a superset"),
+    ("c3_usb", "J1", "1", "oval pad with an oval drill: exact"),
+    ("c3_usb", "U1", "49", "chamfered roundrect: the chamfer is ignored, a superset"),
+    ("ds2", "J1", "1", "thru_hole rect with a round drill: exact"),
+)
+PROBE_RING = 8
+PROBE_EXACT = 25
+"""Of the 32 probes, how many KiCad's `actual` and pcbc's `gap` agree on to 4 dp (measured
+2026-09-20, KiCad 10.0.6; `docs/r2-measurements.md` S3). The other seven are the two supersets A.1
+declares — the hulled concave shield pad and the ignored chamfer — and the probes that land inside
+copper, where KiCad reports a short instead of a clearance and has no `actual` to compare."""
+
+
+@pytest.mark.kicad
+def test_kicad_measures_the_same_air_around_a_real_pad_as_the_shape_model_does():
+    """A.1's table, judged by the arbiter on real board pads instead of by this file's own geometry.
+
+    Method: one footprint lifted from a placed board, a ring of short probe tracks around one pad on
+    a net of their own, and a single clearance rule far wider than the gap, so KiCad prints its own
+    measured `actual` for every probe. The claim is one-sided, because that is what soundness means
+    here: **KiCad's air is never less than pcbc's**, so the model is the true copper or a superset
+    of it and never a subset. Where the model is exact the two agree to the last digit KiCad prints.
+    """
+    import json
+    import re
+    import tempfile
+
+    from pcbc.dru import DruRule, render
+    from pcbc.netcheck import kicad_drc
+    from pcbc.pads import pad_geoms
+    from pcbc.route_geom import track_shape
+    from pcbc.sexp import board_footprint_spans, footprint_at, footprint_reference
+
+    root = Path(__file__).resolve().parent.parent
+    ds2 = Path.home() / "Documents" / "MaD" / "Hardware" / "DS2Addon" / "pcbc"
+    if not ds2.exists():
+        pytest.skip("the DS2 Addon is not checked out here; its header is one of the four rows")
+    pro = {
+        "board": {"design_settings": {"defaults": {}, "rules": {"min_clearance": 0.05, "min_track_width": 0.05}, "rule_severities": {}}},
+        "meta": {"filename": "layout.kicad_pcb", "version": 1},
+        "net_settings": {"classes": [{"name": "Default", "clearance": 0.05, "track_width": 0.16, "via_diameter": 0.5, "via_drill": 0.3}]},
+        "text_variables": {},
+    }
+    actual = re.compile(r"actual ([0-9.]+) mm")
+    agreed = 0
+    for board, ref, num, what in PROBE_PADS:
+        pcb = (ds2 / "layout" / "ds2_addon" / "placed" / "layout.kicad_pcb") if board == "ds2" else (root / "examples" / board / "layout" / board / "placed" / "layout.kicad_pcb")
+        text = pcb.read_text()
+        block = next(text[s:e] for s, e in board_footprint_spans(text) if footprint_reference(text[s:e]) == ref)
+        geoms = pad_geoms(block, footprint_at(block), ref=ref)
+        target = next(g for g in geoms if g.num == num)
+        x0, y0, x1, y1 = target.box()
+        cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
+        reach = max(x1 - x0, y1 - y0) / 2.0 + 0.7
+        probes = []
+        for i in range(PROBE_RING):
+            a = 2.0 * math.pi * i / PROBE_RING
+            px, py = cx + reach * math.cos(a), cy + reach * math.sin(a)
+            tx, ty = -math.sin(a), math.cos(a)
+            probes.append((f"aaaaaaaa-0000-4000-8000-{i:012d}", (round(px - 0.15 * tx, 6), round(py - 0.15 * ty, 6)), (round(px + 0.15 * tx, 6), round(py + 0.15 * ty, 6))))
+        segs = "".join(
+            f'\t(segment\n\t\t(start {a[0]:.6f} {a[1]:.6f})\n\t\t(end {b[0]:.6f} {b[1]:.6f})\n\t\t(width 0.2)\n'
+            f'\t\t(layer "F.Cu")\n\t\t(net 1)\n\t\t(uuid "{u}")\n\t)\n'
+            for u, a, b in probes
+        )
+        nets = sorted({g.net for g in geoms if g.net})
+        netlines = '\t(net 1 "PROBE")\n' + "".join(f'\t(net {i + 2} "{n}")\n' for i, n in enumerate(nets))
+        doc_text = (
+            '(kicad_pcb\n\t(version 20260206)\n\t(generator "pcbc")\n\t(generator_version "0.1")\n'
+            "\t(general\n\t\t(thickness 1.6)\n\t)\n\t(paper \"A4\")\n"
+            '\t(layers\n\t\t(0 "F.Cu" mixed)\n\t\t(2 "B.Cu" mixed)\n\t\t(25 "Edge.Cuts" user)\n\t)\n'
+            "\t(setup\n\t\t(pad_to_mask_clearance 0)\n\t)\n\t(net 0 \"\")\n" + netlines + block + "\n" + segs
+            + '\t(gr_rect\n\t\t(start -20 -20)\n\t\t(end 80 80)\n\t\t(stroke (width 0.05) (type default))\n\t\t(fill none)\n'
+            '\t\t(layer "Edge.Cuts")\n\t\t(uuid "bbbbbbbb-0000-4000-8000-000000000001")\n\t)\n)\n'
+        )
+        with tempfile.TemporaryDirectory() as td:
+            work = Path(td)
+            (work / "layout.kicad_pcb").write_text(doc_text)
+            (work / "layout.kicad_pro").write_text(json.dumps(pro, indent=2))
+            (work / "layout.kicad_dru").write_text(render([DruRule("probe", "(constraint clearance (min 8mm))", "A.NetName == 'PROBE' || B.NetName == 'PROBE'")]))
+            drc = kicad_drc(work / "layout.kicad_pcb", refill=False)
+        for u, a, b in probes:
+            cand = track_shape(a, b, 0.2)
+            mine = round(min(gap(s, cand) for g in geoms for s in g.copper), 4)
+            said = [float(actual.search(v["description"]).group(1)) for v in drc.get("violations", []) if v["type"] == "clearance" and any(i["uuid"] == u for i in v["items"])]
+            if not said:
+                assert mine < 0.0 or not drc, f"{board} {ref}.{num} ({what}): KiCad measured nothing and pcbc says {mine} mm of air"
+                continue
+            kicad = round(min(said), 4)
+            assert kicad >= mine - 1e-4, (
+                f"{board} {ref}.{num} ({what}): KiCad measures {kicad} mm and pcbc claims {mine} mm — "
+                "pcbc read MORE air than the arbiter, which means the shape is a subset of the copper "
+                "and that is the one thing docs/r2-design.md A.1 forbids"
+            )
+            agreed += kicad == mine
+    assert agreed == PROBE_EXACT, (
+        f"{agreed} of {PROBE_RING * len(PROBE_PADS)} probes agreed with KiCad to the last digit it "
+        f"prints; {PROBE_EXACT} did when this was measured (docs/r2-measurements.md S3), and the "
+        "rest are A.1's two declared supersets and the probes that land inside copper"
+    )
 
 
 # --- the golden vectors R3 replays ----------------------------------------------------------------
@@ -868,6 +1193,11 @@ def _vector_doc():
         ),
         "seed": SEED,
         "eps_mm": EPS_MM,
+        # The exact ties where Python's round-half-to-even and Rust's `f64::round`
+        # (half-away-from-zero) disagree by a nanometre. `q`'s Rust form is
+        # `(v * 1e6).round_ties_even() / 1e6`, and a port that reaches for `.round()` fails here
+        # instead of quietly emitting different copper.
+        "q_ties": [[v, q(v)] for v in (5e-07, 1.5e-06, 2.5e-06, 3.5e-06, 4.5e-06, 5.5e-06, 6.5e-06, 7.5e-06)],
         "cases": cases,
     }
 
@@ -887,6 +1217,12 @@ def test_the_golden_vectors_replay_bit_for_bit():
         VECTORS.write_text(_vector_text(doc))
     stored = json.loads(VECTORS.read_text())
     assert stored["seed"] == SEED and stored["eps_mm"] == EPS_MM
+    for v, want in stored["q_ties"]:
+        assert q(v) == want, f"q moved at the tie {v!r}"
+        assert round(v * 1e6) % 2 == 0, (
+            f"{v!r} is an exact tie and q takes it to the EVEN nanometre; Rust's f64::round takes "
+            "half of these the other way, so the port's q is round_ties_even, never round"
+        )
     assert len(stored["cases"]) == CASES, f"D.3 asks for {CASES} vectors"
     for i, case in enumerate(stored["cases"]):
         a = Shape(tuple(tuple(p) for p in case["a"]["pts"]), case["a"]["r"])

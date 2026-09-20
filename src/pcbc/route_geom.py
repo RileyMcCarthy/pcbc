@@ -18,8 +18,10 @@ root, and it exists for report lines, never for a decision.
 
 **One quantisation.** KiCad's unit is 1 nm and `f"{v:.6f}"` is what a board file gets written
 with, so every coordinate entering a `Shape` or a `Path` passes through `q` exactly once, at
-construction. The geometry pcbc checks is bit-for-bit the geometry KiCad parses; there is no
-"we rounded on the way out" class of bug. The predicates that decide overlap (orientation,
+construction, and is written as `f"{q(v):.6f}"` — never as `f"{v:.6f}"` of a raw computed value,
+which is a different number on 38 % of midpoints (see `q`). Follow that one rule and the geometry
+pcbc checks is bit-for-bit the geometry KiCad parses; there is no "we rounded on the way out"
+class of bug. The predicates that decide overlap (orientation,
 containment, segment crossing) run on integer nanometres, so they are exact rather than
 merely repeatable.
 
@@ -39,14 +41,22 @@ NM = 1e-6
 """KiCad's unit, in mm: one nanometre, and the last digit `f"{v:.6f}"` writes."""
 
 EPS_MM = 1e-4
-"""0.1 um, added to every requirement and never subtracted, so pcbc is always this much stricter
-than KiCad. Three orders above the double-precision error on a 100 mm coordinate (~1e-11 mm) and
-below KiCad's own display resolution, so it can never turn a real violation into a pass and never
-shows up as a number a human has to reconcile."""
+"""0.1 um, added to every requirement and never subtracted, so pcbc is always at least this much
+stricter than KiCad. Three orders above the double-precision error on a 100 mm coordinate
+(~1e-11 mm), so it can never turn a real violation into a pass.
+
+The real margin is larger than the constant, and both halves of that are measured (2026-09-20,
+KiCad 10.0.6, `test_kicad_tolerates_half_a_micron_of_shortfall`): KiCad itself allows **0.0005 mm**
+of shortfall on a clearance rule — a 0.2 mm rule last faults at a 0.1994989 mm gap and first passes
+at 0.1994995 — so pcbc is 0.0006 mm stricter than KiCad, not 0.0001. And `EPS_MM` is not *below*
+KiCad's display resolution: 1e-4 mm is exactly the 4-decimal resolution its reports print, so a gap
+of exactly `EPS_MM` is the smallest number `actual 0.0001 mm` can say."""
 
 MICRO_MM = 0.2
 """`copper_bar.MICRO_MM`, re-exported so there is one of it: a segment shorter than this is a
-grid artefact, not a route. It is also KiCad's `track_segment_length (min 0.2mm)` rule."""
+grid artefact, not a route. It is also the number of pcbc's own `pcbc_geometry_segments` rule
+(`dru.py`: `(constraint track_segment_length (min 0.2mm))`), which is why `legs_ok` exists and why
+no pattern may emit a path it refuses."""
 
 MAX_PTS = 16
 """A hull's point ceiling. Chosen so the worst-case hull-to-hull test stays at 16 x 16 edge pairs
@@ -62,7 +72,18 @@ def q(v: float) -> float:
 
     A coordinate exactly half a nanometre from the grid goes to the even nanometre, because that is
     what Python's `round` does and the formula is the specification. Which way a tie falls does not
-    matter; that it always falls the same way does.
+    matter; that it always falls the same way does. **The Rust form of this is
+    `(v * 1e6).round_ties_even() / 1e6`, never `.round()`**, which is half-away-from-zero and moves
+    half of the exact ties by a nanometre; `geom_vectors.json` carries the four diverging ties so a
+    port that reaches for `.round()` fails on replay.
+
+    `q` is KiCad's grid and a **fixed point** of the text format — `float(f"{q(v):.6f}") == q(v)` for
+    every v — but it is *not* the text format: `q` rounds the already-rounded product `v * 1e6`
+    while the format rounds the exact value of the double, and the two differ by a nanometre on 38 %
+    of the midpoints a pattern computes (measured: `a = 21.732048`, `b = 21.734519`, their midpoint
+    goes to 21.733284 here and `f"{mid:.6f}"` writes 21.733283). Hence the house rule, which is what
+    makes the claim "the geometry pcbc checks is the geometry KiCad parses" true: a coordinate is
+    written as `f"{q(v):.6f}"`, never as `f"{v:.6f}"` of a raw computed value.
 
     Negative zero is normalised to zero: `f"{-0.0:.6f}"` writes `-0.000000`, which is a different
     byte string for the same point, and byte-identical output is a contract here.
@@ -263,10 +284,19 @@ class Shape:
             if q(x) != x or q(y) != y:
                 raise ValueError(f"Shape point {(x, y)!r} is not on the 1 nm grid; pass it through qp")
         if n >= 3:
-            ip = _inm(self.pts)
-            for i in range(n):
-                if _cross(ip[i], ip[(i + 1) % n], ip[(i + 2) % n]) <= 0:
-                    raise ValueError(f"Shape points are not a strictly convex CCW hull: {self.pts!r}")
+            # The invariant is "these points ARE their own hull, in hull order", not "every
+            # consecutive triple turns left". The triple test is necessary and not sufficient: a
+            # pentagram winds through 720 degrees, so every triple turns left and the old check
+            # passed it, while the polygon self-intersects and `_in_hull` — which every overlap
+            # decision in `hull_dist2` rests on — is then simply wrong (measured: a via 0.25 mm
+            # INSIDE such a shape was reported 0.4279 mm clear of it, a 0.678 mm error, accepted at
+            # every clearance the five boards compile). No constructor here can produce one, but
+            # `Shape` is public and R2's patterns, A.6's scene and R3's port all build one directly,
+            # so the gate has to be the real thing. O(n log n) on n <= 16, at construction only.
+            ip = list(_inm(self.pts))
+            ch = _chain(ip)
+            if len(ch) != n or not any(ip[k:] + ip[:k] == ch for k in range(n)):
+                raise ValueError(f"Shape points are not a strictly convex CCW hull: {self.pts!r}")
 
 
 def _rot_cs(deg: float) -> tuple[float, float]:
@@ -276,6 +306,15 @@ def _rot_cs(deg: float) -> tuple[float, float]:
     Right angles are returned exactly. `math.cos(math.radians(90))` is 6.1e-17, not 0, and that
     stray term turns a rect pad at 90 degrees into a shape whose corners miss the grid by a
     nanometre and whose stub is no longer axis-aligned.
+
+    This is the one place the module's "identical on every platform" promise rests on libm rather
+    than on IEEE arithmetic, and the residual risk is accepted because it was measured rather than
+    argued: perturbing `cos` by +1 ULP and `sin` by -1 ULP moved **0 of 300 000** rotated rect pads
+    on the 1 nm grid, the closest any raw coordinate came to a half-nanometre tie was 3.39e-07 nm
+    against the ~1.1e-08 nm a 1 ULP change moves a 50 mm coordinate (about one corner in 50
+    million), and every `(at x y rot)` on the five boards is 0, 90, 180 or 270 — all exact here
+    (`docs/r2-measurements.md`, S3). Making the promise unconditional means exact rational rotations
+    for the angles KiCad emits, not chasing libm.
     """
     r = deg % 360.0
     exact = {0.0: (1.0, 0.0), 90.0: (0.0, -1.0), 180.0: (-1.0, 0.0), 270.0: (0.0, 1.0)}
@@ -461,10 +500,26 @@ def clears(a: Shape, b: Shape, need: float) -> bool:
     """Do these two shapes keep `need` mm of copper-to-copper air between them?
 
     The comparison is on squares, so there is no square root in the accept path, and the
-    requirement carries `EPS_MM` on top, so pcbc is strictly stricter than KiCad by 100 nm and a
-    shape that only just fits is refused rather than handed to the arbiter to argue about.
+    requirement carries `EPS_MM` on top, so pcbc is strictly stricter than KiCad and a shape that
+    only just fits is refused rather than handed to the arbiter to argue about.
+
+    The two radii are summed smallest first so the answer cannot depend on which argument is which.
+    Adding them in call order differs in the last bit whenever one order lands exactly on the 1 nm
+    grid, and that flipped the verdict on 286 of 3240 realistic (clearance, radius, radius) triples
+    — two 0.5 mm vias at an exact 0.239 mm separation, say. Nothing unsafe was accepted (`EPS_MM`
+    covers 3e-17 many times over); what broke was determinism, which is the contract this module
+    opens with, since a pattern asking `clears(cand, obstacle)` and a self-check asking
+    `clears(obstacle, cand)` would disagree about the same board.
     """
-    want = need + a.r + b.r + EPS_MM
+    lo, hi = (a.r, b.r) if a.r <= b.r else (b.r, a.r)
+    want = need + lo + hi + EPS_MM
+    if want <= 0.0:
+        # A requirement a shape's own offsets already satisfy is met by definition. Squaring
+        # discards the sign, so without this line a sufficiently negative `need` would read as the
+        # opposite of what it says. `between()` is a max over non-negative clearances floored at
+        # `stackup.clearance_min` (A.3), so `need` is never negative today; `clears` answers
+        # correctly if one ever is, rather than inverting silently in R3's port.
+        return True
     return hull_dist2(a.pts, b.pts) >= want * want
 
 
@@ -473,8 +528,16 @@ def gap(a: Shape, b: Shape) -> float:
 
     A negative number means they overlap; its magnitude is the offset radii, not the true
     penetration depth, because `hull_dist2` stops at 0.0 once two hulls meet.
+
+    Two details make the printed number a function of the geometry alone, which is what lets a
+    report line be asserted as an exact string. The radii are subtracted as one exactly-rounded sum,
+    because subtracting them in call order printed two different 4-dp numbers for the same pair on
+    422 of 400 000 realistic pairs (0.5 and 0.075 mm at 0.73425: 0.1592 one way round, 0.1593 the
+    other, and 0.1593 is the truth). And `+ 0.0` normalises the negative zero that exactly touching
+    shapes underflow to — 88 010 of 400 000 touching pairs — the same hazard `q` already normalises
+    away, since an f-string renders `-0.0` as a different byte string for the same air.
     """
-    return round(math.sqrt(hull_dist2(a.pts, b.pts)) - a.r - b.r, 4)
+    return round(math.sqrt(hull_dist2(a.pts, b.pts)) - math.fsum((a.r, b.r)), 4) + 0.0
 
 
 # --- paths ----------------------------------------------------------------------------------------
@@ -484,9 +547,13 @@ def gap(a: Shape, b: Shape) -> float:
 class Path:
     """A run of copper on one layer: quantised points, a width and a layer name.
 
-    A `Path` does not enforce 0/45/90 — `is_octilinear` and `turn_ok` are the judges, and
+    A `Path` does not enforce 0/45/90 — `is_octilinear`, `turn_ok` and `legs_ok` are the judges, and
     `route_verify` runs them over every piece. What it does enforce is that the points are already
-    on KiCad's grid, so nothing downstream rounds them a second time.
+    on KiCad's grid, so nothing downstream rounds them a second time, and that no point repeats:
+    **a repeated point is not a legal Path.** A doubled point is a degenerate leg with no direction,
+    which is the one thing the three judges cannot agree about (`octant` has no answer for it), and
+    it is what chaining two `octile_path` pieces end to end used to produce at the join. Refusing it
+    at the door is the cheaper contract and it makes the disagreement unreachable.
     """
 
     pts: tuple[Pt, ...]
@@ -496,6 +563,9 @@ class Path:
     def __post_init__(self) -> None:
         if len(self.pts) < 2:
             raise ValueError(f"a Path needs at least 2 points, got {len(self.pts)}")
+        for a, b in zip(self.pts, self.pts[1:]):
+            if a == b:
+                raise ValueError(f"a Path leg has zero length: {a!r} repeats")
         if not math.isfinite(self.w) or self.w <= 0.0:
             raise ValueError(f"track width must be > 0, got {self.w!r}")
         if not self.layer:
@@ -511,10 +581,16 @@ def is_octilinear(pts: tuple[Pt, ...]) -> bool:
     Measured on integer nanometres, so this is exact rather than "within half a degree". KiCad's
     `track_angle` rule and the copper bar's `off_45` both allow a tolerance; pcbc's own copper
     does not need one, because it is built on the grid instead of snapped onto it.
+
+    A zero-length leg is **not** octilinear. It reads as `dx == 0` and would otherwise pass, but it
+    has no direction, `turn_ok` refuses it and `Path` refuses it; the three judges of the same path
+    have to agree, and False is the agreement that is safe.
     """
     ip = _inm(pts)
     for (x1, y1), (x2, y2) in zip(ip, ip[1:]):
         dx, dy = x2 - x1, y2 - y1
+        if dx == 0 and dy == 0:
+            return False
         if dx != 0 and dy != 0 and abs(dx) != abs(dy):
             return False
     return True
@@ -550,7 +626,17 @@ def turn_ok(pts: tuple[Pt, ...]) -> bool:
     The octant difference **must wrap**: north-east (7) followed by east (0) is a legal 45-degree
     turn and `abs(7 - 0) = 7` would reject it, so the test is `min(d, 8 - d) <= 1`. All 64 octant
     pairs are pinned by `test_turn_ok_wraps`.
+
+    Octilinearity is a **precondition, and it is folded in here** rather than left to the caller,
+    because `octant` classifies an off-axis leg by the signs of its deltas alone: two nearly
+    perpendicular legs land in the same octant or in adjacent ones and a 90-degree corner passes.
+    Those legs are not hypothetical — they are exactly the tilted escape stubs S1 straightened
+    (c3_usb's GND stub turns 90.6275 degrees and ds2's GPIO1 stub 90.8952, and both were accepted
+    here). A degenerate (zero-length) leg is refused by the same call, so this returns a bool for
+    every input instead of raising out of `octant` three frames down.
     """
+    if not is_octilinear(pts):
+        return False
     for i in range(1, len(pts) - 1):
         d = abs(octant(pts[i - 1], pts[i]) - octant(pts[i], pts[i + 1]))
         if min(d, 8 - d) > 1:
@@ -558,8 +644,37 @@ def turn_ok(pts: tuple[Pt, ...]) -> bool:
     return True
 
 
+def legs_ok(pts: tuple[Pt, ...]) -> bool:
+    """Is every leg at least `MICRO_MM` long — the third judge, beside `is_octilinear` and `turn_ok`?
+
+    pcbc writes its own `(constraint track_segment_length (min 0.2mm))` as `pcbc_geometry_segments`
+    in every `.kicad_dru`, so a shorter leg is copper pcbc's own rule refuses. `octile_path` can
+    manufacture one (2.15 % of random endpoint pairs on a 60 x 40 board, and 31.20 % of hops under
+    2 mm, where a tap or a chain lives), and KiCad counts exactly the same ones: 72 octile segments
+    from 36 isolated nets drew 11 `track_segment_length` violations at 0.0262 to 0.1832 mm, and
+    `seg_lengths` counts those same 11. The path is still exact copper — collapsing the short leg
+    would move an endpoint, which A.5 forbids — so this is a refusal a pattern reports as a move,
+    never a repair it applies.
+    """
+    return all(L >= MICRO_MM for L in seg_lengths(pts))
+
+
+def _finite(*vals: float) -> None:
+    """`q`'s guard, in `q`'s words, for the measurement functions that do not quantise.
+
+    A nan loses every comparison it takes part in, so a cost or a length that went non-finite would
+    sort as "not worse than anything" instead of failing loudly — the opposite of how `q`, `octant`
+    and `is_octilinear` treat the same input.
+    """
+    for v in vals:
+        if not math.isfinite(v):
+            raise ValueError(f"coordinate is not finite: {v!r}")
+
+
 def seg_lengths(pts: tuple[Pt, ...]) -> tuple[float, ...]:
     """Each leg's length in mm. Not the accept path, so the square roots are free."""
+    for x, y in pts:
+        _finite(x, y)
     return tuple(math.dist(a, b) for a, b in zip(pts, pts[1:]))
 
 
@@ -574,6 +689,7 @@ def clip_len_in_box(a: Pt, b: Pt, box: Box) -> float:
     This is how much of a piece runs through a rule area, a fanout lane or a plane's extent —
     a measurement for a report or a cost, never an accept.
     """
+    _finite(*a, *b, *box)
     x0, y0, x1, y1 = box
     x0, x1 = min(x0, x1), max(x0, x1)
     y0, y1 = min(y0, y1), max(y0, y1)
@@ -606,8 +722,16 @@ def octile_corner(a: Pt, b: Pt, *, diagonal_first: bool = True) -> Pt:
     endpoint and whatever angle that leaves". This is A.5's second construction rule: quantise
     once, then derive, so a corner computed from a rounded midpoint still carries an exact 45.
 
+    The endpoints are quantised here, not assumed to have been: the docstring's "already quantised"
+    used to be a precondition the signature did not show and callers could not see, and every one of
+    50 000 deliberately off-grid pairs came back with a leg that was not 0/45/90 against the
+    caller's own points (a 45 that was 44.99999998). That is the S1 fanout bug exactly — a
+    coordinate that had to stay equal to another one did not. `qp` is idempotent, so this costs
+    nothing on the path that was already on the grid.
+
     When a -> b is already octilinear the corner is b itself and `octile_path` drops it.
     """
+    a, b = qp(a), qp(b)
     ax, ay = _nm(a[0]), _nm(a[1])
     bx, by = _nm(b[0]), _nm(b[1])
     dx, dy = bx - ax, by - ay
@@ -624,9 +748,18 @@ def octile_corner(a: Pt, b: Pt, *, diagonal_first: bool = True) -> Pt:
 def octile_path(a: Pt, b: Pt, *, diagonal_first: bool = True) -> tuple[Pt, ...]:
     """The 0/45/90 path from a to b: two points when it is already octilinear, else three.
 
-    `is_octilinear` and `turn_ok` are true of the result by construction, for every a and b.
+    `is_octilinear` and `turn_ok` are true of the result by construction, for every a and b — but
+    `legs_ok` is not, and the caller must run it: a two-leg path's short leg can be well under
+    `MICRO_MM` (31 % of hops under 2 mm), and shortening or straightening it here would move copper
+    the caller did not ask for.
+
+    A route from a point to itself **raises**. It is a caller bug in the same family `octant`
+    already refuses, and returning it quietly put a zero-length leg into a Path that
+    `is_octilinear` waved through and `turn_ok` then crashed on.
     """
     a, b = qp(a), qp(b)
+    if a == b:
+        raise ValueError(f"a route needs two distinct points; both quantise to {a!r}")
     c = octile_corner(a, b, diagonal_first=diagonal_first)
     if c == a or c == b:
         return (a, b)

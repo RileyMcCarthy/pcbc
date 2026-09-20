@@ -21,16 +21,13 @@ from .compile import CompiledJob
 from .copper import _rotate
 from .layout import footprints_by_ref
 from .model import Design
-from .pcb_place import _EDGE_OUT, _pins_of, lane_rules, parse_foot
-from .sexp import footprint_at, stable_uuid
+from .pcb_place import _pins_of, _EDGE_OUT
+from .route_emit import Piece, seg_piece, via_piece, write_pieces
+from .route_scene import Scene, build_scene, krt_grid  # noqa: F401  (krt_grid is re-exported)
+from .sexp import stable_uuid
 from .stackup import fanout_stagger
 
 _LAYER = re.compile(r'\n\t\t\(layer "([^"]+)"\)')
-
-
-def krt_grid(job: CompiledJob) -> float:
-    """KRT's routing grid for this board; the plan passes the same number as `--grid-step`."""
-    return 0.05 if job.layers <= 2 else 0.1
 
 
 def _excluded(design: Design, job: CompiledJob) -> set[str]:
@@ -54,25 +51,19 @@ def _snap_out(v: float, sign: float, grid: float) -> float:
     return round((math.ceil(q - 1e-9) if sign > 0 else math.floor(q + 1e-9)) * grid, 4)
 
 
-def _segment(x1: float, y1: float, x2: float, y2: float, w: float, layer: str, net: str, uid: str) -> str:
-    return (
-        f"\n\t(segment\n\t\t(start {x1:.6f} {y1:.6f})\n\t\t(end {x2:.6f} {y2:.6f})\n\t\t(width {w:g})\n\t\t(locked yes)\n"
-        f'\t\t(layer "{layer}")\n\t\t(net "{net}")\n\t\t(uuid "{uid}")\n\t)\n'
-    )
+def fanout_pieces(design: Design, job: CompiledJob, text: str, board: str = "board", scene: Scene | None = None) -> tuple[list[Piece], list[dict]]:
+    """The escapes as `Piece`s, which is the model; the board text is a rendering of them.
 
-
-def _via(x: float, y: float, size: float, drill: float, net: str, uid: str) -> str:
-    return (
-        f"\n\t(via\n\t\t(at {x:.6f} {y:.6f})\n\t\t(size {size:g})\n\t\t(drill {drill:g})\n"
-        f'\t\t(layers "F.Cu" "B.Cu")\n\t\t(locked yes)\n\t\t(net "{net}")\n\t\t(uuid "{uid}")\n\t)\n'
-    )
-
-
-def fanout_copper(design: Design, job: CompiledJob, text: str, board: str = "board") -> tuple[str, list[dict]]:
-    """The placed board with an escape stub and via on every closed-row pad of an unconstrained
-    net, locked. Returns (text, one note per via: ref, pad, net, via)."""
-    stack, clearance = lane_rules(job)
-    grid = krt_grid(job)
+    The footprints are read **through the scene** (`route_scene.build_scene`), so the `Foot`s the
+    escapes are built from — the closed rows, the escape sides, the lane widths — are the same
+    objects the router will be judged against, and there is no second reading of a footprint that
+    could disagree with the first. The arithmetic below is unchanged from S1 and the copper is
+    byte-identical on all five boards, which is how S3 knows the new core agrees with the code that
+    already works.
+    """
+    scene = scene if scene is not None else build_scene(design, job, job.constraints, text)
+    stack = scene.stack
+    grid = scene.grid
     nets_of = _pins_of(design)
     count: dict[str, int] = {}
     for pins in nets_of.values():
@@ -80,17 +71,11 @@ def fanout_copper(design: Design, job: CompiledJob, text: str, board: str = "boa
             count[net] = count.get(net, 0) + 1
     excluded = _excluded(design, job)
     default = next((c.track_width_mm for c in job.classes if c.name == "Default"), stack.track_min)
-    items: list[str] = []
+    pieces: list[Piece] = []
     notes: list[dict] = []
-    for ref, block in sorted(footprints_by_ref(text).items()):
-        at = footprint_at(block)
-        if at is None:
-            continue
-        foot = parse_foot(ref, block)
-        foot.at, foot.rot = (at[0], at[1]), at[2]
-        for pad in foot.pads:
-            pad.net = nets_of.get(ref, {}).get(pad.num, pad.net)
-        foot.lane(stack, clearance)
+    blocks = footprints_by_ref(text)
+    for ref, foot in sorted(scene.feet.items()):
+        block = blocks[ref]
         if not foot.closed:
             continue
         if any(pl.ref == ref and (pl.edge or pl.overhang) for pl in job.places):
@@ -109,7 +94,7 @@ def fanout_copper(design: Design, job: CompiledJob, text: str, board: str = "boa
             along = (lambda p: p.x) if side in ("top", "bottom") else (lambda p: p.y)
             row.sort(key=along)
             pitch = min((along(b) - along(a) for a, b in zip(row, row[1:])), default=0.0)
-            stagger = fanout_stagger(stack, clearance, pitch) if pitch else 0.0
+            stagger = fanout_stagger(stack, _lane_clearance(job), pitch) if pitch else 0.0
             nx, ny = _EDGE_OUT[side]
             wx, wy = _rotate(nx, ny, foot.rot)  # the escape direction on the board
             for i, p in enumerate(row):  # i over the whole row: neighbours alternate even with bare pads between
@@ -142,12 +127,24 @@ def fanout_copper(design: Design, job: CompiledJob, text: str, board: str = "boa
                         vy = _snap_out(vy + wy * stagger, wy, grid)
                     vx = round(px, 4)
                 width = max(min(_width(job, net, default), across), stack.track_min)
-                items.append(_segment(px, py, vx, vy, width, layer, net, stable_uuid(board, "fanout", ref, p.num, "stub")))
-                items.append(_via(vx, vy, stack.via_diameter, stack.via_drill, net, stable_uuid(board, "fanout", ref, p.num, "via")))
+                owner = f"{ref}.{p.num}"
+                pieces.append(seg_piece(net, "fanout", layer, (px, py), (vx, vy), width, owner=owner, uuid=stable_uuid(board, "fanout", ref, p.num, "stub")))
+                pieces.append(via_piece(net, "fanout", (vx, vy), stack.via_diameter, stack.via_drill, owner=owner, uuid=stable_uuid(board, "fanout", ref, p.num, "via")))
                 notes.append({"ref": ref, "pad": p.num, "net": net, "via": (vx, vy)})
-    if not items:
+    return (pieces, notes)
+
+
+def _lane_clearance(job: CompiledJob) -> float:
+    """The widest class lane clearance, which is what a row's stagger is sized from (`lane_rules`)."""
+    from .pcb_place import lane_rules
+
+    return lane_rules(job)[1]
+
+
+def fanout_copper(design: Design, job: CompiledJob, text: str, board: str = "board", scene: Scene | None = None) -> tuple[str, list[dict]]:
+    """The placed board with an escape stub and via on every closed-row pad of an unconstrained
+    net, locked. Returns (text, one note per via: ref, pad, net, via)."""
+    pieces, notes = fanout_pieces(design, job, text, board, scene)
+    if not pieces:
         return text, []
-    body = text.rstrip()
-    if not body.endswith(")"):
-        raise ValueError("not a board file")
-    return body[:-1].rstrip() + "\n" + "".join(items) + ")\n", notes
+    return write_pieces(text, pieces), notes

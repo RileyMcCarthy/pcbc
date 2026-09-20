@@ -54,10 +54,6 @@ def _snap_out(v: float, sign: float, grid: float) -> float:
     return round((math.ceil(q - 1e-9) if sign > 0 else math.floor(q + 1e-9)) * grid, 4)
 
 
-def _snap_near(v: float, grid: float) -> float:
-    return round(round(v / grid) * grid, 4)
-
-
 def _segment(x1: float, y1: float, x2: float, y2: float, w: float, layer: str, net: str, uid: str) -> str:
     return (
         f"\n\t(segment\n\t\t(start {x1:.6f} {y1:.6f})\n\t\t(end {x2:.6f} {y2:.6f})\n\t\t(width {w:g})\n\t\t(locked yes)\n"
@@ -120,16 +116,22 @@ def fanout_copper(design: Design, job: CompiledJob, text: str, board: str = "boa
                 # On the router's grid: the first via line snapped away from the pads, the second
                 # line snapped away from the first (snapping each on its own shrank the stagger by
                 # a grid step and left holes 0.49 mm apart), the across coordinate to the nearest.
+                # Along the escape, snap away from the pad so the distance only grows. ACROSS the
+                # escape, keep the pad's own coordinate: snapping it to the router's grid moved the
+                # via up to half a grid step sideways and tilted every stub by up to a degree
+                # (measured: 14 stubs off 0/45/90 across c3_usb, node and ds2). Pattern copper does
+                # not need to sit on KRT's grid; it is locked, so KRT reads it as an obstacle and
+                # never has to land on it.
                 if abs(wx) > 0.5:
                     vx = _snap_out(vx, wx, grid)
                     if i % 2:
                         vx = _snap_out(vx + wx * stagger, wx, grid)
-                    vy = _snap_near(vy, grid)
+                    vy = round(py, 4)
                 else:
                     vy = _snap_out(vy, wy, grid)
                     if i % 2:
                         vy = _snap_out(vy + wy * stagger, wy, grid)
-                    vx = _snap_near(vx, grid)
+                    vx = round(px, 4)
                 width = max(min(_width(job, net, default), across), stack.track_min)
                 items.append(_segment(px, py, vx, vy, width, layer, net, stable_uuid(board, "fanout", ref, p.num, "stub")))
                 items.append(_via(vx, vy, stack.via_diameter, stack.via_drill, net, stable_uuid(board, "fanout", ref, p.num, "via")))

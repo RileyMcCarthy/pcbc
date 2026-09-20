@@ -75,3 +75,22 @@ def test_kicad_finds_no_copper_error_in_the_fanned_board(tmp_path: Path):
     assert errors == [], errors[:3]
     assert not [v for v in doc.get("violations", []) if v.get("type") == "hole_to_hole"]
     assert notes
+
+
+def test_every_escape_stub_is_axis_aligned(tmp_path: Path):
+    """R2 S1: the escape via's across-coordinate used to be snapped to KRT's grid while the pad's
+    was not, so every stub left its pad at up to a degree off square (14 of them across c3_usb,
+    node and ds2, and with them most of pcbc's own contribution to the copper bar's off-45 count).
+    Pattern copper does not need to sit on the router's grid: it is locked, so KRT reads it as an
+    obstacle and never has to land on it."""
+    from pcbc.copper_bar import off_45, segments
+
+    for name in ("c3_usb", "node"):
+        design, job, placed, text, out, notes = _fanned(tmp_path / name, name)
+        assert notes, name
+        stubs = [s for s in segments(out) if s["locked"]]
+        assert len(stubs) == len(notes), (name, len(stubs), len(notes))
+        assert [s for s in stubs if off_45(s)] == [], f"{name}: every escape stub is 0/45/90"
+        for s in stubs:
+            (x1, y1), (x2, y2) = s["start"], s["end"]
+            assert abs(x1 - x2) < 1e-9 or abs(y1 - y2) < 1e-9, f"{name}: a stub leaves its pad square"

@@ -16,9 +16,14 @@ EXAMPLES = Path(__file__).resolve().parent.parent / "examples"
 
 # Recorded 2026-09-19 with KRT 0.21.4; every number is a ceiling. Lower them when the router improves.
 BAR = {
+    # Re-recorded 2026-09-20 from a fresh build of every board, after R2 S1 straightened the
+    # fanout stubs (the escape via's across-coordinate was snapped to KRT's grid while the pad's
+    # was not, tilting every stub by up to a degree: 14 stubs, and with them c3_usb 7 -> 5 off-45,
+    # node 63 -> 62, ds2 23 -> 13). Micro and length move a little with them because KRT routes
+    # around slightly different obstacles. Every number is a ceiling; lower them as R2 lands.
     "buck": {"vias": 4, "off45": 3, "micro": 26, "detour": 2.09},
-    "c3_usb": {"vias": 16, "off45": 7, "micro": 182, "detour": 1.81},
-    "node": {"vias": 30, "off45": 64, "micro": 161, "detour": 1.72},
+    "c3_usb": {"vias": 16, "off45": 5, "micro": 183, "detour": 1.81},
+    "node": {"vias": 29, "off45": 62, "micro": 165, "detour": 1.72},
 }
 
 # R1 (docs/r1-design.md E, H.3): the soft rules' hits per example, {rule name: KiCad warnings}, recorded

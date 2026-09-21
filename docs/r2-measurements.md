@@ -815,3 +815,38 @@ and the tap pattern will change the same neighbourhood again.
 The leftover share barely moves on the big boards, which is exactly what the census predicted: a
 hop is 5.7 % of the copper. The design's 70 % target needs the tap (12 %), and its 45 % target
 needs the spine (37 %).
+
+## Verification of S5 and S5r, independent of the agents that wrote them
+
+Re-run on the committed tree from fresh builds of all five boards:
+
+- **Every number in the S5r table reproduces exactly.** Segments, leftover vias, the exact
+  `vias_pattern` per reason, off-45, micro and routed length match on all five boards, and the
+  gate reports `verified` on each.
+- **The fab check that was blind now fires.** A via planted at the centre of every passive pad is
+  reported as a blocker on all five boards (4 on blinky, 18 buck, 26 c3_usb, 42 node, 44 ds2). The
+  attack's finding was that `via_in_pad_blockers` matched the reference spelling and so could not
+  see the passives on three boards; it reads the part now. The three real via-in-pad hits that
+  remain are on IC pins, which the fab notes allow as filled and capped, and no blocker survives.
+- **The plane slot is gone.** node's tap column under U1 now alternates between x 6.386 and 6.686,
+  so the antipads no longer merge. Every plane on every board comes back as exactly one island
+  after the gate refills, and the check that each tap via lands inside its own net's plane is
+  clean on all five.
+- **460 tests green** with KiCad and KRT.
+
+### What the tap is worth
+
+| board | leftover | vias (leftover + pattern) | off 0/45/90 | under 0.2 mm | routed mm |
+|---|---|---|---|---|---|
+| blinky | 0 % | 0 + 1 tap | 0 | 0 | 23.6 |
+| buck | 100 % → **96.6 %** | 4 → **1** + 6 taps | 3 → **2** | 26 → 37 | 142.5 → **139.4** |
+| c3_usb | 95.2 % → **86.4 %** | 13 → **8** + 39 | 7 → 13 | 168 → 203 | 312.9 → 356.7 |
+| node | 97.0 % → **84.9 %** | 28 → **11** + 62 | 57 → **30** | 154 → **62** | 513.1 → **409.4** |
+| ds2 | 92.7 % → **92.3 %** | 19 → **17** + 11 | 11 → 12 | 118 → 96 | 509.9 → 508.3 |
+
+node is what the pattern was for: a hundred millimetres of copper gone, staircases down by more
+than half, off-45 halved, and seventeen of its vias now placed deliberately rather than found by a
+maze search. c3_usb is the opposite case and is recorded rather than argued away: 34 taps buy it
+nine points of leftover and cost it staircases and length, because its pour is on the back of a
+two-layer board where every tap is also an obstacle to the next track. The spine (S7) owns that
+neighbourhood.

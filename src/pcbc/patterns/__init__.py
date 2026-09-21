@@ -33,7 +33,9 @@ __all__ = [
     "ALL_SHAPES",
     "MAX_LINKS",
     "PRE",
+    "MID",
     "POST",
+    "merge_plans",
     "PatternCtx",
     "PatternPlan",
     "PatternResult",
@@ -52,6 +54,7 @@ __all__ = [
     "pieces_of",
     "shape_ok",
     "terminals",
+    "toward_first",
 ]
 
 
@@ -112,7 +115,7 @@ class PatternCtx:
     job: CompiledJob
     cs: ConstraintSet
     board: str  # for stable_uuid
-    stage: str  # "pre" | "post"
+    stage: str  # "pre" | "mid" | "post" — the keys of `_STAGES`
 
 
 @dataclass(frozen=True)
@@ -297,6 +300,29 @@ def _collinear(a: Pt, b: Pt, c: Pt) -> bool:
     return octant(a, b) == octant(b, c)
 
 
+# --- B.0: the order a link's exits are walked in ---------------------------------------------------
+
+
+def toward_first(exits: Sequence[Exit], here: Terminal, there: Terminal) -> tuple[Exit, ...]:
+    """A.7's exits, re-ordered so the ones pointing at the other pad come first.
+
+    A.7 orders a pad's exits **outward** — away from its own footprint's centre — because that is what
+    a fanout escape needs: a closed row can only go straight out. A link between two pads wants the
+    opposite first, and taking A.7's order literally makes a hop leave its pad in the wrong direction
+    and walk around. Measured: node's `CC1` came out at 1.27x the distance between its pads and its
+    `LED_A` the same, and six of the DS2 Addon's ten hops were two or three segments where one would
+    do; with the re-ordering every one of them is **1.00x**, a single straight segment.
+
+    This is an ordering of the enumeration, not a score on the candidates — B.0's nesting is an order
+    too — and it is derived from the pads' own geometry and nothing else, so the board stays a pure
+    function of the placement. It does not rescue every case: c3_usb's `LED_A` has its two exits
+    0.08 mm from crossing and still walks, which is what `DETOUR_MAX` is for.
+    """
+    dx, dy = there.at[0] - here.at[0], there.at[1] - here.at[1]
+    order = {e.side: i for i, e in enumerate(exits)}
+    return tuple(sorted(exits, key=lambda e: (-(e.dir[0] * dx + e.dir[1] * dy), order[e.side])))
+
+
 def pieces_of(
     pts: Sequence[Pt],
     widths: Sequence[float],
@@ -452,6 +478,20 @@ PRE = ("hop",)
 step, run **after** the hops so `fanout._excluded` can drop the nets the hops claimed — a closed
 row's lane is better spent on the hop that needed it than on a via the hop then has to start from."""
 
+MID = ("spine",)
+"""The rest of C.1's pre stage, the half that runs **after** the fanout.
+
+C.1 puts the fanout at step 2 and the spine at step 5, and the order is the whole argument of the
+stage: least free first. A closed row's escape has exactly one direction it can leave in, and a
+spine is the **widest** copper pcbc writes — buck's `VIN` trunk is 0.781 mm, wider than anything else
+on that board — so a spine placed first can stand across a lane that a fanout via then has no second
+answer for. Running it after means the spine sees every escape as an obstacle and steps round it,
+which is the direction the dependency actually runs.
+
+It costs one extra stage name and one merge (`merge_plans`), and it is measured rather than assumed:
+`docs/r2-measurements.md` S7 records both orders on the two boards that have a fanout at all."""
+
+
 POST = ("tap",)
 """The post stage, in C.1's order. `tap` (B.3) is S5's; `guard` and `stitch` (B.6) are S8's and are
 fixture-only, because no example declares `Guard()`.
@@ -462,10 +502,15 @@ not a tidy one: of the four orderings the design tried on node, taps before KRT 
 taken every tap site. C.1's table has all four."""
 
 
-def _modules() -> dict:
-    from . import hop, tap
+_STAGES = {"pre": PRE, "mid": MID, "post": POST}
+"""Which patterns each stage runs. `pre` and `mid` are the two halves of C.1's pre stage, with
+`route.py`'s own fanout step between them; `post` sits inside the KRT sequence."""
 
-    return {"hop": hop, "tap": tap}
+
+def _modules() -> dict:
+    from . import hop, spine, tap
+
+    return {"hop": hop, "spine": spine, "tap": tap}
 
 
 def pattern_copper(
@@ -495,7 +540,7 @@ def pattern_copper(
     refused: dict[str, list[Refusal]] = {}
     claimed: set[str] = set()
     mods = _modules()
-    for reason in PRE if stage == "pre" else POST:
+    for reason in _STAGES[stage]:
         mod = mods[reason]
         for spec in mod.specs(ctx):
             res = mod.run(ctx, spec)
@@ -530,6 +575,36 @@ def pattern_copper(
         if bad:
             raise ValueError("pattern copper failed its own self-check:\n  " + "\n  ".join(bad))
     return plan
+
+
+def merge_plans(first: PatternPlan, second: PatternPlan) -> PatternPlan:
+    """The two halves of C.1's pre stage, with the fanout between them, as the one plan KRT is handed.
+
+    `second` ran on `first`'s own scene, so the scene is already shared and `done` is recomputed over
+    both stages' claims against it: a net the hops half-claimed and the spine finished is `done`, and
+    asking each half on its own would call it `partial` twice and hand it to KRT anyway.
+    """
+    scene = second.scene if second.scene is not None else first.scene
+    pieces = first.pieces + second.pieces
+    claimed = first.claimed | second.claimed
+    done = frozenset(n for n in sorted(claimed) if scene is not None and not net_open(scene, n))
+    refused: dict = {n: tuple(rs) for n, rs in first.refused.items()}
+    for n, rs in second.refused.items():
+        refused[n] = tuple(refused.get(n, ())) + tuple(rs)
+    return PatternPlan(
+        text=second.text,
+        pieces=pieces,
+        ids=first.ids + second.ids,
+        census=_census(pieces),
+        moves=first.moves + second.moves,
+        notes=first.notes + second.notes,
+        done=done,
+        partial=frozenset(sorted(claimed - done)),
+        refused={n: refused[n] for n in sorted(refused)},
+        claimed=claimed,
+        wall_ms=first.wall_ms + second.wall_ms,
+        scene=scene,
+    )
 
 
 def hard_refusals(plan: PatternPlan) -> tuple[Refusal, ...]:

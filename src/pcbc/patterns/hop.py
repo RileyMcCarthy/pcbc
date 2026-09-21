@@ -19,7 +19,7 @@ import math
 from ..blocking import move_line
 from ..route_geom import MICRO_MM, path_mm
 from ..route_scene import blocked, pad_exits
-from . import ALL_SHAPES, MAX_LINKS, mitre, PatternCtx, PatternResult, Refusal, Terminal, lane_ok, legs_of, legs_ok, link_candidates, pieces_of, shape_ok, terminals
+from . import ALL_SHAPES, MAX_LINKS, mitre, PatternCtx, PatternResult, Refusal, Terminal, lane_ok, legs_of, legs_ok, link_candidates, pieces_of, shape_ok, terminals, toward_first
 
 HOP_MM = 6.0
 """How far apart two pads may be and still be a hop on distance alone. `route.LOCAL_MM` is 5.0; 6.0
@@ -106,8 +106,8 @@ def run(ctx: PatternCtx, spec: str) -> PatternResult:
     # The exits are asked for at the net's full width, not the necked one: the distance out grows
     # with the width, so the wider question gives a stub at least as far from the pad's neighbours as
     # the copper that will actually be written, and never one that is closer.
-    exits_a = _toward_first(pad_exits(scene, a.item, width, layer), a, b)
-    exits_b = _toward_first(pad_exits(scene, b.item, width, layer), b, a)
+    exits_a = toward_first(pad_exits(scene, a.item, width, layer), a, b)
+    exits_b = toward_first(pad_exits(scene, b.item, width, layer), b, a)
     mine = frozenset(it.id for it in scene.items if it.owner in (a.owner, b.owner))
     built = 0  # every (exit pair, link shape) the enumeration produced
     tried = 0  # of those, the ones whose shape is copper pcbc writes, so the board judged them
@@ -184,26 +184,6 @@ def run(ctx: PatternCtx, spec: str) -> PatternResult:
         ),
         tried=tried,
     )
-
-
-def _toward_first(exits, here: Terminal, there: Terminal):
-    """A.7's exits, re-ordered so the ones pointing at the other pad come first.
-
-    A.7 orders a pad's exits **outward** — away from its own footprint's centre — because that is what
-    a fanout escape needs: a closed row can only go straight out. A link between two pads wants the
-    opposite first, and taking A.7's order literally makes a hop leave its pad in the wrong direction
-    and walk around. Measured: node's `CC1` came out at 1.27x the distance between its pads and its
-    `LED_A` the same, and six of the DS2 Addon's ten hops were two or three segments where one would
-    do; with the re-ordering every one of them is **1.00x**, a single straight segment.
-
-    This is an ordering of the enumeration, not a score on the candidates — B.0's nesting is an order
-    too — and it is derived from the pads' own geometry and nothing else, so the board stays a pure
-    function of the placement. It does not rescue every case: c3_usb's `LED_A` has its two exits
-    0.08 mm from crossing and still walks, which is what `DETOUR_MAX` is for.
-    """
-    dx, dy = there.at[0] - here.at[0], there.at[1] - here.at[1]
-    order = {e.side: i for i, e in enumerate(exits)}
-    return tuple(sorted(exits, key=lambda e: (-(e.dir[0] * dx + e.dir[1] * dy), order[e.side])))
 
 
 def _allowed_shapes(ctx, net, a: Terminal, b: Terminal, span: float, exits_a, exits_b, layer: str, mine) -> tuple[frozenset[str], str]:

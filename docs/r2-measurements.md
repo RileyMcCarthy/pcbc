@@ -850,3 +850,199 @@ maze search. c3_usb is the opposite case and is recorded rather than argued away
 nine points of leftover and cost it staircases and length, because its pour is on the back of a
 two-layer board where every tap is also an obstacle to the next track. The spine (S7) owns that
 neighbourhood.
+
+## S7 — the spine, and the width a maze router will not keep
+
+pcbc now writes the power nets itself. `src/pcbc/patterns/spine.py` is B.4; `patterns.MID` is the
+second half of C.1's pre stage — the half that runs **after** the fanout, because C.1 puts the
+escapes at step 2 and the spine at step 5 and the spine is the widest copper pcbc writes — and
+`patterns.merge_plans` makes the two halves one plan for KRT (C.4).
+
+**The number this slice exists for.** `width_power` counts every place KRT necked a power track below
+its class. A spine writes at the class width or refuses, and never in between:
+
+| board | `width_power` before | after | what is left |
+|---|---|---|---|
+| blinky | 0 | 0 | nothing: its one power net is a pour with one pad |
+| buck | 39 | **23** | 2 GND tap stubs; the rest is KRT finishing the links the backbone could not make |
+| c3_usb | 51 | **40** | 5 GND, the rest `VBUS` and `3V3` leftover |
+| node | 15 | **14** | mostly `GND` and `3V3` plane leftover; `VBUS` is the only spine there |
+| ds2 | 3 | 3 | ds2 has no spine at all, and that is the first open issue |
+
+**Before and after, every board, fresh builds** (`pcbc build --force` into a temp copy). "Before" is
+S5r as landed. `PCBC_PATTERNS=off` on this same source reproduces the **S1b** row exactly on all five
+— blinky 6/0/2/22.5/1.03, buck 96/4/3/26/142.5/2.09, c3_usb 342/8+5/7/139/312.8/1.92,
+node 437/28/63/181/512.8/1.72, ds2 337/22/13/113/514.6/3.23 — so the rollback is still a rollback and
+every move below is the spine and nothing else:
+
+| board | leftover share | segments | vias\_leftover | vias\_pattern | off 0/45/90 | under 0.2 mm | routed mm | worst detour | angles | refusals | route wall |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| blinky | 0 % → 0 % | 6 → 6 | 0 → 0 | `{tap: 1}` | 0 → 0 | 0 → 0 | 23.6 → 23.6 | LED 1.04 | 0 → 0 | 0 | 4.6 → 6.9 s |
+| buck | 96.6 % → **84.7 %** | 114 → 175 | 1 → 1 | `{tap: 6}` | 2 → **1** | 37 → **96** | 139.4 → 149.3 | VIN 2.09 → **2.55** | 32 → **28** | 2 hop, **2 spine** | 9.3 → 16.4 s |
+| c3_usb | 86.3 % → **79.6 %** | 453 → **444** | 8 → **7** | `{fanout: 5, tap: 34}` | 13 → **11** | 203 → **188** | 356.7 → 361.2 | USB\_DN 1.81 → **VBUS 1.70** | 122 → **130** | 1 hop, **2 spine**, 2 tap | 16.3 → 23.1 s |
+| node | 84.9 % → **82.4 %** | 318 → **312** | 11 → 11 | `{tap: 62}` | 30 → **25** | 62 → **54** | 409.4 → 409.9 | USB\_DN 1.82 | 98 → **100** | 1 hop, **1 spine**, 2 tap | 25.9 → 34.8 s |
+| ds2 | 92.3 % → 92.3 % | 315 → 315 | 17 → 17 | `{fanout: 9, tap: 2}` | 12 → 12 | 96 → 96 | 508.3 → 508.3 | REFP\_F 3.23 | 14 → 14 | 5 hop | 15.0 → 26.9 s |
+
+The gate is verified on all five (KiCad DRC clean, zero unconnected items, the canary fired, the pads
+bound exactly as `board.py` says); `verify_copper` is empty on all five; every plane comes back one
+island after the gate's refill and there is not a via-in-pad blocker anywhere;
+`copper.power_ampacity_failures` is empty on every board and is now asserted per build rather than
+only through the fab stage.
+
+Two builds of c3_usb and node into two directories, one of them under a different `PYTHONHASHSEED`,
+give an **identical** `copper.json` and routed boards differing in exactly the one and five absolute
+`(model ...)` paths — the caveat `docs/constraints.md` already records and the same result S4 and S5
+measured. The three pattern stages together cost 45 ms on blinky, 209 on ds2, 542 on buck, 990 on
+node and 1456 on c3_usb, against F.3's 2.0 s.
+
+What pcbc owns now, exact per board (`copper.json`'s census, and `test_examples_fab.py::OWNS`):
+
+| board | fanout | hop | spine | tap | leftover |
+|---|---|---|---|---|---|
+| blinky | — | 5 seg / 22.8 mm | — | 1 seg / 1 via / 0.8 mm | 0 |
+| buck | — | — | **10 seg / 18.0 mm** | 6 seg / 6 vias / 4.8 mm | 159 seg / 126.5 mm / 1 via |
+| c3_usb | 5 seg / 5 vias / 5.3 mm | 11 seg / 9.8 mm | **9 seg / 25.1 mm** | 34 seg / 34 vias / 33.5 mm | 385 seg / 287.4 mm / 7 vias |
+| node | — | 11 seg / 15.4 mm | **9 seg / 8.8 mm** | 62 seg / 62 vias / 47.8 mm | 230 seg / 337.9 mm / 11 vias |
+| ds2 | 9 seg / 9 vias / 13.5 mm | 10 seg / 23.7 mm | — | 2 seg / 2 vias / 1.7 mm | 294 seg / 469.3 mm / 17 vias |
+
+A spine writes **no vias**: R2 forbids a layer change on one (H.4), so `vias_pattern` does not move.
+
+### What each board spines, and what it does not
+
+| board | candidate nets | spined | links made | refused |
+|---|---|---|---|---|
+| blinky | 0 | — | — | 0 |
+| buck | 2 (`5V`, `VIN`) | 2 | `5V` 3 of 4, `VIN` 2 of 4 | **2** |
+| c3_usb | 2 (`3V3`, `VBUS`) | 2 | `3V3` 4 of 7, `VBUS` 1 of 6 | **2** |
+| node | 1 (`VBUS`) | 1 | 3 of 6 | **1** |
+| ds2 | 0 | — | — | 0 |
+
+**Not one spine on these boards connects its whole net**, and that is B.4's own answer rather than a
+failure: a pad whose link fails splits the spine and both halves are kept, `net_open` hands what is
+left to KRT, and the refusal names the first link that did not fit. What the pattern buys is not the
+connection — KRT would have made it — but the **width** it is made at.
+
+### Three decisions the measurement forced, each with its number
+
+1. **The comb is tried first and fits no net on any of the five boards.** B.4's (a) is a straight
+   trunk on a lane `free_intervals` proves free, with a perpendicular rib to every pad; its (b) is the
+   stations linked pairwise. Every one of the five spines refuses the comb and takes the backbone, and
+   the `style:` line says so rather than leaving it silent. The comb is not dead code and is tested end
+   to end on the one net in this repo whose comb does fit — ds2's `VDDA`, whose trunk is 14.9615 mm at
+   y = 12.700 with a zero-length rib at `J2.1`, a straight rib from `U1.12` and an **ell** where
+   `C4.1`'s foot is blocked (`test_the_comb_is_the_first_form_and_it_fits_no_net_on_these_boards`).
+   That same comb is why ds2 has no spine at all: see the open issues.
+
+2. **Two pads of one net are routinely closer together than their own exits, and B.0's 112
+   candidates then have nothing to say.** `pad_exits` puts an exit `half + the widest clearance the
+   net owes on that footprint + width/2` out, and that distance grows with the width — so at
+   0.781 mm on buck, `C_IN1.1 -> U1.3` are 1.716 mm apart with their exits 1.3156 and 1.1266 mm out,
+   `U1.3 -> C_IN2.1` 1.543 mm, `C_IN2.1 -> R_EN.1` 3.009 mm, and every exit-to-exit candidate for
+   those three doubles back on itself for `mitre` to refuse as a hairpin. Three of `VIN`'s four links
+   and three of `5V`'s four were going to KRT for a reason about the exits and not about the board.
+   `spine.link_shapes` puts **three** more candidates in front of the enumeration where and only
+   where the pads are `crowded`: the straight centre line and `route_geom`'s two octile paths between
+   the two pad centres. The bound is 4 x 4 x 7 + 3 = **115** per link. The centre line is exempt from
+   nothing — `blocked` judges it exactly as it judges the rest — and it is the one shape the exit
+   enumeration cannot express. Measured: buck went from 1 link of 8 to 5 of 8, and c3_usb's `3V3`
+   from 3 of 7 to 4 of 7.
+
+3. **A backbone is one growing run, not a bag of links.** A middle station is a T-junction whose two
+   links share that pad's centre exactly, so `route_verify.paths_of` re-assembles them into one run
+   and asks `turn_ok` at the station — and where the chain bends there, the two links leave by
+   adjacent sides and meet at a right angle, which is the warning `dru.py` writes
+   `pcbc_geometry_angles` to catch. Judging each link alone writes that corner and then fails pcbc's
+   own self-check. `_backbone` grows one run a link at a time, splices the new link onto the run
+   before `mitre`, and re-judges the whole of it each time, because a mitre moves copper that was
+   already accepted. buck's `5V` bends at `C_OUT1.1` and is the case.
+
+### Two numbers got worse on buck, and they are the finding
+
+buck is 86 % power and the only board here whose class width is 0.781 mm — the widest copper in the
+repo. 18 mm of it is now locked across the middle of the board before KRT starts, and KRT answers:
+
+- **micro 37 → 96.** Segments under 0.2 mm: a grid router's staircases, tripled, as it works round a
+  0.781 mm wall it did not choose.
+- **`VIN`'s detour 2.09 → 2.55**, already the worst on any board. `VIN` gets 2 of its 4 links; the
+  two it does not get are `J_IN.1 -> C_IN1.1` (14.963 mm across a row of `GND` pads — B.4's own
+  worked example, and it refuses for B.4's own reason) and `C_IN2.1 -> R_EN.1`. KRT then routes both
+  around the copper the other two links laid.
+
+Against that: `width_power` 39 → **23**, off-45 2 → **1**, `angles` 32 → **28**, leftover share
+96.6 % → **84.7 %**. The trade is taken because a necked power track is an electrical fact and a
+staircase is not — `docs/r2-design.md` F.3 item 7 forbids a soft rule *rising*, and `width_power`
+falls — but both ceilings are raised in `test_examples_fab.py::BAR` with this paragraph as their
+reason, and they are open issues, not a footnote.
+
+c3_usb is the mirror image and worth reading beside it: its `angles` rise 122 → **130** and its
+routed length 356.7 → 361.2 mm, while `USB_DN` — the differential pair, KRT's until R4 — comes out
+**shorter**, 1.81 → **1.65**, and `USB_DP` 1.62 → 1.56, because `VBUS` is no longer wandering
+through the pair's corridor. Its `3V3` detour rises 1.38 → 1.53 and its `BOOT` 1.05 → 1.18. node
+moves barely at all: off-45 30 → 25, micro 62 → 54, `angles` 98 → 100, one `width_power` hit.
+
+### ds2, and the sweep that decided `WIDE_MM`
+
+**S7 deviates from B.4 in one place**: B.4 uses `WIDE_MM` only to admit a net that is not `power`,
+and S7 applies it to every spine, so a net whose class is narrower than 0.4 mm gets none. ds2 is the
+board that decided it, and the measurement is unambiguous.
+
+ds2 is two layers, dense, with a 0.65 mm TSSOP whose pins escape through 1.29 mm lanes and **six**
+`vias=False` single-layer analog nets whose only corridors are the ones a spine would take. Its Power
+class is **0.25 mm** against a fab floor of 0.127, so a spine there is spending a corridor to save
+0.123 mm of width. Every configuration tried broke the gate:
+
+| ds2 with its 0.25 mm spines | spine copper | what failed |
+|---|---|---|
+| link cap 6 mm | 35.9 mm | `AIN0` found no path on F.Cu to `U1.11` |
+| link cap 8 mm | 18.9 mm | `3V3`, `GND` and `VSS` found no path on any layer |
+| link cap 8 mm, comb capped too | 18.9 mm | the same three |
+| link cap 12 mm | 55.7 mm | `AIN0` again |
+| no cap | 71.6 mm | `AIN1` no path, `GND` no path, the pour could not reach `C5` |
+
+The 6 mm and 12 mm failures are `VDDA`'s **comb**: a 14.9615 mm trunk at y = 12.700 that cuts the
+board in half to pick up `J2.1`. C.1 predicts the whole class of failure — the constrained nets are
+step 3 and the spine is step 5, but until `chain` (S6) lands, step 3 is KRT's and runs *after* the
+whole pre stage, so the spine takes the corridors the constrained nets structurally need.
+
+A locality cap was written and then removed, because with the width floor in place the sweep says it
+only costs:
+
+| SPINE\_MM (link span cap) | buck leftover | c3_usb | node | ds2 |
+|---|---|---|---|---|
+| 8 mm | 91.7 % | 84.8 % | 82.4 % | 92.3 % (no spine) |
+| 12 mm | 84.7 % | 84.8 % | 82.4 % | 92.3 % |
+| none | **84.7 %** | **79.6 %** | **82.4 %** | 92.3 % |
+
+All five build and the gate is verified at every row, so the cap buys nothing and costs c3_usb five
+points of leftover and buck seven. It is gone, and the fact that nothing now bounds how far a spine
+reaches is S7's second open issue rather than a number with no measurement behind it.
+
+### What is not measured here
+
+- **`chain` (S6) has not landed**, so C.1's step 4 does not exist and the spine is the only pattern
+  in the mid stage. The two are independent; the order in `patterns.MID` is C.1's and has room for it.
+- **The comb's rib neck** is implemented to B.4 item 5 and floored at the branch's own share, and no
+  rib on any of the five boards necks, because no comb fits. `test_no_spine_copper_is_ever_narrower_than_its_class`
+  puts the rule to `_rib_width` directly instead.
+- **Nothing about differential pairs**, except where the leftover moved: `USB_DN` and `USB_DP` are
+  KRT's until R4, and their improvement on c3_usb is a by-product, not a claim.
+
+### The open issues S7 leaves
+
+1. **ds2 has no spine, and the reason is a width floor rather than a fix.** 38 % of its copper is
+   power and it keeps every bit of it. What it actually needs is C.1's step 3 — the constrained nets
+   routed before the spine rather than after it — which is `chain` (S6) plus a constrained-net
+   pattern, or R3's blocking analysis deciding corridors properly. `WIDE_MM` is a threshold that
+   happens to separate the boards where the trade pays from the one where it does not, and it is
+   honest about being that.
+2. **Nothing bounds how far a spine reaches.** The cap was measured to cost and removed (above), so a
+   wide net spread across a large board can lay a trunk corner to corner exactly as ds2's `VDDA`
+   comb did. It has not happened on a board that passes the floor; it will.
+3. **buck's micro 37 → 96 and `VIN` 2.09 → 2.55** (above). Both ceilings raised in `BAR`, and `VIN`
+   is still the worst detour in the repo — the net B.4 names in its own refusal example.
+4. **c3_usb's `angles` 122 → 130 and node's 98 → 100.** pcbc's own 135-degree rule, rising for the
+   third slice running (S5's open issue 2 is the same number). Every corner a pattern writes is
+   mitred; these are the leftover's, meeting locked copper at whatever angle KRT chose.
+5. **Five of eight nets are not spined at all and three of five that are get half their links.**
+   `VBUS` on c3_usb gets 1 link of 6. The gap between "pcbc owns the power nets" and what this slice
+   ships is the maze router, which is R3.

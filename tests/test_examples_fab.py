@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from pcbc.build import build_job
+from pcbc.compile import compile_design
 from pcbc.language import load_board
 from pcbc.netcheck import check_copper
 
@@ -44,10 +45,23 @@ BAR = {
     # and that is the one number of the slice's fixes that got worse. c3_usb's off45 11 -> **13** and
     # micro 204 -> **203** are its leftover answering 34 taps moved 0.1 um by the EPS fix (finding 8):
     # a 100 nm move, two more staircases, which is what a grid router's sensitivity looks like.
+    #
+    # Re-recorded 2026-09-20 for R2 S7, the slice where pcbc lays the power nets itself: `spine`
+    # (B.4) runs after the fanout and before KRT, at the class width and never narrower
+    # (`docs/r2-measurements.md` S7). `PCBC_PATTERNS=off` still reproduces the S1b row on all five
+    # boards exactly, so every move below is the spine and nothing else.
+    #
+    # **Two ceilings go up on buck and they are the finding, not a footnote**: micro 37 -> **96** and
+    # `VIN`'s detour 2.09 -> **2.55**. 18 mm of 0.781 mm copper — the widest on any board here — is
+    # locked across the middle of buck before KRT starts, and KRT answers with staircases and a
+    # longer `VIN`. What it buys is `width_power` 39 -> 23 and off-45 2 -> 1 and `angles` 32 -> 28;
+    # what it costs is in DETOURS and here, per F.3 item 7. c3_usb's `angles` 122 -> **130** and its
+    # routed length are the same trade on a board where the pair comes out **better** (`USB_DN`
+    # 1.81 -> 1.65). node improves on every count but `angles` (98 -> 100).
     "blinky": {"vias": 0, "off45": 0, "micro": 0, "detour": 1.04, "angles": 0},
-    "buck": {"vias": 1, "off45": 3, "micro": 37, "detour": 2.09, "angles": 32},
-    "c3_usb": {"vias": 8, "off45": 13, "micro": 203, "detour": 1.81, "angles": 122},
-    "node": {"vias": 11, "off45": 30, "micro": 62, "detour": 1.82, "angles": 98},
+    "buck": {"vias": 1, "off45": 1, "micro": 96, "detour": 2.55, "angles": 28},
+    "c3_usb": {"vias": 7, "off45": 11, "micro": 188, "detour": 1.70, "angles": 130},
+    "node": {"vias": 11, "off45": 25, "micro": 54, "detour": 1.82, "angles": 100},
 }
 
 # D.5 as a number a deleted fragment can move. `plane_islands` cannot see the failure it is
@@ -61,8 +75,8 @@ BAR = {
 PLANES = {
     "blinky": {("GND", "B.Cu"): 917.25},
     "buck": {("GND", "B.Cu"): 935.59},
-    "c3_usb": {("GND", "B.Cu"): 1050.50},
-    "node": {("GND", "In1.Cu"): 2533.39, ("3V3", "In2.Cu"): 2520.84},
+    "c3_usb": {("GND", "B.Cu"): 1053.06},
+    "node": {("GND", "In1.Cu"): 2533.29, ("3V3", "In2.Cu"): 2520.84},
 }
 
 # Finding 14: how many of each board's `track_width` warnings are pcbc's own tap stubs. `tap._width`
@@ -82,14 +96,18 @@ COURTYARD = {"blinky": 0, "buck": 0, "c3_usb": 1, "node": 0}
 # Finding 16: per-net detour, because `worst_detour` is a max and a max hides every net under it —
 # c3_usb's VBUS went 1.33 -> 1.70 through S5 while the reported worst held at USB_DN 1.81. Ceilings,
 # for every net whose airwire is at least 1 mm. A net that creeps here is a test failure now.
+# Re-recorded for S7. Four move on buck and five on c3_usb, and the two directions are the slice:
+# `VIN` 2.09 -> **2.55** and c3_usb's `3V3` 1.38 -> **1.53** and `BOOT` 1.05 -> **1.18** are KRT
+# routing round locked power copper, while `USB_DN` 1.81 -> **1.65** and `USB_DP` 1.62 -> **1.56**
+# are the pair getting a straighter run once `VBUS` is out of its way. ds2 and node barely move.
 DETOURS = {
     "blinky": {"LED": 1.04},
-    "buck": {"5V": 1.12, "BOOT": 1.0, "EN": 1.09, "FB": 1.01, "GND": 1.31, "SW": 1.53, "VIN": 2.09},
-    "c3_usb": {"3V3": 1.38, "BOOT": 1.05, "CC1": 1.2, "CC2": 1.08, "EN": 1.04, "GND": 1.44, "LED": 1.19, "LED_A": 0.79, "USB_DN": 1.81, "USB_DP": 1.62, "VBUS": 1.7},
+    "buck": {"5V": 1.14, "BOOT": 1.0, "EN": 1.09, "FB": 1.01, "GND": 1.3, "SW": 1.52, "VIN": 2.55},
+    "c3_usb": {"3V3": 1.53, "BOOT": 1.18, "CC1": 1.2, "CC2": 1.08, "EN": 1.04, "GND": 1.48, "LED": 1.19, "LED_A": 0.79, "USB_DN": 1.65, "USB_DP": 1.56, "VBUS": 1.7},
     "node": {
         "3V3": 0.13, "BOOT": 1.12, "CC1": 1.0, "CC2": 1.24, "DRV": 1.08, "EN": 1.09, "GATE": 1.03, "GND": 0.43,
         "LED": 1.12, "LED_A": 1.0, "LOAD": 1.0, "SCL": 1.04, "SDA": 1.09, "T_DIV": 1.03, "T_OUT": 1.72,
-        "USB_DN": 1.82, "USB_DP": 1.53, "VBUS": 1.27,
+        "USB_DN": 1.82, "USB_DP": 1.53, "VBUS": 1.26,
     },
 }
 
@@ -110,7 +128,24 @@ VIAS_PATTERN = {
 # C.6: the refusal count per board, **exact**, so a new refusal is a test failure and cannot drift
 # into being ignored. Zero hard refusals everywhere — a hop refusal is never hard, because KRT's own
 # constrained `*_nets` step honours the same intent (C.6, and `patterns/hop.py`'s `_refuse`).
-REFUSED = {"blinky": {}, "buck": {"hop": 2}, "c3_usb": {"hop": 1, "tap": 2}, "node": {"hop": 1, "tap": 2}}
+REFUSED = {
+    "blinky": {},
+    "buck": {"hop": 2, "spine": 2},
+    "c3_usb": {"hop": 1, "spine": 2, "tap": 2},
+    "node": {"hop": 1, "spine": 1, "tap": 2},
+}
+"""A spine refusal is soft for `hop._refuse`'s reason: KRT's own `{class}_nets` step honours the same
+intent with the same numbers, so a refused spine costs a route pcbc would have drawn wider and never
+costs the constraint. One per net that the backbone could not finish, never one per failed link."""
+
+# B.4's refusals, net by net, with the rule that decided each — the `TAP_REFUSED` treatment for the
+# spine. A spine refusal names the first link the backbone could not make.
+SPINE_REFUSED = {
+    "blinky": [],
+    "buck": [("C_OUT2.1->J_OUT.1", "copper"), ("J_IN.1->C_IN1.1", "copper")],
+    "c3_usb": [("U1.3->C_MCU.1", "no candidate"), ("J1.A4B9->U3.5", "copper")],
+    "node": [("U2.1->C_VBUS_HF.1", "no candidate")],
+}
 
 # B.3's refusals, pad by pad, with the rule that decided each. A tap refusal is soft: KRT's own
 # `plane_taps` step runs for exactly these nets and welds exactly these pads, which is why node's
@@ -126,9 +161,9 @@ TAP_REFUSED = {
 # net shows up here before it shows up in the bar.
 OWNS = {
     "blinky": {"hop": (5, 0), "tap": (1, 1)},
-    "buck": {"tap": (6, 6)},
-    "c3_usb": {"fanout": (5, 5), "hop": (11, 0), "tap": (34, 34)},
-    "node": {"hop": (11, 0), "tap": (62, 62)},
+    "buck": {"spine": (10, 0), "tap": (6, 6)},
+    "c3_usb": {"fanout": (5, 5), "hop": (11, 0), "spine": (9, 0), "tap": (34, 34)},
+    "node": {"hop": (11, 0), "spine": (9, 0), "tap": (62, 62)},
 }
 
 # R1 (docs/r1-design.md E, H.3): the soft rules' hits per example, {rule name: KiCad warnings}, recorded
@@ -164,11 +199,17 @@ OWNS = {
 # has no exemption for it, so buck's `R_FB_BOT.2` at 0.64 mm and node's `U4.2`, `U4.6` and `U4.7` at
 # 0.364 mm are four of the 54 combined `width_power` hits. `TAP_NECKED` pins how many, matched to the
 # stubs by position and length, so the claim is a number rather than a sentence.
+#
+# **Re-recorded 2026-09-20 for R2 S7, and `width_power` is the number the slice exists for.** It
+# counts every place a power track was necked below its class, and the spine writes power copper at
+# the class width or refuses: buck 39 -> **23**, c3_usb 51 -> **40**, node 15 -> **14**. Nothing else
+# moves. What remains is the leftover: KRT still routes the links the backbone could not make, plus
+# GND's own leftover on every board and node's whole USB pair (`width_usb`, an R4 item).
 SOFT = {
     "blinky": {"width_power": 0},
-    "buck": {"width_power": 39},
-    "c3_usb": {"width_power": 51, "vias_usb_dn": 0, "vias_usb_dp": 1, "skew_usb_dn_usb_dp": 1, "uncoupled_usb": 1},
-    "node": {"width_usb": 46, "width_power": 15, "vias_usb_dn": 0, "vias_usb_dp": 0, "skew_usb_dn_usb_dp": 1, "uncoupled_usb": 1},
+    "buck": {"width_power": 23},
+    "c3_usb": {"width_power": 40, "vias_usb_dn": 0, "vias_usb_dp": 1, "skew_usb_dn_usb_dp": 1, "uncoupled_usb": 1},
+    "node": {"width_usb": 46, "width_power": 14, "vias_usb_dn": 0, "vias_usb_dp": 0, "skew_usb_dn_usb_dp": 1, "uncoupled_usb": 1},
 }
 
 
@@ -207,6 +248,13 @@ def test_example_builds_to_fab(tmp_path: Path, name: str):
     assert route["refused"] == REFUSED[name], (name, route["refused"], route["pattern_moves"])
     assert not any(r["hard"] for r in route["refusals"]), route["refusals"]
     assert [(r["what"], r["rule"]) for r in route["refusals"] if r["pattern"] == "tap"] == TAP_REFUSED[name], (name, route["refusals"])
+    assert [(r["what"], r["rule"]) for r in route["refusals"] if r["pattern"] == "spine"] == SPINE_REFUSED[name], (name, route["refusals"])
+    # B.4's own rule, asked of the built board: no power net carries copper narrower than its class
+    # anywhere pcbc wrote it, and the ampacity gate the widths were derived from is still empty.
+    from pcbc.copper import power_ampacity_failures
+
+    routed = (tmp_path / "layout" / name / "routed" / "layout.kicad_pcb").read_text()
+    assert power_ampacity_failures(compile_design(load_board(board)), routed) == [], name
     taps = [m for m in route["pattern_moves"] if m.startswith("tap ")]
     if name == "node":
         assert taps[0].splitlines()[0] == (

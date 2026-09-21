@@ -24,6 +24,7 @@ from pcbc.fanout import fanout_pieces
 from pcbc.language import load_board
 from pcbc.patterns import (
     ALL_SHAPES,
+    MAX_LINKS,
     MITRE_MM,
     PatternCtx,
     legs_of,
@@ -35,6 +36,25 @@ from pcbc.patterns import (
     terminals,
 )
 from pcbc.patterns.hop import DETOUR_MAX, HOP_MM, specs as hop_specs
+from pcbc.patterns.spine import (
+    AXES,
+    SpineSpec,
+    WIDE_MM,
+    _comb as _spine_comb,
+    _rib_width as rib_width,
+    anchor as spine_anchor,
+    axis_of as spine_axis_of,
+    crowded,
+    even_across,
+    iaxis as spine_iaxis,
+    link_shapes,
+    run as spine_run,
+    specs as spine_specs,
+    spine_widths,
+    trunk_axis,
+    trunk_span,
+    world as spine_world,
+)
 from pcbc.patterns.tap import TAP_REACH_MM, anchor, specs as tap_specs, tap_via
 from pcbc.route import bar_key, krt_plan, pin_copper_ids, write_fab_overrides
 from pcbc.route_emit import piece_key, seg_piece, via_piece, write_pieces
@@ -227,16 +247,16 @@ def test_a_hop_leaves_its_pad_toward_its_partner_first():
     the opposite first, and taking A.7's order literally sent c3_usb's `LED_A` round the outside at
     1.93x its 1.336 mm airwire. The re-ordering is an ordering of the enumeration, like B.0's own
     nesting, derived from the pads' geometry and nothing else."""
-    from pcbc.patterns.hop import _toward_first
+    from pcbc.patterns import toward_first
 
     scene, _d, _j, _t = _scene("c3_usb")
     a, b = terminals(scene, "CC1")
     outward = [e.side for e in pad_exits(scene, b.item, 0.16, "F.Cu")]
-    toward = [e.side for e in _toward_first(pad_exits(scene, b.item, 0.16, "F.Cu"), b, a)]
+    toward = [e.side for e in toward_first(pad_exits(scene, b.item, 0.16, "F.Cu"), b, a)]
     assert outward == ["right", "down", "up"] and toward == ["down", "right", "up"], (outward, toward)
     assert b.at[1] < a.at[1], "`R_CC1.1` sits above `J1.A5`, so the exit that points at it is `down`"
-    assert [e.side for e in _toward_first(pad_exits(scene, b.item, 0.16, "F.Cu"), b, a)] == [
-        e.side for e in _toward_first(pad_exits(scene, b.item, 0.16, "F.Cu"), b, a)
+    assert [e.side for e in toward_first(pad_exits(scene, b.item, 0.16, "F.Cu"), b, a)] == [
+        e.side for e in toward_first(pad_exits(scene, b.item, 0.16, "F.Cu"), b, a)
     ], "an ordering, not a score: the same pads give the same order"
 
 
@@ -1098,3 +1118,334 @@ def test_the_post_stage_checks_its_own_copper_and_is_fast_enough():
         plan, _d, job, _t = _post(name)
         assert verify_copper(plan.scene, plan.pieces, job.constraints, ids=plan.ids) == [], name
         assert plan.wall_ms <= budget[name], (name, plan.wall_ms, budget[name])
+
+
+# --- B.4: the spine -------------------------------------------------------------------------------
+#
+# S7. The power nets are 37 % of all routed copper on the five boards and the last big block left,
+# and the number this pattern exists to move is `width_power` — every place KRT necked a power track
+# below its class (39 on buck, 51 on c3_usb, 15 on node before this slice). Every number below was
+# measured on 2026-09-20 against the placed boards and is recorded in `docs/r2-measurements.md` (S7);
+# each assertion carries its reference, so a drift names the rule it left.
+
+SPINES = {"blinky": (), "buck": ("5V", "VIN"), "c3_usb": ("3V3", "VBUS"), "node": ("VBUS",), "ds2": ()}
+"""B.4's population per board after S7's one deviation: a net with at least three pads, no plane, and
+a class at least `WIDE_MM` wide.
+
+blinky has none (its only power net is `GND`, which has a pour and one pad) and node has one (its
+`GND` and `3V3` are planes). **ds2 has none and that is the deviation**: its power class is 0.25 mm,
+and every spine it was given broke the gate outright — `spine.WIDE_MM`'s docstring carries the
+measurement and S7's first open issue carries the consequence. buck's `SW` (`switch_node`, 0.3 mm)
+falls out with them."""
+
+SPINE_AXIS = {("buck", "5V"): "x", ("buck", "VIN"): "x", ("c3_usb", "3V3"): "x", ("c3_usb", "VBUS"): "v", ("node", "VBUS"): "u"}
+"""B.4 item 1's trunk axis per net, exact. Two of the five are a **diagonal**, which is why the
+parity arithmetic of `even_across` is a rule with a test rather than a defensive branch: on `u` and
+`v` a world point is `((u + v) / 2, (u - v) / 2)`, so `u + v` has to be even in nanometres."""
+
+SPINE_OWNS = {"blinky": (0, 0.0), "buck": (10, 18.001), "c3_usb": (14, 38.575), "node": (9, 8.819), "ds2": (0, 0.0)}
+"""(segments, mm) each board's mid stage writes on the **placed** board. The build's numbers are not
+these and are pinned where they are measured (`test_examples_fab.py`, and `DS2_BAR`): on a real build
+the spine runs after the hops and the fanout, so c3_usb's 14 segments become 9 once its escapes are
+down. The placed board is the deterministic input a unit test can pin."""
+
+
+def _spine_ctx(name: str):
+    scene, design, job, _t = _scene(name)
+    return PatternCtx(scene=scene, design=design, job=job, cs=job.constraints, board=_uuid_name(name), stage="mid")
+
+
+def _mid(name: str):
+    """The mid stage over the **placed** board — C.1's pre stage resumed after the fanout, asked here
+    without one so the input is the same board every other unit test starts from."""
+    design = load_board(_board(name))
+    job = compile_design(design)
+    text = _placed(name).read_text()
+    return pattern_copper(design, job, job.constraints, text, _uuid_name(name), stage="mid"), design, job, text
+
+
+def test_a_spine_is_a_wide_power_net_with_three_or_more_pads_and_no_plane():
+    """B.4's population, exact per board. A plane net is the tap pattern's — a plane **is** the spine
+    a plane net already has — a pair is R4's, and a declared bus member belongs to the ribbon."""
+    for name in ALL:
+        ctx = _spine_ctx(name)
+        assert tuple(s.net for s in spine_specs(ctx)) == SPINES[name], (name, [s.net for s in spine_specs(ctx)], "docs/r2-measurements.md S7")
+        for s in spine_specs(ctx):
+            c = ctx.cs.by_net(s.net)
+            assert s.net not in ctx.scene.plane_of and c.pair is None, (name, s.net)
+            assert len(s.stations) >= 3 and s.width >= WIDE_MM, (name, s.net, len(s.stations), s.width)
+            assert s.layer in ctx.scene.layers and all(s.layer in t.layers for t in s.stations), (name, s.net, "one layer, and every station on it: R2 puts no via on a spine")
+
+
+def test_a_trunk_carries_the_whole_net_and_a_branch_its_own_share():
+    """The width is not decoration. `Constraint.current.amps` is what the net carries and
+    `stackup.current_width_mm` — `max(IPC-2221B external, IPC-2152 with the board and plane
+    modifiers)` — is the curve `Constraint.width_mm` was itself derived from, so asking it again where
+    the copper is written is a check and not a second opinion. A branch carries `amps / pads`, which
+    is `tap.tap_via`'s own division for the same reason: a decoupling cap's ripple is not the rail.
+
+    Measured on buck's `VIN`, the widest power net on any of these boards: 2 A across 5 pads asks
+    0.781 mm of the trunk and 0.15 mm of a branch, a factor of 5.
+    """
+    from pcbc.stackup import current_width_mm
+
+    for name in ALL:
+        ctx = _spine_ctx(name)
+        for s in spine_specs(ctx):
+            c = ctx.cs.by_net(s.net)
+            assert s.width == float(c.width_mm.value), (name, s.net, "the trunk is the class width, never a number of its own")
+            assert s.width + 1e-9 >= s.trunk_need, (name, s.net, s.width, s.trunk_need, "a trunk that necks is the bug this pattern removes")
+            assert s.branch_need <= s.trunk_need + 1e-9, (name, s.net, "one pad's share never asks more than the whole net's")
+            if c.current is not None:
+                want = current_width_mm(c.current.amps, c.current.temp_rise_c, ctx.scene.stack, c.current.plane_h_mm).value
+                assert s.trunk_need == want and s.share == round(c.current.amps / len(s.stations), 4), (name, s.net)
+    vin = next(s for s in spine_specs(_spine_ctx("buck")) if s.net == "VIN")
+    assert (vin.amps, vin.width, vin.trunk_need, vin.share, vin.branch_need) == (2.0, 0.781, 0.781, 0.4, 0.15), vin
+    assert vin.why == (
+        "the Power class's 0.781 mm trunk against the 0.781 mm IPC asks for VIN's whole 2 A, and 0.15 mm for one pad's 0.4 A"
+    ), vin.why
+
+
+def test_no_spine_copper_is_ever_narrower_than_its_class():
+    """B.0's "a pattern never degrades", at its sharpest. A trunk and every backbone link are written
+    at the class width or not at all — the refusal is the answer, never a narrower track — and the
+    only copper allowed to neck is a comb's **rib**, R-I3's own allowance for the last millimetre into
+    a pad, floored at the width that branch's share of the current needs."""
+    for name in ALL:
+        plan, _d, job, _t = _mid(name)
+        for p in plan.pieces:
+            c = job.constraints.by_net(p.net)
+            assert p.w == float(c.width_mm.value), (name, p.net, p.w, "every backbone link is the class width end to end")
+    ctx = _spine_ctx("buck")
+    vin = next(s for s in spine_specs(ctx) if s.net == "VIN")
+    small = next(t for t in vin.stations if t.owner == "R_EN.1")  # a 0.54 x 0.64 pad under a 0.781 mm class
+    assert rib_width(ctx, vin, small, "x") == 0.54, "R-I3's allowance: a rib necks TO the pad, and 0.54 still carries this pad's 0.4 A"
+    assert rib_width(ctx, vin, small, "x") >= vin.branch_need, (vin.branch_need, "and never below what the branch carries")
+    hungry = SpineSpec(**{**vin.__dict__, "branch_need": 0.7})
+    assert rib_width(ctx, hungry, small, "x") == 0.7, "the share floor bites before the pad's own dimension does"
+    assert rib_width(ctx, SpineSpec(**{**vin.__dict__, "branch_need": 9.0}), small, "x") == 0.781, "and the class width is still the cap"
+
+
+def test_the_trunk_axis_is_the_widest_spread_with_x_y_u_v_breaking_a_tie():
+    """B.4 item 1, and the sqrt(2): `route_scene._project` carries `u = x + y` unscaled, so a raw `u`
+    spread is sqrt(2) times the distance it stands for, and comparing it against `x` directly picks a
+    diagonal trunk for nearly every net on every board."""
+    for name in ALL:
+        ctx = _spine_ctx(name)
+        for s in spine_specs(ctx):
+            axis = trunk_axis(ctx.scene, s)
+            assert axis == SPINE_AXIS[(name, s.net)], (name, s.net, axis, "docs/r2-measurements.md S7")
+            spread = {}
+            for a in AXES:
+                vals = [spine_axis_of(spine_anchor(t), a)[0] for t in s.stations]
+                spread[a] = (max(vals) - min(vals)) / (math.sqrt(2.0) if a in ("u", "v") else 1.0)
+            assert spread[axis] >= max(spread.values()) - ctx.scene.grid, (name, s.net, spread)
+            assert AXES == ("x", "y", "u", "v"), "the tie-break order is B.4's and is not a set"
+
+
+def test_a_diagonal_rib_lands_at_exactly_45_and_not_45_to_a_rounding():
+    """`even_across`: on `u` or `v` a world point is `((u + v) / 2, (u - v) / 2)`, so `u + v` must be
+    even in nanometres or the point does not exist on KiCad's own grid.
+
+    A lane offset carries no such parity, so it is stepped back by the one nanometre that makes it
+    exist. That moves a rib's landing 0.5 nm off the trunk's centreline and leaves it 63500 nm inside
+    the trunk's own copper, which is where the connection is made in any case — KiCad joins tracks
+    that **touch**, not tracks whose endpoints are equal. The alternative is a leg that is 45 degrees
+    to within a rounding error, which `is_octilinear` refuses outright and should.
+    """
+    for axis in ("u", "v"):
+        for pad in ((1.0, 2.0), (1.0005, 2.0007), (-3.25, 7.125)):
+            along, across = spine_iaxis(pad, axis)
+            for step in range(-5, 6):
+                o = even_across(along, across + step, axis)
+                assert 0 <= (across + step) - o <= 1, (axis, pad, step, o, "stepped back by at most one nanometre")
+                foot = spine_world(along, o, axis)
+                assert (q(foot[0]), q(foot[1])) == foot, (axis, pad, foot, "a world point is a whole number of nanometres")
+                assert abs(abs(foot[0] - pad[0]) - abs(foot[1] - pad[1])) < 1e-12, (axis, pad, foot, "the rib is exactly 45 degrees")
+                assert is_octilinear(((q(pad[0]), q(pad[1])), foot)) or foot == (q(pad[0]), q(pad[1])), (axis, pad, foot)
+    for axis in ("x", "y"):
+        assert even_across(12345, 67891, axis) == 67891, "x and y are world points already; nothing is stepped"
+
+
+def test_two_crowded_pads_get_the_centre_line_and_roomy_ones_do_not():
+    """A.7 puts an exit `half + the widest clearance the net owes on that footprint + width/2` out,
+    and that distance grows with the width — so on the widest copper pcbc writes, two neighbouring
+    pads of one net routinely sit **inside** each other's exits and every one of B.0's 112 candidates
+    doubles back on itself.
+
+    Measured at 0.781 mm on buck: `C_IN1.1 -> U1.3` are 1.716 mm apart with their exits 1.3156 and
+    1.1266 mm out; `U1.3 -> C_IN2.1` 1.543 mm, `C_IN2.1 -> R_EN.1` 3.009 mm. Three of `VIN`'s four
+    links, all of them hairpins `mitre` refuses. The centre line is exempt from nothing: `blocked`
+    judges it exactly as it judges the rest, and it is offered only where the exits cross.
+    """
+    ctx = _spine_ctx("buck")
+    spec = next(s for s in spine_specs(ctx) if s.net == "VIN")
+    by = {t.owner: t for t in spec.stations}
+    a, b = by["C_IN1.1"], by["U1.3"]
+    ea = pad_exits(ctx.scene, a.item, spec.width, spec.layer)
+    eb = pad_exits(ctx.scene, b.item, spec.width, spec.layer)
+    assert math.dist(spine_anchor(a), spine_anchor(b)) < max(math.dist(spine_anchor(a), e.at) for e in ea) + max(
+        math.dist(spine_anchor(b), e.at) for e in eb
+    )
+    assert crowded(a, b, ea, eb), "1.716 mm apart, exits 1.3156 and 1.1266 mm out"
+    shapes = link_shapes(a, b, ea, eb)
+    assert [n for n, _p in shapes[:3]] == ["centre", "centre-Z", "centre-L"], shapes[:3]
+    assert len(shapes) <= 4 * 4 * MAX_LINKS + 3, (len(shapes), "B.4's bound as S7 states it: 115 per link")
+    far, near = by["J_IN.1"], by["C_IN1.1"]
+    ef = pad_exits(ctx.scene, far.item, spec.width, spec.layer)
+    en = pad_exits(ctx.scene, near.item, spec.width, spec.layer)
+    assert not crowded(far, near, ef, en), "14.963 mm apart: B.0's enumeration keeps it to itself"
+    assert all(not n.startswith("centre") for n, _p in link_shapes(far, near, ef, en))
+
+
+def test_a_backbone_is_one_run_so_the_turn_at_a_station_is_mitred():
+    """A middle station is a T-junction whose two links share that pad's centre **exactly**, so
+    `route_verify.paths_of` re-assembles them into one run and asks `turn_ok` at the station — and
+    where the chain bends there, the two links leave by adjacent sides and meet at a right angle.
+
+    Judging each link on its own writes that corner and then fails pcbc's own self-check, which is
+    why `_backbone` grows one run a link at a time and re-judges the whole of it each time: a mitre
+    moves copper that was already accepted. buck's `5V` bends at `C_OUT1.1` and is the case.
+    """
+    for name in ALL:
+        plan, _d, job, _t = _mid(name)
+        for path in paths_of(plan.pieces):
+            assert is_octilinear(path) and turn_ok(path), (name, path)
+        assert verify_copper(plan.scene, plan.pieces, job.constraints, ids=plan.ids) == [], name
+    plan, _d, _j, _t = _mid("buck")
+    runs = paths_of([p for p in plan.pieces if p.net == "5V"])
+    assert any(len(r) > 2 for r in runs), (runs, "the run through C_OUT1.1 is one path with a mitred corner, not two links")
+
+
+def test_a_partial_spine_keeps_both_halves_and_hands_the_rest_to_krt():
+    """B.4 (b): a pad whose link fails splits the spine into two components and **both** are kept.
+    Partial copper is legal, useful and honest — `net_open` hands what is left to KRT — and on these
+    boards it is all of what the pattern writes: not one spine here connects its whole net."""
+    for name in ALL:
+        plan, _d, _j, _t = _mid(name)
+        got = (len([p for p in plan.pieces if p.kind == "seg"]), round(sum(p.mm for p in plan.pieces), 3))
+        assert got == SPINE_OWNS[name], (name, got, SPINE_OWNS[name], "docs/r2-measurements.md S7")
+        assert plan.done == frozenset() and plan.partial == plan.claimed, (name, plan.done, plan.partial)
+        assert all(p.kind == "seg" for p in plan.pieces), (name, "no layer change on a spine (R2's stated non-goal, H.4)")
+
+
+def test_the_comb_is_the_first_form_and_it_fits_no_net_on_these_boards():
+    """B.4 (a) end to end, on the one net in this repo whose comb does fit — ds2's `VDDA`, built by
+    hand because `WIDE_MM` keeps ds2 out of the population.
+
+    It is worth a test rather than a note because it is both halves of the story. The comb works: a
+    14.9615 mm trunk on the free lane through `J2.1`'s own row, a zero-length rib there, a straight
+    rib down from `U1.12` and an **ell** where `C4.1`'s foot is blocked. And it is why ds2 has no
+    spine: that trunk cuts the board at y = 12.700, after which `AIN0` — `vias=False` on F.Cu — has
+    no path to `U1.11` at all and the build fails the gate.
+
+    On the five boards' own spines the comb refuses every time and the backbone does the work; the
+    `style:` line says so rather than leaving it silent.
+    """
+    from pcbc.copper_bar import airwire_mm
+
+    ctx = _spine_ctx("ds2")
+    st = terminals(ctx.scene, "VDDA")
+    w, share, tn, bn, why = spine_widths(ctx.scene, ctx.cs, "VDDA", len(st))
+    spec = SpineSpec(
+        net="VDDA", layer="F.Cu", stations=st, width=w, amps=0.1, share=share, trunk_need=tn,
+        branch_need=bn, why=why, airwire=round(airwire_mm([spine_anchor(t) for t in st]), 4),
+    )
+    assert trunk_axis(ctx.scene, spec) == "x" and trunk_span(spec, "x") == (8.04, 23.0015)
+    comb, _seen = _spine_comb(ctx, spec)
+    assert comb["candidate"] == "comb along x at 12.7 on F.Cu", comb["candidate"]
+    assert comb["offsets"] == (12.7, 7.6903, 2.9705, 20.32), (comb["offsets"], "a pad's own row first, then lane centres nearest the median")
+    assert [(round(p.a[0], 4), round(p.a[1], 4), round(p.b[0], 4), round(p.b[1], 4)) for p in comb["pieces"]] == [
+        (8.04, 12.7, 23.0015, 12.7),     # the trunk, extended to each end pad's own half size
+        (20.33, 6.4411, 19.88, 6.4411),  # C4.1's ell: its foot is blocked, so it steps along the trunk
+        (19.88, 6.4411, 19.68, 6.6411),
+        (19.68, 6.6411, 19.68, 12.7),
+        (22.83, 9.33, 22.83, 12.7),      # U1.12's straight rib; J2.1 sits on the trunk and needs none
+    ], comb["pieces"]
+    for name in ALL:
+        plan, _d, _j, _t = _mid(name)
+        for net in SPINES[name]:
+            assert any(n.startswith(f"style: spine {net}: the comb along ") and "did not fit" in n for n in plan.notes), (name, net, plan.notes)
+        assert not any(p.owner.startswith(f"{net} trunk") for p in plan.pieces for net in SPINES[name])
+
+
+def test_a_spine_refusal_is_a_move():
+    """C.6: **soft**, by `hop._refuse`'s argument — KRT's own `{class}_nets` step honours the same
+    intent with the same numbers, so a refused spine costs a route pcbc would have drawn wider and
+    never costs the constraint itself. What it does cost is the `width_power` warning this pattern
+    exists to remove, and the sentence prices it.
+
+    The line says the trunk it wanted with the arithmetic behind its width, what `free_intervals`
+    found, the blockers worst first with the rule that decided each, the links the backbone did and
+    did not make, the candidates it tried, and an edit.
+    """
+    plan, _d, _j, _t = _mid("buck")
+    assert not any(r.hard for r in plan.refusals()), plan.refusals()
+    assert plan.counts() == {"spine": 2}, plan.counts()
+    vin = next(r for r in plan.refusals() if r.net == "VIN")
+    assert vin.move.splitlines() == [
+        "spine VIN: 5 stations from C_IN1.1 to U1.3 cannot reach one trunk at 0.781 mm (the Power class's 0.781 mm "
+        "trunk against the 0.781 mm IPC asks for VIN's whole 2 A, and 0.15 mm for one pad's 0.4 A).",
+        "  In the way: the trunk along x across 1.6..19.37 does not fit on F.Cu at 0.781 mm: 3 free lanes there could "
+        "take it (the widest is 5.243 mm at x=2.922) and none of the 3 tried, nearest the pads' median first, clears.",
+        "  In the way of the trunk, worst first: U1.4 [FB] at 17.41,7.66 leaves -0.391 mm of the 0.200 mm class Power "
+        "needs (rule: copper); L1.1 [SW] at 19.71,13.996 leaves -0.391 mm of the 0.200 mm class Power needs (rule: copper)",
+        "  The backbone linked 2 of its 4 links and left J_IN.1->C_IN1.1, C_IN2.1->R_EN.1 (rule: copper)",
+        "  Tried 3 trunk offsets of at most 6 and 8 backbone candidates of at most 4 x (4 x 4 x 7 + 3).",
+        '  Moves: Place("J_IN", toward="left") opens the lane the trunk wants; or NetReq("VIN", layers=["B.Cu"]) takes '
+        'the spine to the other side; or NetReq("VIN", amps=2) narrows the trunk to what it really carries.',
+    ], vin.move
+
+
+def test_a_trunk_narrower_than_its_current_refuses_rather_than_being_written():
+    """The one guard that is about the electrics rather than the geometry, and it is checked before a
+    millimetre is written: a class width under what IPC-2221/IPC-2152 ask for the net's own current is
+    exactly the failure `copper.power_ampacity_failures` gates the build on, and writing it would be
+    pcbc committing that failure deliberately. No board here reaches it — every class width is at or
+    above its own curve — so the rule is put to a spec built with the number moved."""
+    ctx = _spine_ctx("buck")
+    vin = next(s for s in spine_specs(ctx) if s.net == "VIN")
+    bad = SpineSpec(**{**vin.__dict__, "width": 0.4})
+    res = spine_run(ctx, bad)
+    assert res.pieces == () and res.refusal is not None and res.refusal.rule == "ampacity", res
+    assert res.refusal.move.splitlines()[1] == (
+        "  In the way: the class width 0.4 mm is under the 0.781 mm IPC-2221/IPC-2152 ask for 2 A, so any trunk pcbc "
+        "wrote would be the neck it exists to remove (rule: ampacity)."
+    ), res.refusal.move
+
+
+def test_the_spine_stage_runs_after_the_fanout():
+    """C.1 puts the fanout at step 2 and the spine at step 5, and the order is the whole argument of
+    the stage: least free first. A closed row's escape has one direction it can leave in and a spine
+    is the widest copper pcbc writes, so a spine placed first can stand across a lane that the escape
+    then has no second answer for. `merge_plans` is what makes the two halves one plan for KRT."""
+    from pcbc.patterns import MID, POST, PRE, merge_plans
+
+    assert PRE == ("hop",) and MID == ("spine",) and POST == ("tap",)
+    design = load_board(_board("c3_usb"))
+    job = compile_design(design)
+    text = _placed("c3_usb").read_text()
+    pre = pattern_copper(design, job, job.constraints, text, "c3_usb", stage="pre")
+    fan, _n = fanout_pieces(design, job, pre.text, "c3_usb", pre.scene, claimed=pre.claimed)
+    pre.scene.add(pre.scene.item_of(p) for p in fan)
+    mid = pattern_copper(design, job, job.constraints, write_pieces(pre.text, fan), "c3_usb", stage="mid", scene=pre.scene)
+    assert fan and mid.pieces, "c3_usb has five escapes and two spines"
+    assert len([p for p in mid.pieces if p.kind == "seg"]) == 9, (len(mid.pieces), "the escapes cost the spine five of its fourteen segments")
+    merged = merge_plans(pre, mid)
+    assert merged.pieces == pre.pieces + mid.pieces and merged.scene is pre.scene
+    assert merged.claimed == pre.claimed | mid.claimed and merged.text == mid.text
+    assert merged.wall_ms == pre.wall_ms + mid.wall_ms and merged.ids == pre.ids + mid.ids
+
+
+def test_the_spine_stage_checks_its_own_copper_and_is_fast_enough():
+    """D.1 runs unconditionally at the end of **each** stage, and F.3 item 8's budget is the stages
+    together: at most 2.0 s on node and ds2, 0.3 s on blinky. F.3 item 2 on the same pass: the same
+    placed board gives byte-identical copper."""
+    budget = {"blinky": 300, "buck": 2000, "c3_usb": 2000, "node": 2000, "ds2": 2000}
+    for name in ALL:
+        plan, _d, job, _t = _mid(name)
+        assert verify_copper(plan.scene, plan.pieces, job.constraints, ids=plan.ids) == [], name
+        assert plan.wall_ms <= budget[name], (name, plan.wall_ms, budget[name])
+        again, _d2, _j2, _t2 = _mid(name)
+        assert [piece_key(p) for p in again.pieces] == [piece_key(p) for p in plan.pieces], (name, "pure: same board, same copper")
+        assert [p.uuid for p in again.pieces] == [p.uuid for p in plan.pieces], name

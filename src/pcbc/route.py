@@ -400,9 +400,11 @@ def route_job(design: Design, placed: Path, *, out: Path, name: str = "board") -
     # Hops run FIRST, before the fanout, and the fanout then skips the nets they claimed: a hop
     # between two neighbouring pads has one path and anything routed before it can cut that path, so
     # a closed row's lane is better spent on the hop that needed it than on a via the hop then has to
-    # start from (`docs/copper-plan.md` line 181, and this module's own comment below).
+    # start from (`docs/copper-plan.md` line 181, and this module's own comment below). The spines go
+    # down LAST of the three, after the fanout: C.1 orders the stage by degrees of freedom, and a
+    # spine is the widest copper pcbc writes while a closed row's escape has one way out.
     from .fanout import fanout_pieces
-    from .patterns import empty_plan, hard_refusals, pattern_copper, patterns_off
+    from .patterns import empty_plan, hard_refusals, merge_plans, pattern_copper, patterns_off
     from .route_emit import census as _census, sidecar, write_pieces, write_sidecar
 
     text = placed.read_text()
@@ -413,12 +415,19 @@ def route_job(design: Design, placed: Path, *, out: Path, name: str = "board") -
         # self-check see them. With `PCBC_PATTERNS=off` there is no scene, and `fanout_pieces` builds
         # its own exactly as it did before R2 — which is what makes the switch a true rollback.
         plan.scene.add(plan.scene.item_of(pc) for pc in fan_pieces)
+    board_text = write_pieces(plan.text, fan_pieces) if fan_pieces else plan.text
+    if not patterns_off():
+        # C.1's pre stage resumes after the fanout: the spine is step 5 and the escapes are step 2,
+        # so the widest copper on the board is written last of the three and sees the other two
+        # (`patterns.MID`).
+        plan = merge_plans(plan, pattern_copper(design, job, job.constraints, board_text, name, stage="mid", scene=plan.scene))
+        board_text = plan.text
     pre = tuple(plan.pieces) + tuple(fan_pieces)
     start = placed
     if pre:
         start = work / "00_patterns_pre.kicad_pcb"
         copy_with_siblings(placed, start)
-        start.write_text(write_pieces(plan.text, fan_pieces))
+        start.write_text(board_text)
     steps = krt_plan(job, design, start, work, home, plan, post=not patterns_off())
     result: dict = {
         "pcb": str(out),

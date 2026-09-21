@@ -42,7 +42,10 @@ PCBC_STEP = "pcbc"
 The rest of the command keeps every position a KRT step keeps: the board it reads in slot 4, the
 board it writes in slot 5. So the plan stays one list of steps, `test_route_plan.py`'s chain
 assertion reads it unchanged, the step files number and sort in run order, and `blocking.step_boards`
-names `patterns_post` as the step that placed a tap without knowing anything about patterns."""
+names `patterns_post` as the step that placed a tap without knowing anything about patterns.
+
+There are two such steps — `patterns_post` and `patterns_final` — and which stage each runs travels
+in the command after `--stage`, not in its name: `route_job` reads it back out (`pcbc_step`)."""
 
 _UUID = re.compile(r'\(uuid\s+"([^"]*)"\)')
 _COPPER_ITEM = re.compile(r"\n\t\((segment|via|zone|arc)\b")
@@ -155,7 +158,7 @@ def lock_copper(text: str, nets: set[str]) -> str:
     return "".join(out)
 
 
-def krt_plan(job: CompiledJob, design: Design, placed: Path, work: Path, home: Path, plan: "PatternPlan | None" = None, post: bool = False) -> list[tuple[str, list[str]]]:
+def krt_plan(job: CompiledJob, design: Design, placed: Path, work: Path, home: Path, plan: "PatternPlan | None" = None, post: bool = False, final: bool = False) -> list[tuple[str, list[str]]]:
     """(step name, command) pairs. Pure: the same board.py gives the same plan.
 
     `plan` is the `PatternPlan` the pattern stage handed back (C.4). What it changes: `local_hops` is
@@ -169,6 +172,16 @@ def krt_plan(job: CompiledJob, design: Design, placed: Path, work: Path, home: P
     `blocking.step_boards` can name it as the step that placed a piece. It is not a KRT command —
     `route_job` runs it in process — and it is marked by `PCBC_STEP` in the command's first slot,
     with the board it reads and the board it writes in the two slots every step keeps them in.
+
+    `final` reserves pcbc's third and last stage the same way, and its position is the whole of
+    `docs/stitch-plan.md` R-S1: **after every KRT step**, on both stackups — after `signals` on four
+    layers, after `gnd_pour` and `finalize` on two. Nothing in this function schedules a step after
+    it, which is what makes the stage's copper unable to move a route: there is no router left to
+    react to it. The two flags are separate rather than one because they answer different questions —
+    `post` is "does KRT's tap step have a predecessor?", `final` is "is there a stage after KRT?" —
+    and because a caller (a test, S4) may want one without the other. `route_job` passes both off the
+    same `not patterns_off()`, so `PCBC_PATTERNS=off` removes both and the plan is the pre-R2 one
+    exactly (C.6).
     """
     done = set(plan.done) if plan is not None else set()
     py = str(krt_python(home))
@@ -210,13 +223,19 @@ def krt_plan(job: CompiledJob, design: Design, placed: Path, work: Path, home: P
         steps.append((name, [py, "-X", "utf8", str(router / tool), str(prev), str(out), *args, *common]))
         prev = out
 
-    def pcbc_step(name: str) -> None:
+    def pcbc_step(name: str, stage: str) -> None:
         """One of pcbc's own stages, in the same shape as a KRT step: the board it reads in slot 4,
         the board it writes in slot 5, so the chain, the step files and the stale-file sweep all work
-        on it unchanged. `route_job` runs it in process; nothing is spawned."""
+        on it unchanged. `route_job` runs it in process; nothing is spawned.
+
+        `stage` is a key of `patterns._STAGES` and it travels in the command, after `--stage`, rather
+        than in the step's name: the plan is the only description of the route and `route_job` reads
+        the stage back out of `cmd` (it used to hardcode `"post"` and there was only one). The name
+        and the stage are kept separate because the name is what the step *file* is called and what
+        `blocking.step_boards` prints, while the stage is what `pattern_copper` runs."""
         nonlocal prev
         out = work / f"{len(steps) + 1:02d}_{name}.kicad_pcb"
-        steps.append((name, [PCBC_STEP, "-X", "utf8", "patterns", str(prev), str(out), "--stage", "post"]))
+        steps.append((name, [PCBC_STEP, "-X", "utf8", "patterns", str(prev), str(out), "--stage", stage]))
         prev = out
 
     # The constrained nets: no vias, or a single layer. Grouped by (layers, class), named nets only.
@@ -305,7 +324,7 @@ def krt_plan(job: CompiledJob, design: Design, placed: Path, work: Path, home: P
     # (C.1). On two layers there is no `planes` step and the pour comes last, so the taps go down
     # before the pour exists and `route_verify.pour_raster` is what makes that safe.
     if post:
-        pcbc_step("patterns_post")
+        pcbc_step("patterns_post", "post")
 
     if plane_nets:
         # What the tap pattern refused, and nothing else. KRT's pour places no tap vias; this welds
@@ -321,6 +340,16 @@ def krt_plan(job: CompiledJob, design: Design, placed: Path, work: Path, home: P
     if job.layers <= 2 and "GND" in power:
         step("gnd_pour", "route_planes.py", ["--nets", "GND", "--plane-layers", "B.Cu", "--clearance", _fmt(default_clear)])
         step("finalize", "route.py", signals)
+
+    # 7. pcbc's final stage: the copper whose absence leaves nothing unconnected (`patterns.FINAL`,
+    # `docs/stitch-plan.md` R-S1). It is last on both stackups — after `signals` on four layers,
+    # after `finalize` on two — and it is last for a reason that is checkable rather than argued:
+    # a stitch that loses its site costs a shield, not a pad, so no router step has to follow it, and
+    # none does. That is also why the two-layer boards get the *safer* stage here than `post` does:
+    # at `patterns_post` the back pour does not exist and `route_verify.pour_raster` has to predict
+    # it, while here `gnd_pour` has already written it and every piece of copper on the board is down.
+    if final:
+        pcbc_step("patterns_final", "final")
     return steps
 
 
@@ -428,7 +457,7 @@ def route_job(design: Design, placed: Path, *, out: Path, name: str = "board") -
         start = work / "00_patterns_pre.kicad_pcb"
         copy_with_siblings(placed, start)
         start.write_text(board_text)
-    steps = krt_plan(job, design, start, work, home, plan, post=not patterns_off())
+    steps = krt_plan(job, design, start, work, home, plan, post=not patterns_off(), final=not patterns_off())
     result: dict = {
         "pcb": str(out),
         "router": "krt",
@@ -462,7 +491,14 @@ def route_job(design: Design, placed: Path, *, out: Path, name: str = "board") -
     # it has run. It is what `_lost` checks for survival after every KRT step, what keeps its own
     # uuids through `pin_copper_ids`, and what the copper bar reads a reason off.
     owned: list = list(pre)
-    post_plan = None
+    # pcbc's in-KRT stages, keyed by the stage that ran — "post", then "final". One variable would be
+    # smaller and it would be wrong: every reader below wants a *named* stage, not the last one that
+    # happened to run. `plane_taps` wants the tap stage's refusals and nothing else; the sidecar
+    # labels each stage's pieces with the step file that wrote them; `pattern_links` merges all of
+    # them. Keyed by stage, a reorder of `krt_plan` can move a step without silently changing what a
+    # reader gets — which is what one variable would have done the moment `patterns_final` was
+    # scheduled after `plane_taps`.
+    plans: dict[str, "PatternPlan"] = {}
     current = start
     for step_name, cmd in steps:
         # The chain is the boards that were actually written, not the ones the plan predicted: a
@@ -478,37 +514,48 @@ def route_job(design: Design, placed: Path, *, out: Path, name: str = "board") -
             # hands the next step the project pcbc compiled. Measured: without it KRT routed c3_usb's
             # VBUS 0.2365 mm from `J1`'s NPTH against the 0.25 the board declares, four times.
             copy_with_siblings(placed, produced)
-            post_plan = pattern_copper(design, job, job.constraints, current.read_text(), name, stage="post")
-            produced.write_text(post_plan.text)
-            owned += list(post_plan.pieces)
+            # The stage comes out of the command, not off the step's name: `krt_plan` put it there
+            # and the plan is the only description of the route (`pcbc_step`).
+            stage = cmd[cmd.index("--stage") + 1]
+            sub = pattern_copper(design, job, job.constraints, current.read_text(), name, stage=stage)
+            plans[stage] = sub
+            produced.write_text(sub.text)
+            owned += list(sub.pieces)
             result["patterns"] = _census(owned)
-            result["pattern_moves"] += list(post_plan.moves)
-            result["notes"] += list(post_plan.notes)
-            result["refusals"] += [r.to_dict() for r in post_plan.refusals()]
+            result["pattern_moves"] += list(sub.moves)
+            result["notes"] += list(sub.notes)
+            result["refusals"] += [r.to_dict() for r in sub.refusals()]
             merged = dict(result["refused"])
-            for pattern, n in post_plan.counts().items():
+            for pattern, n in sub.counts().items():
                 merged[pattern] = merged.get(pattern, 0) + n
             result["refused"] = {k: merged[k] for k in sorted(merged)}
-            result["pattern_ms"] += post_plan.wall_ms
+            result["pattern_ms"] += sub.wall_ms
             result["steps"].append(
-                {"step": step_name, "returncode": 0, "log": "", "summary": {"pieces": len(post_plan.pieces), "refused": post_plan.counts(), "ms": post_plan.wall_ms}}
+                {"step": step_name, "returncode": 0, "log": "", "summary": {"pieces": len(sub.pieces), "refused": sub.counts(), "ms": sub.wall_ms}}
             )
-            fatal = hard_refusals(post_plan)
+            fatal = hard_refusals(sub)
             if fatal:
                 result["error"] = "pattern refused:\n" + "\n".join(r.move for r in fatal)
                 return result
             current = produced
             last = produced
             continue
-        if step_name == "plane_taps" and post_plan is not None:
+        if step_name == "plane_taps" and "post" in plans:
             # C.4: KRT's tap step runs for the plane nets whose pads pcbc could not tap, and not at
             # all when there are none. A pad the tap pattern skipped is not a refusal: a through-hole
             # pad's barrel already reaches the plane and the zone connects it (B.3).
             #
-            # `post_plan is not None` is the whole of `PCBC_PATTERNS=off`'s safety here: with the
-            # patterns off there are no taps, so every plane pad still needs KRT's step, and skipping
-            # it left node with 72 unconnected items — the rollback has to be a rollback (C.6).
-            left = sorted({r.net for r in post_plan.refusals() if r.pattern == "tap"})
+            # `"post" in plans` is the whole of `PCBC_PATTERNS=off`'s safety here: with the patterns
+            # off there are no taps, so every plane pad still needs KRT's step, and skipping it left
+            # node with 72 unconnected items — the rollback has to be a rollback (C.6).
+            #
+            # It asks for the **post** stage by name. That was safe before only by an ordering
+            # invariant — `patterns_post` was the only pcbc step, so "the plan that ran" and "the tap
+            # stage" were the same object — and `patterns_final` breaks the coincidence without
+            # breaking the code, which is the worst way for an invariant to go. The `tap` filter on
+            # the refusals would have hidden it: a `final`-stage plan has no `tap` refusals, so the
+            # step would have quietly skipped every net and left the untapped pads unconnected.
+            left = sorted({r.net for r in plans["post"].refusals() if r.pattern == "tap"})
             if not left:
                 result["steps"].append({"step": step_name, "returncode": 0, "log": "skipped: pcbc tapped every plane pad it owns", "summary": {"skipped": True}})
                 continue
@@ -562,7 +609,14 @@ def route_job(design: Design, placed: Path, *, out: Path, name: str = "board") -
 
     reasons = {bar_key(p): p.reason for p in owned}
     owners = {bar_key(p): p.owner for p in owned}
-    result["copper_bar"] = copper_bar(text, reasons, owners)
+    # Who ties each pair of `Ground()` nets, for the census (`docs/stitch-plan.md` S3). `coupling=False`:
+    # the bar wants the part, not the picofarads, and the picofarads are the only slow half (measured
+    # 0.63 s against 0.02 s on the DS2 Addon). `build._bridge_gate` asks the full question in the
+    # same step, on the same file.
+    from .route_verify import bridge_ties
+
+    ties = bridge_ties(text, design, job.constraints, coupling=False) if job.constraints is not None else ()
+    result["copper_bar"] = copper_bar(text, reasons, owners, {f"{t.a}|{t.b}": t.tie or t.verdict for t in ties})
     result["leftover"] = result["copper_bar"]["totals"]["by_reason"].get("leftover", {})
     # Finding 16: the one clearance question neither pcbc nor KiCad asks. A census, not a rule —
     # `route_verify.same_net_slots` says what it counts and why the class is pre-existing.
@@ -572,12 +626,22 @@ def route_job(design: Design, placed: Path, *, out: Path, name: str = "board") -
     # Per net and per reason, so the ledger in `docs/r2-measurements.md` is generated from the same
     # place the build reads instead of hand-copied (findings 5, 8, 15, 17).
     result["pattern_nets"] = census_by_net(owned)
-    result["pattern_links"] = {r: dict(sorted({**plan.links.get(r, {}), **(post_plan.links.get(r, {}) if post_plan is not None else {})}.items())) for r in sorted({*plan.links, *(post_plan.links if post_plan is not None else {})})}
+    # Three plans now, in the order they ran: the pre/mid stage KRT was handed, then each in-KRT
+    # stage. Later stages win a net, which is the order the copper was written in.
+    link_plans = [plan.links] + [plans[s].links for s in ("post", "final") if s in plans]
+    result["pattern_links"] = {r: dict(sorted({k: v for src in link_plans for k, v in src.get(r, {}).items()}.items())) for r in sorted({r for src in link_plans for r in src})}
     doc = sidecar(pre, step="patterns_pre", refusals=result["refusals"], notes=result["notes"], leftover=result["leftover"])
-    if post_plan is not None and post_plan.pieces:
-        # One sidecar, two stages: a piece carries the step that wrote it, so `copper.json` says
-        # which of pcbc's stages a via came from and the census is the whole board's (D.4).
-        doc.items += sidecar(post_plan.pieces, step="patterns_post").items
+    # One sidecar, three stages: a piece carries the step that wrote it, so `copper.json` says which
+    # of pcbc's stages a via came from and the census is the whole board's (D.4). The label is the
+    # step file's name, not the stage's, because that is what `blocking.step_boards` prints and what
+    # the reader will go looking for on disk.
+    wrote = False
+    for stage_name, label in (("post", "patterns_post"), ("final", "patterns_final")):
+        stage_plan = plans.get(stage_name)
+        if stage_plan is not None and stage_plan.pieces:
+            doc.items += sidecar(stage_plan.pieces, step=label).items
+            wrote = True
+    if wrote:
         doc.census = _census(owned, leftover=result["leftover"])
     write_sidecar(out.parent / "copper.json", doc)
     opens = unrouted_nets(text)

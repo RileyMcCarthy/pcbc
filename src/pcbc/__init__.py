@@ -3,6 +3,7 @@
 from .css import AUTO
 from .language import (
     Board,
+    Bridge,
     Bus,
     Capacitor,
     Chain,
@@ -34,6 +35,7 @@ __all__ = [
     "AUTO",
     "Board",
     "BoardSpec",
+    "Bridge",
     "Bus",
     "Capacitor",
     "Chain",

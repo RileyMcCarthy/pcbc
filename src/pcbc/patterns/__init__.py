@@ -35,6 +35,7 @@ __all__ = [
     "PRE",
     "MID",
     "POST",
+    "FINAL",
     "merge_plans",
     "PatternCtx",
     "PatternPlan",
@@ -155,7 +156,15 @@ class PatternCtx:
     job: CompiledJob
     cs: ConstraintSet
     board: str  # for stable_uuid
-    stage: str  # "pre" | "mid" | "post" — the keys of `_STAGES`
+    stage: str
+    """Which of `_STAGES`' keys is running: `"pre"` | `"mid"` | `"post"` | `"final"`.
+
+    The four are not interchangeable and a pattern may read this to say so. `pre` and `mid` see a
+    board with no KRT copper on it at all; `post` sees the planes but not the signals; `final` sees
+    every piece of copper the board will ever have, because nothing routes after it (`FINAL`). On two
+    layers that difference is the whole of D.5: at `post` the back pour does not exist and
+    `route_verify.pour_raster` has to predict it, while at `final` `gnd_pour` has already written it.
+    """
 
 
 @dataclass(frozen=True)
@@ -580,15 +589,67 @@ not a tidy one: of the four orderings the design tried on node, taps before KRT 
 taken every tap site. C.1's table has all four."""
 
 
-_STAGES = {"pre": PRE, "mid": MID, "post": POST}
+FINAL = ("stitch",)
+"""The stage after KRT's last step: copper whose absence leaves nothing unconnected.
+
+The governing rule is `docs/stitch-plan.md` **R-S1** — *copper whose absence leaves nothing
+unconnected is written after the last router step that could have used the space it takes* — with
+the two corollaries that are the whole reason this stage can exist. **R-S2:** a stitch takes what is
+left; it is never an input to a route. **R-S3:** a stitch whose count is an *electrical requirement*
+is all-or-nothing, and one whose count is a *target* applies partially and reports the shortfall.
+
+`POST` cannot hold that copper, and the reason is structural rather than a preference. A tap has to
+be followed by a router step — a pad the tap could not weld is an unconnected pad, and KRT's
+`plane_taps` is what repairs it — which is why C.1's four-way measurement on node put the taps
+between `planes` and `signals` and why taps after the signals left **21 unconnected** pads. A stitch
+is the opposite shape: losing its site costs a shield, not a pad, so nothing has to run after it, and
+`krt_plan` schedules nothing after `patterns_final` on either stackup. The ds2 mechanism — KRT
+reacting to pcbc's locked copper, the table under `MID` and `spine.WIDE_MM` — is therefore not
+*bounded* here, it is **absent**.
+
+**It was empty when the stage landed, and the emptiness was the measurement.** With `FINAL = ()` the
+stage ran for real on every board — `build_scene` over the finished copper, `pattern_copper`'s
+self-check, a step file of its own — and wrote nothing, so a fresh build's `routed/layout.kicad_pcb`
+was byte-identical (sha256) to the same build without the stage. Measured on all five, each in its
+own temp dir, the extra step file being a byte copy of the board before it:
+
+| board | `routed/layout.kicad_pcb` | the step it adds, and its input |
+|---|---|---|
+| ds2    | identical | `06_patterns_final` == `05_finalize` |
+| blinky | identical | `05_patterns_final` == `04_finalize` |
+| buck   | identical | `08_patterns_final` == `07_finalize` |
+| c3_usb | identical | `07_patterns_final` == `06_finalize` |
+| node   | identical | `08_patterns_final` == `07_signals` |
+
+**`stitch` is the first copper it writes, and the claim held.** Measured 2026-09-21 with
+`FINAL = ("stitch",)`: node gains **one rung** — a 0.35/0.2 twin at (28.9,33.4) beside its `VBUS`
+barrel at (28,33.4), with a 0.4 mm link on F.Cu and one on B.Cu — and `BAR`, `DETOURS`, `SOFT`,
+`LEFTOVER`, `SPINE_LINKS`, `SPINE_NETS`, `SPINE_REFUSED` and `TAP_REFUSED` are byte-identical on it,
+as are the `hop`, `spine` and `tap` entries of `REFUSED`. Nothing routes after the stage, so there is
+nothing left to react to its copper; that is the whole architecture and it is now tested rather than
+argued. What did move is exactly the list §1.2 says can: `VIAS_PATTERN`, `OWNS`, and the two inner
+plane areas by the antipads the rung carves.
+
+**ds2 is the board that matters, and it is still empty with the first carrier down** — for want of a trigger,
+not for want of a tuned bound. Its four power nets (`3V3`, `GND`, `VDDA`, `VSS`) each declare 0.1 A
+against the **0.871 A** one 0.4/0.018 mm barrel carries, so `ViaSpec.per_change` is **1** and every
+via group on the board is already rated; it is TSSOP-16 with **zero** `pad_prop_heatsink` pads, so a
+thermal array has no land to sit on; and `Design.guards` is `[]`. There is no number in that
+paragraph that could be moved to make ds2 place a stitch. `docs/stitch-plan.md` §4, §7 (S2).
+"""
+
+
+_STAGES = {"pre": PRE, "mid": MID, "post": POST, "final": FINAL}
 """Which patterns each stage runs. `pre` and `mid` are the two halves of C.1's pre stage, with
-`route.py`'s own fanout step between them; `post` sits inside the KRT sequence."""
+`route.py`'s own fanout step between them; `post` sits inside the KRT sequence and `final` after all
+of it. The keys are the `--stage` values `route.pcbc_step` writes into the plan and `route_job` reads
+back out of the command, so a stage exists here or it does not run."""
 
 
 def _modules() -> dict:
-    from . import chain, hop, spine, tap
+    from . import chain, hop, spine, stitch, tap
 
-    return {"chain": chain, "hop": hop, "spine": spine, "tap": tap}
+    return {"chain": chain, "hop": hop, "spine": spine, "stitch": stitch, "tap": tap}
 
 
 def pattern_copper(
@@ -621,6 +682,14 @@ def pattern_copper(
     mods = _modules()
     for reason in _STAGES[stage]:
         mod = mods[reason]
+        # `CONNECTS` is the module's answer to "does your copper join the pads of the net it is on?"
+        # (`docs/stitch-plan.md` §2k). Every module in `_modules()` says True and the read is a no-op
+        # today; it is here so the one that will say False cannot be added without deciding. Without
+        # it, a guard that wrote only `GND` copper would `claimed.add` the *guarded* net, and
+        # `PatternPlan.done` — which `krt_plan` drops nets from and `signals` writes `!NET` for —
+        # would then say something false about a net no pattern routed. Read as an attribute, not a
+        # `getattr` default: a new module that forgets to declare it should fail here, loudly.
+        connects = mod.CONNECTS
         for spec in mod.specs(ctx):
             res = mod.run(ctx, spec)
             if res.links != (0, 0) or res.coverage:
@@ -629,7 +698,8 @@ def pattern_copper(
                 added = scene.add(scene.item_of(p) for p in res.pieces)
                 pieces.extend(res.pieces)
                 ids.extend(it.id for it in added)
-                claimed.add(res.net)
+                if connects:
+                    claimed.add(res.net)
             if res.refusal is not None:
                 refused.setdefault(res.net, []).append(res.refusal)
                 moves.append(res.refusal.move)

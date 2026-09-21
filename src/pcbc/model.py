@@ -206,6 +206,23 @@ class IsolationReq:
 
 
 @dataclass(frozen=True)
+class BridgeReq:
+    """`Bridge(a, b, at=...)`: the one point at which two declared grounds are tied, and what ties it.
+
+    `at` is a tuple because `kind="off_board"` names the two pads that leave the board and every
+    other kind names one part. pcbc writes no copper for any of them (`docs/stitch-plan.md` §8 item
+    4), so this carries no geometry at all — the tie is a part the board already places.
+    """
+
+    a: str
+    b: str
+    at: tuple[str, ...]
+    kind: str = "short"  # short | cap | bead | off_board
+    why: str = ""
+    line: int = 0
+
+
+@dataclass(frozen=True)
 class GuardReq:
     net: str
     stitch_mm: float = 2.5
@@ -276,6 +293,7 @@ class Design:
     chains: list[ChainReq] = field(default_factory=list)
     isolations: list[IsolationReq] = field(default_factory=list)
     guards: list[GuardReq] = field(default_factory=list)
+    bridges: list[BridgeReq] = field(default_factory=list)
     nets: dict[str, Net] = field(default_factory=dict)
     instances: list[Instance] = field(default_factory=list)
     sch_places: list[SchPlaceSpec] = field(default_factory=list)

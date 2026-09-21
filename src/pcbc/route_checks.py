@@ -13,6 +13,7 @@ F.4 decap loop and hot loop (R-D1, R-D2) `check_loops`
 F.5 keep-away (R-D3, R-A1)              `check_keep_away`
 F.6 reference plane (R-Z3)              `check_reference`
 F.7 isolation line (R-V2)               `check_isolation`
+F.8 ground bridge (docs/stitch-plan.md) `check_bridge`
 """
 
 from __future__ import annotations
@@ -122,6 +123,7 @@ def route_aware_report(design: Design, job: CompiledJob, pcb_text: str) -> tuple
     moves += m
     notes += n
     moves += check_isolation(ctx)
+    moves += check_bridge(ctx)
     return moves, notes
 
 
@@ -1338,10 +1340,156 @@ def check_isolation(ctx: Ctx) -> list[str]:
     return out
 
 
+# ---------------------------------------------------------------- F.8 ground bridge
+
+
+BRIDGE_AXES: tuple[tuple[str, float, float], ...] = (
+    ("x", 1.0, 0.0),
+    ("y", 0.0, 1.0),
+    ("u", 0.7071067811865476, 0.7071067811865476),
+    ("v", 0.7071067811865476, -0.7071067811865476),
+)
+"""The four directions a straight line could separate two domains along, as unit normals.
+
+`check_isolation`'s separating-axis test asked **x and y**, because an `Isolation` separates two
+`Region`s and a Region is an axis-aligned rectangle. Two grounds are not Regions, so the two
+diagonals are asked as well — the same four axes `route_geom` routes on, and the only four a
+45-degree world can put a moat along. A pair that overlaps on all four has no straight line between
+it, and `docs/stitch-plan.md` §8 item 5 refuses to build a moat for exactly that reason.
+
+The projection is of pad **centres** and not of pad boxes, and that is the conservative direction:
+a centre interval is contained in its box interval, so "the centres overlap" implies "the boxes
+overlap" and never the reverse. Measured on the DS2 Addon, 2026-09-21 — centres overlap on all four
+(x 24.480, y 15.444, u 20.610, v 16.797 mm) and so, a fortiori, do the boxes (26.180, 16.394,
+22.679, 18.653 mm). The centre numbers are the ones `docs/stitch-plan.md` §2(n) recorded.
+"""
+
+
+def _axis_spans(points: list[tuple[float, float]]) -> dict[str, tuple[float, float]]:
+    out: dict[str, tuple[float, float]] = {}
+    for name, ax, ay in BRIDGE_AXES:
+        vals = [px * ax + py * ay for px, py in points]
+        out[name] = (min(vals), max(vals))
+    return out
+
+
+def _closest_cross_ref(ctx: Ctx, a: str, b: str) -> tuple[float, str, str] | None:
+    """The nearest pad of `a` to a pad of `b` **on a different footprint**, edge to edge.
+
+    Different footprints, because the answer is "where could a tie part go", and no part goes
+    between two pins of one TSSOP. Measured on the DS2 Addon: the overall closest GND/VSS pads are
+    `U1.4` and `U1.5`, 0.3070 mm apart on a 0.65 mm pitch — a distance that names the reason the two
+    grounds have to be tied somewhere and not a place to tie them; the closest pair on two different
+    parts is `J1.2` and `C7.2`, 2.6675 mm apart, and that is a place.
+    """
+    best: tuple[float, str, str] | None = None
+    for sa in ctx.pads_on.get(a, []):
+        for sb in ctx.pads_on.get(b, []):
+            if sa[0] == sb[0]:
+                continue
+            key = (_gap(_box_of(sa), _box_of(sb)), f"{sa[0]}.{sa[1]}", f"{sb[0]}.{sb[1]}")
+            if best is None or key < best:
+                best = key
+    return best
+
+
+def _reach_to(ctx: Ctx, net: str, other: str, skip: frozenset[str]) -> tuple[float, str, str] | None:
+    """How close `net` gets to `other`, and at which of `net`'s pads — with `skip`'s parts left out.
+
+    `skip` is the tie's own ref, and leaving it out on **both** sides is what makes this well
+    defined. A tie has one pad in each domain, so counting it as a target would answer "which pad of
+    VSS is nearest to GND?" with "the one next to the tie's GND pad" for whichever domain the tie
+    happens to sit closer to — a measurement of where the tie is, asked in order to judge where the
+    tie is. Take the tie out and the question is the board's: where do these two domains come
+    closest to each other on their own?
+    """
+    best: tuple[float, str, str] | None = None
+    for sa in ctx.pads_on.get(net, []):
+        for sb in ctx.pads_on.get(other, []):
+            if sb[0] in skip or sa[0] == sb[0]:
+                continue
+            key = (_gap(_box_of(sa), _box_of(sb)), f"{sa[0]}.{sa[1]}", f"{sb[0]}.{sb[1]}")
+            if best is None or key < best:
+                best = key
+    return best
+
+
+def check_bridge(ctx: Ctx) -> list[str]:
+    """F.8: what the placed board says about two grounds — where a line between them could go, and
+    where the part that ties them should sit.
+
+    Two moves, and neither ever writes copper (`docs/stitch-plan.md` §8 item 4).
+
+    1. **No axis separates them.** For every pair of `Ground()` nets, the four-axis overlap of their
+       pad centres. It is a move rather than a note because the edit it ends in is real: either the
+       two domains are meant to be one (`Net`/`Power` one of them) or they are meant to be two and
+       the placement has to say so. It is the geometric half of `circuit._untied_grounds`, which
+       says the same thing about the netlist; this half is what proves there is no moat to build.
+    2. **The tie is not where the domains meet.** With the tie's own part taken out of the board on
+       both sides (`_reach_to`), each ground has a pad that comes nearest to the other ground. The
+       tie's pad should be that pad, on each side. When it is not, some other part of the domain
+       reaches closer to the other one than the tie does, every return current goes round to the tie
+       to get home, and the coupling at the closer place competes with the tie it was supposed to
+       replace. No tolerance and no distance threshold: it is an `argmin`, so it is a fact about the
+       placement rather than a number somebody chose.
+
+    Silent on all four example boards: each declares exactly one `Ground()`, so the pair loop has
+    nothing to iterate. Measured on the DS2 Addon 2026-09-21, where the first move fires.
+    """
+    out: list[str] = []
+    kinds = {n.name: n.kind for n in ctx.design.nets.values()}
+    grounds = sorted(n for n, k in kinds.items() if k == "ground")
+    if len(grounds) < 2:
+        return out
+    ties = {frozenset((sp.a, sp.b)): sp for sp in ctx.cs.bridges}
+    for i, a in enumerate(grounds):
+        for b in grounds[i + 1 :]:
+            pa = [(x, y) for _r, _n, x, y, _w, _h in ctx.pads_on.get(a, [])]
+            pb = [(x, y) for _r, _n, x, y, _w, _h in ctx.pads_on.get(b, [])]
+            if not pa or not pb:
+                continue
+            sa, sb = _axis_spans(pa), _axis_spans(pb)
+            spans = []
+            apart = []
+            for name, _ax, _ay in BRIDGE_AXES:
+                lo = max(sa[name][0], sb[name][0])
+                hi = min(sa[name][1], sb[name][1])
+                if hi >= lo:
+                    spans.append(f"{name} [{sa[name][0]:.3f},{sa[name][1]:.3f}] vs [{sb[name][0]:.3f},{sb[name][1]:.3f}] overlap {hi - lo:.3f} mm")
+                else:
+                    apart.append(f"{name} clear by {lo - hi:.3f} mm")
+            spec = ties.get(frozenset((a, b)))
+            if spec is None or not spec.pads:
+                if apart:
+                    continue  # a straight line does separate them; `Isolation` is the statement for that
+                near = _closest_cross_ref(ctx, a, b)
+                where = f"{near[1]} and {near[2]} come closest, {near[0]:.4f} mm apart" if near else "no two pads of them share a layer"
+                out.append(
+                    f"{a}/{b}: no axis separates the two grounds — {'; '.join(spans)}. "
+                    f"So there is no moat to cut and no RuleArea to write: {where}, which is where a tie belongs. "
+                    f'Resistor("R11", "0R", p1={a}, p2={b}) with Place("R11", to="{near[1] if near else a}") and Bridge("{a}", "{b}", at="R11").'
+                )
+                continue
+            skip = frozenset({spec.tie_ref})
+            for net, other, own in ((a, b, spec.pads[0]), (b, a, spec.pads[1])):
+                got = _reach_to(ctx, net, other, skip)
+                if got is None or got[1] == own:
+                    continue
+                out.append(
+                    f"{a}/{b}: {spec.tie_ref} ties them at {own}, but {net} comes closest to {other} at {got[1]} — "
+                    f"{got[0]:.4f} mm from {got[2]}, with {spec.tie_ref} itself left out of the measurement on both sides. "
+                    f"Every return current goes round to {spec.tie_ref} to get home while the two grounds touch at {got[1]}. "
+                    f'Place("{spec.tie_ref}", to="{got[1]}").'
+                )
+    return out
+
+
 __all__ = [
+    "BRIDGE_AXES",
     "Ctx",
     "build_ctx",
     "check_airwires",
+    "check_bridge",
     "check_chains",
     "check_corridors",
     "check_isolation",

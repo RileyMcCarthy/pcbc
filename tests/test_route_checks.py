@@ -84,10 +84,21 @@ def stock(tmp_path_factory) -> dict[str, tuple[Path, list[str], list[str]]]:
 
 
 def test_the_five_boards_add_no_route_aware_move(stock):
-    """Acceptance: pcb_job on the five boards adds no new move. The intent lines the checks asked for
-    are in the examples (c3_usb's and node's Chain lines; the DS2 Chain line is suggested in the PR)."""
+    """Acceptance: pcb_job on the five boards adds no new move — except the one F.8 found.
+
+    The intent lines the checks asked for are in the examples (c3_usb's and node's Chain lines; the
+    DS2 Chain line is suggested in the PR). **The DS2 Addon gained exactly one move when F.8 landed**
+    (`docs/stitch-plan.md` S3): `GND` and `VSS` are both `Ground()`, nothing ties them, and their
+    pads overlap on all four separating axes, so there is no line to draw between them either. That
+    is a finding on a real board and not a regression in a check — the four example boards each
+    declare one `Ground()` and stay at zero. It is pinned here as one move and nothing more, so a
+    second one would fail this test rather than hide behind it; `tests/test_bridge.py` holds its
+    text.
+    """
     for name, (_board, moves, _notes) in stock.items():
-        assert moves == [], (name, moves)
+        expected = 1 if name == "ds2_addon" else 0
+        assert len(moves) == expected, (name, moves)
+        assert all(m.startswith("GND/VSS: no axis separates the two grounds") for m in moves), (name, moves)
 
 
 def test_lane_rules_read_the_kinds_clearance_not_the_voltage_row():
@@ -154,7 +165,9 @@ def test_ds2_chain_passes_as_placed_and_a_cap_after_the_pin_is_named(tmp_path: P
     told to sit right of the ADC it projects after the pin along the feed, and the move says so."""
     board = _copy(tmp_path / "ds2", _ds2_src(), [(DS2_POWER, DS2_CHAIN)])
     moves, _notes = _report(board)
-    assert moves == [], moves
+    # F.8's own move about this board's two untied grounds is not F.2's business; it is pinned in
+    # `test_the_five_boards_add_no_route_aware_move` and its text in `tests/test_bridge.py`.
+    assert [m for m in moves if not m.startswith("GND/VSS:")] == [], moves
     board = _copy(tmp_path / "ds2_right", _ds2_src(), [(DS2_POWER, DS2_CHAIN), ('Place("C4", to="U1.AVDD")', 'Place("C4", to="U1.AVDD", toward="right")')])
     moves, _notes = _report(board)
     assert (

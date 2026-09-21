@@ -15,6 +15,9 @@ venv/
 .easyeda_cache/
 # Generated boards (CI rebuilds with --force)
 examples/**/layout/
+# Same for the fixture boards a test builds: every test copies one to tmp_path first, so this only
+# catches a `pcbc build` somebody ran by hand in the tree.
+tests/fixtures/**/layout/
 
 **/review/index.html
 **/review/board.glb

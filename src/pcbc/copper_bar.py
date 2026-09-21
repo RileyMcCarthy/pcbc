@@ -153,7 +153,29 @@ def vias_in_courtyard(text: str, reasons: dict, owners: dict) -> list[dict]:
     return sorted(out, key=lambda h: (h["courtyard"], h["via"]))
 
 
-def copper_bar(text: str, reasons: dict | None = None, owners: dict | None = None) -> dict:
+REDUNDANT = ("stitch",)
+"""Reasons whose copper is **not part of the net's route** (`docs/stitch-plan.md` R-S1).
+
+Every other reason here writes copper whose absence leaves a pad unreached, so counting its
+millimetres against the net's airwire is the question `detour` exists to ask: how far past the
+straight line did the route go. A `stitch` is the opposite by definition — a parallel barrel beside
+one the router already placed, a shield beside a track — and its absence leaves nothing unconnected.
+Measured on node, 2026-09-21: one rung adds 1.800 mm of `VBUS` copper and moves not one nanometre of
+the route, and counting it took `DETOURS["node"]["VBUS"]` from **1.26 to 1.36** and
+`LEFTOVER["node"]["VBUS"]`'s pattern half from 8.819 to 10.619 — two pinned numbers rising to report
+that the route got worse, on a build where `off45`, `micro`, `vias_leftover`, `worst_detour`, every
+other net's detour and the whole `SOFT` table are byte-identical. That is a ceiling measuring the
+wrong thing, and it is the same correction `docs/stitch-plan.md` §6 makes one module over for
+`ampacity.power_bottlenecks`: a 0.127 mm ground guard is not a narrow ground rail.
+
+What it does **not** change: `routed_mm`, `segments` and `vias` still count every piece of copper on
+the net, because a census that hides copper is worse than a ratio that misreads it, and `by_reason` /
+`vias_pattern` still carry every stitch piece exactly. `pattern_mm + leftover_mm + stitch_mm ==
+routed_mm` on every net, which `test_stitch.py` pins. S7's `"guard"` belongs in this tuple for the
+same reason and is left out until there is copper carrying it."""
+
+
+def copper_bar(text: str, reasons: dict | None = None, owners: dict | None = None, bridges: dict | None = None) -> dict:
     """Per-net and total numbers, plus the lines a report prints.
 
     `reasons` maps `bar_key` to the pattern that wrote that piece (D.4). With it the totals gain
@@ -161,6 +183,13 @@ def copper_bar(text: str, reasons: dict | None = None, owners: dict | None = Non
     and the report gains the line that says how much of the board is pcbc's own. Without it every
     piece reads as leftover, which is what a `PCBC_PATTERNS=off` board is: the numbers
     `test_patterns.py::test_patterns_off_claims_nothing_and_is_a_rollback` compares are unchanged.
+
+    `bridges` maps `"A|B"` to the part that ties two `Ground()` nets, or to the verdict when nothing
+    does (`route_verify.bridge_ties`). It is the one entry in this census that counts **no copper at
+    all**, and deliberately: pcbc writes none for a ground tie (`docs/stitch-plan.md` section 8 item
+    4), so the number a board is held to is *who* ties them — which is exactly what `vias_pattern` is
+    for reasons, a value that moves when somebody changes the board and nothing else would say so.
+    `{}` on all four examples, which each declare one `Ground()`.
     """
     segs = segments(text)
     vs = vias(text)
@@ -188,6 +217,10 @@ def copper_bar(text: str, reasons: dict | None = None, owners: dict | None = Non
             "leftover_vias": 0,
             "leftover_micro": 0,
             "pattern_mm": 0.0,
+            # Copper pcbc wrote on this net that is not part of its route (`REDUNDANT`). Held apart
+            # from `pattern_mm` rather than folded into it, so the spine's trade with the leftover
+            # stays a trade between two things that route.
+            "stitch_mm": 0.0,
         }
     for s in segs:
         rec = nets.get(s["net"])
@@ -199,11 +232,14 @@ def copper_bar(text: str, reasons: dict | None = None, owners: dict | None = Non
             rec["off45"] += 1
         if 1e-6 < s["length"] < MICRO_MM:
             rec["micro"] += 1
-        if reasons.get(bar_key("seg", s["layer"], s["start"], s["end"], s["width"]), "leftover") == "leftover":
+        why = reasons.get(bar_key("seg", s["layer"], s["start"], s["end"], s["width"]), "leftover")
+        if why == "leftover":
             rec["leftover_segments"] += 1
             rec["leftover_mm"] += s["length"]
             if 1e-6 < s["length"] < MICRO_MM:
                 rec["leftover_micro"] += 1
+        elif why in REDUNDANT:
+            rec["stitch_mm"] += s["length"]
         else:
             rec["pattern_mm"] += s["length"]
     for v in vs:
@@ -216,7 +252,11 @@ def copper_bar(text: str, reasons: dict | None = None, owners: dict | None = Non
         rec["routed_mm"] = round(rec["routed_mm"], 3)
         rec["leftover_mm"] = round(rec["leftover_mm"], 3)
         rec["pattern_mm"] = round(rec["pattern_mm"], 3)
-        rec["detour"] = round(rec["routed_mm"] / rec["airwire_mm"], 2) if rec["airwire_mm"] >= 0.05 and rec["routed_mm"] > 0 else None
+        rec["stitch_mm"] = round(rec["stitch_mm"], 3)
+        # The ratio is over the copper that **routes** the net. `REDUNDANT` says why, and on every
+        # net with no stitch copper `route` is `routed_mm` to the last bit, so nothing else moves.
+        route = round(rec["routed_mm"] - rec["stitch_mm"], 3)
+        rec["detour"] = round(route / rec["airwire_mm"], 2) if rec["airwire_mm"] >= 0.05 and route > 0 else None
     by_reason: dict[str, dict] = {}
     for item, key in [(s, bar_key("seg", s["layer"], s["start"], s["end"], s["width"])) for s in segs] + [(v, bar_key("via", v["at"])) for v in vs]:
         row = by_reason.setdefault(reasons.get(key, "leftover"), {"segments": 0, "vias": 0, "mm": 0.0})
@@ -244,6 +284,7 @@ def copper_bar(text: str, reasons: dict | None = None, owners: dict | None = Non
     # the slice's largest per-net regression and was in no number anywhere (finding 16).
     totals["detours"] = {n: r["detour"] for n, r in sorted(nets.items()) if r["detour"] is not None and r["airwire_mm"] >= 1.0}
     totals["vias_in_courtyard"] = vias_in_courtyard(text, reasons, owners or {}) if reasons else []
+    totals["bridge"] = dict(sorted((bridges or {}).items()))
     return {"nets": nets, "totals": totals, "lines": bar_lines(nets, totals)}
 
 
@@ -265,9 +306,14 @@ def bar_lines(nets: dict[str, dict], totals: dict) -> list[str]:
     if cy:
         who = ", ".join(f"{h['owner'] or h['reason']} in {h['courtyard']}" for h in cy[:3])
         lines.append(f"copper: {len(cy)} of pcbc's vias sit in another footprint's courtyard ({who})")
+    for pair, who in (totals.get("bridge") or {}).items():
+        a, _, b = pair.partition("|")
+        loose = who in ("none", "open", "multi", "off_board")
+        lines.append(f"copper: {a} and {b} [{who}] — pcbc writes no copper for a ground tie" if loose else f"copper: {a} and {b} are tied at {who}, and at nothing else")
     ranked = sorted(((r["detour"], n, r) for n, r in nets.items() if r["detour"] is not None and r["airwire_mm"] >= 1.0), reverse=True)
     for detour, net, r in ranked[:3]:
         if detour < 1.5:
             break
-        lines.append(f"copper: {net} runs {detour:g}x its airwire ({r['routed_mm']:g} of {r['airwire_mm']:g} mm), {r['vias']} via(s)")
+        route = round(r["routed_mm"] - r.get("stitch_mm", 0.0), 3)
+        lines.append(f"copper: {net} runs {detour:g}x its airwire ({route:g} of {r['airwire_mm']:g} mm), {r['vias']} via(s)")
     return lines

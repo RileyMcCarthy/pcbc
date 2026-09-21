@@ -58,6 +58,24 @@ BAR = {
     # what it costs is in DETOURS and here, per F.3 item 7. c3_usb's `angles` 122 -> **130** and its
     # routed length are the same trade on a board where the pair comes out **better** (`USB_DN`
     # 1.81 -> 1.65). node improves on every count but `angles` (98 -> 100).
+#
+# Re-recorded 2026-09-21 for the stitching slice S4, and **one number in this table moves: node's
+# `angles`, 100 -> 102.** Its `vias`, `off45`, `micro` and `detour` are byte-identical, as are all
+# four numbers on the other three boards. The two warnings are the one rung `patterns/stitch.py`
+# places: a link leaves the anchor via at 90 degrees to the `VBUS` track leaving the same barrel, and
+# KiCad reads a branch at a via as a corner. It is not a corner by pcbc's own reading —
+# `route_verify.paths_of` ends a run of copper at a junction on purpose, so `turn_ok` is never asked
+# of a branch, and every tap stub and spine rib on these boards is one. A filter honouring the rule
+# was written and measured: node's anchor is a straight-through layer change (`VBUS` up on F.Cu, down
+# on In1.Cu), so all eight ring directions are 0 or 90 degrees to one of the two, **no site can
+# satisfy it**, and forcing the nearest thing to it gave `angles` 104 and a via inside `U2`'s
+# courtyard against a `COURTYARD` of 0. 102 is the cheapest true number. `patterns/stitch.py::run`.
+#
+# **Measured after the fact, and it settles what this ceiling counts**: of node's 102 `track_angle`
+# warnings, **98 sit at a via** and 4 do not, on a board with 74 vias and 62 plane welds. So the
+# number is overwhelmingly a census of branches at vias — every tap stub is one — and not of corners
+# that break the rule. The rung adds two of the same kind that 98 others already are. A ceiling that
+# is 96 % one phenomenon is worth knowing about before somebody reads a move in it.
     #
     # **Every ceiling here is met with zero margin, and that is deliberate** (S7 review, finding 23).
     # KRT and KiCad are both pinned to an exact version, so the board is a function of this repo: a
@@ -66,7 +84,7 @@ BAR = {
     "blinky": {"vias": 0, "off45": 0, "micro": 0, "detour": 1.04, "angles": 0},
     "buck": {"vias": 1, "off45": 1, "micro": 96, "detour": 2.55, "angles": 28},
     "c3_usb": {"vias": 7, "off45": 11, "micro": 188, "detour": 1.70, "angles": 130},
-    "node": {"vias": 11, "off45": 25, "micro": 54, "detour": 1.82, "angles": 100},
+    "node": {"vias": 11, "off45": 25, "micro": 54, "detour": 1.82, "angles": 102},
 }
 
 # D.5 as a number a deleted fragment can move. `plane_islands` cannot see the failure it is
@@ -81,7 +99,15 @@ PLANES = {
     "blinky": {("GND", "B.Cu"): 917.25},
     "buck": {("GND", "B.Cu"): 935.59},
     "c3_usb": {("GND", "B.Cu"): 1053.06},
-    "node": {("GND", "In1.Cu"): 2533.29, ("3V3", "In2.Cu"): 2520.84},
+    # node re-pinned 2026-09-21 for S4, **with its arithmetic**: one parallel rung on `VBUS` is one
+    # through via crossing both inner planes, and a foreign via takes a disc of `pi * (dia/2 +
+    # clearance)^2` out of each. At node's numbers that is `pi * (0.175 + 0.2)^2` = **0.4418 mm2**,
+    # and the two planes came back **0.44 mm2** smaller each — 2533.29 -> 2532.85 and 2520.84 ->
+    # 2520.40 — which is the predicted disc to the last digit the 2 dp report can show. Both are
+    # still **one island**, which is the number the whole `final` stage is gambling on: the gate's
+    # `--refill-zones` is the only thing that reads the board after this stage, `antipad_clash`
+    # predicts the neck per candidate and `plane_islands` measures it after, and neither moved.
+    "node": {("GND", "In1.Cu"): 2532.85, ("3V3", "In2.Cu"): 2520.4},
 }
 
 # Finding 14: how many of each board's `track_width` warnings are pcbc's own tap stubs. `tap._width`
@@ -132,7 +158,13 @@ VIAS_PATTERN = {
     "blinky": {"tap": 1},
     "buck": {"tap": 6},
     "c3_usb": {"fanout": 5, "tap": 34},
-    "node": {"tap": 62},
+    # S4: node gains the stitching slice's first copper — one `parallel` rung on `VBUS`, a 0.35/0.2
+    # twin beside the barrel at (28,33.4). Three of its `VBUS` via groups are under-rated and one has
+    # a site; the other two are refused (`STITCH_REFUSED`). The other three boards gain nothing, and
+    # for a structural reason rather than a tuned one: blinky and buck carry no via at all on an
+    # unpoured power net, and c3_usb's 0.5 A sits under one 0.3 mm barrel's 0.707 A, so
+    # `vias_per_change` is 1 and every group it has is already rated.
+    "node": {"stitch": 1, "tap": 62},
 }
 
 
@@ -143,11 +175,18 @@ REFUSED = {
     "blinky": {},
     "buck": {"hop": 2, "spine": 2},
     "c3_usb": {"hop": 1, "spine": 2, "tap": 2},
-    "node": {"hop": 1, "spine": 1, "tap": 2},
+    "node": {"hop": 1, "spine": 1, "stitch": 2, "tap": 2},
 }
 """A spine refusal is soft for `hop._refuse`'s reason: KRT's own `{class}_nets` step honours the same
 intent with the same numbers, so a refused spine costs a route pcbc would have drawn wider and never
-costs the constraint. One per net that the backbone could not finish, never one per failed link."""
+costs the constraint. One per net that the backbone could not finish, never one per failed link.
+
+**The `hop`, `spine` and `tap` counts are byte-identical through S4**, which is the `final` stage's
+claim tested rather than argued: the stitch writes copper after every KRT step, so nothing routes
+after it and nothing can react to it. The `stitch: 2` on node is the new population being counted, not
+a pattern that got worse — and it is exactly **one refusal per spec**, which is the rule
+`docs/stitch-plan.md` §1.3 says this dict exists to enforce: node's two refused groups tried 32 sites
+each and a per-site refusal would have put 64 lines here."""
 
 # B.4's refusals, net by net, with the rule that decided each — the `TAP_REFUSED` treatment for the
 # spine. A spine refusal names the first link the backbone could not make.
@@ -168,13 +207,41 @@ TAP_REFUSED = {
     "node": [("C_VBUS.2", "copper"), ("U1.51", "edge")],
 }
 
+# `docs/stitch-plan.md` S4's refusals, group by group, with the rule that decided each — the
+# `TAP_REFUSED` treatment for the parallel carrier, and **one line per spec, never one per site**.
+# node's three under-rated `VBUS` groups are the whole population on all five boards; one has a site
+# and two are walled in by the copper KRT put around them, each having tried all 32 of its ring.
+STITCH_REFUSED = {
+    "blinky": [],
+    "buck": [],
+    "c3_usb": [],
+    "node": [("VBUS via at (27.8,36.3)", "copper"), ("VBUS via at (31.3,38.5)", "copper")],
+}
+
+# The rungs pcbc wrote, as (net, twin, anchor, centre-to-centre mm, the layers it is joined on).
+# `route_verify.parallel_joined` is the one check in this feature that can fail a build, and it is
+# the one nothing else on the board can make: `ampacity._via_clusters` counts two barrels 0.9 mm
+# apart as a parallel pair with **no connectivity test**, KiCad's unconnected check is pad to pad, and
+# `netcheck.check_copper` never reads a segment or a via. So a twin joined to nothing would make
+# pcbc's own measurement report twice the ampacity of a board carrying no more current.
+RUNGS = {
+    "blinky": [],
+    "buck": [],
+    "c3_usb": [],
+    "node": [("VBUS", (28.9, 33.4), (28.0, 33.4), 0.9, ["B.Cu", "F.Cu"])],
+}
+
 # D.4: what pcbc owns, exact per board — {reason: (segments, vias)}. A pattern that stops claiming a
 # net shows up here before it shows up in the bar.
 OWNS = {
     "blinky": {"hop": (5, 0), "tap": (1, 1)},
     "buck": {"spine": (10, 0), "tap": (6, 6)},
     "c3_usb": {"fanout": (5, 5), "hop": (11, 0), "spine": (9, 0), "tap": (34, 34)},
-    "node": {"hop": (11, 0), "spine": (9, 0), "tap": (62, 62)},
+    # S4's rung is `(2, 1)`: one via and **one link segment on each of the two layers it spans**,
+    # unconditionally and at the class width. That 2 is the whole of `docs/stitch-plan.md` §2(e) —
+    # `ampacity._via_clusters` is single-linkage on distance with no connectivity test, so a bare
+    # twin joined to nothing would double the reported ampacity of a board carrying no more current.
+    "node": {"hop": (11, 0), "spine": (9, 0), "stitch": (2, 1), "tap": (62, 62)},
 }
 
 # R1 (docs/r1-design.md E, H.3): the soft rules' hits per example, {rule name: KiCad warnings}, recorded
@@ -272,7 +339,18 @@ UNDER = {
 }
 """Which nets are not carrying what they declare, and how. `VIN` and node's `VBUS` are `under
 current`; c3_usb's `VBUS` is `under floor` — 0.127 mm carries 0.536 A of its 0.5 A on the IPC curve
-with 7 % margin, while pcbc's own manufacturability floor for that current is 0.150 mm."""
+with 7 % margin, while pcbc's own manufacturability floor for that current is 0.150 mm.
+
+**S4's honest unknown, settled by measurement and neither of the two answers it was offered.**
+`docs/stitch-plan.md` S7 asks whether the parallel carrier takes node's verdict to `ok` or merely
+flips `via -> track`. It does neither: `carries` stays at **0.527** and `kind` stays `via`.
+`power_bottlenecks` walks the **worst** pad-to-pad path, so a rail is as good as its worst barrel —
+and of node's three under-rated `VBUS` groups the one with a site is not one of the two that bind.
+Simulated on the same routed board with all three rungs written in, the walk reads **0.745 A** and
+flips to `track` at a 0.2 mm neck on B.Cu, still `under current`: so even the optimistic answer was
+`via -> track`, `UNDER["node"]` keeps its entry on any reading, and "only blinky has nothing to say"
+is safe. What closes node's via half is two placements this board has no room for, and the two
+`stitch` moves name what is in the way (`STITCH_REFUSED`)."""
 
 # Finding 16: same-net copper closer than the process floor with bare laminate across it — the one
 # clearance question neither pcbc (`route_scene._pair_clashes` skips same-net pairs) nor KiCad (which
@@ -294,6 +372,96 @@ LEFTOVER = {
     # refused all six of its links — and its leftover is the whole rest of the net.
     "c3_usb": {"3V3": (25.132, 31.09), "VBUS": (3.2, 43.833)},
     "node": {"VBUS": (8.819, 14.521)},
+}
+
+
+# `docs/stitch-plan.md` S1 — the two populations, counted before anything is designed around them.
+# Both dicts are recorded against the **checked-in** routed boards (2026-09-20), including the DS2
+# Addon's, read-only; `tests/test_route_verify_stitch.py` is where they are asserted, because a
+# coordinate is a property of the copper KRT chose on the run that wrote that file and this test
+# re-routes from scratch. What the build test asserts is that both counts ran inside `pcbc build`.
+#
+# RETURNS: every via on a net carrying `Constraint.reference`, as (net, at, verdict, nearest
+# reference-net via in mm). **Not one of the eleven is a distance question.** node is four layers
+# with GND on In1.Cu and 3V3 on In2.Cu, so a through via takes the track from copper referenced to
+# GND to copper referenced to 3V3 — the return has to change *net*, and no via joins two nets.
+# c3_usb is two layers with one pour, so the via lands the track in the GND pour's own layer and
+# there is no second plane to reach. blinky, buck and ds2 declare no controlled-impedance net at
+# all, so the population there is **empty and stays empty** — that is the entry, not a missing row.
+# This is why `docs/stitch-plan.md` §8 ships no return-via placer: the population is zero for a
+# structural reason no routing improvement fixes.
+#
+# **Re-measured on fresh builds in a temp directory, 2026-09-20, and the verdicts hold where the
+# counts do not.** node's `USB_DN` and `USB_DP` come out of `pcbc build` with **no via at all** — the
+# pair never leaves F.Cu — so node's seven rows below are a property of the stale checked-in artifact
+# (`docs/stitch-plan.md` §2(o): that routed directory has no `patterns_post` step, so it predates
+# S5). c3_usb comes out with **five**, still every one of them `lost`. The count is the router's; the
+# verdict is the stackup's, and it is the verdict this dict exists to record.
+RETURNS = {
+    "blinky": (),
+    "buck": (),
+    "c3_usb": (
+        ("USB_DN", (15.05, 1.15), "lost", 2.9547),
+        ("USB_DN", (17.45, 19.45), "lost", 3.1851),
+        ("USB_DP", (15.05, 2.75), "lost", 1.6279),
+        ("USB_DP", (19.5, 20.35), "lost", 4.4433),
+    ),
+    "node": (
+        ("USB_DN", (16.3, 12.5), "net_change", 2.1932),
+        ("USB_DN", (18.1, 14.3), "net_change", 2.3537),
+        ("USB_DN", (30.2, 29.7), "net_change", 1.8028),
+        ("USB_DN", (30.8, 38.5), "net_change", 4.9649),
+        ("USB_DN", (31.9, 31.5), "net_change", 3.6688),
+        ("USB_DP", (29.75, 36.5), "net_change", 3.6719),
+        ("USB_DP", (30.75, 36.5), "net_change", 4.5774),
+    ),
+    "ds2": (),
+}
+
+# PARALLEL: every parallel via group on an **unpoured** power rail, as {net: ((at, n, need), ...)}.
+# `need` is `stackup.vias_per_change(amps, drill, plating, temp_rise)` — R1 has compiled that number
+# since `ViaSpec.per_change` and nothing had ever compared it to the vias a finished board has.
+#
+# **Technique 1's whole population is node's `VBUS`**: four singleton groups of a 0.2 mm drill, each
+# carrying `via_amps(0.2)` = 0.527 A of a 1 A rail, each wanting `vias_per_change(1.0, 0.2)` = 2 —
+# four rungs. Every other group on every other board is `n >= need` by arithmetic: c3_usb's 0.5 A and
+# ds2's 0.1 A both sit under one 0.3 mm barrel's 0.707 A, so `need` is 1 and a singleton is rated.
+# blinky and buck carry no via at all on an unpoured power net, so their entry is `{}` and means it.
+#
+# The **poured** rails are exempt for the reason `power_bottlenecks` exempts them: the plane is the
+# conductor and a via into it is a tap carrying one pad's share. That exemption is load-bearing, not
+# tidy — without it buck's `GND` reads five under-rated groups against its 2 A and node's `GND` and
+# `3V3` read sixteen and seven, all of them taps into the pour that carries the current.
+#
+# **The count is four here and three on a fresh build**, measured 2026-09-20 in a temp directory:
+# node's `VBUS` comes out of `pcbc build` with three vias at (27.8,36.3), (28,33.4) and (31.3,38.5),
+# still all singletons, still all short by one. `docs/stitch-plan.md` §2(o) tells S4 to re-measure
+# rather than copy the four, and this is the measurement that says why: the *count* is the router's,
+# the *shortfall per group* is the stackup's — `vias_per_change(1.0, 0.2)` is 2 whatever KRT does.
+PARALLEL = {
+    "blinky": {},
+    "buck": {},
+    "c3_usb": {
+        "3V3": (((16.25, 11.9), 1, 1), ((18.4, 9.7), 1, 1)),
+        "VBUS": (((17.35, 20.45), 1, 1), ((18.35, 23.55), 1, 1), ((19.5, 23.95), 1, 1)),
+    },
+    "node": {"VBUS": (((26.9, 34.7), 1, 2), ((28.0, 38.6), 1, 2), ((32.3, 34.9), 1, 2), ((32.3, 36.4), 1, 2))},
+    "ds2": {
+        "3V3": (((19.05, 16.5), 1, 1), ((22.2, 7.55), 1, 1)),
+        "VDDA": (((22.85, 8.05), 1, 1),),
+        "VSS": (
+            ((4.65, 18.85), 1, 1),
+            ((8.35, 15.15), 1, 1),
+            ((22.85, 16.35), 1, 1),
+            ((23.2, 13.2), 1, 1),
+            ((30.1, 3.25), 1, 1),
+            ((30.9, 4.05), 1, 1),
+            ((35.4, 7.9), 1, 1),
+            ((36.2, 8.7), 1, 1),
+            ((36.4, 12.5), 1, 1),
+            ((40.6, 16.05), 1, 1),
+        ),
+    },
 }
 
 
@@ -333,6 +501,21 @@ def test_example_builds_to_fab(tmp_path: Path, name: str):
     assert not any(r["hard"] for r in route["refusals"]), route["refusals"]
     assert [(r["what"], r["rule"]) for r in route["refusals"] if r["pattern"] == "tap"] == TAP_REFUSED[name], (name, route["refusals"])
     assert [(r["what"], r["rule"]) for r in route["refusals"] if r["pattern"] == "spine"] == SPINE_REFUSED[name], (name, route["refusals"])
+    assert [(r["what"], r["rule"]) for r in route["refusals"] if r["pattern"] == "stitch"] == STITCH_REFUSED[name], (name, route["refusals"])
+    # `docs/stitch-plan.md` S4: every rung pcbc wrote, and whether it is joined to the anchor it is
+    # supposed to be parallel to, on **both** layers its barrel spans. `fails` is the only fatal
+    # thing in `build._barrel_gate` and it is empty on every board: a rail that is still short is a
+    # printed move, a rung that is not a rung is a pcbc bug.
+    barrel = route["parallel"]
+    assert [(r["net"], tuple(r["at"]), tuple(r["anchor"]), r["mm"], r["joined"]) for r in barrel["rungs"]] == [
+        (n, tuple(a), tuple(b), mm, j) for n, a, b, mm, j in RUNGS[name]
+    ], (name, barrel["rungs"])
+    assert barrel["fails"] == [], (name, barrel["fails"])
+    assert all(r["joined"] == r["spans"] for r in barrel["rungs"]), (name, barrel["rungs"])
+    # And the copper is where the census says it is: a rung is one via and two links, so the stitch
+    # millimetres on the bar are exactly the two link segments and nothing counts them as route.
+    stitch_mm = {n: r["stitch_mm"] for n, r in route["copper_bar"]["nets"].items() if r.get("stitch_mm")}
+    assert stitch_mm == ({"VBUS": 1.8} if RUNGS[name] else {}), (name, stitch_mm)
     # B.4's own rule, asked of the built board — and asked so that it **can** fail, which it could
     # not before the S7 review (findings 1, 7, 12, 20). The gate is handed the copper pcbc wrote, off
     # the sidecar: a hop, a spine trunk or a backbone link narrower than its class is a bug a pattern
@@ -466,6 +649,22 @@ def test_example_builds_to_fab(tmp_path: Path, name: str):
     declared = {ch.net for ch in load_board(board).chains}
     assert set(route["chains"]["checked"]) == declared, (name, route["chains"], declared)
     assert route["chains"]["fails"] == [], (name, route["chains"]["fails"], "R-X4: a declared order pcbc routes must be in the copper")
+    # `docs/stitch-plan.md` S1's two counts, asked inside `pcbc build` and not only in the suite —
+    # finding 11's lesson applied *before* the feature that needs them exists. The **numbers** are
+    # pinned against the checked-in routed boards in `test_route_verify_stitch.py` (a coordinate is a
+    # property of the copper KRT chose on the run that wrote the file); what is asserted here is that
+    # they ran and that every verdict is one the classifier admits.
+    #
+    # The return count is report-only **by construction**: it has no `fails` key at all, so there is
+    # no path by which it stops a build, which is why that slice could ship it on all five boards at
+    # once. The barrel gate grew one in S4 and it is the narrowest fatal thing in the feature — a rung
+    # pcbc wrote that is not joined to the anchor it is supposed to be parallel to, which is copper
+    # doing the opposite of what `ampacity._via_clusters` will report about it. A rail that is still
+    # short stays a printed move (`RUNGS`, `STITCH_REFUSED`).
+    assert set(route["returns"]) == {"watched", "vias", "verdicts", "lines"} and "fails" not in route["returns"], (name, route["returns"])
+    assert set(route["parallel"]) == {"rungs", "groups", "short", "fails", "lines"}, (name, route["parallel"])
+    assert set(route["returns"]["verdicts"]) <= {"served", "far", "none", "net_change", "lost"}, (name, route["returns"]["verdicts"])
+    assert len(route["returns"]["vias"]) == sum(route["returns"]["verdicts"].values()), (name, route["returns"])
     from pcbc.fab import board_pads, mask_flashes, passive_refs, via_in_pad, via_in_pad_blockers
     from pcbc.route_emit import append_items, via as via_text
 

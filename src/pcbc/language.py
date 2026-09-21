@@ -26,6 +26,7 @@ from .css import (
 )
 from .model import (
     BoardSpec,
+    BridgeReq,
     BusReq,
     ChainReq,
     Design,
@@ -584,6 +585,74 @@ def Isolation(
     return spec
 
 
+BRIDGE_KINDS = ("short", "cap", "bead", "off_board")
+"""What may tie two grounds, in the order a board is most likely to reach for one.
+
+No `"net_tie"`, and its absence is the decision of `docs/stitch-plan.md` §8 item 4 rather than an
+omission — see `Bridge`'s own docstring for the two judges that would each need an exemption.
+"""
+
+
+def Bridge(a: str, b: str, *, at: str | Sequence[str], kind: str = "short", why: str = "") -> BridgeReq:
+    """The one point at which two declared grounds are tied, and what ties them.
+
+    **pcbc writes no copper for this, and that is the whole design.** `at` names a part the board
+    already places — a 0R, a ferrite, a cap. The netlist keeps both nets, so `netcheck.expected_nets`
+    and `netcheck.copper_nets` agree, KiCad sees no short, and the copper gate is untouched: measured,
+    `copper_nets` (`netcheck.py:125-146`) matches `(pad "N" ... (net "NAME"))` **inside footprint
+    blocks only** and never reads a `(segment)` or a `(via)`, so a component tie changes no pad
+    binding at all. `netcheck.py` has a zero diff in the slice that added this statement.
+
+    **Why there is no `kind="net_tie"` and no copper tie of any shape.** A track joining two declared
+    nets would need an exemption in **two** judges, not one:
+
+    - `fab.copper_drc_errors` (`fab.py:489-505`) surfaces KiCad's own `shorting_items` and exempts
+      only same-footprint pad-to-pad (`_same_footprint_pad_pad`, `fab.py:473`). An exemption keyed on
+      a net pair would be board-wide, so it would also excuse the **accidental** short between those
+      two nets — which is the one thing the check exists to catch.
+    - `route_scene._pair_clashes` decides same-net by `it.net == net`, so GND copper touching a VSS
+      pad is a `Clash("copper", 0.0, 0.200)` that `verify_copper` raises on before the fab gate ever
+      runs.
+
+    So a copper tie is **refused, not exempted**, and it is refused by not existing. And on the one
+    board in reach that has two grounds there is nowhere to put a moat either: measured on the DS2
+    Addon 2026-09-21, GND's and VSS's pad populations overlap on **all four** separating axes
+    (x 24.480 mm, y 15.444 mm, u 20.610 mm, v 16.797 mm), so no straight line divides the domains
+    and `Split(gap_mm=)` has no geometry to act on (`docs/stitch-plan.md` §8 item 5). A 0R **is** a
+    DC tie made of a part; what a component bridge cannot be is zero-area and BOM-free, and no board
+    here needs that.
+
+    `kind` is one of `BRIDGE_KINDS`. `kind="off_board"` says the tie is made elsewhere — in a
+    harness, a chassis stud, a mating board — and `at` then names the two pads that leave the board,
+    `"REF.PAD"` each, with a mandatory `why`. A `kind="cap"` tie earns a note rather than a refusal:
+    a capacitor is an AC bridge and leaves the two grounds with no DC reference between them.
+    """
+    who = f'Bridge("{a}", "{b}")'
+    a, b = str(a), str(b)
+    if a == b:
+        raise ValueError(f"{who}: both sides name the same net; a bridge ties two grounds, not one to itself")
+    kind = str(kind)
+    if kind not in BRIDGE_KINDS:
+        raise ValueError(f'{who}: kind={kind!r} is not one of {", ".join(BRIDGE_KINDS)}')
+    pads = (at,) if isinstance(at, str) else tuple(str(p) for p in at)
+    pads = tuple(str(p) for p in pads)
+    if not pads:
+        raise ValueError(f'{who}: at= names the part that ties them, e.g. at="R11"')
+    if kind == "off_board":
+        if len(pads) != 2 or any("." not in p for p in pads):
+            raise ValueError(
+                f'{who}: kind="off_board" names the two pads that leave the board, '
+                f'e.g. at=("J1.2", "J2.2") — write REF.PAD for each'
+            )
+        if not str(why).strip():
+            raise ValueError(f'{who}: kind="off_board" needs why= — where the tie is made is not on this board, so it has to be written down')
+    elif len(pads) != 1:
+        raise ValueError(f'{who}: at= names one part, e.g. at="R11"; only kind="off_board" takes two pads')
+    spec = BridgeReq(a=a, b=b, at=pads, kind=kind, why=str(why), line=_line())
+    _doc().bridges.append(spec)
+    return spec
+
+
 def Guard(net: str, *, stitch_mm: float = 2.5, ground: str = "GND") -> GuardReq:
     """A stitched ground guard around a net (recorded in R1; the router pattern is R2)."""
     stitch_mm = _num(stitch_mm, "stitch_mm", f'Guard("{net}")', positive=True)
@@ -787,6 +856,7 @@ def load_board(path: str | Path) -> Design:
         "Chain": Chain,
         "Isolation": Isolation,
         "Guard": Guard,
+        "Bridge": Bridge,
         "AUTO": AUTO,
         "Net": Net_,
         "Power": Power,
@@ -844,11 +914,12 @@ def _g_num(v: float) -> str:
     return f"{v:g}"
 
 
-def check_board(path: str | Path, pcb: bool = True) -> list[str]:
+def check_board(path: str | Path, pcb: bool = True, notes: list[str] | None = None) -> list[str]:
     """Everything that can be wrong before a build: unbound pins, missing
     Place()/SchPlace(), and a SchPlace that names a pin or part that is not
     there or hangs a part off a pin it does not share a net with. The
-    schematic loop passes ``pcb=False``: no Place() needed to draw a sheet."""
+    schematic loop passes ``pcb=False``: no Place() needed to draw a sheet.
+    ``notes`` is `check_design`'s out-parameter: findings that are moves and not failures."""
     try:
         design = load_board(path)
     except TypeError as exc:
@@ -860,7 +931,7 @@ def check_board(path: str | Path, pcb: bool = True) -> list[str]:
         # Everything language.py refuses at load (a Bus of one net, a Chain pad without a dot, a
         # number that is not a number): the board's line, not a 15-line traceback.
         return [_at_board_line(exc, Path(path).resolve())]
-    fails = check_design(design, pcb=pcb)
+    fails = check_design(design, pcb=pcb, notes=notes)
     if pcb:
         from .pcb_place import validate
 
@@ -878,4 +949,4 @@ def check_board(path: str | Path, pcb: bool = True) -> list[str]:
     return fails
 
 
-_CONSTRUCTORS.update({"NetReq": NetReq, "Pair": Pair, "Bus": Bus, "Chain": Chain, "Isolation": Isolation, "Guard": Guard})
+_CONSTRUCTORS.update({"NetReq": NetReq, "Pair": Pair, "Bus": Bus, "Chain": Chain, "Isolation": Isolation, "Guard": Guard, "Bridge": Bridge})

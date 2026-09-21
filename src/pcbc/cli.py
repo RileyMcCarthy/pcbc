@@ -87,19 +87,24 @@ def cmd_check(args: argparse.Namespace) -> int:
     if not path.exists():
         print(f"no such file: {path}", file=sys.stderr)
         return 2
-    fails = check_board(path)
+    notes: list[str] = []
+    fails = check_board(path, notes=notes)
     if fails:
         for f in fails:
             print(f, file=sys.stderr)
         if args.json:
-            print(json.dumps({"ok": False, "fails": fails}, indent=2))
+            print(json.dumps({"ok": False, "fails": fails, "notes": notes}, indent=2))
         return 1
     design = load_board(path)
     if args.constraints and args.json:
         # ConstraintSet.to_dict(): every Derived as {"value", "unit", "formula", "ref", "note"}.
         print(json.dumps(compile_design(design).constraints.to_dict(), indent=2))
         return 0
-    print(json.dumps({"ok": True, "instances": len(design.instances), "nets": len(design.nets)}))
+    print(json.dumps({"ok": True, "instances": len(design.instances), "nets": len(design.nets), "notes": notes}))
+    # A move, and an exit code of 0: `check_design`'s `notes` are findings the board should act on
+    # and that no build is stopped for (H.3's promotion procedure, `--strict-power`'s precedent).
+    for line in notes:
+        print(f"note: {line}")
     if args.constraints:
         # One number per line with its source, sorted by net (docs/r1-design.md A.1); the numbers the
         # AI did not have to know. A caveat (the 2-layer USB note) is a line, never a failure.
@@ -144,6 +149,15 @@ def cmd_build(args: argparse.Namespace) -> int:
     # thing a passing build says that a reader must not scroll past (`ampacity.power_moves`).
     for line in result.get("power") or []:
         print(f"power: {line}", file=sys.stderr)
+    # The two findings that are moves and not failures, on stderr as well as in the JSON: two
+    # `Ground()` nets with nothing tying them (`circuit._untied_grounds`, the check stage) and what
+    # the finished copper says about the same pair (`build._bridge_gate`, the route stage). Only the
+    # check stage's `notes` is read here, not every step's — a route step's `notes` is the pattern
+    # stage's style list and it already has a home in the JSON.
+    for step in result.get("steps") or []:
+        lines = (step.get("notes") or []) if step.get("stage") == "check" else (step.get("bridges") or {}).get("notes") or []
+        for line in lines:
+            print(f"note: {line}", file=sys.stderr)
     if result.get("error"):
         print(result["error"], file=sys.stderr)
         return 1
@@ -258,6 +272,8 @@ def cmd_pcb(args: argparse.Namespace) -> int:
         print(f"style: {len(notes)} note{'s' if len(notes) > 1 else ''} (legal, not counted)")
         for m in notes:
             print(f"  - {m}")
+    for line in result.get("check_notes") or []:
+        print(f"note: {line}")
     if args.constraints and result.get("constraints"):
         lines = list(result["constraints"]["lines"]) + [rules_line(result["rules"])]
         print(f"constraints: {len(lines)} lines (what the placement was checked against; pcbc check --constraints prints them alone)")

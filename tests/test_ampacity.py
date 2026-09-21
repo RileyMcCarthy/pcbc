@@ -330,6 +330,44 @@ def test_an_unmeasured_net_is_not_a_shortfall():
     assert _verdict(walked).verdict == "under floor", walked
 
 
+def test_a_via_bottleneck_is_not_a_placement_move_and_says_what_it_is_instead():
+    """`docs/stitch-plan.md` §5's one sentence: the move a **via** bottleneck gets.
+
+    Every edit `power_moves` offers is about width, and a barrel has none — `stackup.via_amps` is the
+    drill and the plating, both the fab's — so "move the parts either side closer together" is the
+    same class of wrong answer as naming the pad pair instead of the neck's coordinate was: it names
+    an edit that cannot move a single ampere. What a via bottleneck wants is a second via beside it,
+    which is technique 1 — and since `docs/stitch-plan.md` S4 `patterns/stitch.py` places one
+    wherever the ring around the anchor has room, so the sentence points at the `stitch` move that
+    names what took the room rather than at a slice that has not shipped.
+    `route_verify.via_parallelism` is where the count lives.
+
+    The edits that still apply do still apply: the pour, where the board has a free inner layer, and
+    `amps=` on the `NetReq` the net already has. A via row can never be `under floor` — `_verdict`
+    only stamps that on a track — so the move is never left with no edit at all.
+    """
+    from pcbc.ampacity import power_moves
+
+    row = _row(net="VBUS", amps=1.0, carries=0.527, width_mm=0.0, kind="via", where="C_VBUS.1->U3.5",
+               at_mm="32.3,34.9 on B.Cu/F.Cu/In1.Cu/In2.Cu", need_mm=0.4, class_mm=0.4, under_mm=6.476)
+    got = power_moves({"VBUS": row}, ("F.Cu", "In1.Cu", "In2.Cu", "B.Cu"), (("GND", "In1.Cu"), ("3V3", "In2.Cu")))
+    assert got == [
+        "VBUS: declared 1 A, carries 0.527 A through its narrowest single via at "
+        "32.3,34.9 on B.Cu/F.Cu/In1.Cu/In2.Cu (6.476 mm of this net is narrower than its 0.4 mm class; "
+        "path C_VBUS.1->U3.5). A barrel's rating is a count of vias and not a width — `stackup.via_amps` "
+        "is the drill and the plating, both the fab's — so no Place() and no shorter path moves another "
+        "ampere through it; what this wants is a second via beside it, which `patterns/stitch.py` "
+        "places where the ring has room, so a `stitch` move above this line names what took the room. "
+        "Change amps= on the NetReq that already declares \"VBUS\""
+    ], got
+    # The *edit* is gone; the word survives only inside the sentence that says why it is gone.
+    assert "Place() the parts either side" not in got[0] and "no Place() and no shorter path" in got[0], got[0]
+    assert "Place() the parts either side" in power_moves({"VIN": _row()}, ("F.Cu", "B.Cu"))[0], "and a track keeps the edit it always had"
+    # One free inner layer: the pour is still an edit that pours copper, so it is still offered.
+    poured = power_moves({"VBUS": row}, ("F.Cu", "In1.Cu", "In2.Cu", "B.Cu"), (("GND", "In1.Cu"),))[0]
+    assert 'add ("VBUS", "In2.Cu") to your Board(planes=...)' in poured and "Place() the parts" not in poured, poured
+
+
 def test_the_move_names_where_the_copper_is_and_not_the_pair_that_found_it():
     """`where` is a pad pair, and every pair whose path crosses one neck ties at that neck's amps —
     so the reported pair is the first in sorted order among the tied ones. buck's is

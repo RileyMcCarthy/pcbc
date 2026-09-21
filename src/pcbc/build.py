@@ -76,6 +76,145 @@ def _chain_gate(routed_text: str, design) -> dict:
     }
 
 
+def _return_gate(routed_text: str, design) -> dict:
+    """R-Z4's **V**, run in the product and **never fatal** (`docs/stitch-plan.md` §6 row 5, S1).
+
+    Every via on a net carrying `Constraint.reference`, classified by what its layer change does to
+    the return current. Wired the way `_plane_gate` and `_chain_gate` are — one parse of a file
+    already on disk, in the route step — and deliberately without a `fails` key, because there is
+    nothing here a build should stop on: the verdict on all eleven vias of the two boards that have
+    any is settled by the **stackup**, and the edits that change it (`Board(planes=...)` on node,
+    `NetReq(layers=...)` on c3_usb) are board decisions rather than routing faults. S5 owns printing
+    them as moves; S1 owns counting them, so that the placer `docs/stitch-plan.md` §8 refuses to
+    build is refused against a measured population and not an assumed one.
+    """
+    from .compile import compile_design
+    from .route_verify import referenced_nets, return_lines, return_vias
+
+    job = compile_design(design)
+    cs = job.constraints
+    watched = referenced_nets(cs) if cs is not None else ()
+    rows = return_vias(routed_text, cs) if cs is not None else ()
+    verdicts: dict[str, int] = {}
+    for r in rows:
+        verdicts[r.verdict] = verdicts.get(r.verdict, 0) + 1
+    return {
+        "watched": list(watched),
+        "vias": [r.to_dict() for r in rows],
+        "verdicts": dict(sorted(verdicts.items())),
+        "lines": return_lines(rows, watched),
+    }
+
+
+def _bridge_gate(routed_text: str, design) -> dict:
+    """Technique 6's verify half, run in the product: what joins each pair of `Ground()` nets.
+
+    Wired the way `_plane_gate` and `_chain_gate` are — one parse of a file already on disk, in the
+    route step, with a move for its error — and **fatal for `multi` alone**
+    (`docs/stitch-plan.md` §6 row 6). The reasoning behind that one-verdict list is worth keeping:
+
+    - `multi` is fatal because it is the only thing here KiCad cannot see. To KiCad two declared nets
+      joined by two separate 0R parts are two nets and two parts; there is no violation to report,
+      and the board ships with a ground loop nobody wrote down. pcbc owns the single-point check
+      precisely because it is the half `fab.copper_drc_errors` structurally cannot make.
+    - `open` is **not** fatal, and not out of leniency: a tie whose pad no copper reaches is a KiCad
+      unconnected item, so `netcheck.check_copper` already stops that build two lines above this one.
+      A second fatal gate for it would only change which sentence the author reads.
+    - `none` is not fatal because the DS2 Addon ships that way and builds green today; failing it
+      here would stop a board on a defect its author has not been told about, which is H.3's
+      promotion procedure and `--strict-power`'s precedent. The move is printed, exit 0.
+
+    Nothing here writes copper, and `netcheck.py` has a zero diff in the slice that added it.
+    """
+    from .compile import compile_design
+    from .route_verify import bridge_lines, bridge_ties
+
+    job = compile_design(design)
+    rows = bridge_ties(routed_text, design, job.constraints) if job.constraints is not None else ()
+    return {
+        "ties": [r.to_dict() for r in rows],
+        "verdicts": {f"{r.a}|{r.b}": r.verdict for r in rows},
+        "fails": [f"{r.a} and {r.b} are tied at more than one point: {r.why}. {r.move}" for r in rows if r.verdict == "multi"],
+        "notes": [r.line() for r in rows if r.verdict != "tied"],
+        "lines": bridge_lines(rows),
+    }
+
+
+def _barrel_gate(routed_text: str, doc, design) -> dict:
+    """Technique 1's two halves on the finished board: what the rails have, and what pcbc wrote.
+
+    S1 shipped this as `_parallel_gate`, a census with nothing to check; S4 gives it a rung and the
+    one question that can fail. Wired the way `_plane_gate` is — one parse of a file already on
+    disk, in the route step, off the sidecar KiCad has already refilled and saved around.
+
+    **Fatal for exactly one thing: a rung that is not joined to its anchor.**
+    `ampacity._via_clusters` counts proximity with no connectivity test, so an unjoined twin makes
+    pcbc's own measurement report twice the ampacity of a board carrying no more current — and
+    nothing else on the board can see it. KiCad's unconnected-items check is pad to pad, so a via on
+    a named net welded to nothing passes DRC; `netcheck.check_copper` reads pad bindings inside
+    footprint blocks and never a segment or a via; `verify_copper` asks about clearance, angle and
+    size. That is copper pcbc itself wrote doing the opposite of what pcbc reports, which is the
+    definition of a bug this tool should stop a build on.
+
+    **Not fatal: a rail that is still short.** `via_parallelism`'s census is a measurement of the
+    board, and a rail short a barrel after this stage is short because the pattern **refused** —
+    every site on the ring blocked by copper the router put there — and the refusal is already
+    printed as a move with its blockers. Stopping the build there would stop a board that builds
+    today on a fault whose repair the tool has just been unable to make, which is C.6's argument and
+    `--strict-power`'s precedent; `ampacity.power_moves` says the same thing once more in the fab
+    step. The one exception is the case that would be a tool bug rather than a board fact: **every**
+    spec on a net succeeded, pcbc wrote every rung its own arithmetic asked for, and the finished
+    board still reads that rail's bottleneck as a single barrel under its declared current. Then the
+    copper went in and the measurement did not move, and one of the two is wrong.
+
+    Measured 2026-09-21: node writes one rung, is joined to its anchor on both layers it spans, and
+    two of its three `VBUS` groups refused — so the rail's own verdict is a note here and a move in
+    the fab step, and `fails` is empty. The other four boards write no rung at all.
+    """
+    from .compile import compile_design
+    from .route_emit import seg_piece, via_piece
+    from .route_verify import parallel_joined, parallel_joined_lines, parallel_lines, via_parallelism
+
+    job = compile_design(design)
+    pieces = []
+    for i in (doc.items if doc is not None else []):
+        if i.get("reason") != "stitch":
+            continue
+        key = i.get("key") or [""]
+        if key[0] == "via":
+            pieces.append(via_piece(i["net"], i["reason"], tuple(key[1]), float(i.get("w") or 0.0), float(i.get("drill") or 0.0), owner=i.get("owner", "")))
+        elif key[0] == "seg":
+            pieces.append(seg_piece(i["net"], i["reason"], key[1], tuple(key[2]), tuple(key[3]), float(i.get("w") or 0.0), owner=i.get("owner", "")))
+    rungs = parallel_joined(routed_text, pieces)
+    rows = via_parallelism(routed_text, job.constraints) if job.constraints is not None else ()
+    # Which nets pcbc set out to stitch and finished: a stitch refusal names the net it was on, so a
+    # net with copper here and no refusal is one where every spec was served.
+    refused = {r.get("net") for r in (doc.refusals if doc is not None else []) if r.get("pattern") == "stitch"}
+    served = {r.net for r in rungs} - refused
+    fails = [f"pcbc wrote a parallel via that is not parallel: {r.line()}. Drop the rung or join it: this is a pcbc bug, not a board move" for r in rungs if not r.ok]
+    stalled = []
+    if job.constraints is not None and served:
+        from .ampacity import CURVE_EPS, power_bottlenecks
+
+        for net, row in sorted(power_bottlenecks(job, routed_text).items()):
+            if net not in served or row["zoned"]:
+                continue
+            carries = row["carries"] or 0.0
+            if row["kind"] == "via" and carries + 1e-9 < row["amps"] * (1.0 - CURVE_EPS):
+                stalled.append(
+                    f"{net}: pcbc placed every rung vias_per_change asked for and the worst path still carries "
+                    f"{carries:g} A of {row['amps']:g} A through one barrel at {row['at_mm']} — the copper went in "
+                    f"and the measurement did not move, so one of the two is wrong"
+                )
+    return {
+        "rungs": [r.to_dict() for r in rungs],
+        "groups": [r.to_dict() for r in rows],
+        "short": [r.to_dict() for r in rows if r.add],
+        "fails": fails + stalled,
+        "lines": parallel_joined_lines(rungs) + parallel_lines(rows),
+    }
+
+
 def rules_summary(job: CompiledJob) -> dict:
     """What `job.dru` holds, for the one report line `constraints.py` cannot print itself (it sits
     below `dru.py`, so it never sees the rules): every rule pcbc wrote, how many are errors, how many
@@ -142,8 +281,10 @@ def pcb_job(board: Path) -> dict:
     layout = layout_dir(board)
     name = board.stem
     result: dict = {"board": str(board), "layout": str(layout), "error": None}
-    fails = check_design(design, pcb=True) + validate(design)
+    check_notes: list[str] = []
+    fails = check_design(design, pcb=True, notes=check_notes) + validate(design)
     result["check"] = fails
+    result["check_notes"] = check_notes
     if fails:
         result["error"] = "; ".join(fails)
         return result
@@ -191,8 +332,11 @@ def build_job(
         return result
 
     if "check" in plan:
-        fails = check_design(design)
-        step = {"stage": "check", "fails": fails}
+        check_notes: list[str] = []
+        fails = check_design(design, notes=check_notes)
+        # Findings that are moves and not failures (`check_design`'s `notes`): today, two `Ground()`
+        # nets with nothing tying them. Printed with an exit code of 0 — see `check_design`.
+        step = {"stage": "check", "fails": fails, "notes": check_notes}
         if not fails:
             step["constraints"] = constraint_lines(compile_design(design))
         result["steps"].append(step)
@@ -253,6 +397,12 @@ def build_job(
             result["steps"].append(entry)
             result["error"] = step["error"]
             return result
+        # Read before the KiCad block rather than inside it: `_barrel_gate` runs on every build,
+        # `kicad-cli` or not, and what it needs is the copper pcbc wrote, which is pcbc's own file.
+        from .route_emit import read_sidecar as _read_sidecar
+
+        side = routed.parent / "copper.json"
+        doc = _read_sidecar(side) if side.exists() else None
         try:
             gate = check_copper(design, routed)
             entry["copper"] = "verified" if gate["ok"] else gate["fails"]
@@ -263,13 +413,10 @@ def build_job(
             # given; None until netcheck provides them.
             entry["soft"] = gate.get("soft")
             entry["rules"] = gate.get("rules")
-            from .route_emit import read_sidecar
             from .sexp import pin_all_uuids
 
             # KiCad's save invented ids. pcbc's own copper keeps the ids the sidecar names, so a
             # piece stays traceable from `copper.json` into the board and into KiCad's UI (D.4).
-            side = routed.parent / "copper.json"
-            doc = read_sidecar(side) if side.exists() else None
             mine = frozenset(i["uuid"] for i in doc.items) if doc is not None else frozenset()
             routed.write_text(pin_all_uuids(routed.read_text(), name, "routed", keep=mine))
             # D.5 on the board the arbiter itself refilled and saved. Until S5's review both halves
@@ -288,10 +435,28 @@ def build_job(
         # R-X4's **V**, outside the `try` because it needs no KiCad: one parse of the routed file,
         # asking whether each declared `Chain()`'s order is in the copper KRT finished. The chain
         # pattern's refusal is soft (C.6) precisely because this runs.
-        entry["chains"] = _chain_gate(routed.read_text(), design)
+        final_text = routed.read_text()
+        entry["chains"] = _chain_gate(final_text, design)
+        # `docs/stitch-plan.md` S1's return-via count, which can never fail a build, and S4's barrel
+        # gate, which can fail it for exactly one thing: a rung pcbc wrote that is not joined to the
+        # anchor it is supposed to be parallel to (`_barrel_gate`).
+        entry["returns"] = _return_gate(final_text, design)
+        entry["parallel"] = _barrel_gate(final_text, doc, design)
+        # Technique 6's verify half (`docs/stitch-plan.md` S3): what joins each pair of `Ground()`
+        # nets, and whether it joins them at one point. Fatal for `multi` and nothing else — see
+        # `_bridge_gate` for why each of the other four verdicts is a printed move instead.
+        entry["bridges"] = _bridge_gate(final_text, design)
         if entry["chains"]["fails"]:
             result["steps"].append(entry)
             result["error"] = "a declared chain is not fed in its order: " + "; ".join(entry["chains"]["fails"])
+            return result
+        if entry["bridges"]["fails"]:
+            result["steps"].append(entry)
+            result["error"] = "two grounds are tied at more than one point: " + "; ".join(entry["bridges"]["fails"])
+            return result
+        if entry["parallel"]["fails"]:
+            result["steps"].append(entry)
+            result["error"] = "a parallel via is not parallel: " + "; ".join(entry["parallel"]["fails"])
             return result
         result["steps"].append(entry)
         if not gate["ok"]:

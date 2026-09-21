@@ -74,6 +74,10 @@ from . import (
 
 REASON = "spine"
 
+CONNECTS = True
+"""A spine's trunk and its branches join the pads of the net it is on (`docs/stitch-plan.md` §2k).
+See `hop.CONNECTS`."""
+
 WIDE_MM = 0.4
 """How wide a net's class has to be before it gets a spine at all.
 

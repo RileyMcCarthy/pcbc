@@ -40,6 +40,10 @@ from . import PatternCtx, PatternResult, Refusal, Terminal, _pad_key, lane_ok, t
 
 REASON = "tap"
 
+CONNECTS = True
+"""A tap joins its pad to its own net's plane, so the net it claims is the net it connects
+(`docs/stitch-plan.md` §2k). See `hop.CONNECTS`."""
+
 TAP_REACH_MM = 1.5
 """How far past its own first site a tap may step outward, in mm.
 

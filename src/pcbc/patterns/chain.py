@@ -125,6 +125,11 @@ from .spine import WIDE_MM, anchor
 
 REASON = "chain"
 
+CONNECTS = True
+"""A chain's copper joins the stations of the net it is on (`docs/stitch-plan.md` §2k). See
+`hop.CONNECTS`. `chain` is not in any stage tuple (`patterns.MID`), so this is never read today; it
+is declared because `_modules()` is what a stage looks a module up in, not `_STAGES`."""
+
 ELBOWS = ("L-h*", "L-v*")
 """B.0's `L-h` and `L-v`, offered again **after** `mitre` has had them rather than before.
 

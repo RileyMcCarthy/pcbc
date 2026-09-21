@@ -95,8 +95,14 @@ def test_check_constraints_prints_every_number_with_its_source(tmp_path: Path, c
     board = _ds2(tmp_path)
     assert main(["check", str(board), "--constraints"]) == 0, "S5 acceptance: exit code as `check` today; a clean board is 0"
     out = capsys.readouterr().out.splitlines()
-    assert json.loads(out[0]) == {"ok": True, "instances": 28, "nets": 25}, "the check line comes first, as `pcbc check` prints it today"
-    lines = out[1:]
+    doc = json.loads(out[0])
+    assert {k: doc[k] for k in ("ok", "instances", "nets")} == {"ok": True, "instances": 28, "nets": 25}, "the check line comes first, as `pcbc check` prints it today"
+    # `notes` is `check_design`'s out-parameter for a finding that is a **move and not a failure**
+    # (`docs/stitch-plan.md` S3): the DS2 Addon's `GND` and `VSS` are both `Ground()` and nothing ties
+    # them. It has to be in the JSON as well as on stdout, or the one consumer that reads only the
+    # JSON — an AI — never sees the finding at all. Exit code stays 0, which is the point.
+    assert len(doc["notes"]) == 1 and doc["notes"][0].startswith("GND/VSS: VSS cannot reach GND."), doc["notes"]
+    lines = [ln for ln in out[1:] if not ln.startswith("note: ")]
     assert lines[:-1] == DS2_CONSTRAINT_LINES, (
         "S5 acceptance: one line per number with its source (D power: 0.25 floor under 0.2 A, C.6 2152 extrapolates below 0.274 A, "
         "C.7 0.4/0.018 mm barrel 0.871 A at 10 C, C.8 row 0-15 V B2 0.1; D analog: 0.2/0.2, no vias, F.Cu, 5W, airwire 25 overridden to 30 on line 96)"
@@ -115,8 +121,11 @@ def test_check_constraints_json_prints_the_constraintset_with_its_keys(tmp_path:
     assert main(["check", str(board), "--constraints", "--json"]) == 0
     doc = json.loads(capsys.readouterr().out)
     assert sorted(doc) == [
-        "canary_net", "classes", "constraints", "groups", "isolation_specs", "isolations", "lines", "refusals", "rule_areas", "stackup",
-    ], "A.1 ConstraintSet.to_dict(): the fields of the frozen dataclass (isolation_specs is S2's additive carrier of the C.8 numbers)"
+        "bridges", "canary_net", "classes", "constraints", "groups", "isolation_specs", "isolations", "lines", "refusals", "rule_areas", "stackup",
+    ], (
+        "A.1 ConstraintSet.to_dict(): the fields of the frozen dataclass (isolation_specs is S2's additive carrier of the C.8 numbers; "
+        "bridges is S3's, and it is the one spec in the file with no number in it — a `Bridge()` compiles to a part the board already places)"
+    )
     assert doc["stackup"] == "jlcpcb_2l_1oz" and doc["canary_net"] == "3V3" and doc["refusals"] == []
     assert doc["lines"] == DS2_CONSTRAINT_LINES, "the same lines as the text report (cs.lines; the rules line is the CLI's, from job.dru)"
     assert sorted(doc["constraints"][0]) == [
@@ -150,7 +159,7 @@ def test_check_constraints_exit_code_is_checks_and_a_caveat_is_not_a_failure(tmp
     captured = capsys.readouterr()
     assert captured.err.splitlines() == [msg] and captured.out == ""
     assert main(["check", str(bad), "--constraints", "--json"]) == 1
-    assert json.loads(capsys.readouterr().out) == {"ok": False, "fails": [msg]}
+    assert json.loads(capsys.readouterr().out) == {"ok": False, "fails": [msg], "notes": []}
     # c3_usb's 2-layer USB pair cannot reach 90 ohm (C.3 clamp): the note is a line, the exit code stays 0.
     assert main(["check", str(EXAMPLES / "c3_usb" / "c3_usb.py"), "--constraints"]) == 0, "S5 acceptance: the 2L USB note is not a failure"
     out = capsys.readouterr().out.splitlines()
@@ -160,7 +169,10 @@ def test_check_constraints_exit_code_is_checks_and_a_caveat_is_not_a_failure(tmp
     ) in out, "C.10 vector 10: the pair-fit clamp's note"
     assert out[-1].startswith("rules: ") and out[-1].endswith(", canary on net 3V3")
     assert main(["check", str(EXAMPLES / "c3_usb" / "c3_usb.py")]) == 0
-    assert capsys.readouterr().out.splitlines() == ['{"ok": true, "instances": 19, "nets": 11}'], "without --constraints the check prints what it printed before R1"
+    assert capsys.readouterr().out.splitlines() == ['{"ok": true, "instances": 19, "nets": 11, "notes": []}'], (
+        "without --constraints the check prints what it printed before R1, plus S3's `notes` — empty here, and empty on every board "
+        "with fewer than two `Ground()` nets, which is all four examples"
+    )
 
 
 def test_pcb_constraints_prints_the_lines_and_json_carries_the_constraintset(tmp_path: Path, capsys):

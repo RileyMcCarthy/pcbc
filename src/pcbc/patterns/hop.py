@@ -43,6 +43,13 @@ the boards actually want and below that one. `docs/r2-measurements.md` S4."""
 
 REASON = "hop"
 
+CONNECTS = True
+"""A hop's copper joins the two pads of the net it is on, so the net it claims is the net it
+connects (`docs/stitch-plan.md` §2k). `pattern_copper` reads this before `claimed.add`: a module that
+writes copper on one net to serve *another* — a ground guard around an analog input is the case that
+forced the flag — declares False, and `PatternPlan.done` then says nothing about the net it shielded.
+"""
+
 
 def specs(ctx: PatternCtx) -> tuple[str, ...]:
     """Every net this pattern will try, `sorted(net)` — B.0's order for a net-driven pattern."""

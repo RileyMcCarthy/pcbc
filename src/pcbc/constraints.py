@@ -17,7 +17,7 @@ import fnmatch
 from dataclasses import asdict, dataclass, field, replace
 
 from .layout import resolve_regions
-from .model import BusReq, ChainReq, Design, GuardReq, IsolationReq, NetReqSpec, PairReq
+from .model import BridgeReq, BusReq, ChainReq, Design, GuardReq, IsolationReq, NetReqSpec, PairReq
 from .stackup import (
     IPC2221_TABLE_6_1,
     IEC60664_TABLE_F5_PD2,
@@ -55,6 +55,7 @@ __all__ = [
     "PAIR_FIT_MM",
     "PRESETS",
     "SOFT_RULES",
+    "BridgeSpec",
     "ClearanceTable",
     "CompiledClass",
     "Constraint",
@@ -221,6 +222,32 @@ class IsolationSpec:
     across_nets: tuple[str, ...] = ()  # nets an `across=` part carries: its own pad pitch is its rating
 
 
+@dataclass(frozen=True)
+class BridgeSpec:
+    """One `Bridge()` compiled: the two grounds, the part that ties them, and the two pads it ties.
+
+    There is no number in it, and that is the point — every other spec in this file exists because a
+    declaration had to become millimetres, and a bridge becomes a **part the board already places**
+    (`docs/stitch-plan.md` §8 item 4). What compiling it buys is the resolution: `at="R11"` turned
+    into `("R11.1", "R11.2")` with the a-side pad first, so `route_verify.bridge_ties` asks the
+    copper about pads rather than about a reference, and so a tie whose pads are not one per net is
+    refused by `circuit.check_design` before any copper exists.
+
+    `pads` is empty when `at` names no instance on this board, or names one whose pads do not land
+    one per net. The refusal for that is `check_design`'s, not this file's: it is a fact about the
+    netlist, and it reads better beside the instance it names.
+    """
+
+    req: BridgeReq
+    a: str
+    b: str
+    kind: str
+    at: tuple[str, ...]
+    tie_ref: str  # "R11", or "" for kind="off_board" and for an `at` that resolved to nothing
+    pads: tuple[str, ...]  # ("R11.1", "R11.2"), a-side first; () when it did not resolve
+    why: str
+
+
 @dataclass
 class DruRule:  # moved here from compile.py; compile re-exports it
     name: str
@@ -254,6 +281,7 @@ class ConstraintSet:
     refusals: tuple[str, ...]  # what `pcbc check` fails on (a Chain pin off its net, ...)
     lines: tuple[str, ...]  # the report, one number per line, sorted by net
     isolation_specs: tuple[IsolationSpec, ...] = ()  # the numbers behind `isolations`
+    bridges: tuple[BridgeSpec, ...] = ()  # one per `Bridge()`; no geometry, see `BridgeSpec`
 
     def by_net(self, name: str) -> Constraint | None:
         for c in self.constraints:
@@ -269,6 +297,7 @@ class ConstraintSet:
             "groups": [asdict(g) for g in self.groups],
             "isolations": [asdict(i) for i in self.isolations],
             "isolation_specs": [_to_json(asdict(i)) for i in self.isolation_specs],
+            "bridges": [_to_json(asdict(b)) for b in self.bridges],
             "rule_areas": [asdict(a) for a in self.rule_areas],
             "canary_net": self.canary_net,
             "refusals": list(self.refusals),
@@ -810,6 +839,52 @@ def compile_constraints(design: Design) -> ConstraintSet:
         synthesised(gd.net)
         constraints[gd.net] = replace(constraints[gd.net], guard_stitch_mm=gd.stitch_mm)
 
+    # -- bridges: the one point two grounds are tied at, and nothing else ------------------------
+    #
+    # No geometry is compiled here and none ever will be: `docs/stitch-plan.md` §8 item 4 refuses
+    # every copper form of a ground tie, so what a `Bridge()` becomes is a resolved pair of pads on
+    # a part the board already places. The net-level refusals are here because they are facts about
+    # the netlist the compiler already holds; the instance-level ones are `circuit.check_design`'s,
+    # beside the part they name.
+    bridge_specs: list[BridgeSpec] = []
+    seen_pairs: dict[frozenset[str], int] = {}
+    for br in design.bridges:
+        who = f'Bridge("{br.a}", "{br.b}") line {br.line}'
+        ok = True
+        for name in (br.a, br.b):
+            net = design.nets.get(name)
+            if net is None:
+                refusals.append(f"{who}: no net {name!r}{_closest(name, net_names)}")
+                ok = False
+            elif net.kind != "ground":
+                said = "Power" if net.kind == "power" else "Net"
+                refusals.append(
+                    f'{who}: {name} is declared with {said}(); a bridge ties two grounds — write Ground("{name}")'
+                )
+                ok = False
+        pair = frozenset((br.a, br.b))
+        if pair in seen_pairs:
+            refusals.append(f"{who}: {br.a} and {br.b} are already bridged on line {seen_pairs[pair]}; two grounds are tied at one point or they are not tied at one point")
+            ok = False
+        else:
+            seen_pairs[pair] = br.line
+        if not ok:
+            continue
+        tie_ref, pads = "", ()
+        if br.kind == "off_board":
+            pads = br.at
+        else:
+            tie_ref = br.at[0]
+            inst = next((i for i in design.instances if i.ref == tie_ref), None)
+            if inst is not None:
+                on = {}
+                for pin, net_name in inst.pins.items():
+                    for num in (inst.part.pins[pin].pads if pin in inst.part.pins else (pin,)):
+                        on.setdefault(net_name, []).append(f"{tie_ref}.{num}")
+                if len(on.get(br.a, ())) == 1 and len(on.get(br.b, ())) == 1:
+                    pads = (on[br.a][0], on[br.b][0])
+        bridge_specs.append(BridgeSpec(req=br, a=br.a, b=br.b, kind=br.kind, at=br.at, tie_ref=tie_ref, pads=tuple(pads), why=br.why))
+
     # -- isolations: sides from Place() lines, the corridor, the numbers -------------------------
     rule_areas: list[RuleArea] = []
     iso_specs: list[IsolationSpec] = []
@@ -846,6 +921,7 @@ def compile_constraints(design: Design) -> ConstraintSet:
         refusals=tuple(refusals),
         lines=(),
         isolation_specs=tuple(iso_specs),
+        bridges=tuple(bridge_specs),
     )
     return replace(cs, lines=tuple(_report(cs, design, numbers, notes_lines, has_switch_node)))
 
@@ -1440,6 +1516,15 @@ def _report(cs: ConstraintSet, design: Design, numbers, notes_lines: list[str], 
             if note not in seen_notes:
                 seen_notes.add(note)
                 lines.append(note)
+    for spec in cs.bridges:
+        tag = f"Bridge {spec.a}/{spec.b}"
+        where = f"Bridge line {spec.req.line}"
+        if spec.kind == "off_board":
+            lines.append(f"{tag}: tied off this board at {' and '.join(spec.at)} ({where}; {spec.why}); pcbc writes no copper for it")
+        elif spec.pads:
+            lines.append(f"{tag}: tied at {spec.tie_ref} kind={spec.kind}, {spec.pads[0]} on {spec.a} and {spec.pads[1]} on {spec.b} ({where}); pcbc writes no copper for it")
+        else:
+            lines.append(f"{tag}: tied at {spec.tie_ref} kind={spec.kind} ({where}); pcbc writes no copper for it")
     for spec in cs.isolation_specs:
         tag = f"Isolation {spec.req.a}/{spec.req.b}"
         lines.append(f"{tag}: clearance {spec.clearance_mm.line()}")

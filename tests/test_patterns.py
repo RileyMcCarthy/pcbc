@@ -1020,18 +1020,24 @@ def test_the_final_stage_is_the_last_step_of_the_plan_on_both_stackups():
         )
 
 
-def test_the_final_stage_is_empty_and_the_emptiness_is_what_s2_proves():
-    """`patterns.FINAL` is `()`, so the stage runs for real and writes nothing.
+def test_the_final_stage_writes_nothing_on_a_board_with_no_population():
+    """`patterns.FINAL` is `("stitch",)`, and on a **placed** board it writes nothing on any example.
 
-    It is not switched off and it is not short-circuited: `pattern_copper` builds the scene over the
-    finished copper and runs its own self-check, exactly as it will when a carrier lands in `FINAL`.
-    What comes back is the same board text, `is`-identical because `write_pieces` is never called —
-    which is why the step file on disk is a byte copy of its input and why a fresh build of all five
-    boards is byte-identical to the same build without the stage (measured in `FINAL`'s docstring).
+    S2 asserted this with an empty `FINAL` and it was the architecture's own test: the stage runs for
+    real — `pattern_copper` builds the scene over the finished copper and runs its own self-check —
+    and a fresh build of all five boards came back byte-identical to the same build without it. S4
+    puts a carrier in the stage and the assertion survives here because the **population** is empty on
+    a placed board: the only vias on one are pcbc's own taps and fanouts, and every net that carries
+    them is either poured (and so exempt) or rated by `vias_per_change`.
+
+    What that does **not** prove is that the stage writes nothing on a routed board, and on node it
+    writes one rung. That is `test_examples_fab.py`'s to pin, and it pins the rest of the bar
+    unchanged beside it (`docs/stitch-plan.md` §1.2's list). `tests/test_stitch.py` is where the
+    carrier's own arithmetic lives.
     """
     from pcbc.patterns import FINAL, _STAGES
 
-    assert FINAL == () and _STAGES["final"] is FINAL
+    assert FINAL == ("stitch",) and _STAGES["final"] is FINAL
     for name in ALL:
         design = load_board(_board(name))
         job = compile_design(design)
@@ -1040,24 +1046,25 @@ def test_the_final_stage_is_empty_and_the_emptiness_is_what_s2_proves():
         assert plan.text is text and plan.pieces == () and plan.ids == (), name
         assert plan.census == {} and plan.moves == () and plan.notes == () and plan.refused == {}, name
         assert plan.claimed == frozenset() and plan.done == frozenset() and plan.partial == frozenset(), name
-        assert plan.scene is not None, f"{name}: the scene is built, not skipped — S4 inherits a live stage"
+        assert plan.scene is not None, f"{name}: the scene is built, not skipped"
 
 
 def test_every_pattern_module_says_whether_its_copper_connects_the_net_it_claims():
     """`docs/stitch-plan.md` §2k. `pattern_copper` reads `CONNECTS` before `claimed.add`, and reads
     it as an attribute so a module that forgets to declare it raises here rather than defaulting.
 
-    All four say True and the read is a no-op today; the flag exists because the first module that
-    will say False — a guard writes `GND` copper to serve an analog net — would otherwise make
-    `PatternPlan.done` claim the guarded net was routed, and `krt_plan` drops `done` nets from every
-    step and writes `!NET` for them in `signals`. A net nothing routed would then be routed by
-    nobody."""
+    The four route-writing modules say True. **`stitch` says False**, which is what the flag was put
+    there for: a guard (S7) writes `GND` copper to serve an analog net, and a parallel rung (S4) is on
+    its own net and still connects no pad to anything — the anchor was already joined to the rail and
+    the twin is a second path beside it. Either way `claimed.add` would make `PatternPlan.done` say a
+    net was routed that this module did not route, and `krt_plan` drops `done` nets from every step
+    and writes `!NET` for them in `signals`."""
     from pcbc.patterns import _modules
 
     mods = _modules()
-    assert sorted(mods) == ["chain", "hop", "spine", "tap"]
+    assert sorted(mods) == ["chain", "hop", "spine", "stitch", "tap"]
     for reason, mod in sorted(mods.items()):
-        assert mod.CONNECTS is True, reason
+        assert mod.CONNECTS is (reason != "stitch"), reason
         assert mod.REASON == reason, reason
 
 

@@ -455,6 +455,21 @@ def power_moves(
        `NetReq` for a net another one names is refused twice, and a second `Board()` raises at load.
     4. **Widen it by hand** in KiCad, which is the escape hatch and not a fix pcbc can keep.
 
+    **A via bottleneck gets edit 1 taken away and one sentence put in its place**
+    (`docs/stitch-plan.md` §5). Every edit above is about width and a barrel has none: `via_amps` is
+    the drill and the plating, so `Place()` moves parts that are not the problem in exactly the way
+    naming the pad pair instead of `at_mm` did. What a via bottleneck wants is a second via beside
+    it — technique 1 — and since S4 `patterns/stitch.py` places one wherever the ring around the
+    anchor has room, so the sentence now points at the `stitch` move rather than at a slice that has
+    not shipped. Measured 2026-09-20, the population is node's `VBUS` and nothing else: singleton
+    groups of a 0.2 mm drill carrying 0.527 A of a 1 A rail, four of them on the checked-in board and
+    three on a fresh build, every one short by exactly one via. Re-measured 2026-09-21 with the
+    carrier live: one of node's three rings has room and the rail still reads `kind == "via"` at
+    0.527 A, because the barrel this line names is one of the two whose ring is full of `J1`'s pads
+    and KRT's `USB_DN` — so this move and the two `stitch` moves above it are the same finding said
+    from both ends. `route_verify.via_parallelism` is where the count lives and
+    `route_verify.parallel_joined` is where the rungs are checked.
+
     Deliberately *not* a build failure by default (`--strict-power` makes it one): the copper that
     necks is the router's leftover, R3's maze router owns it, and a gate that stops three of five
     boards on a fault the tool cannot yet repair teaches an author to pass `--force`, which is worse
@@ -504,15 +519,31 @@ def power_moves(
         # twice over (`kind="generic"` does not take `amps=`, and the net is already named by
         # another NetReq), and a second bare `Board()` raises before `check` even runs.
         edits = []
-        if not at_floor:
+        if not at_floor and r["kind"] != "via":
             # A shorter path is a narrower one less often: the neck is the leftover router filling a
             # gap the patterns did not span, and a gap is a placement fact. Left out at the floor,
-            # where the copper is on the curve already and the number it misses is a constant.
+            # where the copper is on the curve already and the number it misses is a constant — and
+            # left out for a via, where it is simply the wrong advice (`lead`, below).
             edits.append("Place() the parts either side of that copper closer together")
         if plane:
             edits.append(f'pour it: add ("{name}", "{plane}") to your Board(planes=...)')
         if not at_floor:
             edits.append(f'change amps= on the NetReq that already declares "{name}"')
+        # The one sentence a via bottleneck gets that a track does not (`docs/stitch-plan.md` §5).
+        # Every edit above is about **width**, and a barrel has none: `via_amps` is a function of the
+        # drill and the plating, both the fab's, so no `Place()` and no shorter path moves a single
+        # ampere through it. What a via bottleneck wants is a second via beside it, which is
+        # technique 1 — and until S4 places one, saying so is the whole of the honest answer.
+        # `_verdict` only stamps `under floor` on a track, so a via row is always `under current`
+        # here and the `amps=` edit is always offered: this never leaves the move with no edit at all.
+        lead = (
+            "A barrel's rating is a count of vias and not a width — `stackup.via_amps` is the drill "
+            "and the plating, both the fab's — so no Place() and no shorter path moves another ampere "
+            "through it; what this wants is a second via beside it, which `patterns/stitch.py` places "
+            "where the ring has room, so a `stitch` move above this line names what took the room. "
+            if r["kind"] == "via"
+            else ""
+        )
         tail = (
             ", or ".join(edits)
             if edits
@@ -520,6 +551,6 @@ def power_moves(
         )
         out.append(
             head + why + f" ({r['under_mm']:g} mm of this net is narrower than its {r['class_mm']:g} mm "
-            f"class{seen}). " + tail[0].upper() + tail[1:]
+            f"class{seen}). " + lead + tail[0].upper() + tail[1:]
         )
     return out

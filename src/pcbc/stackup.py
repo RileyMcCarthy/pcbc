@@ -790,6 +790,50 @@ def current_width_mm(amps: float, temp_rise_c: float, stack: Stackup, plane_h_mm
     )
 
 
+def ipc2221_amps(width_mm: float, temp_rise_c: float = 10.0, copper_oz: float = 1.0, outer: bool = True) -> float:
+    """`ipc2221_width_mm` solved for the current: `I = k dT^0.44 A^0.725` on the track's own area.
+
+    The forward function clamps its answer at 0.15 mm — pcbc's own manufacturability floor, not the
+    curve — so it is **not** invertible over that range and this is the curve alone. That difference
+    is the whole of c3_usb's `VBUS`: 0.127 mm of 1 oz copper carries 0.536 A on the curve against the
+    0.5 A the rail declares, while `width_ipc2221` asks for 0.15 mm because 0.15 is the floor. A gate
+    that reports both numbers says which of the two a board is failing.
+    """
+    if width_mm <= 0:
+        return 0.0
+    k = 0.048 if outer else 0.024
+    dt = max(temp_rise_c, 1.0)
+    area = width_mm / 0.0254 * OZ_MIL * copper_oz
+    return round(k * dt**0.44 * area**0.725, 3)
+
+
+def ipc2152_amps(width_mm: float, temp_rise_c: float, copper_oz: float, board_mm: float, plane_h_mm: float | None) -> float:
+    """`ipc2152_width_mm` solved for the current, modifiers divided back out."""
+    if width_mm <= 0:
+        return 0.0
+    dt = max(temp_rise_c, 1.0)
+    area = width_mm / 0.0254 * OZ_MIL * copper_oz
+    area /= ipc2152_board_modifier(board_mm) * ipc2152_plane_modifier(plane_h_mm)
+    return round(0.0897 * dt**0.394 * area ** (0.5038 * dt**0.0385), 3)
+
+
+def track_amps(width_mm: float, temp_rise_c: float, stack: Stackup, plane_h_mm: float | None) -> float:
+    """What a track of this width carries: the exact inverse of `current_width_mm`.
+
+    `current_width_mm` returns `max(IPC-2221 external, IPC-2152 with modifiers)`, so the current a
+    given width is good for is the **min** of the two curves — the narrower answer is the binding
+    one in exactly the same direction. Round-tripped in `test_dru.py`: widening to
+    `current_width_mm(I)` and asking this back never returns less than `I`.
+
+    This is the number a report should print beside a neck. "0.3905 mm" says nothing to a person
+    reading a power net; "carries 1.21 A of the 2 A VIN declares" is the same fact and is the
+    question the width was derived from.
+    """
+    a = ipc2221_amps(width_mm, temp_rise_c, stack.copper_oz)
+    b = ipc2152_amps(width_mm, temp_rise_c, stack.copper_oz, stack.board_mm, plane_h_mm)
+    return round(min(a, b), 3)
+
+
 # ---------------------------------------------------------------------------------------------
 # C.7 Vias per amp: IPC-2221 internal curve on the plated barrel
 # ---------------------------------------------------------------------------------------------

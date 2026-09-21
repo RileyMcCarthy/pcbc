@@ -24,10 +24,12 @@ Two forms, in B.4's order:
 
 **The spine never necks, and that is the whole point.** B.0's "a pattern never degrades" is sharper
 here than anywhere else: a trunk narrower than its class is the bug this pattern exists to fix, so
-every trunk piece and every backbone link is written at the class width or not at all. Only a
-comb's **rib** may neck, which is R-I3's own allowance for the last millimetre into a pad, and even
-then never below the width its own share of the current needs (`_rib_width`). A neck that does
-happen is a `style:` line, never a silence.
+every trunk piece and every backbone link is written at the class width or not at all. The only
+copper allowed to neck is a comb's rib **into a bypass pad** — R-I3's allowance for the last
+millimetre into a decoupling cap, and nothing else: a rib to an IC's power pin, a connector or a
+series passive is the trunk width, because what a branch carries is a property of the pin and not of
+the pad count (`_rib_width`, `shunt_stations`, and the S7 review's findings 4 and 11). A neck that
+does happen is a `style:` line, never a silence.
 
 **No layer change** (R2's stated non-goal, and H.4): a spine is single-layer, so R-I2's `per_change`
 via budget never arises. A net whose pads do not all share one copper layer gets the links it can.
@@ -100,6 +102,16 @@ AXES = ("x", "y", "u", "v")
 in `route_scene._project`'s frame: no sqrt(2) on any coordinate, so 4 dp stays exact and the sqrt(2)
 is carried by the half-widths and the spreads instead."""
 
+ACROSS = {"x": "y", "y": "x", "u": "v", "v": "u"}
+"""The axis a trunk's **offset** is measured on, which is the other one.
+
+A lane returned by `free_intervals` is an interval of `across` coordinates at a fixed `along` span, so
+printing one as `x=2.922` when the trunk runs along `x` names the wrong axis for the one number a
+person or an agent acts on. Every shipped spine refusal did (finding 14): buck's `VIN` printed
+`x=2.922` for a `y`; c3_usb's `3V3` printed `x=29.190` for a `y` near the bottom edge; c3_usb's
+`VBUS` printed `v=56.605` for a `u`, a value the `v` axis cannot take over that span at all.
+`docs/r2-design.md` B.4 has the correct form — "0.430 mm at **y=13.100**" for a trunk along x."""
+
 MAX_OFFSETS = 6
 """B.4 item 3's bound on the comb: at most six trunk offsets are tried for a net, and they are the
 free lanes nearest the pads' median. The bound is declared here and nowhere else."""
@@ -108,8 +120,9 @@ COMB_DETOUR_MAX = 1.6
 """How far past the net's airwire a whole comb may run, as a ratio.
 
 Without it the comb is not a pattern but a bad route. On buck's `VIN` **no** free lane on F.Cu
-overlaps the pads' own row — they sit at y 6.45 to 11.98 and the lanes are 0.30-5.54, 16.40-19.41
-and 22.59-24.70 — so the nearest lane centre is y 2.92, and the comb it gives is a 17.8 mm trunk
+overlaps the pads' own row — they sit at y 6.45 to 11.98 and the lanes are 0.69-5.54, 16.40-19.41
+and 22.59-24.31 once `trunk_window` takes the trunk's own half width off the board's own window — so
+the nearest lane centre is y 3.12, and the comb it gives is a 17.8 mm trunk
 hugging the board edge with five ribs 3.5 to 9.1 mm long: **52.7 mm** of 0.781 mm copper for a
 21.2 mm airwire, 2.49x, walling off the top of the board for a net the backbone then links in 21 mm.
 
@@ -150,11 +163,12 @@ class SpineSpec:
     stations: tuple[Terminal, ...]
     width: float  # the class width: what a trunk and every backbone link is written at
     amps: float  # what the net carries (Constraint.current)
-    share: float  # one pad's share of it
+    share: float  # an even 1/pads of it — a placeholder for a bypass pad's ripple, see `spine_widths`
     trunk_need: float  # max(IPC-2221 external, IPC-2152 with modifiers) at `amps`
     branch_need: float  # the same curve at `share`
     why: str  # the arithmetic, for the report and the refusal
     airwire: float  # the MST over the stations: the shortest copper that could connect them
+    shunts: frozenset[str] = frozenset()  # the station owners a rib is allowed to neck into
 
 
 def _layer(ctx: PatternCtx, net: str, stations: tuple[Terminal, ...]) -> str:
@@ -172,7 +186,44 @@ def _layer(ctx: PatternCtx, net: str, stations: tuple[Terminal, ...]) -> str:
     return ""
 
 
-def spine_widths(scene: Scene, cs, net: str, pads: int) -> tuple[float, float, float, float, str]:
+def shunt_stations(ctx: PatternCtx, stations: tuple[Terminal, ...]) -> frozenset[str]:
+    """Which stations are a **bypass pad** — the only ones whose rib may be narrower than the trunk.
+
+    A rib carries what its pad draws, and `amps / pads` is not that number for any pad on any of
+    these boards (findings 4, 6 and 11). buck's `VIN` is the case: five pads, and `J_IN.1` (the input
+    connector) and `U1.3` (the TPS54202's VIN pin) carry the whole 2 A in series while `R_EN.1`, a
+    100 k pull-up, carries 12 V / 100 k = **0.12 mA**. Dividing the rail evenly understated the two
+    that matter by five and overstated the one that does not by four orders of magnitude, and it did
+    it where it lands: `_rib_width` returned 0.532 mm for `U1.3` — a SOT-23-6's pad width, arrived at
+    by luck of package geometry — which carries 1.515 A of that pin's 2 A.
+
+    pcbc cannot read a pin's role from the netlist yet (R1's `Constraint.current` has no per-pad
+    share), so this is the one population it *can* name, and it is `tap`'s own: a **declared
+    two-terminal passive whose other pad is on a plane or return net**. That is a decoupling or
+    bypass cap and nothing else — a series resistor's other pin is a signal, an IC pin is not a
+    passive, and a two-pin power connector is not a declared passive (which is what keeps buck's
+    `J_IN` out, and it sources the whole rail). Every other station gets the trunk width, and when
+    the trunk width does not fit beside its neighbours `blocked` refuses the comb — which is B.0's
+    "a pattern never degrades" enforced by the clearance table rather than by a second rule.
+    """
+    from ..fab import passive_refs
+
+    passives = passive_refs(ctx.design)
+    pads_by_ref: dict[str, set[tuple[str, str]]] = {}
+    for it in ctx.scene.items:
+        if it.kind == "pad" and it.owner:
+            pads_by_ref.setdefault(it.owner.split(".")[0], set()).add((it.owner, it.net))
+    returns = set(ctx.scene.plane_of)
+    out = set()
+    for t in stations:
+        siblings = pads_by_ref.get(t.ref, set())
+        others = {n for owner, n in siblings if owner != t.owner}
+        if t.ref in passives and len(siblings) == 2 and others & returns:
+            out.add(t.owner)
+    return frozenset(out)
+
+
+def spine_widths(scene: Scene, cs, net: str, stations: tuple[Terminal, ...], shunts: frozenset[str] = frozenset()) -> tuple[float, float, float, float, str]:
     """(width, share, trunk_need, branch_need, why) — the current this spine has to carry.
 
     One source for both numbers, and it is R1's: `Constraint.current.amps` is what the net carries
@@ -182,13 +233,16 @@ def spine_widths(scene: Scene, cs, net: str, pads: int) -> tuple[float, float, f
     copper is actually written, which is what makes "the trunk carries everything downstream of it"
     a check rather than a claim.
 
-    A branch carries **one pad's share**, `amps / pads` — `tap.tap_via`'s own division, for the same
-    reason: a decoupling cap's ripple is not the rail. Measured on buck's `VIN`, the widest power net
-    on any of these boards: 2 A across 5 pads is 0.4 A a pad, which asks 0.15 mm against the 0.781 mm
-    the whole net asks, a factor of 5. The share is what floors a rib's neck; it never widens one.
+    **`share` is a placeholder and the `why` string now says so.** It is `amps / pads`, and no pad on
+    any of these boards draws it: buck's `VIN` reported "0.15 mm for one pad's 0.4 A" on every build
+    while its five pads draw 2 A, 2 A, ripple, ripple and 0.12 mA (finding 6). It survives as the
+    **floor** under a bypass pad's rib, where an honest number does not exist until a `Pin(amps=)`
+    does, and it applies to nothing else: `shunt_stations` says which pads it applies to and the
+    string names them, so the assumption is printed rather than implied.
     """
     c = cs.by_net(net)
     stack = scene.stack
+    pads = len(stations)
     width = float(c.width_mm.value) if c is not None else stack.track_min
     cur = c.current if c is not None else None
     amps = cur.amps if cur is not None else 0.0
@@ -198,12 +252,14 @@ def spine_widths(scene: Scene, cs, net: str, pads: int) -> tuple[float, float, f
     trunk_need = current_width_mm(amps, dt, stack, plane_h).value if amps > 0 else 0.0
     branch_need = current_width_mm(share, dt, stack, plane_h).value if share > 0 else 0.0
     cls = c.class_name if c is not None else "net"
+    where = ", ".join(sorted(shunts)) if shunts else "no pad here"
     if amps <= 0:
         why = f"the {cls} class's {width:g} mm, which is the width the class declares; {net} carries no current a NetReq named"
     else:
         why = (
             f"the {cls} class's {width:g} mm trunk against the {trunk_need:g} mm IPC asks for {net}'s whole {amps:g} A, "
-            f"and {branch_need:g} mm for one pad's {share:g} A"
+            f"and every rib at that width too except into a bypass pad ({where}), which may neck to {branch_need:g} mm "
+            f"— an even 1/{pads} share of {amps:g} A, a placeholder and not a current any pad was declared to draw"
         )
     return (width, share, trunk_need, branch_need, why)
 
@@ -228,11 +284,13 @@ def specs(ctx: PatternCtx) -> tuple[SpineSpec, ...]:
         stations = terminals(scene, net)
         if len(stations) < 3:
             continue
-        width, share, trunk_need, branch_need, why = spine_widths(scene, ctx.cs, net, len(stations))
+        shunts = shunt_stations(ctx, stations)
+        width, share, trunk_need, branch_need, why = spine_widths(scene, ctx.cs, net, stations, shunts)
         if width < WIDE_MM:
             continue
         out.append(
             SpineSpec(
+                shunts=shunts,
                 net=net,
                 layer=_layer(ctx, net, stations),
                 stations=stations,
@@ -350,6 +408,41 @@ def trunk_span(spec: SpineSpec, axis: str) -> tuple[float, float]:
     return (lo, hi)
 
 
+def trunk_window(outline: tuple[float, float, float, float], axis: str, span: tuple[float, float], half: float) -> tuple[float, float]:
+    """Which offsets a trunk across `span` can take and still be **on the board**.
+
+    On `x` and `y` this is `_project(outline, axis)[1]` shrunk by the trunk's half width, because the
+    across extent of a rectangle does not depend on where along it you stand. On a diagonal it does,
+    and `_project` is the wrong function to ask: it returns the min and max of `u` over the
+    rectangle's four *corners*, which is exactly right as a conservative obstacle extent and wrong as
+    a containment window. Measured on c3_usb's `VBUS` (finding 13): the window it gave was
+    `(0.6, 69.4)`, the two offsets tried were `u=56.605` and `u=66.983`, and all four trunk endpoints
+    they produce are off a board that ends at x=39.7, y=29.7 — one of them at x=45.0. Both of the
+    comb's at-most-six candidates were spent on lanes that cannot hold a trunk, and the refusal then
+    said "2 free lanes there could take it" one line above naming the board edge as the blocker.
+
+    The attainable set is linear in `along`, so intersecting it at the span's two ends is exact for
+    everything between them. For `u` (along `u = x + y`, across `v = x - y`) a world point is
+    `x = (u + v)/2, y = (u - v)/2`, so `v` is in `[max(2x0 - u, u - 2y1), min(2x1 - u, u - 2y0)]`;
+    for `v` the same algebra gives `u` in `[max(2x0 - v, 2y0 + v), min(2x1 - v, 2y1 + v)]`. An empty
+    window is returned as a zero-width interval, which `free_intervals` reads as no lane at all.
+    """
+    x0, y0, x1, y1 = outline
+    pad = half * (math.sqrt(2.0) if axis in ("u", "v") else 1.0)
+    if axis in ("x", "y"):
+        lo, hi = _project(outline, axis)[1]
+        return (lo + pad, hi - pad) if hi - pad >= lo + pad else (lo + pad, lo + pad)
+    ends = []
+    for along in (min(span), max(span)):
+        if axis == "u":
+            ends.append((max(2 * x0 - along, along - 2 * y1), min(2 * x1 - along, along - 2 * y0)))
+        else:
+            ends.append((max(2 * x0 - along, 2 * y0 + along), min(2 * x1 - along, 2 * y1 + along)))
+    lo = max(e[0] for e in ends) + pad
+    hi = min(e[1] for e in ends) - pad
+    return (lo, hi) if hi >= lo else (lo, lo)
+
+
 def trunk_offsets(scene: Scene, spec: SpineSpec, axis: str, free: tuple[tuple[float, float], ...]) -> tuple[float, ...]:
     """B.4 item 3's candidate list, in B.4's order and bounded at `MAX_OFFSETS`.
 
@@ -390,14 +483,24 @@ def _trunk(ctx: PatternCtx, spec: SpineSpec, axis: str, span: tuple[float, float
 
 
 def _rib_width(ctx: PatternCtx, spec: SpineSpec, t: Terminal, axis: str) -> float:
-    """B.4 item 5: a rib, and only a rib, may neck to the pad's across dimension (R-I3).
+    """B.4 item 5: a rib into a **bypass pad**, and only that, may neck to the pad's across
+    dimension (R-I3).
 
-    Floored three ways and capped once: never under the fab's `track_min`, never under the width
-    this branch's **own share** of the current needs, and never over the class width. The share
-    floor is the difference between R-I3's allowance and a silent neck — `fanout.py` and `tap.py`
-    take the same allowance without it because a fanout escape and a tap carry a pad's ripple into a
-    plane, while a rib carries that pad's current on the only copper it has.
+    Everything else — an IC's power pin, a connector pin, a series passive — gets the trunk width,
+    because the current a branch carries is a property of the pin and not of the pad count, and the
+    only pad pcbc can currently prove draws less than the rail is a decoupling cap's
+    (`shunt_stations`). This is the rule the S7 review found returning 0.532 mm for buck's `U1.3` —
+    the TPS54202's VIN pin, which draws the whole 2 A of the rail — against the 0.781 mm its class
+    declares; 0.532 mm of 1 oz copper carries **1.513 A** on the IPC-2221B external curve at that
+    net's own 10 C rise, so the rule under-sized by a third the one branch that carries everything
+    (findings 4 and 11).
+
+    A necked bypass rib is still floored twice and capped once: never under the fab's `track_min`,
+    never under `branch_need` (which is a placeholder — `spine_widths` says so in the string it
+    prints), and never over the class width.
     """
+    if t.owner not in spec.shunts:
+        return spec.width
     box = t.item.box()
     # "Across" is across the RIB, which runs perpendicular to the trunk: on an `x` trunk the rib is
     # vertical, so the pad dimension it has to fit into is the horizontal one.
@@ -422,7 +525,7 @@ def _comb(ctx: PatternCtx, spec: SpineSpec) -> tuple[dict, list[Clash]]:
     scene = ctx.scene
     axis = trunk_axis(scene, spec)
     span = trunk_span(spec, axis)
-    window = _project(scene.outline, axis)[1]
+    window = trunk_window(scene.outline, axis, span, spec.width / 2.0)
     free = free_intervals(axis, span, window, spec.width / 2.0, spec.net, scene, spec.layer)
     offsets = trunk_offsets(scene, spec, axis, free)
     mine = frozenset(it.id for it in scene.items if it.owner in {t.owner for t in spec.stations})
@@ -491,8 +594,9 @@ def _rib(
         c = ctx.cs.by_net(spec.net)
         note = (
             f"style: spine {spec.net}: {t.owner}'s rib necks to {w:g} mm, the pad's across dimension, against the "
-            f"{c.class_name if c is not None else 'class'}'s {spec.width:g} mm (it carries this pad's {spec.share:g} A, "
-            f"which asks {spec.branch_need:g} mm)",
+            f"{c.class_name if c is not None else 'class'}'s {spec.width:g} mm — it is a bypass pad, so what it draws "
+            f"is ripple and the floor under it is {spec.branch_need:g} mm, an even 1/{len(spec.stations)} share of "
+            f"{spec.amps:g} A and not a declared current",
         )
     if math.dist(at, foot) < MICRO_MM:
         if t.item.copper is not None and gap(track_shape(trunk.a, trunk.b, trunk.w), t.item.copper) <= 0.0:
@@ -625,17 +729,24 @@ def crowded(a: Terminal, b: Terminal, exits_a, exits_b) -> bool:
 
     A.7 puts an exit `half + the widest clearance this net owes on the footprint + width/2` out, and
     that distance grows with the width — so on the widest copper pcbc writes, two neighbouring pads
-    of the same net routinely sit **inside** each other's exits. Measured at 0.781 mm on buck:
-    `C_IN1.1 -> U1.3` are 1.716 mm apart with their exits 1.09 and 0.73 mm out, `U1.3 -> C_IN2.1`
-    1.543 mm with 0.73 and 1.09, `C_IN2.1 -> R_EN.1` 3.009 mm; every one of the 112 exit-to-exit
-    candidates for those three links doubles back on itself, `mitre` refuses the hairpin, and three
-    quarters of buck's `VIN` and `5V` went to KRT for a reason that is about the exits and not about
-    the board. `docs/r2-measurements.md` S7.
+    of the same net routinely sit **inside** each other's exits. Measured at 0.781 mm on buck, and
+    re-taken from a build for the S7 review, which found three of these numbers invented (finding
+    22): `C_IN1.1 -> U1.3` are 1.7160 mm apart with their widest exits **1.3156 and 1.1266** mm out,
+    `U1.3 -> C_IN2.1` 1.5432 mm with 1.1266 and 1.3156, and on `5V` `L1.2 -> C_OUT1.1` 2.1620 mm with
+    2.4006 and 1.3156. Every exit-to-exit candidate for those links doubles back on itself, `mitre`
+    refuses the hairpin, and three quarters of buck's `VIN` and `5V` went to KRT for a reason that is
+    about the exits and not about the board.
+
+    `C_IN2.1 -> R_EN.1` (3.0093 mm against 1.3156 + 0.9106) used to be listed here as a fourth case
+    and is **not** one: it measures roomy, gets six candidates rather than 112, and still fails with
+    `no candidate`. It is a link this change did not help, which is worth saying and is not evidence
+    for it. `docs/r2-measurements.md` S7.
 
     The **widest** exit on each pad, not the nearest: the question is whether any exit pair can
     cross, and it is the pair facing each other that does. On buck's `C_OUT1.1 -> C_OUT2.1` the two
-    pads are 2.250 mm apart, their nearest exits 1.09 mm out and the two facing ones 1.32 mm, so the
-    nearest-exit reading calls them roomy and all seventeen candidates then double back.
+    pads are 2.2500 mm apart, their nearest exits 1.0906 mm out and the two facing ones 1.3156 mm, so
+    the nearest-exit reading calls them roomy (2.1812 < 2.25) and every exit-to-exit candidate then
+    doubles back, while the widest reading (2.6312 > 2.25) calls them crowded, which they are.
     """
     if not exits_a or not exits_b:
         return True
@@ -686,6 +797,62 @@ def _dedupe(pts: tuple[Pt, ...]) -> tuple[Pt, ...]:
 # --- one net ----------------------------------------------------------------------------------------
 
 
+def joined(spec: SpineSpec, pieces: tuple[Piece, ...]) -> tuple[tuple[tuple[str, str], ...], int]:
+    """(the station pairs this copper joins, how many pairs that is) — counted off the **copper**.
+
+    Not off the `_link` calls that returned something. The two disagree in both directions and the S7
+    report published both mistakes on one board (findings 5, 8, 15, 17): c3_usb's `VBUS` was recorded
+    as making 1 of 6 links while `run` emits no `VBUS` copper at all, and its `3V3` as 4 of 7 while
+    the nine pieces it does write join **five** pairs — a link that runs over a third station of its
+    own net connects it for free, and no count of successful calls can see that. A union-find over
+    the stations and the emitted pieces is what the board does, so it is what gets reported.
+
+    `gap(...) <= 0` is the same touch test `_rib` already uses to decide a zero-length rib, and it is
+    KiCad's own rule: tracks that touch are connected, whether or not their endpoints are equal.
+    """
+    shapes: list[tuple[frozenset[str], object]] = [(t.layers, t.item.copper) for t in spec.stations]
+    for p in pieces:
+        if p.kind != "seg" or p.b is None:
+            continue
+        shapes.append((frozenset({p.layer if isinstance(p.layer, str) else p.layer[0]}), track_shape(p.a, p.b, p.w)))
+    parent = list(range(len(shapes)))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for i in range(len(shapes)):
+        for j in range(i + 1, len(shapes)):
+            (la, sa), (lb, sb) = shapes[i], shapes[j]
+            if sa is None or sb is None or not (la & lb):
+                continue
+            if gap(sa, sb) <= 0.0:
+                a, b = find(i), find(j)
+                if a != b:
+                    parent[a] = b
+    groups: dict[int, list[str]] = {}
+    for i, t in enumerate(spec.stations):
+        groups.setdefault(find(i), []).append(t.owner)
+    pairs = tuple(
+        (a, b) for members in (sorted(g) for g in groups.values()) if len(members) > 1 for a, b in zip(members, members[1:])
+    )
+    return (tuple(sorted(pairs)), len(spec.stations) - len(groups))
+
+
+def _result(ctx: PatternCtx, spec: SpineSpec, pieces: tuple[Piece, ...], **kw) -> dict:
+    """The three numbers every `PatternResult` from this pattern carries, from the copper it wrote."""
+    pairs, made = joined(spec, pieces)
+    mm = sum(p.mm for p in pieces)
+    return {
+        "joins": pairs,
+        "links": (made, len(spec.stations) - 1),
+        "coverage": round(mm / spec.airwire, 4) if spec.airwire > 0 else 0.0,
+        **kw,
+    }
+
+
 def run(ctx: PatternCtx, spec: SpineSpec) -> PatternResult:
     """One net: the comb if it fits, the backbone if it does not, and what is left for KRT."""
     if not spec.layer:
@@ -702,32 +869,30 @@ def run(ctx: PatternCtx, spec: SpineSpec) -> PatternResult:
             reason=REASON,
             net=spec.net,
             pieces=comb["pieces"],
-            joins=tuple((t.owner, f"{spec.net} trunk") for t in spec.stations),
-            candidate=comb["candidate"],
-            tried=comb["tried"],
-            notes=comb["notes"],
+            **_result(ctx, spec, comb["pieces"], candidate=comb["candidate"], tried=comb["tried"], notes=comb["notes"]),
         )
-    pieces, joins, failed, tried = _backbone(ctx, spec)
+    pieces, _calls, failed, tried = _backbone(ctx, spec)
     notes = (_comb_note(spec, comb),) if pieces else ()
     if not failed:
         return PatternResult(
             reason=REASON,
             net=spec.net,
             pieces=tuple(pieces),
-            joins=tuple(joins),
-            candidate=f"backbone of {len(spec.stations)} stations on {spec.layer}",
-            tried=comb["tried"] + tried,
-            notes=notes,
+            **_result(ctx, spec, tuple(pieces), candidate=f"backbone of {len(spec.stations)} stations on {spec.layer}", tried=comb["tried"] + tried, notes=notes),
         )
     return PatternResult(
         reason=REASON,
         net=spec.net,
         pieces=tuple(pieces),
-        joins=tuple(joins),
-        candidate=f"backbone of {len(spec.stations)} stations on {spec.layer}" if pieces else "",
-        tried=comb["tried"] + tried,
-        notes=notes,
-        refusal=_refuse(ctx, spec, comb, seen, failed, tried),
+        **_result(
+            ctx,
+            spec,
+            tuple(pieces),
+            candidate=f"backbone of {len(spec.stations)} stations on {spec.layer}" if pieces else "",
+            tried=comb["tried"] + tried,
+            notes=notes,
+            refusal=_refuse(ctx, spec, comb, seen, failed, tried),
+        ),
     )
 
 
@@ -816,17 +981,17 @@ def _refuse(ctx: PatternCtx, spec: SpineSpec, comb: dict, seen: list[Clash], fai
         # tried are the numbers that say so.
         wide, at = max(((hi - lo, (lo + hi) / 2.0) for lo, hi in comb["free"]))
         head += (
-            f"{len(comb['free'])} free lanes there could take it (the widest is {wide:.3f} mm at {comb['axis']}={at:.3f}) and "
+            f"{len(comb['free'])} free lanes there could take it (the widest is {wide:.3f} mm at {ACROSS[comb['axis']]}={at:.3f}) and "
             f"none of the {comb['tried']} tried, nearest the pads' median first, clears"
         )
     else:
         # B.4's own sentence, and its number: the widest gap there is at all, against the width a
         # trunk plus its two clearances needs. Asked at half width zero, so it is the room the board
         # has rather than the room this trunk fits in.
-        raw = free_intervals(comb["axis"], comb["span"], _project(ctx.scene.outline, comb["axis"])[1], 0.0, spec.net, ctx.scene, spec.layer)
+        raw = free_intervals(comb["axis"], comb["span"], trunk_window(ctx.scene.outline, comb["axis"], comb["span"], 0.0), 0.0, spec.net, ctx.scene, spec.layer)
         wide = max((hi - lo for lo, hi in raw), default=0.0)
         at = max(((hi - lo, (lo + hi) / 2.0) for lo, hi in raw), default=(0.0, 0.0))[1]
-        head += f"the widest free lane there is {wide:.3f} mm at {comb['axis']}={at:.3f}, and the trunk needs {need:.3f} mm"
+        head += f"the widest free lane there is {wide:.3f} mm at {ACROSS[comb['axis']]}={at:.3f}, and the trunk needs {need:.3f} mm"
     by_pair: dict[tuple[str, int], Clash] = {}
     for c in seen:
         key = (c.rule, c.item.id)

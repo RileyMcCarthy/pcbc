@@ -395,18 +395,33 @@ def test_fab_notes_print_the_constraint_lines_and_the_rule_count(tmp_path: Path)
     assert notes.endswith("- classes: Default 0.16/0.18, USB 0.2288/0.18 pair 0.2288/0.15, Power 0.4/0.2 via 0.8/0.4, Analog 0.2/0.2 via 0.6/0.3\n- rules: 13 written (4 error, 6 soft), canary on net 3V3\n"), "node: 13 rules; error: novia x2, usb_pair_gap, pads_of_one_footprint; soft: width x2, vias x2, skew, uncoupled; the geometry rules and the canary are warnings of neither kind"
 
 
-def test_power_ampacity_reads_the_constraints_width():
-    """A.3 item 7: one source. The number is the constraint's IPC-2221 external width (node VBUS at
-    1 A: 0.300 mm), so the gate is unchanged."""
+def test_power_ampacity_gates_the_copper_pcbc_wrote_and_not_the_nets_widest_track():
+    """The gate's criterion, and the S7 review's findings 1, 7, 12 and 20 in one test.
+
+    It used to read `copper_by_net`'s `width`, which is a **max**, so one wide segment satisfied a
+    whole net and the check could not fail: the board below has 4 mm of 0.2 mm `VBUS` copper on a 1 A
+    rail and a 0.781 mm segment somewhere else on the same net, and the old gate passed it. It is now
+    two questions. `power_ampacity_failures` judges the copper **pcbc wrote** — where a neck is a bug
+    a pattern committed — and `ampacity.power_bottlenecks` measures the whole net including KRT's
+    leftover, which is the honest number and is a ledger rather than a build stopper.
+    """
     job = compile_design(load_board(EXAMPLES / "node" / "node.py"))
     assert job.constraints.by_net("VBUS").current.width_ipc2221.value == 0.3
     text = (
         '(kicad_pcb\n\t(net 1 "VBUS")\n\t(net 2 "LOAD")\n'
         '\t(segment\n\t\t(start 1 1)\n\t\t(end 5 1)\n\t\t(width 0.2)\n\t\t(layer "F.Cu")\n\t\t(net 1)\n\t)\n'
+        '\t(segment\n\t\t(start 1 8)\n\t\t(end 5 8)\n\t\t(width 0.781)\n\t\t(layer "F.Cu")\n\t\t(net 1)\n\t)\n'
         '\t(segment\n\t\t(start 1 3)\n\t\t(end 5 3)\n\t\t(width 0.4)\n\t\t(layer "F.Cu")\n\t\t(net 2)\n\t)\n)\n'
     )
-    assert power_ampacity_failures(job, text) == ["VBUS copper 0.20 mm < 0.30 mm required for 1 A (add a plane or pour)"]
-    assert power_ampacity_failures(replace(job, constraints=None), text) == ["VBUS copper 0.20 mm < 0.30 mm required for 1 A (add a plane or pour)"], "without a ConstraintSet the fallback is the same formula"
+    assert copper_by_net(text)["VBUS"] == {"segment": 2, "via": 0, "zone": 0, "width": 0.781, "width_min": 0.2}, "both, because a presence test wants the max and an ampacity question wants the min"
+    assert power_ampacity_failures(job, text) == [], "nothing here is pcbc's, so the gate has nothing of pcbc's to judge"
+    # The same board with that 0.2 mm segment written by a spine, which is the bug the gate exists
+    # to catch: B.0 says a pattern never degrades, and the class is 0.4 mm.
+    assert power_ampacity_failures(job, text, owned=[("VBUS", "spine", 0.2)]) == [
+        "VBUS spine copper 0.2 mm < the 0.4 mm VBUS class (1 A, IPC asks 0.3 mm)"
+    ]
+    assert power_ampacity_failures(job, text, owned=[("VBUS", "tap", 0.2)]) == [], "R-I3's neck into a pad is a tap's and a fanout's alone"
+    assert power_ampacity_failures(replace(job, constraints=None), text, owned=[("VBUS", "spine", 0.2)]) == [], "without a ConstraintSet there is no class width to judge against"
 
 
 # ---------------------------------------------------------------------------------------------

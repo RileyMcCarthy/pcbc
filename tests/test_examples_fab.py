@@ -58,6 +58,11 @@ BAR = {
     # what it costs is in DETOURS and here, per F.3 item 7. c3_usb's `angles` 122 -> **130** and its
     # routed length are the same trade on a board where the pair comes out **better** (`USB_DN`
     # 1.81 -> 1.65). node improves on every count but `angles` (98 -> 100).
+    #
+    # **Every ceiling here is met with zero margin, and that is deliberate** (S7 review, finding 23).
+    # KRT and KiCad are both pinned to an exact version, so the board is a function of this repo: a
+    # count that moves is a routing change somebody should read, not noise. The assertion is `<=`, so
+    # an improvement passes silently and only a regression fails — which is what a ceiling is for.
     "blinky": {"vias": 0, "off45": 0, "micro": 0, "detour": 1.04, "angles": 0},
     "buck": {"vias": 1, "off45": 1, "micro": 96, "detour": 2.55, "angles": 28},
     "c3_usb": {"vias": 7, "off45": 11, "micro": 188, "detour": 1.70, "angles": 130},
@@ -97,9 +102,15 @@ COURTYARD = {"blinky": 0, "buck": 0, "c3_usb": 1, "node": 0}
 # c3_usb's VBUS went 1.33 -> 1.70 through S5 while the reported worst held at USB_DN 1.81. Ceilings,
 # for every net whose airwire is at least 1 mm. A net that creeps here is a test failure now.
 # Re-recorded for S7. Four move on buck and five on c3_usb, and the two directions are the slice:
-# `VIN` 2.09 -> **2.55** and c3_usb's `3V3` 1.38 -> **1.53** and `BOOT` 1.05 -> **1.18** are KRT
-# routing round locked power copper, while `USB_DN` 1.81 -> **1.65** and `USB_DP` 1.62 -> **1.56**
-# are the pair getting a straighter run once `VBUS` is out of its way. ds2 and node barely move.
+# `VIN` 2.09 -> **2.55**, buck's `5V` 1.12 -> **1.14**, c3_usb's `3V3` 1.38 -> **1.53**, its `BOOT`
+# 1.05 -> **1.18** and its `GND` 1.44 -> **1.48** are all KRT routing round locked power copper —
+# the last two were unnamed here until the S7 review counted them (finding 23) — while `USB_DN`
+# 1.81 -> **1.65** and `USB_DP` 1.62 -> **1.56** are the pair getting a straighter run. ds2 and node
+# barely move.
+#
+# `USB_DN`'s improvement is **not** attributed to `VBUS` (finding 18): pcbc writes no `VBUS` copper on
+# c3_usb at all, and `VBUS`'s own detour is unmoved. The net whose corridor changed is `3V3`, whose
+# 25.1 mm backbone is locked before KRT's signals step and whose own detour rose to pay for it.
 DETOURS = {
     "blinky": {"LED": 1.04},
     "buck": {"5V": 1.14, "BOOT": 1.0, "EN": 1.09, "FB": 1.01, "GND": 1.3, "SW": 1.52, "VIN": 2.55},
@@ -212,6 +223,79 @@ SOFT = {
     "node": {"width_usb": 46, "width_power": 14, "vias_usb_dn": 0, "vias_usb_dp": 0, "skew_usb_dn_usb_dp": 1, "uncoupled_usb": 1},
 }
 
+# Findings 5, 8, 15 and 17: what each spine actually joined and how much of the net it wrote, off the
+# **copper** rather than off the `_link` calls that returned something. `{net: (made, needed,
+# coverage)}` — `made` is `stations - components` over the emitted pieces and the station pads, and
+# `coverage` is the spine's millimetres over the net's airwire.
+#
+# The S7 table published `c3_usb` as spining two nets with `VBUS` at "1 of 6". `VBUS` makes **0** and
+# writes no copper at all, and `3V3` makes **5** of 7 rather than 4, because a link that runs over a
+# third station of its own net connects it for free. Both numbers are now generated where the build
+# reads them, so the ledger cannot drift from the board again.
+SPINE_LINKS = {
+    "blinky": {},
+    "buck": {"5V": (3, 4, 0.6386), "VIN": (2, 4, 0.1593)},
+    "c3_usb": {"3V3": (5, 7, 0.683), "VBUS": (0, 6, 0.0)},
+    "node": {"VBUS": (3, 6, 0.4771)},
+}
+
+# D.4 one key deeper: the census per reason **and net**, exact. A net listed as spined that writes no
+# copper now fails a test rather than a table (findings 5, 8, 17).
+SPINE_NETS = {
+    "blinky": {},
+    "buck": {"5V": (7, 14.6184), "VIN": (3, 3.3831)},
+    "c3_usb": {"3V3": (9, 25.1315)},
+    "node": {"VBUS": (9, 8.8192)},
+}
+
+# Findings 1, 3, 7, 12 and 20: what each power net's worst pad-to-pad path can actually carry, vias
+# included (`ampacity.power_bottlenecks`). **A ledger, not a gate** — it is the number the old
+# `power_ampacity_failures` was offered as proof of and could not see, because it read the net's
+# widest track. Three of these are under what the net declares and R2 cannot fix them: the copper
+# that necks is KRT's leftover. `docs/r2-measurements.md` S7.
+#
+# `carries` is a floor that must rise and `under_mm` a ceiling that must fall. Against the
+# `PCBC_PATTERNS=off` board the spine moves two of them a long way — buck's `5V` 0.707 -> 1.999 A and
+# its `VIN` 0.536 -> 1.21 A (its 2 A path `J_IN.1 -> U1.3` goes 0.127 -> 0.781 mm) — and leaves the
+# two nets it refused exactly where they were.
+BOTTLENECK = {
+    "blinky": {},
+    "buck": {"5V": (1.999, 0.0), "VIN": (1.21, 19.394)},
+    "c3_usb": {"3V3": (1.231, 0.0), "VBUS": (0.536, 24.068)},
+    "node": {"LOAD": (1.231, 0.0), "VBUS": (0.527, 6.476)},
+}
+UNDER = {
+    "blinky": [],
+    "buck": ["VIN"],
+    "c3_usb": ["VBUS"],
+    "node": ["VBUS"],
+}
+"""Which nets are not carrying what they declare, and how. `VIN` and node's `VBUS` are `under
+current`; c3_usb's `VBUS` is `under floor` — 0.127 mm carries 0.536 A of its 0.5 A on the IPC curve
+with 7 % margin, while pcbc's own manufacturability floor for that current is 0.150 mm."""
+
+# Finding 16: same-net copper closer than the process floor with bare laminate across it — the one
+# clearance question neither pcbc (`route_scene._pair_clashes` skips same-net pairs) nor KiCad (which
+# exempts them outright) asks. A **ceiling**, and the class is pre-existing rather than the spine's:
+# the `PCBC_PATTERNS=off` boards measure buck 3, c3_usb 17, node 22 against these.
+SAME_NET = {"blinky": 0, "buck": 1, "c3_usb": 22, "node": 16}
+
+# Finding 10: the leftover's own half of the trade, per spined net — `(spine mm, leftover mm)`. The
+# per-net `routed_mm` and `detour` are over **all** the copper on a net, so a spine that adds to
+# KRT's route rather than replacing it looks like a win in every number that exists. Against the
+# `PCBC_PATTERNS=off` leftover (buck `5V` 24.233, `VIN` 44.304; c3_usb `3V3` 40.381; node `VBUS`
+# 24.786) the trade is 0.87 leftover millimetres saved per millimetre of spine on buck's `5V`, 0.37
+# on c3_usb's `3V3`, 1.16 on node's `VBUS` — and **-1.88** on buck's `VIN`, which writes 3.38 mm and
+# costs 6.37. `docs/r2-measurements.md` S7 records why that one is kept.
+LEFTOVER = {
+    "blinky": {},
+    "buck": {"5V": (14.618, 11.586), "VIN": (3.383, 50.675)},
+    # c3_usb's `VBUS` is the control: its 3.2 mm is the **fanout's**, not a spine's — the spine
+    # refused all six of its links — and its leftover is the whole rest of the net.
+    "c3_usb": {"3V3": (25.132, 31.09), "VBUS": (3.2, 43.833)},
+    "node": {"VBUS": (8.819, 14.521)},
+}
+
 
 @pytest.mark.kicad
 @pytest.mark.krt
@@ -249,12 +333,30 @@ def test_example_builds_to_fab(tmp_path: Path, name: str):
     assert not any(r["hard"] for r in route["refusals"]), route["refusals"]
     assert [(r["what"], r["rule"]) for r in route["refusals"] if r["pattern"] == "tap"] == TAP_REFUSED[name], (name, route["refusals"])
     assert [(r["what"], r["rule"]) for r in route["refusals"] if r["pattern"] == "spine"] == SPINE_REFUSED[name], (name, route["refusals"])
-    # B.4's own rule, asked of the built board: no power net carries copper narrower than its class
-    # anywhere pcbc wrote it, and the ampacity gate the widths were derived from is still empty.
+    # B.4's own rule, asked of the built board — and asked so that it **can** fail, which it could
+    # not before the S7 review (findings 1, 7, 12, 20). The gate is handed the copper pcbc wrote, off
+    # the sidecar: a hop, a spine trunk or a backbone link narrower than its class is a bug a pattern
+    # committed, and the two reasons R-I3 exempts (`tap`, `fanout`) are the pad necks `TAP_NECKED`
+    # already counts. The probe below shows it firing.
+    from pcbc.ampacity import power_bottlenecks
     from pcbc.copper import power_ampacity_failures
+    from pcbc.fab import _owned_copper
 
-    routed = (tmp_path / "layout" / name / "routed" / "layout.kicad_pcb").read_text()
-    assert power_ampacity_failures(compile_design(load_board(board)), routed) == [], name
+    job = compile_design(load_board(board))
+    routed_pcb = tmp_path / "layout" / name / "routed" / "layout.kicad_pcb"
+    routed = routed_pcb.read_text()
+    owned_cu = _owned_copper(routed_pcb)
+    assert power_ampacity_failures(job, routed, owned=owned_cu) == [], name
+    # And the honest whole-net number beside it: what the worst pad-to-pad path carries, vias
+    # included. A ledger — `carries` must not fall and `under_mm` must not rise.
+    bottleneck = power_bottlenecks(job, routed)
+    necked = [(n, r, 0.1) for n, r, _w in owned_cu if r not in ("tap", "fanout") and n in bottleneck]
+    assert bool(power_ampacity_failures(job, routed, owned=necked)) == bool(necked), (name, necked[:2], "a gate that cannot fail is not a gate")
+    got = {n: (r["carries"], r["under_mm"]) for n, r in bottleneck.items() if not r["zoned"]}
+    assert sorted(got) == sorted(BOTTLENECK[name]), (name, sorted(got), "a power net that appears or disappears here is a change nobody recorded")
+    for net, (carries, under) in sorted(BOTTLENECK[name].items()):
+        assert got[net][0] >= carries - 1e-9 and got[net][1] <= under + 1e-9, (name, net, got[net], (carries, under), "BOTTLENECK: a floor that rises and a ceiling that falls")
+    assert sorted(n for n, r in bottleneck.items() if r["verdict"] not in ("ok",)) == UNDER[name], (name, {n: r["verdict"] for n, r in bottleneck.items()})
     taps = [m for m in route["pattern_moves"] if m.startswith("tap ")]
     if name == "node":
         assert taps[0].splitlines()[0] == (
@@ -276,6 +378,19 @@ def test_example_builds_to_fab(tmp_path: Path, name: str):
         assert step is None, (name, step)
     owns = {r: (v["segments"], v["vias"]) for r, v in route["copper_bar"]["totals"]["by_reason"].items() if r != "leftover"}
     assert owns == OWNS[name], (name, owns, route["copper_bar"]["lines"])
+    # Per net, so a net recorded as spined that writes no copper fails here rather than in a table
+    # (findings 5, 8, 15, 17). Both halves come off the build, not off a hand-copied row.
+    spine_nets = {n: (v["segments"], v["mm"]) for n, v in (route["pattern_nets"].get("spine") or {}).items()}
+    assert spine_nets == SPINE_NETS[name], (name, spine_nets, "D.4's census, one key deeper")
+    links = {n: tuple(v) for n, v in (route["pattern_links"].get("spine") or {}).items()}
+    assert links == {n: tuple(v) for n, v in SPINE_LINKS[name].items()}, (name, links, "links made, counted off the copper")
+    assert all(n in spine_nets or made == 0 for n, (made, _need, _cov) in SPINE_LINKS[name].items()), (name, "a spine with no copper joins nothing")
+    # The leftover's own half of the trade (finding 10).
+    bar_nets = route["copper_bar"]["nets"]
+    left = {n: (bar_nets[n]["pattern_mm"], bar_nets[n]["leftover_mm"]) for n in LEFTOVER[name]}
+    assert left == LEFTOVER[name], (name, left, "LEFTOVER: what the spine wrote, and what KRT still had to")
+    # The one clearance question nobody asks (finding 16), as a ceiling.
+    assert len(route["same_net_slots"]) <= SAME_NET[name], (name, route["same_net_slots"][:3], SAME_NET[name])
     from pcbc.route_emit import read_sidecar
 
     doc = read_sidecar(tmp_path / "layout" / name / "routed" / "copper.json")
@@ -288,8 +403,6 @@ def test_example_builds_to_fab(tmp_path: Path, name: str):
     fab = tmp_path / "layout" / name / "fab"
     assert (fab / "bom.csv").exists() and (fab / "cpl.csv").exists()
     assert any((fab / "gerbers").glob("*")), "no gerbers"
-    routed_pcb = tmp_path / "layout" / name / "routed" / "layout.kicad_pcb"
-    routed = routed_pcb.read_text()
     assert "filled_polygon" in routed, "the gate judged unfilled pours"
     # D.5, asked of the arbiter's own answer after the gate refilled: every plane is still ONE island,
     # still filled, still the area it was, and every tap via lands inside its own net's plane.

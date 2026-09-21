@@ -103,6 +103,23 @@ class PatternResult:
     refusal: Refusal | None = None
     notes: tuple[str, ...] = ()  # "style:" lines (the advisory mask rule, loop areas)
     tried: int = 0  # how many candidates were judged, for the report
+    links: tuple[int, int] = (0, 0)
+    """`(made, needed)`: how many of the pad pairs this spec had to join the emitted copper actually
+    joins, counted **off the copper** rather than off the calls that succeeded.
+
+    The two differ in both directions and the S7 report got both wrong on one board (findings 5, 8,
+    15, 17): c3_usb's `VBUS` was published as "1 of 6" and writes no copper at all, and its `3V3` as
+    "4 of 7" when the copper joins five pairs, because a link that passes over a third station of its
+    own net connects it for free. `made` is `len(stations) - components` over the stations and the
+    pieces, which is what the board does; `needed` is `len(stations) - 1`."""
+    coverage: float = 0.0
+    """`sum(piece.mm) / airwire`: how much of the net's shortest possible copper this pattern wrote.
+
+    The number that separates a spine that replaced a route from one that only got in its way, and
+    neither the piece count nor `links` says it: buck's `VIN` makes 2 of its 4 links (0.50, the same
+    ratio as node's `VBUS`) and covers **0.159** of its airwire, against 0.639 on buck's `5V`, 0.683
+    on c3_usb's `3V3` and 0.477 on node's `VBUS` (finding 9). Reported per net, not gated — see
+    `docs/r2-measurements.md` S7 for why a coverage floor was measured and rejected."""
 
 
 @dataclass(frozen=True)
@@ -132,6 +149,13 @@ class PatternPlan:
     partial: frozenset[str] = frozenset()  # nets with pattern copper and still open
     refused: dict = field(default_factory=dict)  # net -> its refusals
     claimed: frozenset[str] = frozenset()  # every net a pattern wrote copper for
+    links: dict = field(default_factory=dict)
+    """`{reason: {net: [made, needed, coverage]}}` — what each pattern joined, off its own copper.
+
+    Generated here so the ledger in `docs/r2-measurements.md` and the assertion in
+    `test_examples_fab.py` read the same place the build does. The S7 table was hand-copied and said
+    c3_usb spined two nets with `VBUS` at "1 of 6"; the build writes no `VBUS` copper at all
+    (findings 5, 8, 15, 17)."""
     wall_ms: int = 0
     scene: Scene | None = None
 
@@ -539,11 +563,14 @@ def pattern_copper(
     notes: list[str] = []
     refused: dict[str, list[Refusal]] = {}
     claimed: set[str] = set()
+    links: dict[str, dict[str, list]] = {}
     mods = _modules()
     for reason in _STAGES[stage]:
         mod = mods[reason]
         for spec in mod.specs(ctx):
             res = mod.run(ctx, spec)
+            if res.links != (0, 0) or res.coverage:
+                links.setdefault(reason, {})[res.net] = [res.links[0], res.links[1], res.coverage]
             if res.pieces:
                 added = scene.add(scene.item_of(p) for p in res.pieces)
                 pieces.extend(res.pieces)
@@ -565,6 +592,7 @@ def pattern_copper(
         partial=frozenset(sorted(claimed - done)),
         refused={n: tuple(rs) for n, rs in sorted(refused.items())},
         claimed=frozenset(claimed),
+        links={r: dict(sorted(v.items())) for r, v in sorted(links.items())},
         wall_ms=int(round((time.perf_counter() - t0) * 1000)),
         scene=scene,
     )
@@ -602,6 +630,7 @@ def merge_plans(first: PatternPlan, second: PatternPlan) -> PatternPlan:
         partial=frozenset(sorted(claimed - done)),
         refused={n: refused[n] for n in sorted(refused)},
         claimed=claimed,
+        links={r: dict(sorted({**first.links.get(r, {}), **second.links.get(r, {})}.items())) for r in sorted({*first.links, *second.links})},
         wall_ms=first.wall_ms + second.wall_ms,
         scene=scene,
     )

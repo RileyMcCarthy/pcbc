@@ -11,6 +11,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
+from .ampacity import bottleneck_lines, power_bottlenecks
 from .apply import write_dru
 from .check import check_job
 from .compile import CompiledJob
@@ -517,6 +518,27 @@ def cpl_refs(cpl_csv: str) -> set[str]:
     return refs
 
 
+def _owned_copper(pcb: Path) -> tuple[tuple[str, str, float], ...]:
+    """`(net, reason, width_mm)` for every segment pcbc wrote, off `routed/copper.json`.
+
+    The sidecar sits beside the routed board (`route.py` writes it there), and it is the only place
+    that says which copper is pcbc's: the board file has `(locked yes)` on it, but `locked` is a KiCad
+    flag a person can set too, and it does not carry the reason the width has to be judged against.
+    An absent sidecar is not an error — a board routed with `PCBC_PATTERNS=off` has none — it simply
+    leaves the gate with the missing-rail rule and nothing of pcbc's to judge."""
+    side = pcb.parent / "copper.json"
+    if not side.exists():
+        return ()
+    from .route_emit import read_sidecar
+
+    doc = read_sidecar(side)
+    return tuple(
+        (str(i["net"]), str(i["reason"]), float(i["w"]))
+        for i in doc.items
+        if i.get("key", ("",))[0] == "seg" and i.get("net")
+    )
+
+
 def fab_job(
     job: CompiledJob,
     pcb: Path,
@@ -688,8 +710,16 @@ def fab_job(
         result["error"] = "; ".join(via_fail)
         _write_notes(out_dir, job, result)
         return result
-    amp = power_ampacity_failures(job, text)
+    # Two different questions, and the S7 review is the reason they are two (findings 1, 2, 3, 7,
+    # 12, 20). `power_ampacity_failures` is the **gate**: pcbc's own pattern copper, at the class
+    # width it declared, which is the thing pcbc is answerable for and which stops the build.
+    # `power_bottlenecks` is the **measurement**: what the whole net — leftover and all — can carry
+    # between its pads, which three of the five boards fail today and R3's maze router owns. It is
+    # recorded in `report.json` and in `FAB_NOTES.md`, and pinned per board in
+    # `test_examples_fab.py`, so it is a ledger that must fall rather than a boolean already true.
+    amp = power_ampacity_failures(job, text, owned=_owned_copper(pcb))
     result["ampacity"] = amp
+    result["ampacity_bottleneck"] = power_bottlenecks(job, text)
     if amp:
         result["error"] = "; ".join(amp)
         _write_notes(out_dir, job, result)
@@ -806,6 +836,14 @@ def _write_notes(out_dir: Path, job: CompiledJob, result: dict) -> None:
         soft = sum(1 for r in job.dru if r.severity == "warning" and soft_kind(r.name) is not None)
         canary = f", canary on net {job.constraints.canary_net}" if job.constraints.canary_net else ""
         lines += [f"- rules: {len(job.dru)} written ({errors} error, {soft} soft){canary}", ""]
+    rows = result.get("ampacity_bottleneck") or {}
+    if rows:
+        # The number a person checking the electrics wants, and the one the board was quietly failing
+        # while the gate read the net's widest track (S7 review, finding 1): what the **narrowest**
+        # copper on each rail's worst pad-to-pad path can carry, vias included.
+        lines += ["## Power, end to end", ""]
+        lines += [f"- {line}" for line in bottleneck_lines(rows)]
+        lines += [""]
     if result.get("error"):
         lines += ["## Error", "", result["error"], ""]
     (out_dir / "FAB_NOTES.md").write_text("\n".join(lines))

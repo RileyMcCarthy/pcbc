@@ -869,6 +869,11 @@ its class. A spine writes at the class width or refuses, and never in between:
 | node | 15 | **14** | mostly `GND` and `3V3` plane leftover; `VBUS` is the only spine there |
 | ds2 | 3 | 3 | ds2 has no spine at all, and that is the first open issue |
 
+**Read this table with S7r's millimetres beside it.** `width_power` counts necked **segments**, so
+the same copper cut into fewer pieces reads as an improvement: buck's fall is real (52.65 → 20.42 mm
+of sub-class power copper), c3_usb's and node's are mostly KRT re-segmenting identical copper, and the
+one net c3_usb spined had no `width_power` hits to lose. The per-net millimetres are in S7r.
+
 **Before and after, every board, fresh builds** (`pcbc build --force` into a temp copy). "Before" is
 S5r as landed. `PCBC_PATTERNS=off` on this same source reproduces the **S1b** row exactly on all five
 — blinky 6/0/2/22.5/1.03, buck 96/4/3/26/142.5/2.09, c3_usb 342/8+5/7/139/312.8/1.92,
@@ -887,7 +892,9 @@ The gate is verified on all five (KiCad DRC clean, zero unconnected items, the c
 bound exactly as `board.py` says); `verify_copper` is empty on all five; every plane comes back one
 island after the gate's refill and there is not a via-in-pad blocker anywhere;
 `copper.power_ampacity_failures` is empty on every board and is now asserted per build rather than
-only through the fab stage.
+only through the fab stage — **and that assertion said nothing about the board as S7 shipped it**,
+because the function read the net's widest track. See S7r: the gate now judges the copper pcbc wrote
+and can fail, and `ampacity.power_bottlenecks` measures what each rail really carries.
 
 Two builds of c3_usb and node into two directories, one of them under a different `PYTHONHASHSEED`,
 give an **identical** `copper.json` and routed boards differing in exactly the one and five absolute
@@ -909,13 +916,29 @@ A spine writes **no vias**: R2 forbids a layer change on one (H.4), so `vias_pat
 
 ### What each board spines, and what it does not
 
-| board | candidate nets | spined | links made | refused |
-|---|---|---|---|---|
-| blinky | 0 | — | — | 0 |
-| buck | 2 (`5V`, `VIN`) | 2 | `5V` 3 of 4, `VIN` 2 of 4 | **2** |
-| c3_usb | 2 (`3V3`, `VBUS`) | 2 | `3V3` 4 of 7, `VBUS` 1 of 6 | **2** |
-| node | 1 (`VBUS`) | 1 | 3 of 6 | **1** |
-| ds2 | 0 | — | — | 0 |
+| board | candidate nets | spined | pad pairs joined | coverage | refused |
+|---|---|---|---|---|---|
+| blinky | 0 | — | — | — | 0 |
+| buck | 2 (`5V`, `VIN`) | 2 | `5V` 3 of 4, `VIN` 2 of 4 | 0.639, **0.159** | **2** |
+| c3_usb | 2 (`3V3`, `VBUS`) | **1** | `3V3` **5** of 7, `VBUS` **0** of 6 (no copper) | 0.683, 0.000 | **2** |
+| node | 1 (`VBUS`) | 1 | 3 of 6 | 0.477 | **1** |
+| ds2 | 0 | — | — | — | 0 |
+
+**Two cells in this row were wrong as first published and the review caught both** (S7 review,
+findings 5, 8, 15, 17). c3_usb spines **one** net, not two: the `VBUS` spine refuses all six of its
+links and writes no copper at all, so the board's nine `spine` pieces (25.13 mm) are `3V3`'s alone.
+And `3V3` joins **five** of its seven pad pairs, not four, because a link that runs over a third
+station of its own net connects it for free and no count of successful `_link` calls can see that.
+
+Both numbers now come off the copper rather than off a hand-copied row: `PatternResult.links` is
+`stations - components` over a union-find of the emitted pieces and the station pads,
+`route_emit.census_by_net` splits D.4's census by net as well as by reason, and
+`test_examples_fab.py::SPINE_LINKS` and `SPINE_NETS` pin both per board, exact. A net listed as
+spined that writes no copper is now a test failure.
+
+`coverage` is spine millimetres over the net's own airwire, and it is the column that separates a
+spine that replaced a route from one that got in its way. By links made, buck's `VIN` (2 of 4) and
+node's `VBUS` (3 of 6) are indistinguishable; by coverage they are 0.159 and 0.477.
 
 **Not one spine on these boards connects its whole net**, and that is B.4's own answer rather than a
 failure: a pad whose link fails splits the spine and both halves are kept, `net_open` hands what is
@@ -976,9 +999,19 @@ reason, and they are open issues, not a footnote.
 
 c3_usb is the mirror image and worth reading beside it: its `angles` rise 122 → **130** and its
 routed length 356.7 → 361.2 mm, while `USB_DN` — the differential pair, KRT's until R4 — comes out
-**shorter**, 1.81 → **1.65**, and `USB_DP` 1.62 → 1.56, because `VBUS` is no longer wandering
-through the pair's corridor. Its `3V3` detour rises 1.38 → 1.53 and its `BOOT` 1.05 → 1.18. node
-moves barely at all: off-45 30 → 25, micro 62 → 54, `angles` 98 → 100, one `width_power` hit.
+**shorter**, 1.81 → **1.65**, and `USB_DP` 1.62 → 1.56. Its `3V3` detour rises 1.38 → 1.53, its
+`BOOT` 1.05 → 1.18 and its `GND` 1.44 → 1.48. node moves barely at all: off-45 30 → 25, micro
+62 → 54, `angles` 98 → 100, one `width_power` hit.
+
+**The reason first given for the pair's improvement was wrong and is withdrawn** (S7 review, finding
+18). It read "because `VBUS` is no longer wandering through the pair's corridor"; pcbc writes **no**
+`VBUS` copper on c3_usb — the spine refuses all six of its links — and `VBUS`'s own detour is
+1.70 before and after, the one c3_usb net in `totals["detours"]` that does not move. The only net the
+spine wrote copper for there is `3V3`, whose 25.1 mm backbone is locked before KRT's `signals` step
+and whose own detour rose 1.38 → 1.53 to pay for it. Whether that is what straightened the pair is
+not measured here, so the pair's 1.81 → 1.65 is recorded as unattributed leftover motion rather than
+given a cause: showing it would take a build with the `3V3` spine suppressed, the way the `crowded`
+claim was shown by disabling `crowded`.
 
 ### ds2, and the sweep that decided `WIDE_MM`
 
@@ -1021,9 +1054,10 @@ reaches is S7's second open issue rather than a number with no measurement behin
 
 - **`chain` (S6) has not landed**, so C.1's step 4 does not exist and the spine is the only pattern
   in the mid stage. The two are independent; the order in `patterns.MID` is C.1's and has room for it.
-- **The comb's rib neck** is implemented to B.4 item 5 and floored at the branch's own share, and no
-  rib on any of the five boards necks, because no comb fits. `test_no_spine_copper_is_ever_narrower_than_its_class`
-  puts the rule to `_rib_width` directly instead.
+- **The comb's rib neck** is implemented to B.4 item 5, and no rib on any of the five boards necks
+  because no comb fits. `test_no_spine_copper_is_ever_narrower_than_its_class` puts the rule to
+  `_rib_width` directly instead. The rule it puts is not the one S7 shipped: the review found the
+  neck floored on `amps / pads`, which under-sized the one branch that carries everything (below).
 - **Nothing about differential pairs**, except where the leftover moved: `USB_DN` and `USB_DP` are
   KRT's until R4, and their improvement on c3_usb is a by-product, not a claim.
 
@@ -1043,6 +1077,208 @@ reaches is S7's second open issue rather than a number with no measurement behin
 4. **c3_usb's `angles` 122 → 130 and node's 98 → 100.** pcbc's own 135-degree rule, rising for the
    third slice running (S5's open issue 2 is the same number). Every corner a pattern writes is
    mitred; these are the leftover's, meeting locked copper at whatever angle KRT chose.
-5. **Five of eight nets are not spined at all and three of five that are get half their links.**
-   `VBUS` on c3_usb gets 1 link of 6. The gap between "pcbc owns the power nets" and what this slice
-   ships is the maze router, which is R3.
+5. **Four of the eight candidate nets write copper, and every one of the four is partial.** The
+   population is exactly eight: buck's `5V` and `VIN`, c3_usb's `3V3` and `VBUS`, node's `VBUS`, and
+   ds2's `3V3`, `VDDA` and `VSS`. The three ds2 nets are excluded by `WIDE_MM` (0.25 < 0.4) and
+   c3_usb's `VBUS` refuses all six of its links and writes nothing, so four write copper: buck's `5V`
+   joins 3 of its 4 pad pairs, buck's `VIN` 2 of 4, c3_usb's `3V3` 5 of 7 and node's `VBUS` 3 of 6.
+   (The sentence here first said "five of eight nets are not spined and three of five that are get
+   half their links", which contradicted the table two sections above it — S7 review, finding 21.
+   `specs` filters on **terminals**, so "three or more pads" is three or more footprints, which is
+   worth saying since it is the only place the population is named.) The gap between "pcbc owns the
+   power nets" and what this slice ships is the maze router, which is R3.
+6. **Three of the five boards do not carry their declared current end to end, and R2 cannot fix
+   them.** buck's `VIN` carries 1.21 A of 2 A, node's `VBUS` 0.527 A of 1 A through a single 0.2 mm
+   via, and c3_usb's `VBUS` runs 24.07 mm below its class including 0.127 mm cut edges in series. The
+   copper that necks is KRT's leftover in every case. Recorded as a ledger below and pinned in
+   `test_examples_fab.py::BOTTLENECK`; R3's maze router owns it.
+7. **Same-net copper closer than the process floor.** buck 1, c3_usb 22, node 16 places where two
+   pieces of one net sit under `clearance_min` apart with bare laminate across the gap. The class is
+   pre-existing rather than the spine's — `PCBC_PATTERNS=off` measures buck 3, c3_usb 17, node 22 —
+   but nothing measured it at all until the review, and a wide locked spine is the copper most likely
+   to be hugged.
+
+---
+
+## S7r — the review of S7, and what the twenty-three findings moved
+
+Four independent attacks on S7, 23 findings, 14 of them bug-grade. **No board changed**: every BAR,
+SOFT, OWNS, DETOURS and refusal number in the tables above is byte-for-byte what S7 recorded, because
+every bug was in a measurement, a printed sentence or a rule no board reaches yet. What changed is
+what the build can see and what it says.
+
+### The gate could not fail, and three boards were failing its criterion
+
+`copper.power_ampacity_failures` compared `copper_by_net`'s `width` — a **`max`** over the net's
+segments — against IPC. One wide segment satisfied a whole net however narrow the rest of it was, so
+the check returned `[]` on every board and could not have returned anything else. S7 added a
+per-build assertion that it is empty and offered it as proof that "a spine that necks is the bug it
+exists to fix" is enforced; the same assertion passes on the `PCBC_PATTERNS=off` board whose `VIN` is
+two thirds fab-floor copper. Four of the twenty-three findings are this one (1, 7, 12, 20), and a
+fifth (2) is the same blindness one layer down: nothing in the build read a **via's** current at all,
+and `ViaSpec.per_change` appeared nowhere outside `constraints.py`.
+
+It is now two questions, because they have two different answers.
+
+**The gate** (`power_ampacity_failures`) judges the copper **pcbc wrote**, off `routed/copper.json`:
+a hop, a spine trunk or a backbone link narrower than its class fails the build, with the one
+exemption R-I3 already grants (`tap` and `fanout` pad necks, which `TAP_NECKED` counts). It is empty
+on all five boards and it is now failable — `test_examples_fab.py` re-runs it with the same copper
+declared narrow and requires it to fire.
+
+**The measurement** (`ampacity.power_bottlenecks`) is the honest whole-net question: the
+widest-bottleneck path between every pair of a net's pads over the copper that actually touches, with
+each piece carrying what it can carry — `stackup.track_amps` (the exact inverse of
+`current_width_mm`) for a track, `stackup.via_amps` for a via, and vias within 1.0 mm of each other
+counted as parallel. The unit is amps because a 0.2 mm drill and a 0.2 mm track are not comparable as
+widths: 0.527 A against 0.745 A. A net with a zone in the file is exempt — a plane is the rail's
+conductor — and the exemption reads the **file**, not `job.planes`, which is `()` on buck, c3_usb and
+ds2 while all three have a poured `GND`.
+
+What it says, `PCBC_PATTERNS=off` → as built, with the millimetres of that net's copper under its
+class beside it:
+
+| net | carries, off | carries, built | class | under class, off → built | verdict |
+|---|---|---|---|---|---|
+| buck `5V` | 0.707 A (a via) | **1.999 A** (0.781 mm) | 2 A | 9.68 → **0.00** mm | ok |
+| buck `VIN` | 0.536 A (0.127 mm) | **1.21 A** (0.3905 mm) | 2 A | 41.64 → **19.39** mm | **under current** |
+| c3_usb `3V3` | 0.707 A (a via) | **1.231 A** (0.4 mm) | 0.5 A | 0.00 → 0.00 mm | ok |
+| c3_usb `VBUS` | 0.536 A (0.127 mm) | 0.536 A (0.127 mm) | 0.5 A | 20.56 → **24.07** mm | **under floor** |
+| node `VBUS` | 0.527 A (a via) | 0.527 A (a via) | 1 A | 7.60 → **6.48** mm | **under current** |
+| node `LOAD` | 1.231 A | 1.231 A | 1 A | 0.00 → 0.00 mm | ok |
+
+Three things to read in it.
+
+- **The spine's real win is buck, and it is large.** `5V` goes from a 0.707 A via bottleneck to the
+  full 2 A, and `VIN`'s own 2 A path — `J_IN.1 → U1.3`, connector to regulator pin — goes from
+  **0.127 mm to 0.781 mm**, a factor of six. `VIN`'s remaining 0.3905 mm bottleneck is on the branch
+  to `R_EN.1`, a 100 k pull-up drawing 0.12 mA, which is the one leaf where a neck is defensible.
+- **c3_usb's `VBUS` got worse.** 20.56 → 24.07 mm under class, on the net the spine refused, because
+  the 25.1 mm `3V3` backbone is in its way. That is the obstruction cost, and no number in S7 could
+  show it. Its verdict is `under floor` rather than `under current`: 0.127 mm carries 0.536 A of its
+  0.5 A on the IPC-2221B curve with 7 % margin, and the 0.150 mm it is short of is pcbc's own
+  manufacturability floor. Seven per cent and no allowance for the LDO's inrush is not margin.
+- **node's `VBUS` is a via problem, not a track problem** (finding 2). Its 1 A crosses two single
+  0.2 mm-drill vias in series, each rated 0.527 A — 1.9x over, twice — and the class via for that net
+  is 0.8/0.4 (0.871 A), which KRT was never handed. Both vias are KRT's; the spine writes none.
+
+**This is a ledger and not a build-stopper**, and the reason is stated rather than assumed: the copper
+that necks is KRT's leftover on every one of the three, and R2 has no slice that can move it. Making
+it fatal would stop all three boards instead of measuring them. `BOTTLENECK` in
+`test_examples_fab.py` pins `carries` as a floor that must rise and `under_mm` as a ceiling that must
+fall, per net, per board.
+
+### A branch's current is a property of the pin, not of the pad count
+
+`_rib_width` floored a rib's neck at `current_width_mm(amps / pads)` and then let the pad's own
+across dimension decide. On buck's `VIN` that is 2 A over five pads = 0.4 A a pad, and **no pad on
+that net draws it**: `J_IN.1` (the input connector) and `U1.3` (the TPS54202's VIN pin) carry the
+whole 2 A in series, the two 22 uF caps carry ripple, and `R_EN.1` carries 12 V / 100 k = 0.12 mA. So
+the rule asked `U1.3` for a rib of **0.532 mm** — a SOT-23-6 pad's width, arrived at by luck of
+package geometry — which carries 1.513 A of that pin's 2 A, while handing 0.54 mm to a pull-up that
+needs four orders of magnitude less (findings 4, 6, 11).
+
+The fix is to stop dividing. A rib may neck only into a **bypass pad**, and that is the one
+population pcbc can name today: a declared two-terminal passive whose other pad is on a plane or
+return net, which is `tap`'s own test. Everything else — an IC's power pin, a connector, a series
+passive — gets the trunk width, and when the trunk width does not fit beside its neighbours `blocked`
+refuses the comb, which is B.0's "a pattern never degrades" enforced by the clearance table rather
+than by a second rule. `share` survives as the floor under a bypass rib, and the string the refusal
+prints now says it is a placeholder and names the pads it applies to, instead of stating a per-pad
+current as fact on all five boards.
+
+Latency, stated plainly: the comb fits no net here, so this under-width copper was never on a board.
+It was the rule that would decide the first one.
+
+### Two bugs in the comb's own geometry, both visible in the refusal it prints
+
+- **The free-lane window on a diagonal was the bounding box** (finding 13). `_project` returns the
+  min and max of `u` over the outline's four corners, which is right as a conservative obstacle
+  extent and wrong as a containment window: the across range attainable on a diagonal shrinks as you
+  move along it. c3_usb's `VBUS` got a window of `(0.6, 69.4)` and spent both its candidate offsets
+  on lanes whose trunk endpoints are off a board that ends at x=39.7, y=29.7 — one of them at x=45.0
+  — while the refusal said "2 free lanes there could take it" one line above naming the board edge as
+  the blocker. `spine.trunk_window` now returns the attainable range, intersected at the span's two
+  ends (exact, because the bound is linear in `along`), less the trunk's own half width. The real
+  window for that net is `(23.9078, 53.2272)`. It also shrinks the `x` and `y` windows by the same
+  half width, which moves ds2's `VDDA` comb offset 2.9705 → 3.033 and buck's widest reported lane
+  5.243 → 4.853 mm — lanes that could not hold the trunk centred in them were never lanes.
+- **The refusal printed the lane's coordinate with the wrong axis letter** (finding 14). The offset
+  is an **across** coordinate and the string labelled it with the trunk's **along** axis: buck's
+  `VIN` printed `x=2.922` for a `y`, c3_usb's `VBUS` printed `v=56.605` for a value `v` cannot take
+  over that span at all, and `docs/r2-design.md` B.4's own worked example has it right. It is the one
+  number a person or an agent acts on — the line ends in `Place("J_IN", toward="left")`. `ACROSS` is
+  the fix, and a test asserts the printed letter differs from the trunk's on every refusal on every
+  board, so the two cannot drift back together.
+
+### What the leftover paid, which nothing measured
+
+`copper_bar`'s per-net `routed_mm` and `detour` are over **all** the copper on a net, pattern and
+leftover together, so a spine that adds to KRT's route rather than replacing it looks like a win in
+every number that existed (finding 10). `nets[net]` now carries `pattern_mm`, `leftover_mm`,
+`leftover_segments`, `leftover_vias` and `leftover_micro` beside them, and the trade, against the
+`PCBC_PATTERNS=off` leftover, is:
+
+| net | spine mm | leftover off → built | leftover mm saved per mm of spine | coverage |
+|---|---|---|---|---|
+| buck `5V` | 14.62 | 24.23 → 11.59 | **0.87** | 0.639 |
+| buck `VIN` | 3.38 | 44.30 → **50.68** | **-1.88** | **0.159** |
+| c3_usb `3V3` | 25.13 | 40.38 → 31.09 | 0.37 | 0.683 |
+| node `VBUS` | 8.82 | 24.79 → 14.52 | 1.16 | 0.477 |
+
+**A coverage floor was proposed and is rejected, and the measurement is why.** Finding 9 asked for
+`SPINE_COVER_MIN = 0.30`, which drops buck's `VIN` alone: its 3.38 mm of spine buys +6.27 mm of
+leftover, +38 segments, +40 staircases and `VIN`'s detour 2.09 → 2.55, and a `5V`-only buck is better
+than the shipped one on every BAR number except `width_power`. But the same build is worse on the
+number this slice exists for: `VIN`'s 2 A path `J_IN.1 → U1.3` is **0.127 mm without the `VIN` spine
+and 0.781 mm with it** (measured on the `PCBC_PATTERNS=off` board, whose `VIN` leftover is identical
+to a `5V`-only board's — the two spines do not interact). Refusing that spine would trade a factor of
+six on the rail's only series path for staircases the fab does not care about, and a necked power
+track is an electrical fact while a staircase is not — `docs/r2-design.md` F.3 item 7's own argument,
+applied in the direction it points. The coverage ratio is **reported** per net instead, in
+`PatternResult.coverage`, in the table above and pinned in `SPINE_LINKS`, so a future spine that
+covers less than buck's `VIN` is a number that moved rather than a silence.
+
+### `width_power` counts segments, and two of its three falls are re-segmentation
+
+`width_power` is a KiCad `track_width` warning count — one hit per necked **segment** — so the same
+copper cut into fewer pieces reads as an improvement (finding 19). Per net, against
+`PCBC_PATTERNS=off`, in millimetres of copper under the class:
+
+- **buck: genuine.** `5V` 9.68 → **0.00** mm, `VIN` 41.64 → **19.39** mm, `GND` 7.41 → 1.02 mm. The
+  whole of `VIN`'s 0.127 mm copper is gone.
+- **c3_usb: not the spine's width.** The one net it spined, `3V3`, had no necked copper before the
+  slice and none after (0.00 → 0.00 mm). `VBUS`, which it refused, went 20.56 → **24.07** mm — worse
+  — and `GND` 16.02 → 5.31 mm. The fall in the hit count is `VBUS`'s copper re-segmented and `GND`'s
+  taps.
+- **node: one segment.** `VBUS` 7.60 → 6.48 mm.
+
+The millimetres are what `BOTTLENECK`'s `under_mm` pins, per net, so a fall that is only
+re-segmentation cannot be reported as a width win again.
+
+### The clearance question neither pcbc nor KiCad asks
+
+`route_scene._pair_clashes` skips the copper and mask rules for a same-net pair by design, KiCad
+exempts same-net pairs from clearance entirely, and KRT treats its own net as free — so nothing
+anywhere looks at how close a net's own copper comes to itself (finding 16). `route_verify.same_net_slots`
+counts it: same-net copper on one layer closer than the process floor, with the closest-approach line
+sampled and any gap another piece of same-net copper fills discarded, which removes every mitre
+corner and continuous run exactly. Built: blinky 0, buck 1, c3_usb 22, node 16, ds2 0, against
+`PCBC_PATTERNS=off` buck 3, c3_usb 17, node 22. The class is pre-existing and both directions move,
+so it is a census and not a rule; node's tightest is 0.050 mm between KRT's leftover and the locked
+`VBUS` spine on a board whose floor is 0.0889 mm.
+
+### The nits, and one number that did not reproduce
+
+- `crowded`'s docstring cited exit distances no build produces (finding 22). Re-taken:
+  `C_IN1.1 → U1.3` are 1.7160 mm apart with widest exits **1.3156 and 1.1266** mm, not 1.09 and 0.73.
+  `C_IN2.1 → R_EN.1` is dropped from the list of pairs the centre line rescued — it measures roomy,
+  gets six candidates rather than 115, and still fails with `no candidate` — and a test now asserts
+  that, so the docstring cannot drift back to claiming it.
+- Every tightened BAR ceiling sits at its measured value (finding 23). That is deliberate and now
+  says so: KRT and KiCad are pinned to exact versions, the assertion is `<=`, so an improvement
+  passes silently and only a regression fails. The two `DETOURS` risers the comment did not name —
+  buck's `5V` 1.12 → 1.14 and c3_usb's `GND` 1.44 → 1.48 — are named.
+- **One pinned number did not reproduce**: finding 11 gives `ipc2221_amps(0.532)` as 1.515 A and
+  finding 4 gives 1.513 A for the same width. pcbc's own curve says **1.513**, and that is what the
+  docs and the assertion carry.

@@ -37,6 +37,7 @@ from pcbc.patterns import (
 )
 from pcbc.patterns.hop import DETOUR_MAX, HOP_MM, specs as hop_specs
 from pcbc.patterns.spine import (
+    ACROSS,
     AXES,
     SpineSpec,
     WIDE_MM,
@@ -50,11 +51,15 @@ from pcbc.patterns.spine import (
     link_shapes,
     run as spine_run,
     specs as spine_specs,
+    shunt_stations,
     spine_widths,
     trunk_axis,
     trunk_span,
+    trunk_window,
     world as spine_world,
 )
+from pcbc.patterns import _nm as _spine_nm
+from pcbc.route_scene import _project as _spine_project
 from pcbc.patterns.tap import TAP_REACH_MM, anchor, specs as tap_specs, tap_via
 from pcbc.route import bar_key, krt_plan, pin_copper_ids, write_fab_overrides
 from pcbc.route_emit import piece_key, seg_piece, via_piece, write_pieces
@@ -1181,11 +1186,13 @@ def test_a_trunk_carries_the_whole_net_and_a_branch_its_own_share():
     """The width is not decoration. `Constraint.current.amps` is what the net carries and
     `stackup.current_width_mm` — `max(IPC-2221B external, IPC-2152 with the board and plane
     modifiers)` — is the curve `Constraint.width_mm` was itself derived from, so asking it again where
-    the copper is written is a check and not a second opinion. A branch carries `amps / pads`, which
-    is `tap.tap_via`'s own division for the same reason: a decoupling cap's ripple is not the rail.
+    the copper is written is a check and not a second opinion.
 
-    Measured on buck's `VIN`, the widest power net on any of these boards: 2 A across 5 pads asks
-    0.781 mm of the trunk and 0.15 mm of a branch, a factor of 5.
+    `share` is `amps / pads` and is a **placeholder**: no pad on any of these boards draws it, and the
+    string the refusal prints now says so rather than offering it as the arithmetic behind the width
+    (S7 review, finding 6). buck's `VIN` used to print "0.15 mm for one pad's 0.4 A" on every build
+    while its five pads draw 2 A (`J_IN.1`), 2 A (`U1.3`), ripple, ripple and 12 V / 100 k =
+    **0.12 mA** (`R_EN.1`).
     """
     from pcbc.stackup import current_width_mm
 
@@ -1201,16 +1208,30 @@ def test_a_trunk_carries_the_whole_net_and_a_branch_its_own_share():
                 assert s.trunk_need == want and s.share == round(c.current.amps / len(s.stations), 4), (name, s.net)
     vin = next(s for s in spine_specs(_spine_ctx("buck")) if s.net == "VIN")
     assert (vin.amps, vin.width, vin.trunk_need, vin.share, vin.branch_need) == (2.0, 0.781, 0.781, 0.4, 0.15), vin
+    # Which pads the placeholder applies to, named, so the assumption is printed rather than implied:
+    # the two 22 uF input caps and nothing else. `J_IN.1` is a two-pin part whose other pin is GND and
+    # is **not** here, because it is not a declared passive and it sources the whole rail.
+    assert vin.shunts == frozenset({"C_IN1.1", "C_IN2.1"}), vin.shunts
     assert vin.why == (
-        "the Power class's 0.781 mm trunk against the 0.781 mm IPC asks for VIN's whole 2 A, and 0.15 mm for one pad's 0.4 A"
+        "the Power class's 0.781 mm trunk against the 0.781 mm IPC asks for VIN's whole 2 A, and every rib at that "
+        "width too except into a bypass pad (C_IN1.1, C_IN2.1), which may neck to 0.15 mm — an even 1/5 share of 2 A, "
+        "a placeholder and not a current any pad was declared to draw"
     ), vin.why
 
 
 def test_no_spine_copper_is_ever_narrower_than_its_class():
     """B.0's "a pattern never degrades", at its sharpest. A trunk and every backbone link are written
     at the class width or not at all — the refusal is the answer, never a narrower track — and the
-    only copper allowed to neck is a comb's **rib**, R-I3's own allowance for the last millimetre into
-    a pad, floored at the width that branch's share of the current needs."""
+    only copper allowed to neck is a comb's rib **into a bypass pad**, R-I3's allowance for the last
+    millimetre into a decoupling cap.
+
+    The S7 review found the old rule necking by pad count rather than by what the pin draws (findings
+    4 and 11): `_rib_width` returned **0.532 mm** for buck's `U1.3` — the TPS54202's VIN pin, which
+    carries the whole 2 A — because a SOT-23-6 pad is 0.532 mm across and the floor under it was
+    `amps / pads`, computed for 0.4 A that no pad on the net draws. 0.532 mm of 1 oz copper carries
+    1.513 A on the IPC-2221B external curve at VIN's own 10 C rise, so the rule under-sized by a third
+    the one branch that carries everything, and the ampacity gate could not have reported it.
+    """
     for name in ALL:
         plan, _d, job, _t = _mid(name)
         for p in plan.pieces:
@@ -1218,12 +1239,18 @@ def test_no_spine_copper_is_ever_narrower_than_its_class():
             assert p.w == float(c.width_mm.value), (name, p.net, p.w, "every backbone link is the class width end to end")
     ctx = _spine_ctx("buck")
     vin = next(s for s in spine_specs(ctx) if s.net == "VIN")
-    small = next(t for t in vin.stations if t.owner == "R_EN.1")  # a 0.54 x 0.64 pad under a 0.781 mm class
-    assert rib_width(ctx, vin, small, "x") == 0.54, "R-I3's allowance: a rib necks TO the pad, and 0.54 still carries this pad's 0.4 A"
-    assert rib_width(ctx, vin, small, "x") >= vin.branch_need, (vin.branch_need, "and never below what the branch carries")
-    hungry = SpineSpec(**{**vin.__dict__, "branch_need": 0.7})
-    assert rib_width(ctx, hungry, small, "x") == 0.7, "the share floor bites before the pad's own dimension does"
-    assert rib_width(ctx, SpineSpec(**{**vin.__dict__, "branch_need": 9.0}), small, "x") == 0.781, "and the class width is still the cap"
+    series = next(t for t in vin.stations if t.owner == "U1.3")  # the regulator's VIN pin: the whole 2 A
+    assert rib_width(ctx, vin, series, "x") == 0.781, "IPC-2221B external at 10 C: 0.532 mm carries 1.513 A of this pin's 2 A"
+    pullup = next(t for t in vin.stations if t.owner == "R_EN.1")  # a 100 k pull-up: 12 V / 100 k = 0.12 mA
+    assert rib_width(ctx, vin, pullup, "x") == 0.781 and pullup.owner not in vin.shunts, "a series passive is not a bypass pad"
+    cap = next(t for t in vin.stations if t.owner == "C_IN1.1")  # 22 uF to GND: ripple, not the rail
+    assert rib_width(ctx, vin, cap, "x") == 0.781, "and this pad is 1.0 x 1.45, so it takes the class width whole"
+    small = SpineSpec(**{**vin.__dict__, "width": 1.6})
+    assert rib_width(ctx, small, cap, "x") == 1.0, "R-I3's allowance: a rib into a bypass pad necks TO the pad"
+    assert rib_width(ctx, small, series, "x") == 1.6, "and never into an IC's power pin, whatever the pad measures"
+    hungry = SpineSpec(**{**small.__dict__, "branch_need": 1.2})
+    assert rib_width(ctx, hungry, cap, "x") == 1.2, "the share floor bites before the pad's own dimension does"
+    assert rib_width(ctx, SpineSpec(**{**small.__dict__, "branch_need": 9.0}), cap, "x") == 1.6, "and the class width is still the cap"
 
 
 def test_the_trunk_axis_is_the_widest_spread_with_x_y_u_v_breaking_a_tie():
@@ -1273,10 +1300,15 @@ def test_two_crowded_pads_get_the_centre_line_and_roomy_ones_do_not():
     pads of one net routinely sit **inside** each other's exits and every one of B.0's 112 candidates
     doubles back on itself.
 
-    Measured at 0.781 mm on buck: `C_IN1.1 -> U1.3` are 1.716 mm apart with their exits 1.3156 and
-    1.1266 mm out; `U1.3 -> C_IN2.1` 1.543 mm, `C_IN2.1 -> R_EN.1` 3.009 mm. Three of `VIN`'s four
-    links, all of them hairpins `mitre` refuses. The centre line is exempt from nothing: `blocked`
-    judges it exactly as it judges the rest, and it is offered only where the exits cross.
+    Measured at 0.781 mm on buck: `C_IN1.1 -> U1.3` are 1.7160 mm apart with their widest exits
+    1.3156 and 1.1266 mm out, and `U1.3 -> C_IN2.1` 1.5432 mm with 1.1266 and 1.3156. The centre line
+    is exempt from nothing: `blocked` judges it exactly as it judges the rest, and it is offered only
+    where the exits cross.
+
+    `C_IN2.1 -> R_EN.1` was listed in `crowded`'s docstring as a third case of the same thing and is
+    not one (S7 review, finding 22): 3.0093 mm against 1.3156 + 0.9106 measures **roomy**, gets six
+    candidates rather than 115, and still fails with `no candidate`. It is asserted here so the
+    docstring cannot drift back to claiming it.
     """
     ctx = _spine_ctx("buck")
     spec = next(s for s in spine_specs(ctx) if s.net == "VIN")
@@ -1296,6 +1328,13 @@ def test_two_crowded_pads_get_the_centre_line_and_roomy_ones_do_not():
     en = pad_exits(ctx.scene, near.item, spec.width, spec.layer)
     assert not crowded(far, near, ef, en), "14.963 mm apart: B.0's enumeration keeps it to itself"
     assert all(not n.startswith("centre") for n, _p in link_shapes(far, near, ef, en))
+    roomy_a, roomy_b = by["C_IN2.1"], by["R_EN.1"]
+    ra = pad_exits(ctx.scene, roomy_a.item, spec.width, spec.layer)
+    rb = pad_exits(ctx.scene, roomy_b.item, spec.width, spec.layer)
+    assert round(math.dist(spine_anchor(roomy_a), spine_anchor(roomy_b)), 4) == 3.0093
+    assert not crowded(roomy_a, roomy_b, ra, rb) and len(link_shapes(roomy_a, roomy_b, ra, rb)) == 6, (
+        "finding 22: a pair the centre line never helped, and the docstring said it did"
+    )
 
 
 def test_a_backbone_is_one_run_so_the_turn_at_a_station_is_mitred():
@@ -1346,15 +1385,18 @@ def test_the_comb_is_the_first_form_and_it_fits_no_net_on_these_boards():
 
     ctx = _spine_ctx("ds2")
     st = terminals(ctx.scene, "VDDA")
-    w, share, tn, bn, why = spine_widths(ctx.scene, ctx.cs, "VDDA", len(st))
+    shunts = shunt_stations(ctx, st)
+    w, share, tn, bn, why = spine_widths(ctx.scene, ctx.cs, "VDDA", st, shunts)
     spec = SpineSpec(
         net="VDDA", layer="F.Cu", stations=st, width=w, amps=0.1, share=share, trunk_need=tn,
-        branch_need=bn, why=why, airwire=round(airwire_mm([spine_anchor(t) for t in st]), 4),
+        branch_need=bn, why=why, airwire=round(airwire_mm([spine_anchor(t) for t in st]), 4), shunts=shunts,
     )
     assert trunk_axis(ctx.scene, spec) == "x" and trunk_span(spec, "x") == (8.04, 23.0015)
     comb, _seen = _spine_comb(ctx, spec)
     assert comb["candidate"] == "comb along x at 12.7 on F.Cu", comb["candidate"]
-    assert comb["offsets"] == (12.7, 7.6903, 2.9705, 20.32), (comb["offsets"], "a pad's own row first, then lane centres nearest the median")
+    assert comb["offsets"] == (12.7, 7.6903, 3.033, 20.32), (comb["offsets"], "a pad's own row first, then lane centres nearest the median")
+    # 2.9705 before the S7 review: the lane hugging the board edge is now shrunk by the trunk's own
+    # half width at both ends, so its centre moves 0.0625 mm inward (`trunk_window`, finding 13).
     assert [(round(p.a[0], 4), round(p.a[1], 4), round(p.b[0], 4), round(p.b[1], 4)) for p in comb["pieces"]] == [
         (8.04, 12.7, 23.0015, 12.7),     # the trunk, extended to each end pad's own half size
         (20.33, 6.4411, 19.88, 6.4411),  # C4.1's ell: its foot is blocked, so it steps along the trunk
@@ -1378,6 +1420,16 @@ def test_a_spine_refusal_is_a_move():
     The line says the trunk it wanted with the arithmetic behind its width, what `free_intervals`
     found, the blockers worst first with the rule that decided each, the links the backbone did and
     did not make, the candidates it tried, and an edit.
+
+    Three numbers in it moved in the S7 review and each is a bug the string was carrying:
+
+    - the lane's coordinate is labelled with the **across** axis, `y`, not the trunk's own `x`
+      (finding 14). It is the one number a person or an agent acts on, and every shipped refusal on
+      every board named the wrong axis for it — `ACROSS` and the assertion below are the fix.
+    - the widest lane is 4.853 mm rather than 5.243 mm and sits at y=3.117 rather than y=2.922,
+      because `trunk_window` now shrinks the board's own window by the trunk's half width at both
+      ends (finding 13): a lane that cannot hold this trunk centred in it is not a lane it could take.
+    - the width arithmetic no longer states a per-pad current no pad draws (finding 6).
     """
     plan, _d, _j, _t = _mid("buck")
     assert not any(r.hard for r in plan.refusals()), plan.refusals()
@@ -1385,16 +1437,59 @@ def test_a_spine_refusal_is_a_move():
     vin = next(r for r in plan.refusals() if r.net == "VIN")
     assert vin.move.splitlines() == [
         "spine VIN: 5 stations from C_IN1.1 to U1.3 cannot reach one trunk at 0.781 mm (the Power class's 0.781 mm "
-        "trunk against the 0.781 mm IPC asks for VIN's whole 2 A, and 0.15 mm for one pad's 0.4 A).",
+        "trunk against the 0.781 mm IPC asks for VIN's whole 2 A, and every rib at that width too except into a bypass "
+        "pad (C_IN1.1, C_IN2.1), which may neck to 0.15 mm — an even 1/5 share of 2 A, a placeholder and not a current "
+        "any pad was declared to draw).",
         "  In the way: the trunk along x across 1.6..19.37 does not fit on F.Cu at 0.781 mm: 3 free lanes there could "
-        "take it (the widest is 5.243 mm at x=2.922) and none of the 3 tried, nearest the pads' median first, clears.",
-        "  In the way of the trunk, worst first: U1.4 [FB] at 17.41,7.66 leaves -0.391 mm of the 0.200 mm class Power "
-        "needs (rule: copper); L1.1 [SW] at 19.71,13.996 leaves -0.391 mm of the 0.200 mm class Power needs (rule: copper)",
+        "take it (the widest is 4.853 mm at y=3.117) and none of the 3 tried, nearest the pads' median first, clears.",
+        "  In the way of the trunk, worst first: R_FB_TOP.2 [FB] at 18.54,7.66 leaves -0.470 mm of the 0.200 mm class "
+        "Power needs (rule: copper); U1.4 [FB] at 17.41,7.66 leaves -0.391 mm of the 0.200 mm class Power needs "
+        "(rule: copper)",
         "  The backbone linked 2 of its 4 links and left J_IN.1->C_IN1.1, C_IN2.1->R_EN.1 (rule: copper)",
         "  Tried 3 trunk offsets of at most 6 and 8 backbone candidates of at most 4 x (4 x 4 x 7 + 3).",
         '  Moves: Place("J_IN", toward="left") opens the lane the trunk wants; or NetReq("VIN", layers=["B.Cu"]) takes '
         'the spine to the other side; or NetReq("VIN", amps=2) narrows the trunk to what it really carries.',
     ], vin.move
+    # The axis letter, asserted as a letter: the lane's coordinate is never on the trunk's own axis,
+    # so the two can never drift back together (finding 14).
+    for name in ALL:
+        for r in _mid(name)[0].refusals():
+            if r.pattern != "spine" or "free lane" not in r.move:
+                continue
+            along = r.move.split("the trunk along ", 1)[1][0]
+            printed = r.move.split(" mm at ", 1)[1][0]
+            assert printed == ACROSS[along] != along, (name, r.net, along, printed, r.move)
+
+
+def test_a_diagonal_trunk_window_is_the_board_and_not_its_bounding_box():
+    """Finding 13. `_project` returns the min and max of `u` over the outline's four **corners**,
+    which is right as a conservative obstacle extent and wrong as a containment window: the across
+    range attainable on a diagonal shrinks as you move along it, so the box answer offers lanes that
+    are off the board entirely.
+
+    c3_usb's `VBUS` is the case. Its window was `(0.6, 69.4)` and the two offsets the comb spent were
+    `u=56.605` and `u=66.983`; every one of the four trunk endpoints those produce is outside an
+    outline that ends at x=39.7, y=29.7 — one of them at x=45.0 — and the refusal then said "2 free
+    lanes there could take it" one line above naming the board edge as the blocker.
+    """
+    ctx = _spine_ctx("c3_usb")
+    spec = next(s for s in spine_specs(ctx) if s.net == "VBUS")
+    axis = trunk_axis(ctx.scene, spec)
+    span = trunk_span(spec, axis)
+    assert axis == "v" and (round(span[0], 4), round(span[1], 4)) == (-5.89, 23.025)
+    x0, y0, x1, y1 = ctx.scene.outline
+    box = _spine_project(ctx.scene.outline, axis)[1]
+    assert (round(box[0], 4), round(box[1], 4)) == (0.6, 69.4), box
+    lo, hi = trunk_window(ctx.scene.outline, axis, span, spec.width / 2.0)
+    # [23.625, 53.51] is the attainable `u` over the span's two ends, less the 0.2 x sqrt(2) the
+    # trunk's own half width takes on a diagonal.
+    assert (round(lo, 4), round(hi, 4)) == (23.9078, 53.2272), (lo, hi)
+    # Every offset the window allows puts both trunk ends on the board; every offset the box allowed
+    # and the window does not puts at least one of them off it.
+    for off in (lo, hi, (lo + hi) / 2.0, 56.605, 66.9829):
+        ends = [spine_world(_spine_nm(a), _spine_nm(off), axis) for a in span]
+        on = all(x0 - 1e-6 <= p[0] <= x1 + 1e-6 and y0 - 1e-6 <= p[1] <= y1 + 1e-6 for p in ends)
+        assert on == (lo - 1e-6 <= off <= hi + 1e-6), (off, ends, "a lane the comb may spend a candidate on is a lane the trunk fits in")
 
 
 def test_a_trunk_narrower_than_its_current_refuses_rather_than_being_written():

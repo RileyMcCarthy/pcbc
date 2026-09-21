@@ -172,6 +172,25 @@ def census(pieces, *, leftover: dict | None = None) -> dict:
     return doc
 
 
+def census_by_net(pieces) -> dict:
+    """The census of `census()` split by net as well as by reason.
+
+    Every piece already carries its net, so this is the same loop asked one key deeper — and it is the
+    number the S7 ledger got wrong by hand: c3_usb's spine census is 9 segments and 25.13 mm, all of
+    it `3V3`, while the table recorded `VBUS` as spined too (findings 5, 8, 15, 17). Keyed by reason
+    then net, both sorted, so the JSON is a function of the copper.
+    """
+    out: dict[str, dict[str, dict]] = {}
+    for p in pieces:
+        row = out.setdefault(p.reason, {}).setdefault(p.net, {"segments": 0, "vias": 0, "mm": 0.0})
+        row["segments" if p.kind == "seg" else "vias"] += 1
+        row["mm"] += p.mm
+    return {
+        r: {n: {**v, "mm": round(v["mm"], 4)} for n, v in sorted(nets.items())}
+        for r, nets in sorted(out.items())
+    }
+
+
 def _jsonable(v):
     """A key as JSON: tuples become lists, all the way down, so `read_sidecar(write_sidecar(x))`
     compares equal to `piece_key` after the same conversion and a diff of the file is readable."""
@@ -186,9 +205,10 @@ class Sidecar:
     refusals: list[dict] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
     census: dict = field(default_factory=dict)
+    census_nets: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
-        return {"items": self.items, "refusals": self.refusals, "notes": self.notes, "census": self.census}
+        return {"items": self.items, "refusals": self.refusals, "notes": self.notes, "census": self.census, "census_nets": self.census_nets}
 
 
 def sidecar(pieces, *, step: str, refusals=(), notes=(), leftover: dict | None = None) -> Sidecar:
@@ -215,6 +235,7 @@ def sidecar(pieces, *, step: str, refusals=(), notes=(), leftover: dict | None =
         refusals=[dict(r) for r in refusals],
         notes=list(notes),
         census=census(pieces, leftover=leftover),
+        census_nets=census_by_net(pieces),
     )
 
 
@@ -225,4 +246,10 @@ def write_sidecar(path: Path, doc: Sidecar) -> None:
 
 def read_sidecar(path: Path) -> Sidecar:
     raw = json.loads(Path(path).read_text())
-    return Sidecar(items=raw.get("items", []), refusals=raw.get("refusals", []), notes=raw.get("notes", []), census=raw.get("census", {}))
+    return Sidecar(
+        items=raw.get("items", []),
+        refusals=raw.get("refusals", []),
+        notes=raw.get("notes", []),
+        census=raw.get("census", {}),
+        census_nets=raw.get("census_nets", {}),
+    )

@@ -157,18 +157,38 @@ def copper_bar(text: str, reasons: dict | None = None, owners: dict | None = Non
     """Per-net and total numbers, plus the lines a report prints.
 
     `reasons` maps `bar_key` to the pattern that wrote that piece (D.4). With it the totals gain
-    `by_reason`, `vias_pattern` and `vias_leftover`, and the report gains the line that says how much
-    of the board is pcbc's own. Without it the output is byte-identical to what it was before R2,
-    which is what `PCBC_PATTERNS=off` relies on.
+    `by_reason`, `vias_pattern` and `vias_leftover`, the per-net rows gain their `leftover_*` half,
+    and the report gains the line that says how much of the board is pcbc's own. Without it every
+    piece reads as leftover, which is what a `PCBC_PATTERNS=off` board is: the numbers
+    `test_patterns.py::test_patterns_off_claims_nothing_and_is_a_rollback` compares are unchanged.
     """
     segs = segments(text)
     vs = vias(text)
     pads = pads_by_net(text)
     nets: dict[str, dict] = {}
+    reasons = reasons or {}
     for net, sites in pads.items():
         if len(sites) < 2 or not net or net.startswith("unconnected-"):
             continue
-        nets[net] = {"airwire_mm": round(airwire_mm([(x, y) for _r, x, y in sites]), 3), "routed_mm": 0.0, "vias": 0, "off45": 0, "micro": 0, "segments": 0}
+        nets[net] = {
+            "airwire_mm": round(airwire_mm([(x, y) for _r, x, y in sites]), 3),
+            "routed_mm": 0.0,
+            "vias": 0,
+            "off45": 0,
+            "micro": 0,
+            "segments": 0,
+            # The leftover's own half of every number above (finding 10). Without it there is no
+            # figure anywhere for what KRT paid for a pattern: `routed_mm` and `detour` are over
+            # **all** the copper on the net, pattern and leftover together, so c3_usb's `3V3`
+            # reads as a 19.81 mm win (leftover 50.90 -> 31.09) while the net's own total copper
+            # rose 10 % and its leftover doubled in segments. A pattern that starts costing more
+            # leftover than it writes is then a number that moved rather than a silence.
+            "leftover_mm": 0.0,
+            "leftover_segments": 0,
+            "leftover_vias": 0,
+            "leftover_micro": 0,
+            "pattern_mm": 0.0,
+        }
     for s in segs:
         rec = nets.get(s["net"])
         if rec is None:
@@ -179,14 +199,24 @@ def copper_bar(text: str, reasons: dict | None = None, owners: dict | None = Non
             rec["off45"] += 1
         if 1e-6 < s["length"] < MICRO_MM:
             rec["micro"] += 1
+        if reasons.get(bar_key("seg", s["layer"], s["start"], s["end"], s["width"]), "leftover") == "leftover":
+            rec["leftover_segments"] += 1
+            rec["leftover_mm"] += s["length"]
+            if 1e-6 < s["length"] < MICRO_MM:
+                rec["leftover_micro"] += 1
+        else:
+            rec["pattern_mm"] += s["length"]
     for v in vs:
         rec = nets.get(v["net"])
         if rec is not None:
             rec["vias"] += 1
+            if reasons.get(bar_key("via", v["at"]), "leftover") == "leftover":
+                rec["leftover_vias"] += 1
     for rec in nets.values():
         rec["routed_mm"] = round(rec["routed_mm"], 3)
+        rec["leftover_mm"] = round(rec["leftover_mm"], 3)
+        rec["pattern_mm"] = round(rec["pattern_mm"], 3)
         rec["detour"] = round(rec["routed_mm"] / rec["airwire_mm"], 2) if rec["airwire_mm"] >= 0.05 and rec["routed_mm"] > 0 else None
-    reasons = reasons or {}
     by_reason: dict[str, dict] = {}
     for item, key in [(s, bar_key("seg", s["layer"], s["start"], s["end"], s["width"])) for s in segs] + [(v, bar_key("via", v["at"])) for v in vs]:
         row = by_reason.setdefault(reasons.get(key, "leftover"), {"segments": 0, "vias": 0, "mm": 0.0})

@@ -5,6 +5,7 @@ from __future__ import annotations
 import fnmatch
 import math
 import re
+from collections.abc import Sequence
 
 from .compile import CompiledJob
 from .sexp import board_footprint_spans, footprint_at, footprint_reference, matching_paren
@@ -84,7 +85,17 @@ def pads_by_net(text: str) -> dict[str, list[tuple[str, float, float]]]:
 
 
 def copper_by_net(text: str) -> dict[str, dict[str, float]]:
-    """Per net: segment count, via count, zone count, max track width mm."""
+    """Per net: segment count, via count, zone count, widest and narrowest track width mm.
+
+    **Both widths, because they answer different questions.** `width` is the maximum and is what a
+    presence test wants — "is there copper of this class on this net at all", and a zone reads as
+    10 mm because a plane is wider than any rule asks. `width_min` is the minimum **over segments
+    only**, and it is the one an ampacity question wants: a net is as good as its narrowest series
+    copper, and the maximum is satisfied by one wide segment however narrow the rest is. Reading the
+    maximum is what made `power_ampacity_failures` unable to fail (S7 review, findings 1, 7, 12 and
+    20) while buck shipped 19.39 mm of 0.3905 mm copper on a 2 A net. `width_min` is 0.0 on a net
+    with no segments at all.
+    """
     names = net_table(text)
     hits: dict[str, dict[str, float]] = {}
     for tag in ("segment", "via", "zone"):
@@ -93,13 +104,15 @@ def copper_by_net(text: str) -> dict[str, dict[str, float]]:
             if not name:
                 continue
             rec = hits.setdefault(
-                name, {"segment": 0, "via": 0, "zone": 0, "width": 0.0}
+                name, {"segment": 0, "via": 0, "zone": 0, "width": 0.0, "width_min": 0.0}
             )
             rec[tag] += 1
             if tag == "segment":
                 wm = _WIDTH.search(block)
                 if wm:
-                    rec["width"] = max(rec["width"], float(wm.group(1)))
+                    w = float(wm.group(1))
+                    rec["width"] = max(rec["width"], w)
+                    rec["width_min"] = w if not rec["width_min"] else min(rec["width_min"], w)
             if tag == "zone":
                 rec["width"] = max(rec["width"], 10.0)
     return hits
@@ -257,34 +270,76 @@ def vias_on_no_via_nets(job: CompiledJob, text: str) -> list[str]:
     return fails
 
 
-def _ipc2221_need(job: CompiledJob, name: str, amps: float) -> float:
-    """The IPC-2221 external width the constraint already derived (one source, A.3 item 7); the
-    same formula and the same default rise, so the number and the gate are unchanged."""
+def _class_need(job: CompiledJob, name: str, amps: float) -> float:
+    """What the current asks of a track: `max(IPC-2221 external, IPC-2152 with modifiers)`.
+
+    The same `max` `stackup.current_width_mm` takes and the same one `Constraint.width_mm` was
+    derived from, so the gate asks the question the width was an answer to. It used to read
+    `width_ipc2221` alone (finding 1), which is the smaller of the two on every net where the 2152
+    curve wins and made the gate quietly weaker than the number on the board."""
     cs = job.constraints
     c = cs.by_net(name) if cs is not None else None
     if c is not None and c.current is not None:
-        return c.current.width_ipc2221.value
+        return max(c.current.width_ipc2221.value, c.current.width_ipc2152.value)
     return ipc2221_width_mm(amps)
 
 
-def power_ampacity_failures(job: CompiledJob, text: str) -> list[str]:
-    """Fail when a power net's copper is narrower than IPC-2221 for its amps."""
+def _class_width(job: CompiledJob, name: str) -> float:
+    cs = job.constraints
+    c = cs.by_net(name) if cs is not None else None
+    return float(c.width_mm.value) if c is not None else 0.0
+
+
+PATTERN_NECK_OK = ("tap", "fanout")
+"""The two reasons whose copper is allowed to be narrower than its class.
+
+R-I3's allowance is for **the last millimetre into a pad**, and those are the two patterns that write
+only that: `tap._width` and `fanout` neck an escape stub to the pad's own across dimension, which
+`TAP_NECKED` counts and `test_examples_fab.py` pins. Everything else pcbc writes — a hop, a spine
+trunk, a backbone link, a chain, a bus member — is written at the class width or not at all (B.0: a
+pattern never degrades), so a narrow one is a bug in the pattern rather than a fact about the board."""
+
+
+def power_ampacity_failures(
+    job: CompiledJob, text: str, owned: Sequence[tuple[str, str, float]] = ()
+) -> list[str]:
+    """The hard gate: **pcbc must not write a necked power track**, and a rail must have copper.
+
+    `owned` is `(net, reason, width_mm)` per piece pcbc wrote, off `routed/copper.json`; `fab_job`
+    reads the sidecar beside the board and passes it. With it empty only the missing-rail rule can
+    fire, which is what a board with no pattern copper has to be judged by.
+
+    **What this deliberately does not judge, and why.** Until the S7 review this function compared
+    the net's *widest* track (`copper_by_net`'s `width` is a `max`) against IPC, so one wide segment
+    satisfied a whole net and the check could not fail — it returned `[]` on buck while buck shipped
+    19.39 mm of 0.3905 mm copper on a 2 A rail, and returned `[]` just as readily on the
+    patterns-off board whose `VIN` is two thirds fab-floor copper (findings 1, 7, 12, 20). The honest
+    whole-net question is the **bottleneck** between the net's pads, and `ampacity.power_bottlenecks`
+    asks it and reports the answer. It is not this gate because three of the five boards fail it
+    today and R2 cannot fix them: the copper that necks is KRT's leftover, and R3's maze router owns
+    the leftover (`docs/r2-measurements.md` S7, open issues). Making a build-stopping error out of a
+    number no slice in R2 can move would stop every board instead of measuring the necks; the
+    numbers are pinned per board in `test_examples_fab.py` as a ledger that must fall.
+
+    So the criterion here is the one pcbc *is* answerable for, and it is failable: a pattern's own
+    copper, at the class width the pattern declared, with the one exemption R-I3 already grants
+    (`PATTERN_NECK_OK`).
+    """
     copper = copper_by_net(text)
-    plane_nets = {n for n, _ in job.planes}
+    plane_nets = {n for n, _ in job.planes} | {n for n, r in copper.items() if r.get("zone")}
     fails: list[str] = []
     for net in job.nets:
         if net.kind != "power" or not net.amps or net.amps < 0.2:
             continue
-        need = _ipc2221_need(job, net.patterns[0], float(net.amps))
-        for name in [n for n in (list(copper) + list(plane_nets)) if _match(n, net.patterns)]:
-            if name in plane_nets:
+        need = _class_need(job, net.patterns[0], float(net.amps))
+        for name, reason, width in owned:
+            if reason in PATTERN_NECK_OK or not _match(name, net.patterns):
                 continue
-            need = _ipc2221_need(job, name, float(net.amps))
-            have = (copper.get(name) or {}).get("width") or 0.0
-            if have + 1e-6 < need * 0.85:
+            cls = _class_width(job, name)
+            if cls and width + 1e-6 < cls:
                 fails.append(
-                    f"{name} copper {have:.2f} mm < {need:.2f} mm required for "
-                    f"{net.amps:g} A (add a plane or pour)"
+                    f"{name} {reason} copper {width:g} mm < the {cls:g} mm {name} class "
+                    f"({net.amps:g} A, IPC asks {_class_need(job, name, float(net.amps)):g} mm)"
                 )
         # Pattern never seen as copper or plane
         if not any(_match(n, net.patterns) for n in list(copper) + list(plane_nets)):
@@ -293,4 +348,4 @@ def power_ampacity_failures(job: CompiledJob, text: str) -> list[str]:
                     f"{net.patterns[0]} has no copper/plane for {net.amps:g} A "
                     f"(need ≥ {need:.2f} mm)"
                 )
-    return fails
+    return sorted(set(fails))

@@ -553,3 +553,128 @@ def _largest_region(blocked_cells: bytearray, nx: int, ny: int, cell: float, x0:
         if len(region) > len(best):
             best = region
     return PourRaster(cell=cell, x0=x0, y0=y0, nx=nx, ny=ny, free=frozenset(best))
+
+
+# --- same-net spacing: the one clearance question nobody asks ----------------------------------
+
+
+SAME_NET_SAMPLES = 9
+"""How many points of the closest-approach line are tested for intervening copper. Nine is enough to
+catch the case the test exists for — a mitre corner, where the copper between the two pieces is
+continuous and every sample lands on it — and cheap enough to run over every pair on a board."""
+
+
+def _closest_on_seg(p: Pt, a: Pt, b: Pt) -> Pt:
+    dx, dy = b[0] - a[0], b[1] - a[1]
+    d2 = dx * dx + dy * dy
+    if d2 <= 0.0:
+        return a
+    t = max(0.0, min(1.0, ((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / d2))
+    return (a[0] + t * dx, a[1] + t * dy)
+
+
+def closest_points(a, b) -> tuple[Pt, Pt, float]:
+    """The two points of bare copper that face each other, and the gap between them.
+
+    `hull_dist2` answers *how far*, never *where*, and the where is what decides whether a
+    sub-clearance gap is a real slot or the inside of a mitre. The witness is the minimum over every
+    vertex-to-edge pair in both directions — the same enumeration `hull_dist2` walks — then each point
+    is pushed toward the other by its own shape's offset radius, which is where the copper's edge
+    actually is.
+    """
+    best = (float("inf"), a.pts[0], b.pts[0])
+    for pts_p, pts_q, flip in ((a.pts, b.pts, False), (b.pts, a.pts, True)):
+        for p in pts_p:
+            for i in range(len(pts_q)):
+                s, e = pts_q[i], pts_q[(i + 1) % len(pts_q)]
+                w = _closest_on_seg(p, s, e)
+                d = math.dist(p, w)
+                if d < best[0]:
+                    best = (d, w, p) if flip else (d, p, w)
+    d, pa, pb = best
+    if d <= 1e-12:
+        return (pa, pb, -(a.r + b.r))
+    ux, uy = (pb[0] - pa[0]) / d, (pb[1] - pa[1]) / d
+    return ((pa[0] + ux * a.r, pa[1] + uy * a.r), (pb[0] - ux * b.r, pb[1] - uy * b.r), round(d - a.r - b.r, 4))
+
+
+def _inside(shape, at: Pt) -> bool:
+    from .route_geom import hull_dist2
+
+    return hull_dist2((at,), shape.pts) <= (shape.r + 1e-9) ** 2
+
+
+def same_net_slots(text: str, floor: float, layers: tuple[str, ...] = ("F.Cu", "B.Cu", "In1.Cu", "In2.Cu")) -> list[dict]:
+    """Same-net copper on one layer closer than `floor` with **bare laminate** in between.
+
+    The one clearance question neither pcbc nor KiCad asks, and a wide locked spine is the copper most
+    likely to be hugged: `route_scene._pair_clashes` skips rules 1 and 4 for a same-net pair by
+    design, KiCad exempts same-net pairs from clearance entirely, and KRT treats its own net as free.
+    The S7 review measured node's leftover sitting **0.0501 mm** from the locked `VBUS` spine on a
+    board whose process floor is 0.0889 mm, and fifteen more such gaps across the five boards
+    (finding 16). It is a census, not a rule: the class is pre-existing — the patterns-off node has as
+    many — and an etch this fine is a yield question for the fab rather than a DRC error.
+
+    A mitre corner and a continuous run are two pieces of copper 0.05 mm apart with copper between
+    them, and they are every false positive here, so they are removed: the closest-approach line is
+    sampled and a gap with any other same-net copper across it is not a slot.
+
+    **Where that is approximate, and in which direction.** Two exactly parallel runs have a whole
+    segment of equally-close points and `closest_points` returns one of them, so copper bridging the
+    pair somewhere else along their length does not discard the gap. It over-reports rather than
+    under-reports, which is the right direction for a census, and it is exact on the case it exists
+    for: a corner's closest approach is a single point and the mitre leg covers it.
+    """
+    from .ampacity import ALL_CU, _SEG, _VIA, board_pad_geoms
+    from .copper import net_table
+    from .route_geom import track_shape
+
+    names = net_table(text)
+    items: list[tuple[str, frozenset[str], object, str]] = []
+    for m in _SEG.finditer(text):
+        net = names.get(int(m.group(7))) if m.group(7) else m.group(8)
+        if not net:
+            continue
+        x1, y1, x2, y2, w = (float(m.group(k)) for k in range(1, 6))
+        items.append((net, frozenset({m.group(6)}), track_shape((x1, y1), (x2, y2), w), f"track ({x1:g},{y1:g})-({x2:g},{y2:g}) w{w:g}"))
+    for m in _VIA.finditer(text):
+        net = names.get(int(m.group(7))) if m.group(7) else m.group(8)
+        if not net:
+            continue
+        at = (float(m.group(1)), float(m.group(2)))
+        items.append((net, ALL_CU, via_shape(at, float(m.group(3))), f"via ({at[0]:g},{at[1]:g})"))
+    for p in board_pad_geoms(text, layers=layers):
+        for s in p.copper:
+            items.append((p.net, p.cu_layers, s, f"pad {p.id}"))
+    by_net: dict[str, list[int]] = {}
+    for i, (net, _l, _s, _w) in enumerate(items):
+        if net and not net.startswith("unconnected-"):
+            by_net.setdefault(net, []).append(i)
+    out: list[dict] = []
+    for net, idx in sorted(by_net.items()):
+        boxes = {i: aabb(items[i][2]) for i in idx}
+        for n, i in enumerate(idx):
+            for j in idx[n + 1 :]:
+                if not (items[i][1] & items[j][1]):
+                    continue
+                a, b = boxes[i], boxes[j]
+                if a[0] > b[2] + floor or b[0] > a[2] + floor or a[1] > b[3] + floor or b[1] > a[3] + floor:
+                    continue
+                pa, pb, g = closest_points(items[i][2], items[j][2])
+                if not (0.0 < g < floor):
+                    continue
+                filled = False
+                for k in range(1, SAME_NET_SAMPLES + 1):
+                    t = k / (SAME_NET_SAMPLES + 1)
+                    at = (pa[0] + (pb[0] - pa[0]) * t, pa[1] + (pb[1] - pa[1]) * t)
+                    if any(
+                        m not in (i, j) and (items[m][1] & items[i][1] & items[j][1]) and _inside(items[m][2], at)
+                        for m in idx
+                    ):
+                        filled = True
+                        break
+                if filled:
+                    continue
+                layer = sorted(items[i][1] & items[j][1])[0]
+                out.append({"net": net, "layer": layer, "gap": g, "a": items[i][3], "b": items[j][3], "at": [round(pa[0], 4), round(pa[1], 4)]})
+    return sorted(out, key=lambda r: (r["gap"], r["net"], r["layer"], r["a"], r["b"]))

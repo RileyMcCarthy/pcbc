@@ -405,7 +405,7 @@ def route_job(design: Design, placed: Path, *, out: Path, name: str = "board") -
     # spine is the widest copper pcbc writes while a closed row's escape has one way out.
     from .fanout import fanout_pieces
     from .patterns import empty_plan, hard_refusals, merge_plans, pattern_copper, patterns_off
-    from .route_emit import census as _census, sidecar, write_pieces, write_sidecar
+    from .route_emit import census as _census, census_by_net, sidecar, write_pieces, write_sidecar
 
     text = placed.read_text()
     plan = empty_plan(text) if patterns_off() else pattern_copper(design, job, job.constraints, text, name, stage="pre")
@@ -561,6 +561,15 @@ def route_job(design: Design, placed: Path, *, out: Path, name: str = "board") -
     owners = {bar_key(p): p.owner for p in owned}
     result["copper_bar"] = copper_bar(text, reasons, owners)
     result["leftover"] = result["copper_bar"]["totals"]["by_reason"].get("leftover", {})
+    # Finding 16: the one clearance question neither pcbc nor KiCad asks. A census, not a rule —
+    # `route_verify.same_net_slots` says what it counts and why the class is pre-existing.
+    from .route_verify import same_net_slots
+
+    result["same_net_slots"] = same_net_slots(text, job.constraints.stackup.clearance_min) if job.constraints is not None else []
+    # Per net and per reason, so the ledger in `docs/r2-measurements.md` is generated from the same
+    # place the build reads instead of hand-copied (findings 5, 8, 15, 17).
+    result["pattern_nets"] = census_by_net(owned)
+    result["pattern_links"] = {r: dict(sorted({**plan.links.get(r, {}), **(post_plan.links.get(r, {}) if post_plan is not None else {})}.items())) for r in sorted({*plan.links, *(post_plan.links if post_plan is not None else {})})}
     doc = sidecar(pre, step="patterns_pre", refusals=result["refusals"], notes=result["notes"], leftover=result["leftover"])
     if post_plan is not None and post_plan.pieces:
         # One sidecar, two stages: a piece carries the step that wrote it, so `copper.json` says

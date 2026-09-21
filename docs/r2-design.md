@@ -369,6 +369,13 @@ typical query returns 4 to 20 ids against 152 for a linear scan over pads alone.
 
 ### A.7 Pad exits and fanout lanes
 
+> **Amended after S5's review** (`docs/r2-measurements.md` S5r, finding 6): the lane rule below is
+> written for a **segment** — "may cross, may not run along", with `lane_budget` as the threshold —
+> and `lane_ok` implemented it by skipping every piece that was not one. A via has no run length to
+> budget: it **occupies**, so any part of a lane its copper touches is a lane that footprint's pads
+> can no longer escape through, and the rule for a via is occupancy. ds2 had one, `C5.2`'s tap via,
+> 0.1221 mm inside `U1`'s top lane.
+
 A pattern never starts a track at a pad centre and aims at another pad centre. Measured on the
 placed boards for this design, the straight centre-to-centre line for buck's `EN`
 (`U1.5 (16.46, 7.66) -> R_EN.2 (17.71, 6.454)`) passes **0.0892 mm** from `U1.4 [FB]` against
@@ -696,6 +703,14 @@ chain VDDA: link 2 of 3, C4.1 at (12.40,8.05) -> U1.12 at (15.10,9.65), does not
 ```
 
 ### B.3 `tap` — a pad to its plane or pour
+
+> **Amended after S5's review** (`docs/r2-measurements.md` S5r, finding 10): "one via per pad, never
+> clustered" is right and it is not the whole rule. A through via on a foreign net carves an antipad
+> out of every **other** plane it crosses, and a row of them at a footprint's own pitch merges those
+> antipads into a slot the fill then deletes — node's `U1` column cut 8.74 mm out of the 3V3 plane
+> while every check here reported one island and every tap inside its own. A candidate is now refused
+> when its antipad would come within a foreign zone's `min_thickness` of another hole's, and the row
+> steps out of line instead (`route_scene.antipad_clash`, `zone_rules`).
 
 **Routes.** Every **SMD** pad whose net has a plane or pour (`scene.plane_of`), on an outer layer,
 that does not already carry fanout copper. Through-hole pads on a plane net are **skipped and the
@@ -1197,6 +1212,16 @@ exactly three entries today (buck, c3_usb, node) and `grep -rn ds2 tests/` finds
 records it.
 
 ### D.5 Plane, island and return checks (cheap, so in)
+
+> **Amended after S5's review** (`docs/r2-measurements.md` S5r, findings 9, 11, 12 and 17). Three
+> sentences below do not survive their own arithmetic. **The island count cannot see what it is for**:
+> under `island_removal_mode 0` a cut-off fragment is *deleted*, so it is never written as a second
+> `filled_polygon` and the count stays at 1 — the number that moves is the filled **area**
+> (`route_verify.plane_area`), and ds2 drops five orphans, 8.52 mm2, at a count of one. **The centre
+> is not the via**: containment is asked of the ring, 16 points of it, and `copper.json` carries the
+> size so a caller no longer has to invent one. **Absence is an answer**: a net whose zone came back
+> unfilled reports a line rather than being skipped. And all of it runs in `pcbc build`, not only in
+> the suite — until the review neither check was called from `src/` at all.
 
 - **Island count and via containment, on every plane layer a via SPANS.** Every pattern via is a
   through via (`F.Cu`..`B.Cu`), so on node a GND tap punches a clearance hole in the **3V3** plane

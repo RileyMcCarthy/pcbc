@@ -418,17 +418,23 @@ def lane_ok(scene: Scene, pieces: Sequence[Piece], refs: Sequence[str]) -> tuple
     its own lane, and for a link both ends' footprints are owners: a stub into a closed row's pad is
     inside that row's lane by construction.
     """
-    from ..route_verify import lane_overrun
+    from ..route_verify import lane_overrun, via_in_lane
 
     exempt = frozenset({*refs} | {p.owner.split(".")[0] for p in pieces})
     # The same set `route_verify.served_refs` computes from the finished copper: the footprints this
     # run lands on. The two must agree, or a candidate the pattern accepts fails the self-check.
     for p in pieces:
-        if p.kind != "seg":
+        if p.kind == "via":
+            # A via cannot cross a lane at all — it occupies one. Asked here because until S5's
+            # review this loop skipped every piece that was not a segment, so 105 of the tap's 210
+            # pieces were never put to the rule (finding 6).
+            who = via_in_lane(scene, p.a, p.w, exempt)
+            if who:
+                return (False, f"puts a via inside {who}")
             continue
         run, who = lane_overrun(scene, p.a, p.b, p.w, exempt)
         if who:
-            return (False, f"{run:g} mm along {who}")
+            return (False, f"runs {run:g} mm along {who}")
     return (True, "")
 
 

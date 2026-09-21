@@ -183,89 +183,142 @@ _VIA_AT = re.compile(
     r"\(via\s*\n\s*\(at ([0-9.+-]+) ([0-9.+-]+)\)"
     r"(?:\s*\n\s*\(size ([0-9.+-]+)\))?"
 )
-_PAD_SIZE = re.compile(r"\(size ([0-9.+-]+) ([0-9.+-]+)\)")
+PASSIVE_PREFIXES = ("C", "R", "L", "D", "FB")
+"""The reference *prefixes* a two-terminal passive declares. A `Part` says its own prefix (`Component(
+prefix="L")`, and pcbc's `Resistor`/`Capacitor`/`Led` set "R"/"C"/"D"), so this reads a declaration and
+not a spelling. `via_in_pad_blockers` takes the design where it has one; the regex below is what it
+falls back to when it is handed only a board file."""
+
+_PASSIVE_REF = re.compile(r"^(?:FB|[CRLD])(?![A-Za-z])")
+r"""The fallback, when no `Design` is at hand. The `\d` this used to end in was the bug: it matched
+`C1` and `R1` and not `C_VBUS`, `C_3V3_HF`, `R_FB_BOT` or `R_CC1`, which is every passive on buck,
+c3_usb and node. Measured by injecting a via dead-centre in every passive pad of every built board:
+blinky 2 of 2 refused, ds2 44 of 44, buck **2 of 18**, c3_usb **0 of 24**, node **0 of 40** (that
+probe walked R/C/L footprints; `passive_refs` reads every declared passive prefix, so the suite's own
+counts are 4, 18, 26 and 42)
+(`docs/r2-measurements.md` S5r, finding 1). The negative lookahead keeps `U1`, `J1`, `SW_RST`,
+`FID1`, `Y1` out; `D1` is in, and so is a ferrite `FB1`."""
+
+_RING_SAMPLES = 32
+"""How many points of a via's ring `inside` is decided on. A pad is convex (A.1), so a ring whose 32
+points all lie in the pad is inside it to within `r*(1-cos(pi/32))` = 0.5 % of the ring radius, i.e.
+0.9 um on a 0.35 mm via. `inside` only picks the exemption, never whether the via is a hit."""
 
 
-def _rot_pt(x: float, y: float, deg: float) -> tuple[float, float]:
-    """KiCad footprint rotation (Y-down): +deg is clockwise on the page."""
-    a = math.radians(-deg)
-    c, s = math.cos(a), math.sin(a)
-    return x * c - y * s, x * s + y * c
+_FLASH = re.compile(r"X(-?\d+)Y(-?\d+)D03\*")
+_FS = re.compile(r"%FSLAX(\d)(\d)Y(\d)(\d)\*%")
 
 
-def via_in_pad(pcb_text: str) -> list[dict]:
-    """Vias whose centre sits inside a copper pad (via-in-pad).
+def mask_flashes(gerber_text: str) -> list[tuple[float, float]]:
+    """Every aperture flash in a solder-mask Gerber, in board mm (Y negated, as Gerber writes it).
 
-    Test in pad-local coordinates so a 90° footprint does not inflate the
-    pad AABB and count a via sitting *next* to the land.
+    The one end-to-end way to ask "is this via tented?": a tented via has no mask aperture, so its
+    coordinate is simply not in this list. `Stackup.via_tenting` is what pcbc writes into the board
+    (`seed._tenting`) and this is what reads back what the arbiter plotted from it — because until
+    S5's review the stanza on every routed board was KiCad's default and nothing checked it
+    (`docs/r2-measurements.md` S5r, finding 3).
+
+    Only `%MOMM%` files with a leading-zero-omitted absolute format are read, which is every Gerber
+    KiCad 10 writes here; anything else comes back empty rather than wrong.
     """
+    if "%MOMM*%" not in gerber_text:
+        return []
+    fs = _FS.search(gerber_text)
+    if not fs:
+        return []
+    scale = 10.0 ** int(fs.group(2))
+    return [(int(m.group(1)) / scale, -int(m.group(2)) / scale) for m in _FLASH.finditer(gerber_text)]
+
+
+def board_pads(pcb_text: str) -> list:
+    """Every pad of every footprint on the board, as the copper it actually draws.
+
+    `pad_geoms` and not `(size w h)`: a custom pad's size is KiCad's anchor and not its copper (S1b),
+    so a USB-C shell pad reads as 5 um square to anything that believes the size field, which is what
+    `parse_foot` did before S1b and what this function did until S5r (finding 2).
+    """
+    from .pads import pad_geoms
+
+    out = []
+    for start, end in board_footprint_spans(pcb_text):
+        block = pcb_text[start:end]
+        ref = footprint_reference(block) or "?"
+        at = footprint_at(block)
+        if at is None:
+            continue
+        side = "B" if re.search(r'\(layer "B\.Cu"\)', block[: block.find("(pad") if "(pad" in block else len(block)]) else "F"
+        out.extend(g for g in pad_geoms(block, at, side=side, ref=ref) if g.kind == "smd" and g.copper)
+    return out
+
+
+def via_in_pad(pcb_text: str, *, pads: list | None = None) -> list[dict]:
+    """Vias whose copper touches a copper pad, with `inside` saying whether it is wholly in it.
+
+    Two questions, split, because the old single test answered neither honestly (finding 2). It asked
+    for **full containment** inside the pad's `(size w h)` box, so a via breaking a pad's edge — which
+    wicks the joint exactly as a centred one does — came back as no hit at all, and a custom pad was
+    measured as its 5 um anchor. Now the hit is an **overlap** of the true copper (`route_geom.clears`
+    against `pads.pad_geoms`' own shapes, so rotation, roundrect corners and custom primitives are
+    exact), and `inside` is what the exemption in `via_in_pad_blockers` reads.
+
+    Measured on the S5 boards: three overlaps no number mentioned before — c3_usb's via at
+    (14.75,1.5) over `U1.27` by 0.2 mm and (15.55,1.45) over `U1.26` by 0.15 mm, node's (17,2.4) over
+    `U1.51` by 0.025 mm, all of them KRT's leftover vias on IC pins and all same-net.
+    """
+    from .route_geom import clears, hull_dist2, via_shape
+
     vias = [
         (float(m.group(1)), float(m.group(2)), float(m.group(3) or 0.25))
         for m in _VIA_AT.finditer(pcb_text)
     ]
-    fps: list[tuple[str, tuple[float, float, float], list[tuple]]] = []
-    for start, end in board_footprint_spans(pcb_text):
-        block = pcb_text[start:end]
-        ref = footprint_reference(block) or "?"
-        at = footprint_at(block) or (0.0, 0.0, 0.0)
-        pads: list[tuple] = []
-        for pad in re.finditer(r'\(pad "([^"]*)"\s+(\S+)', block):
-            name = pad.group(1)
-            kind = pad.group(2)
-            if not name or kind != "smd":
-                continue
-            chunk = block[pad.start() : pad.start() + 400]
-            pm = re.search(
-                r"\(at ([0-9.+-]+) ([0-9.+-]+)(?: ([0-9.+-]+))?\)", chunk
-            )
-            sm = _PAD_SIZE.search(chunk)
-            if not pm or not sm:
-                continue
-            pads.append(
-                (
-                    name,
-                    float(pm.group(1)),
-                    float(pm.group(2)),
-                    float(pm.group(3) or 0),
-                    float(sm.group(1)),
-                    float(sm.group(2)),
-                )
-            )
-        fps.append((ref, at, pads))
+    geoms = board_pads(pcb_text) if pads is None else pads
     hits = []
     for vx, vy, vsize in vias:
-        vr = vsize / 2
-        found = False
-        for ref, (fx, fy, frot), pads in fps:
-            lx, ly = _rot_pt(vx - fx, vy - fy, -frot)
-            for name, px, py, prot, sx, sy in pads:
-                dx, dy = _rot_pt(lx - px, ly - py, -prot)
-                # Via copper fully inside the pad — grazing a 0603 end-cap is not VIP.
-                if abs(dx) + vr <= sx / 2 + 1e-9 and abs(dy) + vr <= sy / 2 + 1e-9:
-                    hits.append({"via": (vx, vy), "pad": f"{ref}.{name}"})
-                    found = True
-                    break
-            if found:
+        ring = via_shape((vx, vy), vsize)
+        vr = vsize / 2.0
+        for g in geoms:
+            for shape in g.copper:
+                if clears(ring, shape, 0.0):
+                    continue
+                inside = all(
+                    hull_dist2(((vx + vr * math.cos(2 * math.pi * k / _RING_SAMPLES), vy + vr * math.sin(2 * math.pi * k / _RING_SAMPLES)),), shape.pts) <= shape.r * shape.r + 1e-12
+                    for k in range(_RING_SAMPLES)
+                )
+                hits.append({"via": (vx, vy), "pad": f"{g.ref}.{g.num}", "inside": inside, "net": g.net})
                 break
+            else:
+                continue
+            break
     return hits
 
 
-_PASSIVE_REF = re.compile(r"^[CRL]\d")
+def passive_refs(design) -> frozenset[str]:
+    """The refs of every part whose declared prefix makes it a two-terminal passive."""
+    return frozenset(i.ref for i in getattr(design, "instances", ()) if i.part.prefix in PASSIVE_PREFIXES or i.part.kind in ("generic", "led"))
 
 
-def via_in_pad_blockers(hits: list[dict]) -> list[dict]:
+def via_in_pad_blockers(hits: list[dict], design=None) -> list[dict]:
     """VIP that JLC Standard cannot assemble: passives and connector mounting pegs.
 
     USB-C underpad (qfn_fanout --allow-via-in-pad) and IC pins stay named in
     FAB_NOTES as filled+capped; they are not a Standard-fab hard fail.
-    A via inside an 0603/resistor/inductor pad wicks the joint even when filled.
+    A via inside an 0603/resistor/inductor pad wicks the joint even when filled — and so does one
+    that only breaks its edge, which is why a passive blocks on **any** overlap while the IC and
+    USB-C exemption still covers a hit of either kind (`docs/r2-measurements.md` S5r, finding 2's
+    deviation: the three partial overlaps on these boards are all same-net vias grazing an IC pin,
+    all tented, and refusing them would refuse two boards that ship).
+
+    `design` is what decides what a part *is*; the reference string cannot (finding 1). Without one
+    the `_PASSIVE_REF` fallback reads the spelling, which is what an audit of a bare board file has.
     """
+    passives = passive_refs(design) if design is not None else None
     out: list[dict] = []
     for h in hits:
         pad = str(h.get("pad") or "")
         ref = pad.split(".", 1)[0]
         name = pad.split(".", 1)[-1] if "." in pad else ""
-        if name.upper() == "MP" or _PASSIVE_REF.match(ref):
+        passive = (ref in passives) if passives is not None else bool(_PASSIVE_REF.match(ref))
+        if name.upper() == "MP" or passive:
             out.append(h)
     return out
 
@@ -471,6 +524,7 @@ def fab_job(
     out_dir: Path | None = None,
     components: Path | None = None,
     insert_fids: bool = True,
+    design=None,
 ) -> dict:
     pcb = Path(pcb)
     out_dir = Path(out_dir) if out_dir else _default_fab_dir(pcb)
@@ -502,7 +556,9 @@ def fab_job(
     bom_rows, missing_lcsc = jlc_bom(text, sources)
     write_bom_csv(bom_rows, out_dir / "bom.csv")
     vip = via_in_pad(text)
-    blockers = via_in_pad_blockers(vip)
+    # The design, not the reference string, is what says a part is a passive whose pad a via wicks
+    # (finding 1). `build_job` hands it over; an audit of a bare board file falls back to the ref.
+    blockers = via_in_pad_blockers(vip, design)
 
     cli = kicad_cli()
     steps: list[dict] = []
@@ -706,8 +762,9 @@ def _write_notes(out_dir: Path, job: CompiledJob, result: dict) -> None:
     lines += ["", "## Via-in-pad", ""]
     blockers = result.get("via_in_pad_blockers") or []
     if vip:
+        inside = sum(1 for h in vip if h.get("inside"))
         lines.append(
-            f"{len(vip)} via(s) have copper fully inside an SMT pad. "
+            f"{len(vip)} via(s) touch an SMT pad's copper, {inside} of them wholly inside it. "
             "USB-C underpad may stay (filled + capped, IPC-4761 Type VII). "
             "Passives and connector mounting pegs must be dog-boned — they fail this gate:"
         )

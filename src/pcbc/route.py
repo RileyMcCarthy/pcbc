@@ -549,7 +549,8 @@ def route_job(design: Design, placed: Path, *, out: Path, name: str = "board") -
     from .copper_bar import copper_bar
 
     reasons = {bar_key(p): p.reason for p in owned}
-    result["copper_bar"] = copper_bar(text, reasons)
+    owners = {bar_key(p): p.owner for p in owned}
+    result["copper_bar"] = copper_bar(text, reasons, owners)
     result["leftover"] = result["copper_bar"]["totals"]["by_reason"].get("leftover", {})
     doc = sidecar(pre, step="patterns_pre", refusals=result["refusals"], notes=result["notes"], leftover=result["leftover"])
     if post_plan is not None and post_plan.pieces:

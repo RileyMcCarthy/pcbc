@@ -18,6 +18,32 @@ from .seed import seed_job
 STAGES = ("check", "seed", "sch", "place", "route", "fab")
 
 
+def _plane_gate(routed_text: str, doc) -> dict:
+    """D.5, run in the product: every tap via inside its own plane, and every plane still one island.
+
+    The islands are reported as `{(net, layer): count}` with their filled **area**, because the count
+    alone cannot see a fragment the fill deleted (`route_verify.plane_area`, finding 9). The area is
+    a number to read and to pin, never a pass/fail here: what a plane is *worth* is the board's, and
+    only a recorded baseline (`test_examples_fab.py::PLANES`) can say whether a given mm2 is right.
+    """
+    from .route_emit import via_piece
+    from .route_verify import plane_area, plane_checks, plane_islands
+
+    pieces = []
+    for i in (doc.items if doc is not None else []):
+        if i.get("key", [""])[0] != "via":
+            continue
+        pieces.append(via_piece(i["net"], i["reason"], tuple(i["key"][1]), float(i.get("w") or 0.0), float(i.get("drill") or 0.0), owner=i.get("owner", "")))
+    islands = plane_islands(routed_text)
+    fails = plane_checks(routed_text, pieces)
+    fails += [f"the {net} plane on {layer} is {n} islands, so a fragment has been cut off it (D.5)" for (net, layer), n in sorted(islands.items()) if n > 1]
+    return {
+        "islands": {f"{net} {layer}": n for (net, layer), n in sorted(islands.items())},
+        "area_mm2": {f"{net} {layer}": a for (net, layer), a in sorted(plane_area(routed_text).items())},
+        "fails": fails,
+    }
+
+
 def rules_summary(job: CompiledJob) -> dict:
     """What `job.dru` holds, for the one report line `constraints.py` cannot print itself (it sits
     below `dru.py`, so it never sees the rules): every rule pcbc wrote, how many are errors, how many
@@ -211,8 +237,19 @@ def build_job(
             # KiCad's save invented ids. pcbc's own copper keeps the ids the sidecar names, so a
             # piece stays traceable from `copper.json` into the board and into KiCad's UI (D.4).
             side = routed.parent / "copper.json"
-            mine = frozenset(i["uuid"] for i in read_sidecar(side).items) if side.exists() else frozenset()
+            doc = read_sidecar(side) if side.exists() else None
+            mine = frozenset(i["uuid"] for i in doc.items) if doc is not None else frozenset()
             routed.write_text(pin_all_uuids(routed.read_text(), name, "routed", keep=mine))
+            # D.5 on the board the arbiter itself refilled and saved. Until S5's review both halves
+            # of this check lived only in the suite — `grep plane_checks src/` found nothing outside
+            # `route_verify`'s own definitions — so "every tap via lands in its own net's plane" and
+            # "every plane is still one island" were asked of the five examples and of no user's
+            # board at all (finding 11). It costs one parse of a file already on disk.
+            entry["planes"] = _plane_gate(routed.read_text(), doc)
+            if entry["planes"]["fails"]:
+                result["steps"].append(entry)
+                result["error"] = "the planes the taps weld to: " + "; ".join(entry["planes"]["fails"])
+                return result
         except KicadMissing as exc:
             gate = {"ok": True, "fails": []}
             entry["copper"] = f"unchecked: {exc}"
@@ -224,7 +261,7 @@ def build_job(
     if "fab" in plan:
         src = routed if routed.exists() else placed if placed.exists() else seed
         job = compile_design(design)
-        step = fab_job(job, src, out_dir=layout / "fab")
+        step = fab_job(job, src, out_dir=layout / "fab", design=design)
         result["steps"].append({"stage": "fab", "fab": step.get("fab"), "error": step.get("error")})
         if step.get("error"):
             result["error"] = step["error"]

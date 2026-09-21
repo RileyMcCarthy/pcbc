@@ -403,10 +403,15 @@ they differ.** They are implemented as taken, and each carries its arithmetic:
    The cap is what keeps node routable: at the Power class's 0.8 mm ring two taps need 1.0 mm between
    centres against 0.7 mm, and node's pads are not 1.0 mm apart. The middle case — the class via
    chosen because it *covers* where the standard one does not — is unreachable on all five boards,
-   and that is arithmetic and not luck: it needs a share in (0.527, 0.871] A on four layers, and no
-   board's amps over a whole number of pads lands there (buck's 2 A over 2 pads is 1.0, over 3 is
-   0.667). The rule is swept over every pad count from 1 to 119 on every plane net of all five
-   boards, so a board that does reach it is not a surprise.
+   and that is arithmetic and not luck. Each board's window is its **own** stackup's, and the
+   sentence used to mix two boards' references into one (finding 18): on node the window is
+   (0.527, 0.871] A — the 0.2 mm barrel against the Power class's 0.4 mm one — and node's `GND`
+   carries 1 A, which is 1.0 A over one pad (past the cap) and 0.5 A over two (below the floor), so
+   no whole number of pads lands in it; on buck the stackup via is 0.3 mm and carries
+   `via_amps(0.3, 0.018, 10)` = 0.707 A, so its window is (0.707, 0.871] and needs a pad count in
+   [2.296, 2.828], which is not an integer either — 2 A over 2 pads is 1.0 and over 3 is 0.667. The
+   rule is swept over every pad count from 1 to 119 on every plane net of all five boards, so a board
+   that does reach it is not a surprise.
 2. **The copper bar's via ceiling splits.** `vias_leftover` stays a ceiling; `vias_pattern` is exact
    per reason, like `SOFT` and the refusal counts. node goes from 28 vias to 76 and that is allowed:
    62 are taps, and holding node to 28 means holding forty-seven ground pads off the ground plane.
@@ -498,6 +503,15 @@ island** after the taps and every tap via lands inside its own net's plane, meas
 refilled copper (`plane_islands`, `plane_checks`), and there is not one via inside a pad anywhere
 (`fab.via_in_pad`).
 
+**Three of those four sentences were weaker than they read, and S5r below is what each of them says
+now.** The island count cannot see a fragment the fill *deleted* (ds2 drops five, 8.52 mm2, and still
+reports one island); `plane_checks` asked the via's **centre**, never its ring, and said nothing at
+all about a net whose plane came back unfilled; and `via_in_pad` asked for full containment inside a
+pad's declared `(size w h)`, so it missed three vias that break an IC pad's edge on the built boards
+and measured a custom pad as its 5 um anchor. None of the five boards is wrong — the taps themselves
+clear every same-net pad by `clearance_min` and every plane is genuinely one island — but the backstop
+behind them was not the statement it looked like.
+
 ### One KRT patch, and why it is not the third workaround C.5 forbids
 
 With the taps down, KRT routed c3_usb's `VBUS` **0.2365 mm from `J1`'s NPTH mounting hole** against
@@ -516,12 +530,22 @@ hole-clearance key, so there is nothing to write there instead.
 
 ### What got worse, board by board, and why it is recorded rather than fixed
 
-**c3_usb: `micro` 168 → 204, `segments` 377 → 453, `routed mm` 312.9 → 355.8, and the soft
-`width_power` 36 → 49.** Thirty-four new locked vias sit between the connector and the MCU, and KRT
-answers by staircasing the leftover `GND` and `VBUS` around them. Against that: `vias_leftover` 9 →
-8, the leftover share 95.2 % → 86.3 %, and the board's ground is now welded pad by pad to the back
-pour instead of relying on whatever KRT could reach. F.3 item 7 says soft-rule hits must not rise, and
-`width_power` does; it is in the open issues.
+**c3_usb: `micro` 168 → 204, `segments` 377 → 453, `routed mm` 312.9 → 355.8, `off45` 7 → 11, the
+soft `width_power` 36 → 49, and the per-net detour on `VBUS` 1.33 → 1.70.** Thirty-four new locked
+vias sit between the connector and the MCU, and KRT answers by staircasing the leftover `GND` and
+`VBUS` around them. Per net, because the split is not what the sentence above it used to say: `VBUS`
+takes 35 of the 36 new micro segments (`GND` +7, `3V3` -6) and goes 36.849 → 47.158 mm, `GND` takes
+all four of the new off-45 segments (0 → 4), and `GND` 1.23 → 1.44 and `3V3` 1.10 → 1.38 move with
+them. Against that: `vias_leftover` 9 → 8, the leftover share 95.2 % → 86.3 %, and the board's ground
+is now welded pad by pad to the back pour instead of relying on whatever KRT could reach. F.3 item 7
+says soft-rule hits must not rise, and `width_power` does; it is in the open issues.
+
+`off45` 7 → 11 and `VBUS` 1.33 → 1.70 were **raised ceilings that this section did not name** until
+the S5 review (findings 15 and 16). `VBUS` is the larger of the two and it is invisible in the table:
+`worst_detour` is a `max`, and it held at `USB_DN` 1.81 only because a different net was already
+worse. The bar now carries `detours` per net and `test_examples_fab.py` pins every one of them, so a
+net creeping toward the worst net's number is a test failure rather than a silence — S7 owns `VBUS`
+and is expected to take this back.
 
 **buck: `micro` 26 → 37 and `segments` 96 → 114**, against `vias_leftover` 4 → **1**, off45 3 → 2,
 142.5 → **139.4 mm** and `width_power` 40 → 39. Six taps on a board with eight ground pads, and the
@@ -531,6 +555,27 @@ same staircase answer at a much smaller scale.
 touch and R4 owns. Its `width_power` falls 44 → **20** in the same build, because the taps carry GND
 and 3V3 to their planes at the class width and KRT has far less power copper left to neck.
 
+**Every board: `angles`, pcbc's own 135-degree corner rule, on three of them.** `pcbc_geometry_angles`
+is the rule pcbc writes into every `.kicad_dru` (`(constraint track_angle (min 135))`) and it goes
+buck 6 → 32, c3_usb 40 → 124, node 32 → 104 — the largest proportional soft-rule rise of the slice,
+and it was in neither this section nor the open issues until the review found it (finding 5). It is
+the taps, directly: matching each `track_angle` warning's position and KiCad's own reported track
+length against `copper.json`, a tap stub is one of the two tracks in 16 of buck's 32, 74 of c3_usb's
+124 and 92 of node's 104. A tap stub is axis-aligned by construction and KRT arrives at whatever
+angle it likes, so every tap is a fresh corner for the leftover router to make sharp. No copper is
+illegal — `kicad-cli pcb drc` reports the rule as a warning — and it is **accepted** here the way
+`width_power` is, with the number now a pinned ceiling in `BAR` rather than a silence. Making the tap
+prefer an exit whose junction with the leftover can be 135 degrees or wider is a copper change and
+belongs behind its own measurement (S7's neighbourhood).
+
+**Four tap stubs are inside the `width_power` counts above**, against the sentence in
+`test_examples_fab.py` that said no tap stub was in them (finding 14): buck's `R_FB_BOT.2` at 0.64 mm
+against `width_power`'s 0.781 mm, and node's `U4.2`, `U4.6` and `U4.7` at 0.364 mm against 0.4 mm.
+`tap._width` narrows the class width to the pad's across dimension — `fanout.py`'s own neck, and the
+right answer for a 0402 — and the width rule has no such exemption, so the stub is a soft hit like
+any other necked track. The pattern now emits a `style:` line naming each one, the count is pinned as
+`TAP_NECKED`, and the sentence says how many instead of denying them.
+
 ### What is not measured here
 
 `bus`, `guard` and `stitch` still read zero on every board (S8). The decap loop-area note D.5 asks the
@@ -538,9 +583,197 @@ tap stage for is **not** written: `route_checks._loop_area` needs the IC-and-cap
 checker builds, and reproducing that inside a pattern for a `style:` line is work S5 did not do — the
 loop is still reported by `check_decoupling` where it always was. A.4 rule 4 (the mask dam) is still
 advisory and still counts zero: a tap's mask opening is its own ring, and no tap came within 0.10 mm
-of a foreign one. The leftover share does **not** reach F.3 item 5's 70 % on any board, and it was
-never going to at S5: the census says a hop is 5.7 % of the copper and a plane tap 12 %, so 82 % is
-the arithmetic. The 45 % target needs the spine (37 %), which is S7.
+of a foreign one — and what keeps the barrel out of the pad's own opening is the tenting, which S5r
+makes pcbc's fact rather than KiCad's default. The leftover share does **not** reach F.3 item 5's
+70 % on any board, and it was never going to at S5: the census says a hop is 5.7 % of the copper and
+a plane tap 12 %, so 82 % is the arithmetic. The 45 % target needs the spine (37 %), which is S7.
+
+### The open issues S5 leaves, as they stand after the review
+
+1. **`width_power` rises on c3_usb**, 36 → 49 at S5 and 49 → **51** after the review's EPS fix; F.3
+   item 7 forbids a soft-rule rise. It is KRT's leftover around locked copper, and S7's spine owns
+   that neighbourhood.
+2. **`angles` — pcbc's own 135-degree rule — triples on buck, c3_usb and node** (finding 5). The
+   number is recorded and pinned as a ceiling; the fix is a tap that can choose an exit the leftover
+   can meet at 135 degrees or wider, and it is a copper change for a later slice.
+3. **node's worst detour 1.72 → 1.82**, on `USB_DN`. The pair is KRT's until R4 and the `signals`
+   step re-lays it; this is the price of the taps stepping out of line for finding 10, taken against
+   `vias_leftover` 14 → 11, micro 67 → 62, off45 31 → 30 and a 3V3 plane that is no longer cut.
+4. **c3_usb's `VBUS` detour is 1.70 against a 1.81 ceiling** (finding 16). S7 owns `VBUS` and should
+   take it back; until then the per-net ceiling is what stops it drifting the last 0.11.
+5. **ds2's pour drops five orphan islands, 8.52 mm2** (finding 9). Pre-existing — the patterns-off
+   build drops three, 10.34 mm2 — and now a pinned area rather than an unchecked one.
+
+## S5r — the review of S5, and what the eighteen findings moved
+
+Four independent attacks ran against S5 as committed (716166b) and raised eighteen findings, five of
+them bug-grade. Every one is answered below with what it cost. Two things are true of all of them:
+**no shipped board was wrong** — the taps themselves clear every same-net pad, every plane is one
+island, KiCad DRC is clean on all five — and **most of the backstops behind them were not the
+statements they looked like**. A check that cannot fail is not a check, and five of these were.
+
+**The bar, re-recorded from fresh builds, 2026-09-20.** "S5" is the row this document recorded when
+the slice landed; "now" is the same board built from the fixed tree.
+
+| board | segments | vias\_leftover | off 0/45/90 | under 0.2 mm | routed mm | worst detour | angles | plane mm2 |
+|---|---|---|---|---|---|---|---|---|
+| blinky | 6 → 6 | 0 → 0 | 0 → 0 | 0 → 0 | 23.6 → 23.6 | LED 1.04 | 0 → 0 | GND B.Cu 917.25 |
+| buck | 114 → 114 | 1 → 1 | 2 → 2 | 37 → 37 | 139.4 → 139.4 | VIN 2.09 | 32 → 32 | GND B.Cu 935.59 |
+| c3_usb | 453 → 453 | 8 → 8 | 11 → **13** | 204 → **203** | 355.8 → **356.7** | USB\_DN 1.81 | 124 → **122** | GND B.Cu 1050.50 |
+| node | 335 → **318** | 14 → **11** | 31 → **30** | 67 → **62** | 400.8 → **409.4** | T\_OUT 1.72 → **USB\_DN 1.82** | 104 → **98** | GND In1 2533.39, 3V3 In2 2520.84 |
+| ds2 | 310 → **315** | 19 → **17** | 11 → **12** | 91 → **96** | 507.4 → **508.3** | REFP\_F 3.23 | 14 → 14 | GND B.Cu 1008.42 |
+
+The census does not move: `{tap: 1}`, `{tap: 6}`, `{fanout: 5, tap: 34}`, `{tap: 62}`,
+`{fanout: 9, tap: 2}`, and every refusal is the same pad for the same reason. Two boards' copper
+changed on purpose and their neighbours answered:
+
+- **node** — the taps of a row now step out of line where staying in it would slot the plane below
+  (finding 10). Everything in the bar improves except one number, and that one is the pair: `USB_DN`
+  1.72 → **1.82**, which the `signals` step re-lays and R4 owns. It is the only regression the fixes
+  bought, it is accepted, and it is in the open issues. `width_usb` 58 → **46** and `width_power`
+  20 → **15** fall in the same build.
+- **ds2** — one tap moved out of a fanout lane (finding 6) and KRT re-staircased around it:
+  `vias_leftover` 19 → **17** and 2.13 mm2 more filled pour, against segments 310 → 315, micro
+  91 → 96, off45 11 → 12 and 507.4 → 508.3 mm.
+- **c3_usb** — nothing moved but 34 vias, by **0.1 um** each (finding 8), and its leftover came back
+  with two more off-45 segments, two more `width_power` hits and one fewer micro segment. That is
+  worth writing down for what it says about the leftover router rather than about the taps: KRT's
+  output is not continuous in its input, and a 100 nm change is enough to move it.
+
+### The five bug-grade findings
+
+**1. `fab.via_in_pad_blockers` could not see a passive on three of the five boards.** `_PASSIVE_REF`
+was `^[CRL]\d` — a digit straight after the letter — so it matched `C1` and `R1` and not `C_VBUS`,
+`C_3V3_HF`, `R_FB_BOT` or `R_CC1`, which is every passive on buck, c3_usb and node. Reproduced by
+injecting a via dead-centre in every passive pad of every built board: blinky 2 hits / 2 blockers,
+ds2 44 / 44, buck 18 / **2**, c3_usb 24 / **0**, node 40 / **0**. `blockers` is the fab stage's hard
+stop, so on c3_usb and node a via sitting in a 0402's pad would have shipped. Fixed by reading the
+**part** rather than the reference: `Part.prefix` (`C`, `R`, `L`, `D`, `FB`) and pcbc's own
+`kind="generic"`/`"led"`, with the corrected regex as the fallback an audit of a bare board file has.
+The `== []` assertions are now positive: a via at every passive pad centre, and the blocker count must
+equal the pad count — **4, 18, 26, 42** on blinky, buck, c3_usb and node. Those four are larger than
+the probe's own census above (2, 18, 24, 40) for a reason worth naming: the probe walked `R`/`C`/`L`
+footprints, and `passive_refs` reads every part whose declared prefix is a two-terminal passive's, so
+the LEDs and diodes are in it too — which is the point of reading the part instead of the spelling.
+
+**2. `via_in_pad` asked for containment, so a via breaking a pad's edge was invisible.** It tested
+`|dx| + r <= sx/2` against the pad's declared `(size w h)` — full containment, of the anchor rather
+than the copper. Three vias on the shipped boards break an IC pad's edge and no number mentioned
+them: c3_usb (14.75,1.50) over `U1.27` by 0.2 mm, c3_usb (15.55,1.45) over `U1.26` by 0.15 mm, node
+(17.0,2.4) over `U1.51` by 0.025 mm. The hit is now an **overlap** of the true copper
+(`route_geom.clears` against `pads.pad_geoms`, so rotation, roundrect corners and a USB-C shell pad's
+`gr_poly` are exact) and each hit carries `inside`. **Deviation from the finding's fix**, recorded
+because it is a real disagreement: it asked for the IC exemption to be narrowed to `inside=True`
+hits, which would refuse c3_usb and node — all three overlaps are same-net vias grazing an IC pin,
+all tented, none of them a solder path — so a passive blocks on any overlap, partial or whole, and
+the IC/USB-C exemption stays as FAB_NOTES describes it.
+
+**5. pcbc's own 135-degree corner rule tripled and the number was nowhere.** buck 6 → 32, c3_usb
+40 → 124, node 32 → 104 across S4 → S5, with a tap stub one of the two tracks in 16, 74 and 92 of
+them. Recorded in S5's "what got worse" above and pinned as a ceiling in `BAR`. Accepted, not fixed:
+making the tap prefer an exit whose junction with the leftover can be 135 degrees or wider is a
+copper change and belongs behind its own measurement.
+
+**9. The island check cannot see a fragment the fill deleted.** `plane_islands` counts
+`filled_polygon` blocks, and under `island_removal_mode 0` a cut-off fragment is **removed** — so it
+is never written as a second polygon and the count stays at 1. Measured: ds2's shipped board drops
+five orphan GND islands totalling 8.52 mm2 and reports one island; a synthetic wall of 38 vias
+fencing off a corner of node's GND plane deletes 69.44 mm2 and still reports one. The number that
+moves is the **area**, so `route_verify.plane_area` is new and `test_examples_fab.py` pins mm2 per
+(net, layer) beside the island count. ds2's orphans are a **pre-existing condition and not an S5
+regression** — the `PCBC_PATTERNS=off` build drops three totalling 10.34 mm2 — and its pinned
+1008.42 mm2 is 2.13 mm2 more than the S5 build, because the tap that left `U1`'s lane freed pour.
+
+**10. A tap row at a footprint's own pitch cut the plane it did not join.** Eleven taps down node's
+`U1`, one per pad at 0.8 mm, each carving `0.35 + 2 * 0.2` out of the **3V3** plane on In2.Cu: 0.05 mm
+of neck against the zone's 0.1 mm `min_thickness`, so KiCad deleted the necks and eleven antipads
+became one slot. Measured on the shipped board: a continuous **8.74 mm** void down x = 6.6861, and
+inside a 3.5 mm window around the column **no path at all** through the 3V3 copper from (6.0,7.0) to
+(8.0,7.0). B.3's "one via per pad, never clustered" had never been introduced to the zone's own
+arithmetic — `plane_checks` only ever asks about the tapped net's plane, and `plane_islands` stays at
+1 because a necked plane is not two islands.
+
+`route_scene.zone_rules` now reads every pour's `(net, layer, connect_pads clearance, min_thickness)`
+off the board — the header exists at post time and the fill does not — and `antipad_clash` refuses a
+site whose antipad would come within `min_thickness` of another hole's **in a plane the via does not
+join**. The clearance is the larger of the zone's own number and the clearance table's, which is
+measured and not assumed: node writes `(clearance 0.18)`, the GND-to-3V3 class clearance is 0.2, and
+the antipad on the built board has radius 0.375-0.380 mm around a 0.175 mm ring. Taking the zone's
+0.18 alone put the requirement 0.02 mm light, and the first build with it still slotted the plane.
+
+The result, on the same board: the taps of `U1`'s column alternate x = 6.686 and x = 6.386 — a 0.30 mm
+stagger, which is the first candidate at which 0.35 + 2 × 0.2 + 0.1 = 0.85 mm fits between centres
+0.8 mm apart — **all 62 taps are still placed**, the longest void down any line of the column is
+0.75 mm (one antipad), the plane is continuous across the column between every pair, and the path
+that did not exist is now 2.33 mm against a 2.00 mm straight line. node's plane gains 2.82 mm2 of GND
+and 1.48 mm2 of 3V3.
+
+**14. "No tap stub is in these counts" was false.** Four of the 54 combined `width_power` hits are
+pcbc's own tap stubs: buck's `R_FB_BOT.2` at 0.64 mm against 0.781, node's `U4.2`, `U4.6` and `U4.7`
+at 0.364 mm against 0.4. The narrowing is deliberate — `tap._width` is `fanout.py`'s neck, and a 0402
+pad is 0.5 mm wide — so the pattern now says so itself in a `style:` note per stub, and `TAP_NECKED`
+pins the count per board, matched to the stubs by the position and length KiCad reports.
+
+### The gaps and the nits
+
+**3 — tenting is pcbc's fact now.** Every tap's ring sits at exactly `clearance_min` from the pad it
+welds (0.0889 mm on node, 0.1270 mm elsewhere) and a pad's mask opening here **is** its copper
+(`pad_to_mask_clearance 0`, `solder_mask_margin 0`). What keeps solder out of the barrel is
+`(tenting (front yes) (back yes))` — and that stanza was KiCad 10's default, written the first time
+KiCad saved the file; `grep -rn tent src/pcbc/` returned nothing. `Stackup.via_tenting` now carries
+the fact with its measurement, `seed` writes it into the board, and `test_examples_fab.py` reads it
+back out of the F/B mask Gerbers: no pattern via has a flash (node's `layout-F_Mask.gts` has 157
+flashes and none of them is a tap).
+
+**4 — two taps in another part's courtyard, now counted.** c3_usb's tap for `J1.A1B12` at
+(14.6729, 22.44) is inside `SW_RST`'s courtyard; node's for `C_MCU.1` was inside `U1`'s and is not any
+more, because finding 10's antipad rule moved that tap. `copper_bar` reports `vias_in_courtyard` and
+the count is pinned per board: **c3_usb 1, blinky, buck, node and ds2 0**. It is a placement note, not a refusal: KiCad's
+courtyard rules are footprint-to-footprint, the via is tented, and nothing is illegal.
+
+**6 — a via may not sit in a fanout lane.** `lane_ok` and D.1 both looped
+`if p.kind != "seg": continue`, so no via was ever put to the lane rule and 105 of the tap's 210
+pieces were exempt from it. One instance on the boards: ds2's `C5.2` tap via, 0.1221 mm inside `U1`'s
+top lane, occupying the column `U1.11` (AIN0) escapes through. A via has no run length, so occupancy
+is the test; the stub now leaves that pad upward. ds2's bar paid for it, above.
+
+**7 — the neck is a `style:` line now**, counted in the census like A.4 rule 4: "tap GND: U4.7's stub
+necks to 0.364 mm, the pad's across dimension, against the Power class's 0.4 mm".
+
+**8 — the tap adds `EPS_MM` like everything else.** 88 of 105 taps sat at exactly `clearance_min`
+from the pad they weld, which is copper `route_geom.clears` refuses; the pattern only got away with it
+because `_in_a_pad` exempts the primitive it leaves from. `route_scene.pad_exits` already adds the
+same epsilon with the same comment. The cost is above: c3_usb's leftover moved.
+
+**11 — D.5 runs in the product.** `plane_checks` and `plane_islands` were called from `tests/` and
+from nowhere in `src/`, so on any board that is not one of the five examples neither question was ever
+asked. `build_job` now asks both on the board the gate itself refilled and saved, and fails the build
+with the sentence naming the pad; the result carries `planes: {islands, area_mm2, fails}`.
+
+**12 — `plane_checks` asks the ring.** It asked the centre, and the via's diameter never entered it,
+because `copper.json`'s via key carries neither size nor drill and the one caller had to invent 0.0.
+The sidecar now records `w` and `drill` per piece and the check requires the centre plus 16 points of
+the ring to be in the net's own filled copper. Measured before changing it: all 62 node taps, all 34
+c3_usb taps and both ds2 taps are fully covered, so this tightens a true statement rather than
+fixing a false one.
+
+**13 — the fall-through's real price, in B.3's own docstring.** A refused tap "costs a via pcbc would
+have placed better and never costs the connection" was half the story: KRT's `plane_taps` step runs
+with `--same-net-pad-clearance -1`, for the reason recorded in `route.py` (with the keepout on it
+welded nothing — 4 of 59 GND pads), so its replacement via is under no obligation to clear the pad it
+welds. node's refused `U1.51` came back with a via overlapping that pad's copper by 0.025 mm, which
+is exactly what `_in_a_pad` refuses. **Deviation:** the finding's second option — pass the flag to
+that step — is refused by the measurement already in the code, so the docstring is where this lands.
+
+**15, 16, 18 — the record.** c3_usb's `off45` 7 → 11 and `VBUS`'s detour 1.33 → 1.70 are now in S5's
+"what got worse" with their per-net attribution, and the bar carries `detours` per net so a max can no
+longer hide a net under it. S5's decision-1 arithmetic quoted node's window and buck's example in one
+sentence; each board's window is now given with its own numbers.
+
+**17 — an unfilled plane is a sentence.** `plane_checks` skipped a net with no filled zone and
+`set(plane_islands(...).values()) <= {1}` is True of an empty dict, so deleting node's 3V3 fill left
+both checks silent while 17 taps welded nothing. The first reports the line; the second is pinned
+against the expected key set.
 
 ## Verification of S2 to S4, independent of the agents that wrote them
 

@@ -22,6 +22,7 @@ a handful of ids against a linear scan of 152 pads alone.
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import dataclass, field
 from typing import Iterable, Sequence
 
@@ -34,6 +35,7 @@ from .model import Design
 from .pads import PadGeom, pad_geoms
 from .pcb_place import _EDGE_OUT, _pins_of, Foot, lane_rules, parse_foot
 from .route_emit import Piece, seg_piece
+from .sexp import matching_paren
 from .route_geom import (
     Box,
     EPS_MM,
@@ -61,6 +63,8 @@ __all__ = [
     "Item",
     "KIND_ORDER",
     "Scene",
+    "ZoneRule",
+    "antipad_clash",
     "audit",
     "blocked",
     "build_scene",
@@ -74,6 +78,7 @@ __all__ = [
     "net_open",
     "pad_exits",
     "plane_targets",
+    "zone_rules",
 ]
 
 KIND_ORDER = {"pad": 0, "hole": 1, "track": 2, "via": 3, "keepout": 4, "lane": 5, "edge": 6}
@@ -313,6 +318,114 @@ def _sort_key(it: Item) -> tuple:
     return (KIND_ORDER.get(it.kind, 99), it.net, it.owner, round(b[0] * 1e6), round(b[1] * 1e6))
 
 
+# --- the zones' own numbers -----------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ZoneRule:
+    """One copper pour's fill arithmetic, read off the board file it is written in.
+
+    A pour is not an obstacle (A.4), so nothing in the scene modelled it until S5's review. What it
+    still decides is the copper it *keeps*: a foreign hole in a plane carves an antipad of the hole's
+    copper plus `pad_clearance`, and where two antipads leave a neck narrower than `min_thickness`
+    KiCad deletes the neck and the two become one slot (`docs/r2-measurements.md` S5r, finding 10:
+    eleven taps on node's `U1` at the footprint's own 0.8 mm pitch cut an 8.65 mm slot through the
+    3V3 plane, and the path across it went from 1.80 mm to 8.09 mm).
+
+    Only the header is read, never the fill: on four layers the zone exists when the post stage runs
+    and its polygons do not (`04_planes.kicad_pcb` has zero `filled_polygon`), which is the whole
+    reason the numbers are worth having at placement time.
+    """
+
+    net: str
+    layer: str
+    pad_clearance: float
+    min_thickness: float
+
+
+_ZONE_HEAD = re.compile(r"\n\t\(zone\b")
+_ZONE_NET_RE = re.compile(r'\(net_name "([^"]*)"\)|\(net "([^"]*)"\)')
+_ZONE_LAYER_RE = re.compile(r'\(layers? "([^"]+)"')
+_ZONE_CLEAR_RE = re.compile(r"\(connect_pads[^()]*(?:\s*\(clearance ([-0-9.]+)\))")
+_ZONE_MINTHICK_RE = re.compile(r"\(min_thickness ([-0-9.]+)\)")
+
+
+def zone_rules(text: str) -> tuple[ZoneRule, ...]:
+    """Every copper pour's `(net, layer, connect_pads clearance, min_thickness)`, in file order.
+
+    A keepout zone has no net and several layers and is skipped: it pours no copper, so it has no
+    antipads to merge. A zone naming more than one layer is skipped for the same reason — every pour
+    pcbc's plans write names exactly one.
+    """
+    out: list[ZoneRule] = []
+    for m in _ZONE_HEAD.finditer(text):
+        end = matching_paren(text, m.start() + 2)
+        head = text[m.start() : end + 1].split("(polygon", 1)[0]
+        if "(keepout" in head:
+            continue
+        nm = _ZONE_NET_RE.search(head)
+        lm = _ZONE_LAYER_RE.search(head)
+        net = (nm.group(1) or nm.group(2)) if nm else ""
+        layers = lm.group(1) if lm else ""
+        if not net or " " in layers or not layers:
+            continue
+        cm = _ZONE_CLEAR_RE.search(head)
+        tm = _ZONE_MINTHICK_RE.search(head)
+        out.append(
+            ZoneRule(
+                net=net,
+                layer=layers,
+                pad_clearance=float(cm.group(1)) if cm else 0.0,
+                min_thickness=float(tm.group(1)) if tm else 0.0,
+            )
+        )
+    return tuple(out)
+
+
+ANTIPAD_QUERY_MM = 3.0
+"""How far past the via the bucket index is asked to look for a neighbouring antipad, in mm. The
+widest number this check can need is `2 * pad_clearance + min_thickness` — 0.46 mm on node — plus the
+two rings; 3 mm covers it with the same room `_MAX_NEED` leaves the clearance rules."""
+
+
+def antipad_clash(scene: "Scene", at: Pt, dia: float, net: str, *, ignore: frozenset[int] = frozenset()) -> Clash | None:
+    """Would a through via here merge its antipad with a neighbour's, in a plane it does not join?
+
+    A via on a foreign net punches a hole of `via + 2 * pad_clearance` in a pour. Two such holes
+    `min_thickness` or less apart leave a neck KiCad deletes, and the two antipads become one slot —
+    which is how eleven taps on node's `U1`, placed one per pad at the footprint's own 0.8 mm pitch
+    (0.71 mm of antipad, a 0.09 mm neck against the zone's 0.1 mm `min_thickness`), cut 8.65 mm of
+    the 3V3 plane in half and turned a 1.80 mm path across it into 8.09 mm (finding 10).
+
+    Asked of **holes**, which is what the measurement found and what a tap can add: every drilled item
+    already on this layer that is not the pour's own net. A track on a plane layer voids copper too,
+    but no plan here routes one, and a rule is only worth what it has been measured against.
+
+    The clearance an antipad is cut at is the **larger** of the zone's own `connect_pads` number and
+    the clearance table's, because KiCad's fill honours both. Measured on node, where they differ:
+    the zone is written `(connect_pads yes (clearance 0.18))` and the class clearance between GND and
+    3V3 is 0.2, and a tap via's antipad in the 3V3 plane comes back with a radius of 0.375-0.38 mm
+    against the via's own 0.175 — the class number, not the zone's. Taking the zone's alone put the
+    requirement 0.02 mm light and left a neck KiCad then deleted anyway.
+    """
+    ring = via_shape(at, dia)
+    box = (at[0], at[1], at[0], at[1])
+    for z in scene.zone_rules:
+        if z.net == net or z.layer not in scene.layers or z.min_thickness <= 0.0:
+            continue
+        mine = max(z.pad_clearance, scene.table.between(z.net, net)[0])
+        for i in scene.query(z.layer, box, mine * 2 + z.min_thickness + dia + ANTIPAD_QUERY_MM):
+            it = scene.items[i]
+            if i in ignore or it.hole is None or it.net == z.net or z.layer not in it.layers:
+                continue
+            shape = it.copper if it.copper is not None else it.hole
+            theirs = max(z.pad_clearance, scene.table.between(z.net, it.net)[0]) if it.copper is not None else scene.table.hole_to_copper()
+            need = round(mine + theirs + z.min_thickness, 6)
+            if not clears(ring, shape, need):
+                return Clash(it, gap(ring, shape), need, it.at(), "plane_neck", f"the {z.net} plane on {z.layer}, whose min_thickness is {z.min_thickness:g} mm")
+    return None
+
+
 # --- the scene ------------------------------------------------------------------------------------
 
 
@@ -329,6 +442,7 @@ class Scene:
     layers: tuple[str, ...]
     grid: float  # krt_grid(job)
     feet: dict[str, Foot]
+    zone_rules: tuple[ZoneRule, ...] = ()  # the filled zones' own fill numbers, read off the board
     _cells: dict = field(default_factory=dict, repr=False)
     _max_r: float = 0.0  # the widest offset radius on the board; the query pad is built from it
 
@@ -470,6 +584,7 @@ def build_scene(design: Design, job: CompiledJob, cs: ConstraintSet, pcb_text: s
         layers=layers,
         grid=krt_grid(job),
         feet=feet,
+        zone_rules=zone_rules(pcb_text),
     )
     scene._index(ordered)
     scene._max_r = max([0.0] + [s.r for it in ordered for s in (it.copper, it.hole, it.mask) if s is not None])

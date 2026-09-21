@@ -123,6 +123,15 @@ class Stackup:
     # costs in tap sites (docs/r2-design.md A.4). No compiled number reads it, so no
     # `tests/fixtures/compiled/*.json` moves.
     mask_bridge_min: float = 0.0
+    # Every via tented, both sides, and it is pcbc's fact rather than KiCad's default. Measured:
+    # every tap sits at exactly `clearance_min` from the pad it welds (0.0889 mm on node, 0.1270 mm
+    # on the two-layer rungs) and a pad's mask opening is its copper here (`pad_to_mask_clearance 0`,
+    # `solder_mask_margin 0`), so with the vias open the dam between a 0402's opening and a tap ring
+    # is 0.0889 mm — under `mask_bridge_min`, the sliver a fab drops — and pad and barrel end up in
+    # one opening. `(tenting (front yes) (back yes))` is what keeps solder out of the barrel, and
+    # until S5's review nothing in pcbc wrote it or checked it: the stanza on every routed board was
+    # KiCad 10's own default (`docs/r2-measurements.md` S5r, finding 3).
+    via_tenting: bool = True
     mask_over_substrate_mm: float = 0.0305  # JLC impedance page: 1.2 mil
     mask_over_trace_mm: float = 0.0152  # 0.6 mil
     mask_dk: float = 3.8

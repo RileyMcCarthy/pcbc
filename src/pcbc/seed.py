@@ -191,6 +191,20 @@ def _outline(w: float, h: float, board: str) -> str:
     )
 
 
+def _tenting(design: Design) -> str:
+    """The via tenting stanza, from the Stackup (`Stackup.via_tenting` carries the measurement).
+
+    A seeded board that does not say leaves it to whatever the tool that opens it defaults to, and
+    a tap's mask dam is 0.0889 mm on node — under the sliver a fab will print. It is an owned fact
+    now, so `pcbc check` and the gate are reading pcbc's answer and not KiCad's.
+    """
+    from .stackup import get_stackup
+
+    if design.board is None or not get_stackup(design.board.stackup).via_tenting:
+        return "\t\t(tenting\n\t\t\t(front no)\n\t\t\t(back no)\n\t\t)\n"
+    return "\t\t(tenting\n\t\t\t(front yes)\n\t\t\t(back yes)\n\t\t)\n"
+
+
 def emit_pcb(design: Design, *, name: str) -> str:
     if design.board is None:
         raise ValueError("no Board()")
@@ -218,7 +232,8 @@ def emit_pcb(design: Design, *, name: str) -> str:
         + "\t(setup\n"
         "\t\t(pad_to_mask_clearance 0)\n"
         "\t\t(allow_soldermask_bridges_in_footprints no)\n"
-        "\t)\n"
+        + _tenting(design)
+        + "\t)\n"
         + _nets(design)
         + "".join(fps)
         + _outline(w, h, name)

@@ -202,6 +202,13 @@ def sidecar(pieces, *, step: str, refusals=(), notes=(), leftover: dict | None =
                 "owner": p.owner,
                 "step": step,
                 "mm": round(p.mm, 4),
+                # The size, because the key does not carry it and a reader that needs it had to
+                # invent one: `test_examples_fab.py` rebuilt every via at diameter 0.0 to ask
+                # `plane_checks` about it, which is exactly why that check could only ever test the
+                # centre (`docs/r2-measurements.md` S5r, finding 12). `w` is the track width on a
+                # segment and the ring diameter on a via; `drill` is 0.0 on a segment.
+                "w": round(p.w, 4),
+                "drill": round(p.drill or 0.0, 4),
             }
             for p in pieces
         ],

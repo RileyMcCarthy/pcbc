@@ -98,7 +98,62 @@ def bar_key(kind: str, *parts) -> tuple:
     return ("via", (round(at[0], 4), round(at[1], 4)))
 
 
-def copper_bar(text: str, reasons: dict | None = None) -> dict:
+def courtyard_boxes(text: str) -> list[tuple[str, tuple[float, float, float, float]]]:
+    """Every footprint's courtyard as a world AABB, `(ref, box)`, sorted by ref.
+
+    KiCad's courtyard rules are footprint-to-footprint only, so DRC says nothing about a via that
+    lands in one and pcbc said nothing either (finding 4). It is not a refusal — a tented via under
+    a part's keep-out is legal copper — but H.1's third decision is that a pattern which makes a
+    neighbour worse gets a number, so the number is here.
+    """
+    from .geom import footprint_box_local
+    from .sexp import board_footprint_spans, footprint_at, footprint_reference
+
+    out: list[tuple[str, tuple[float, float, float, float]]] = []
+    for start, end in board_footprint_spans(text):
+        block = text[start:end]
+        at = footprint_at(block)
+        if at is None:
+            continue
+        x0, y0, x1, y1 = footprint_box_local(block, "courtyard")
+        if x1 <= x0 or y1 <= y0:
+            continue
+        fx, fy, rot = at
+        rad = math.radians(-rot)
+        c, s = math.cos(rad), math.sin(rad)
+        xs, ys = [], []
+        for px, py in ((x0, y0), (x1, y0), (x1, y1), (x0, y1)):
+            xs.append(fx + px * c - py * s)
+            ys.append(fy + px * s + py * c)
+        out.append((footprint_reference(block) or "?", (min(xs), min(ys), max(xs), max(ys))))
+    return sorted(out)
+
+
+def vias_in_courtyard(text: str, reasons: dict, owners: dict) -> list[dict]:
+    """Every via pcbc placed that sits inside a courtyard belonging to some **other** footprint.
+
+    Its own footprint's courtyard is where a tap is supposed to be: the via leaves that pad. The
+    number that was silent is the other one: c3_usb's tap for `J1.A1B12` at (14.6729, 22.44) sits in
+    `SW_RST`'s courtyard, and node's for `C_MCU.1` sat in `U1`'s until the antipad rule moved it.
+    Both boards read 0 before the taps (`docs/r2-measurements.md` S5r, finding 4).
+    """
+    boxes = courtyard_boxes(text)
+    out: list[dict] = []
+    for v in vias(text):
+        key = bar_key("via", v["at"])
+        reason = reasons.get(key)
+        if reason is None:
+            continue  # KRT's leftover via: R3 owns where those land, and it is not measured here
+        owner = (owners.get(key) or "").split(".")[0]
+        x, y = v["at"]
+        for ref, (x0, y0, x1, y1) in boxes:
+            if ref != owner and x0 <= x <= x1 and y0 <= y <= y1:
+                out.append({"via": [round(x, 4), round(y, 4)], "reason": reason, "owner": owners.get(key, ""), "courtyard": ref})
+                break
+    return sorted(out, key=lambda h: (h["courtyard"], h["via"]))
+
+
+def copper_bar(text: str, reasons: dict | None = None, owners: dict | None = None) -> dict:
     """Per-net and total numbers, plus the lines a report prints.
 
     `reasons` maps `bar_key` to the pattern that wrote that piece (D.4). With it the totals gain
@@ -154,6 +209,11 @@ def copper_bar(text: str, reasons: dict | None = None) -> dict:
     totals["by_reason"] = {r: {"segments": v["segments"], "vias": v["vias"], "mm": round(v["mm"], 1)} for r, v in sorted(by_reason.items())}
     totals["vias_pattern"] = {r: v["vias"] for r, v in sorted(by_reason.items()) if r != "leftover" and v["vias"]}
     totals["vias_leftover"] = by_reason.get("leftover", {}).get("vias", 0)
+    # Per net, not just the worst: `worst_detour` is a max, and a max hides every net under it. It
+    # held at USB_DN 1.81 on c3_usb through S5 while VBUS went 1.33 -> 1.70 underneath it, which is
+    # the slice's largest per-net regression and was in no number anywhere (finding 16).
+    totals["detours"] = {n: r["detour"] for n, r in sorted(nets.items()) if r["detour"] is not None and r["airwire_mm"] >= 1.0}
+    totals["vias_in_courtyard"] = vias_in_courtyard(text, reasons, owners or {}) if reasons else []
     return {"nets": nets, "totals": totals, "lines": bar_lines(nets, totals)}
 
 
@@ -171,6 +231,10 @@ def bar_lines(nets: dict[str, dict], totals: dict) -> list[str]:
             f"{round(sum(v['mm'] for v in owned.values()), 1):g} mm and {sum(v['vias'] for v in owned.values())} vias ({what}); "
             f"leftover {left['segments']} segments / {left['mm']:g} mm / {left['vias']} vias"
         )
+    cy = totals.get("vias_in_courtyard") or []
+    if cy:
+        who = ", ".join(f"{h['owner'] or h['reason']} in {h['courtyard']}" for h in cy[:3])
+        lines.append(f"copper: {len(cy)} of pcbc's vias sit in another footprint's courtyard ({who})")
     ranked = sorted(((r["detour"], n, r) for n, r in nets.items() if r["detour"] is not None and r["airwire_mm"] >= 1.0), reverse=True)
     for detour, net, r in ranked[:3]:
         if detour < 1.5:

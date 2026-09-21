@@ -346,7 +346,7 @@ def _refuse(ctx, net, a: Terminal, b: Terminal, layer: str, clash, rule: str, na
             f"past the {DETOUR_MAX:g}x a hop may take (rule: detour)"
         )
     elif clash is None and lane:
-        blockers = f"every candidate runs {lane}, and a fanout lane may be crossed and not run along (rule: lane)"
+        blockers = f"every candidate {lane}, and a fanout lane may be crossed, not run along and not sat in (rule: lane)"
     elif clash is None:
         blockers = (
             f"no link fits between the exits these pads have on {where} "

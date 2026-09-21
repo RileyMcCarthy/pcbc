@@ -175,6 +175,26 @@ def kicad_drc(pcb: Path, cli: Path | None = None, *, refill: bool = True) -> dic
         return json.loads(out.read_text())
 
 
+_TRACK_LEN = re.compile(r"length ([0-9.]+) mm")
+
+
+def _width_hits(violations: list) -> list[dict]:
+    """Every `track_width` warning as `{"at": [x, y], "mm": length}`, in KiCad's own order.
+
+    The position and the length together name the segment: the uuid cannot, because the board is
+    DRC'd after KiCad's save has invented its own ids and before `pin_all_uuids` puts pcbc's back.
+    """
+    out: list[dict] = []
+    for v in violations:
+        if v.get("type") != "track_width":
+            continue
+        for item in v.get("items") or []:
+            pos = item.get("pos") or {}
+            m = _TRACK_LEN.search(str(item.get("description", "")))
+            out.append({"at": [pos.get("x"), pos.get("y")], "mm": float(m.group(1)) if m else None, "rule": str(v.get("description", ""))})
+    return out
+
+
 def check_copper(design: Design, pcb: Path, cli: Path | None = None, floor_mm: float | None = None, *, refill: bool = True) -> dict:
     """The copper gate: KiCad DRC clean, nothing unconnected, pads bound exactly as board.py says."""
     from .compile import compile_design
@@ -231,6 +251,10 @@ def check_copper(design: Design, pcb: Path, cli: Path | None = None, floor_mm: f
             and not any(names_rule(str(v.get("description", "")), name) for name in pcbc_warning_rules)
         ),
         "geometry": geometry,  # KiCad's own count of staircases and 90 degree corners
+        # Where each `track_width` warning is, so a caller can ask **whose** copper it is. The
+        # aggregate alone let four of pcbc's own tap stubs sit inside a KRT total while the comment
+        # above it said "no tap stub is in these counts" (`docs/r2-measurements.md` S5r, finding 14).
+        "width_hits": _width_hits(violations),
         "canary": canary_fired,
         "soft": soft,  # {rule name: hits} for pcbc's soft rules (track_width, skew, via budget, uncoupled)
         "rules": rule_hits,  # {rule name: hits} for every pcbc rule

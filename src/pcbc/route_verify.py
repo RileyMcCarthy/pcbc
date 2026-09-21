@@ -19,7 +19,7 @@ from typing import Sequence
 
 from .constraints import ConstraintSet
 from .route_emit import Piece
-from .route_geom import MICRO_MM, Box, Pt, aabb, clip_len_in_box, is_octilinear, legs_ok, q, seg_lengths, turn_ok
+from .route_geom import MICRO_MM, Box, Pt, aabb, clears, clip_len_in_box, is_octilinear, legs_ok, q, seg_lengths, turn_ok, via_shape
 from .route_scene import Item, Scene, clashes
 from .sexp import matching_paren
 
@@ -29,9 +29,12 @@ __all__ = [
     "Zone",
     "in_zone",
     "lane_overrun",
+    "via_in_lane",
     "paths_of",
     "plane_checks",
     "plane_islands",
+    "plane_area",
+    "poly_area",
     "pour_raster",
     "verify_copper",
     "zones",
@@ -130,6 +133,9 @@ def verify_copper(scene: Scene, pieces: Sequence[Piece], cs: ConstraintSet, *, i
                 out.append(f"{p.reason} {p.net}: {v!r} is not a whole number of nanometres")
         if p.kind == "via":
             out += _via_rules(scene, cs, p, pieces)
+            who = via_in_lane(scene, p.a, p.w, served[(p.net, p.reason)] | {p.owner.split(".")[0]})
+            if who:
+                out.append(f"{p.reason} {p.net}: a via inside {who}, which is a fanout lane (A.7)")
         else:
             run, who = lane_overrun(scene, p.a, p.b, p.w, served[(p.net, p.reason)] | {p.owner.split(".")[0]})
             if who:
@@ -192,6 +198,26 @@ def lane_overrun(scene: Scene, a: Pt, b: Pt, w: float, exempt: frozenset[str]) -
         if run > lane_budget(scene, it, w) and run > worst:
             worst, who = run, it.owner
     return (round(worst, 4), who)
+
+
+def via_in_lane(scene: Scene, at: Pt, dia: float, exempt: frozenset[str]) -> str:
+    """Whose fanout lane this via's copper sits in, or `""`.
+
+    A segment may **cross** a lane and may not run along one (A.7), and `lane_overrun` measures the
+    run. A via has no run to measure: it occupies, so any part of a lane it touches is a lane that
+    footprint's own pads can no longer escape through. Until S5's review neither `lane_ok` nor D.1
+    asked a via anything — both looped `if p.kind != "seg": continue` — so half of every tap was
+    exempt from the rule the DS2 Addon's walled-in AVDD, DVDD and UART pins bought
+    (`docs/copper-plan.md`, and `docs/r2-measurements.md` S5r, finding 6: ds2's `C5` tap via sat
+    0.1221 mm inside `U1`'s top lane, in `U1.11`'s own escape column).
+    """
+    ring = via_shape(at, dia)
+    for it in sorted(scene.items, key=lambda i: i.id):
+        if it.kind != "lane" or it.copper is None or it.owner.split(" ")[0] in exempt:
+            continue
+        if not clears(ring, it.copper, 0.0):
+            return it.owner
+    return ""
 
 
 def _via_rules(scene: Scene, cs: ConstraintSet, p: Piece, pieces_on_net: Sequence[Piece] = ()) -> list[str]:
@@ -336,12 +362,27 @@ def _in_poly(poly: Sequence[Pt], at: Pt) -> bool:
     return inside
 
 
+RING_SAMPLES = 16
+"""How many points of a tap via's ring `plane_checks` asks about, besides its centre.
+
+The check used to ask the **centre** and nothing else, and the via's diameter never entered it — so
+a via sitting half out of the pour, welded by a sliver of annulus or by nothing, passed (finding 12).
+Sixteen points is 22.5 degrees apart: a retreat of the fill that misses all of them and the centre is
+a notch narrower than `r * (1 - cos(11.25 deg))`, 0.3 % of the ring. Measured on the S5 boards, all
+62 node taps, all 34 c3_usb taps and both ds2 taps are covered at every one of them."""
+
+
 def plane_checks(text: str, pieces: Sequence[Piece]) -> list[str]:
     """D.5's first half, asked of a filled board: every tap via lands in its own net's plane.
 
     A via that clears every rule and sits where the fill retreated is copper that connects nothing,
     and the gate reports it three stages later as an unconnected pad rather than as the tap it was.
     Here it is one sentence naming the pad.
+
+    Two things this asks that it did not before S5's review: the **ring** and not just the centre
+    (finding 12), and the **absence** of the plane and not only a via outside one — a tap pattern
+    that ran at all implies the plane was supposed to exist, so a net whose zone came back unfilled
+    is a sentence rather than a `continue` (finding 17).
     """
     out: list[str] = []
     zs = [z for z in zones(text) if z.polys]
@@ -352,10 +393,46 @@ def plane_checks(text: str, pieces: Sequence[Piece]) -> list[str]:
         # any filled zone of its own net, whichever layer that zone is on.
         mine = [z for z in zs if z.net == p.net]
         if not mine:
-            continue  # the net has no filled zone on this board; `net_open` is what speaks for it
-        if not any(in_zone(z, p.a) for z in mine):
+            out.append(f"tap {p.net}: {p.net} has no filled zone on this board, so the via at ({p.a[0]:g},{p.a[1]:g}) for {p.owner} welds nothing")
+            continue
+        r = (p.w or 0.0) / 2.0
+        ring = [p.a] + [(p.a[0] + r * math.cos(2 * math.pi * k / RING_SAMPLES), p.a[1] + r * math.sin(2 * math.pi * k / RING_SAMPLES)) for k in range(RING_SAMPLES)] if r > 0 else [p.a]
+        held = sum(1 for pt in ring if any(in_zone(z, pt) for z in mine))
+        if held < len(ring):
             where = ", ".join(sorted(z.layer for z in mine))
-            out.append(f"tap {p.net}: the via at ({p.a[0]:g},{p.a[1]:g}) for {p.owner} is not inside the {p.net} plane on {where}")
+            out.append(f"tap {p.net}: the via at ({p.a[0]:g},{p.a[1]:g}) for {p.owner} has {held}/{len(ring)} of its ring inside the {p.net} plane on {where}")
+    return out
+
+
+def poly_area(poly: Sequence[Pt]) -> float:
+    """The shoelace area of one filled polygon, in mm2, always positive."""
+    a = 0.0
+    n = len(poly)
+    for i in range(n):
+        x0, y0 = poly[i]
+        x1, y1 = poly[(i + 1) % n]
+        a += x0 * y1 - x1 * y0
+    return abs(a) / 2.0
+
+
+def plane_area(text: str) -> dict[tuple[str, str], float]:
+    """`{(net, layer): filled copper in mm2}`, rounded to 2 dp, for every filled zone.
+
+    The island **count** cannot see the failure D.5 is documented to watch, and that is arithmetic,
+    not an oversight: with `island_removal_mode 0` a cut-off fragment is *deleted*, so it is never
+    written as a second `filled_polygon` and the count stays at 1. The count only rises when both
+    halves keep a live connection, which is the rarer case. Measured: ds2's shipped board silently
+    drops five orphan GND islands totalling 8.52 mm2 and `plane_islands` reports 1; a synthetic wall
+    of 38 vias across node's corner deletes 69.44 mm2 of In1.Cu and it still reports 1 (finding 9).
+
+    So the number to pin is the **area**. A fragment that disappears moves it; the count does not.
+    """
+    out: dict[tuple[str, str], float] = {}
+    for z in zones(text):
+        if not z.polys:
+            continue
+        key = (z.net, z.layer)
+        out[key] = round(out.get(key, 0.0) + sum(poly_area(poly) for poly in z.polys), 2)
     return out
 
 

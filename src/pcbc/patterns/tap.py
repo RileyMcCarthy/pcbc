@@ -32,8 +32,8 @@ from dataclasses import dataclass
 
 from ..blocking import move_line
 from ..route_emit import Piece, seg_piece, via_piece
-from ..route_geom import MICRO_MM, Pt, clears, gap, q
-from ..route_scene import Clash, Scene, blocked, pad_exits
+from ..route_geom import EPS_MM, MICRO_MM, Pt, clears, gap, q
+from ..route_scene import Clash, Scene, antipad_clash, blocked, pad_exits
 from ..sexp import stable_uuid
 from ..stackup import via_amps
 from . import PatternCtx, PatternResult, Refusal, Terminal, _pad_key, lane_ok, terminals
@@ -236,7 +236,13 @@ def _sites(ctx: PatternCtx, spec: TapSpec) -> tuple[tuple[str, tuple[int, int], 
         dx, dy = ex.dir
         half = (box[2] - box[0]) / 2.0 if dx else (box[3] - box[1]) / 2.0
         w = _width(spec, ctx, dx != 0)
-        d0 = half + scene.stack.clearance_min + dia / 2.0
+        # `+ EPS_MM` for `route_scene.pad_exits`' own reason, in its own words: "a stub placed at
+        # exactly `need` is copper this module's own judge refuses". `clears` demands `need + EPS_MM`
+        # and this pattern is the one that placed copper at exactly `need`, exempting the pad it
+        # welds from the test — 88 of 105 taps sat on the fab floor to the last bit (0.0889 mm on
+        # node, 0.1270 elsewhere). 0.1 um out, and the docstring's claim survives the exemption
+        # being removed (`docs/r2-measurements.md` S5r, finding 8).
+        d0 = half + scene.stack.clearance_min + EPS_MM + dia / 2.0
         for k in range(steps + 1):
             d = d0 + k * scene.grid
             out.append((ex.side, (dx, dy), k, (q(cx + dx * d), q(cy + dy * d)), w))
@@ -335,7 +341,15 @@ def run(ctx: PatternCtx, spec: TapSpec) -> PatternResult:
         if pieces[0].mm < MICRO_MM:
             continue  # a stub KiCad's own `track_segment_length` would count; the next site is longer
         tried += 1
-        clash = _in_a_pad(scene, spec, at) or blocked(scene, pieces, t.net, ignore=mine)
+        clash = (
+            _in_a_pad(scene, spec, at)
+            or blocked(scene, pieces, t.net, ignore=mine)
+            # The plane this via does NOT join is the one it can quietly cut: a row of taps at a
+            # footprint's own pitch merges its antipads into a slot (finding 10). `_sites` offers 16
+            # distances on each of four sides, so a row that cannot be tapped one-per-pad in line can
+            # still be tapped by stepping alternate pads out until the neck holds.
+            or antipad_clash(scene, at, spec.via[0], t.net, ignore=mine)
+        )
         if clash is not None:
             seen.append(clash)
             if worst is None or (clash.need - clash.have) > worst[0]:
@@ -358,6 +372,7 @@ def run(ctx: PatternCtx, spec: TapSpec) -> PatternResult:
             joins=((t.owner, f"{t.net} plane on {spec.plane}"),),
             candidate=f"{side}+{k} {spec.via[0]:g}/{spec.via[1]:g}",
             tried=tried,
+            notes=_neck_note(ctx, spec, w),
         )
     return PatternResult(
         reason=REASON,
@@ -365,6 +380,23 @@ def run(ctx: PatternCtx, spec: TapSpec) -> PatternResult:
         refusal=_refuse(ctx, spec, worst[1] if worst else None, seen, len(sites), tried, lane_why, unreached),
         tried=tried,
     )
+
+
+def _neck_note(ctx: PatternCtx, spec: TapSpec, w: float) -> tuple[str, ...]:
+    """A `style:` line when the stub is narrower than the class the net declares.
+
+    `_width` narrows to the pad's across dimension on purpose — it is `fanout.py`'s own neck, and a
+    0402 pad is 0.5 mm wide — but the class's `width_*` rule has no such exemption, so KiCad counts
+    the stub as a soft hit like any other necked track. `test_examples_fab.py` used to say the
+    opposite ("no tap stub is in these counts") and four stubs were in them: buck's `R_FB_BOT.2` at
+    0.64 mm against `width_power`'s 0.781, and node's `U4.2`, `U4.6` and `U4.7` at 0.364 against 0.4
+    (finding 14). Counted here so a board where the neck matters electrically is a line pcbc wrote
+    rather than a DRC warning nobody attributed.
+    """
+    c = ctx.cs.by_net(spec.pad.net)
+    if c is None or w >= float(c.width_mm.value) - 1e-9:
+        return ()
+    return (f"style: tap {spec.pad.net}: {spec.pad.owner}'s stub necks to {w:g} mm, the pad's across dimension, against the {c.class_name} class's {float(c.width_mm.value):g} mm",)
 
 
 def _raster(ctx: PatternCtx, spec: TapSpec):
@@ -419,7 +451,13 @@ def _refuse(ctx: PatternCtx, spec: TapSpec, clash: Clash | None, seen: list[Clas
 
     Soft because the fall-through is exact: `route.py` runs KRT's own `plane_taps` step for the
     plane nets a pad of which was refused, and skips it entirely when there are none. So a refused
-    tap costs a via pcbc would have placed better and never costs the connection.
+    tap never costs the connection — but it costs more than "a via pcbc would have placed better",
+    and the honest price is written here (finding 13). That step runs with
+    `--same-net-pad-clearance -1`, because with the keepout on it welded nothing (node: 4 of 59 GND
+    pads), so KRT's replacement via is under no obligation to clear the pad it welds: node's own
+    refused `U1.51` came back with a via overlapping that pad's copper by 0.025 mm, which is exactly
+    what `_in_a_pad` refuses. It is legal — an IC pin, same net, tented, and `via_in_pad_blockers`
+    exempts IC pads — and it is the difference between pcbc placing the via and KRT placing it.
 
     It lists the blockers **worst first** — B.3 asks for that, because the second one is usually the
     reason the first cannot simply be moved — names the rule of A.4 that decided each, counts the
@@ -439,7 +477,7 @@ def _refuse(ctx: PatternCtx, spec: TapSpec, clash: Clash | None, seen: list[Clas
     elif unreached:
         blockers = f"every site clears, and the pour does not reach {unreached} of them (rule: pour_reach)"
     elif lane:
-        blockers = f"every site runs {lane}, and a fanout lane may be crossed and not run along (rule: lane)"
+        blockers = f"every site {lane}, and a fanout lane may be crossed, not run along and not sat in (rule: lane)"
     else:
         blockers = f"no site is even {MICRO_MM:g} mm of copper from the pad (rule: no candidate)"
     blockers += f"\n  Tried {sites} sites (4 sides, {sites // 4} distances {ctx.scene.grid:g} mm apart), {tried} of them copper pcbc writes"

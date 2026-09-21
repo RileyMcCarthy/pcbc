@@ -56,9 +56,13 @@ def _board(name: str) -> Path:
 
 
 def _placed(name: str) -> Path:
-    if name == "ds2":
-        return DS2 / "layout" / "ds2_addon" / "placed" / "layout.kicad_pcb"
-    return EXAMPLES / name / "layout" / name / "placed" / "layout.kicad_pcb"
+    # Generated from `board.py`, never read out of `examples/**/layout/` — that directory is
+    # gitignored build output, so reading it made 45 tests in this file raise
+    # `FileNotFoundError` on a clean checkout, and the artifacts were stale besides
+    # (`conftest.placed_board`). Placing is pure Python: check + seed + place, no KiCad.
+    from conftest import placed_board
+
+    return placed_board(name, _board(name))
 
 
 def _routed(name: str) -> Path:
@@ -503,9 +507,20 @@ def test_free_intervals_answers_the_whole_question_at_once_and_on_all_four_axes(
 # --- A.9 who still needs KRT ----------------------------------------------------------------------
 
 
+@pytest.mark.kicad
+@pytest.mark.krt
+@pytest.mark.skipif(
+    not (EXAMPLES / "buck" / "layout" / "buck" / "routed" / "layout.kicad_pcb").exists(),
+    reason="the routed half needs a built board: run `pcbc build examples/buck/buck.py` first",
+)
 def test_a_placed_board_is_open_and_a_routed_one_is_not():
     """A.9: connectivity is computed, never declared, so a pattern that connects three of a net's
-    four pads is honest by construction. On a placed board every pad is its own component."""
+    four pads is honest by construction. On a placed board every pad is its own component.
+
+    Marked and guarded because the second half reads a **routed** board, which is not a pure
+    function of `board.py` the way a placed one is: it needs KiCad and KRT, and
+    `examples/**/layout/` is gitignored build output a clean checkout does not have.
+    """
     placed, _d, _j, _t = _scene("buck")
     assert net_open(placed, "GND"), "nothing is routed yet, so GND is open"
     assert len(components(placed, "GND")) == len(placed.pads_of("GND")), "one component per pad"

@@ -59,9 +59,13 @@ def _board(name: str) -> Path:
 
 
 def _placed(name: str) -> Path:
-    if name == "ds2":
-        return DS2 / "layout" / "ds2_addon" / "placed" / "layout.kicad_pcb"
-    return EXAMPLES / name / "layout" / name / "placed" / "layout.kicad_pcb"
+    # Generated from `board.py`, never read out of `examples/**/layout/` — that directory is
+    # gitignored build output, so reading it made 45 tests in this file raise
+    # `FileNotFoundError` on a clean checkout, and the artifacts were stale besides
+    # (`conftest.placed_board`). Placing is pure Python: check + seed + place, no KiCad.
+    from conftest import placed_board
+
+    return placed_board(name, _board(name))
 
 
 def _uuid_name(name: str) -> str:

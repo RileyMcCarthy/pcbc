@@ -35,6 +35,23 @@ def _board(name: str) -> Path:
     return DS2 / "ds2_addon.py" if name == "ds2" else EXAMPLES / name / f"{name}.py"
 
 
+
+# A **routed** board is not a pure function of `board.py`: it needs KiCad and KRT and minutes of
+# work, and `examples/**/layout/` is gitignored build output that a clean checkout does not have.
+# So every test here that reads one is marked `kicad` + `krt` — which is what those markers already
+# promise — and skips when the artifact is absent rather than raising `FileNotFoundError` in the
+# fast job. Measured: at 77d596b a clean `git archive` checkout failed 45 tests in
+# `test_patterns.py` and 4 here, and CI runs `pytest` **before** its first `pcbc build` in both
+# jobs, so the suite was green only on a machine that had built the boards before.
+pytestmark = [
+    pytest.mark.kicad,
+    pytest.mark.krt,
+    pytest.mark.skipif(
+        not (EXAMPLES / "c3_usb" / "layout" / "c3_usb" / "routed" / "layout.kicad_pcb").exists(),
+        reason="needs routed boards: run `pcbc build` on the examples first",
+    ),
+]
+
 def _routed(name: str) -> Path:
     if name == "ds2":
         return DS2 / "layout" / "ds2_addon" / "routed" / "layout.kicad_pcb"

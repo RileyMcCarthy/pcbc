@@ -80,9 +80,13 @@ def _board(name: str) -> Path:
 
 
 def _placed(name: str) -> Path:
-    if name == "ds2":
-        return DS2 / "layout" / "ds2_addon" / "placed" / "layout.kicad_pcb"
-    return EXAMPLES / name / "layout" / name / "placed" / "layout.kicad_pcb"
+    # Generated from `board.py`, never read out of `examples/**/layout/` — that directory is
+    # gitignored build output, so reading it made 45 tests in this file raise
+    # `FileNotFoundError` on a clean checkout, and the artifacts were stale besides
+    # (`conftest.placed_board`). Placing is pure Python: check + seed + place, no KiCad.
+    from conftest import placed_board
+
+    return placed_board(name, _board(name))
 
 
 def _uuid_name(name: str) -> str:
@@ -974,6 +978,87 @@ def test_the_post_stage_runs_between_the_planes_and_the_signals():
             prev = cmd[5]
     plain = [n for n, _ in krt_plan(compile_design(load_board(_board("node"))), load_board(_board("node")), _placed("node"), Path("w"), Path("/krt"))]
     assert "patterns_post" not in plain, "`PCBC_PATTERNS=off` passes post=False, and the plan is then the pre-R2 one exactly (C.6)"
+
+
+def test_the_final_stage_is_the_last_step_of_the_plan_on_both_stackups():
+    """`docs/stitch-plan.md` R-S1 and §7 (S2): copper whose absence leaves nothing unconnected is
+    written after the last router step that could have used the space it takes.
+
+    The position is the whole architectural claim, and it is one a plan can be asked about rather
+    than argued over: `patterns_final` is **last**, on four layers after `signals` and on two after
+    `gnd_pour`/`finalize`, so there is no router step left to react to its copper. `post` and `final`
+    are separate flags because they answer different questions, and `route_job` passes both off the
+    same `patterns_off()` so the rollback stays a rollback (C.6).
+    """
+    from pcbc.route import PCBC_STEP
+
+    for name, want in (
+        ("node", ["local_hops", "analog_nets", "pair_usb_dn", "planes", "patterns_post", "plane_taps", "signals", "patterns_final"]),
+        ("c3_usb", ["local_hops", "pair_usb_dn", "patterns_post", "signals", "gnd_pour", "finalize", "patterns_final"]),
+    ):
+        design = load_board(_board(name))
+        job = compile_design(design)
+        plan, _d, _j, _t = _plan(name)
+        steps = krt_plan(job, design, _placed(name), Path("work"), Path("/krt"), plan, post=True, final=True)
+        assert [n for n, _ in steps] == want, (name, [n for n, _ in steps])
+        cmd = dict(steps)["patterns_final"]
+        assert cmd[0] == PCBC_STEP and cmd[-2:] == ["--stage", "final"], cmd
+        assert cmd[4].endswith(("signals.kicad_pcb", "finalize.kicad_pcb")), "it reads what the last router step wrote"
+        assert Path(cmd[5]).name.endswith("_patterns_final.kicad_pcb"), cmd
+        prev = str(_placed(name))
+        for n, c in steps:
+            assert c[4] == prev, (name, n, c[4], prev)
+            prev = c[5]
+        # The two flags are independent, and the `post` step keeps the position C.1 measured for it.
+        only_post = [n for n, _ in krt_plan(job, design, _placed(name), Path("work"), Path("/krt"), plan, post=True)]
+        only_final = [n for n, _ in krt_plan(job, design, _placed(name), Path("work"), Path("/krt"), plan, final=True)]
+        assert only_post == [n for n in want if n != "patterns_final"], (name, only_post)
+        assert only_final == [n for n in want if n != "patterns_post"], (name, only_final)
+        neither = [n for n, _ in krt_plan(job, design, _placed(name), Path("work"), Path("/krt"), plan)]
+        assert "patterns_post" not in neither and "patterns_final" not in neither, (
+            "`PCBC_PATTERNS=off` passes post=False and final=False, and the plan is then the pre-R2 one exactly (C.6)"
+        )
+
+
+def test_the_final_stage_is_empty_and_the_emptiness_is_what_s2_proves():
+    """`patterns.FINAL` is `()`, so the stage runs for real and writes nothing.
+
+    It is not switched off and it is not short-circuited: `pattern_copper` builds the scene over the
+    finished copper and runs its own self-check, exactly as it will when a carrier lands in `FINAL`.
+    What comes back is the same board text, `is`-identical because `write_pieces` is never called —
+    which is why the step file on disk is a byte copy of its input and why a fresh build of all five
+    boards is byte-identical to the same build without the stage (measured in `FINAL`'s docstring).
+    """
+    from pcbc.patterns import FINAL, _STAGES
+
+    assert FINAL == () and _STAGES["final"] is FINAL
+    for name in ALL:
+        design = load_board(_board(name))
+        job = compile_design(design)
+        text = _placed(name).read_text()
+        plan = pattern_copper(design, job, job.constraints, text, _uuid_name(name), stage="final")
+        assert plan.text is text and plan.pieces == () and plan.ids == (), name
+        assert plan.census == {} and plan.moves == () and plan.notes == () and plan.refused == {}, name
+        assert plan.claimed == frozenset() and plan.done == frozenset() and plan.partial == frozenset(), name
+        assert plan.scene is not None, f"{name}: the scene is built, not skipped — S4 inherits a live stage"
+
+
+def test_every_pattern_module_says_whether_its_copper_connects_the_net_it_claims():
+    """`docs/stitch-plan.md` §2k. `pattern_copper` reads `CONNECTS` before `claimed.add`, and reads
+    it as an attribute so a module that forgets to declare it raises here rather than defaulting.
+
+    All four say True and the read is a no-op today; the flag exists because the first module that
+    will say False — a guard writes `GND` copper to serve an analog net — would otherwise make
+    `PatternPlan.done` claim the guarded net was routed, and `krt_plan` drops `done` nets from every
+    step and writes `!NET` for them in `signals`. A net nothing routed would then be routed by
+    nobody."""
+    from pcbc.patterns import _modules
+
+    mods = _modules()
+    assert sorted(mods) == ["chain", "hop", "spine", "tap"]
+    for reason, mod in sorted(mods.items()):
+        assert mod.CONNECTS is True, reason
+        assert mod.REASON == reason, reason
 
 
 def test_krts_tap_step_runs_only_for_the_nets_the_pattern_refused():

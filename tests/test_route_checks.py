@@ -57,7 +57,10 @@ def _placed(board: Path):
     """(design, job, ctx) of a board pcb_job has placed."""
     design = load_board(board)
     job = compile_design(design)
-    text = (board.parent / "layout" / board.stem / "placed" / "layout.kicad_pcb").read_text()
+    # Generated, not read: `examples/**/layout/` is gitignored build output (`conftest.placed_board`).
+    from conftest import placed_board
+
+    text = placed_board(board.stem, board).read_text()
     return design, job, build_ctx(design, job, text)
 
 
@@ -208,7 +211,9 @@ def test_the_corridor_check_stays_under_the_bar_on_node(stock):
     """Acceptance: node's pcb_job gets no more than 3 s slower; the route checks (four 0.4 mm nets,
     two outer layers, 0.1 mm grid over 60 x 45 mm) run in a fraction of that."""
     design, job, _ctx = _placed(stock["node"][0])
-    text = (stock["node"][0].parent / "layout" / "node" / "placed" / "layout.kicad_pcb").read_text()
+    from conftest import placed_board
+
+    text = placed_board("node", stock["node"][0]).read_text()
     t0 = time.perf_counter()
     moves, _notes = route_aware_report(design, job, text)
     assert time.perf_counter() - t0 < 3.0, "H.8: node under 3 s is the bar"

@@ -94,7 +94,7 @@ Limits (their capabilities page; pcbc's `Stackup` carries the ones in bold, the 
 | hole to copper | 0.2 (NPTH), 0.28 PTH-to-track | **0.25** (what KRT holds on its grid) |
 | copper to edge | 0.2 | **0.3** (routing wants the lane) |
 | solder mask bridge | 0.10 (1 oz) | not modelled; KiCad's `solder_mask_bridge` check exists |
-| via-in-pad | filled and capped, 0.15 to 0.55 | refused on passives at fab, allowed on IC pins |
+| via-in-pad | filled and capped, 0.15 to 0.55 | refused on passives at fab, allowed on IC pins; `Stackup.via_fill` / `via_fill_min_drill` / `via_fill_max_drill` carry the row, and R-T1's array declares it in `FAB_NOTES.md` |
 | dielectrics | the four impedance stackups below, core Dk 4.6 | every stackup carries its stack top to bottom (copper, prepreg, core) with JLC's thickness and Dk; `jlcpcb_4l_1oz` is **JLC04161H-7628** (what JLC builds when no impedance stackup is picked), the other three by their JLC code |
 | impedance | JLC's calculator (Polar-type, mask and etch modelled) | closed forms (H&J, Wadell, Ghione-Naldi) times a per-stackup **fab bias** fitted to JLC's published 50 / 90 / 100 ohm rows: +-3 % on 7628, +-3 % / +-6 % on 1080, interpolated and labelled on 3313 / 2116, `formula only` on 2L and inner layers (`docs/constraints.md`) |
 
@@ -172,7 +172,15 @@ enforces it: **L** language, **C** compile (numbers), **P** placement check, **R
 - R-Z3 Reference plane. A controlled-impedance net names its reference layer (default: the
   nearest plane in `planes=`); the router keeps the track over that plane and pcbc verifies no
   crossing of a split in the filled zone (KiCad has no such check). **R, V**.
-- R-Z4 Layer changes on a pair carry a return via within 1 mm on the reference net. **R, V**.
+- R-Z4 Layer changes on a pair carry a return via within 1 mm on the reference net. **C, R, V** —
+  the tag read **R, V** until `docs/stitch-plan.md` S5, and the missing **C** turned out to be the
+  half worth shipping. `constraints.return_rules` classifies the layer change off `board.py` alone,
+  before any copper exists: measured 2026-09-21, node is `net_change` (F.Cu references `GND` on
+  In1.Cu, B.Cu references `3V3` on In2.Cu, and a via joins one net to itself) and c3_usb is `lost`
+  (B.Cu *is* the `GND` pour, and two layers have no second plane to reach). The **R** half is refused
+  outright for those two verdicts (`docs/stitch-plan.md` §8 item 2): the population is zero for a
+  structural reason, so a placer could only widen a tolerance until something landed. The **V** half
+  is `route_verify.return_vias`, and it agrees with the **C** on all eleven vias of the two boards.
 - R-Z5 USB 2.0 high speed as the first preset: 90 ohm differential, tolerance 15 %, pair
   matched (intra-pair skew) to 0.5 mm, uncoupled length at most 2 mm, no stubs, ESD at the
   connector in line, series termination at the source when the IC asks. Sources agree on the
@@ -197,8 +205,12 @@ enforces it: **L** language, **C** compile (numbers), **P** placement check, **R
   term), **V, B**.
 - R-X2 Adjacent signal layers route orthogonally (a per-layer preferred direction in the
   cost). **R**.
-- R-X3 Stitching vias along a guard or a plane edge every 2.5 mm (the "100 mil" rule) when a
-  net asks for a guard. **R** (pattern).
+- R-X3 Stitching vias along a guard every 2.5 mm (the "100 mil" rule) when a net asks for a guard.
+  **R** (pattern). Shipped S7 as `Guard(stitch_mm=2.5)` — the pitch is the **author's**, and 2.5 is
+  `language.Guard`'s default rather than a derivation. **The "or a plane edge" half is withdrawn**:
+  it contradicted R-E1's own 5 mm for the same copper, and neither number had a basis. A plane edge
+  is stitched at R-E1's derived pitch (above), which on these stackups is 6.98895 mm at a 500 ps
+  edge — so the two rules disagreed by 2.8x about the same vias and both were folklore.
 - R-X4 No stubs: a track that branches to a third pad on a high-speed net is a chain order
   violation. **P** (chain), **V**.
 
@@ -224,10 +236,78 @@ enforces it: **L** language, **C** compile (numbers), **P** placement check, **R
 
 ### 4.9 Thermal and EMC
 
-- R-T1 Thermal via arrays under exposed pads (`thermal=` on a part): a grid of vias at the
-  stackup's hole-to-hole. **L, R**.
-- R-E1 Plane edges stitched every 5 mm when two ground pours face each other across layers.
-  **R** (pattern). Deferred until a board needs it.
+- R-T1 Thermal via arrays under exposed pads: `Thermal("U1.49", watts=...)`, a **statement**
+  rather than `thermal=` on a part (a part knows its package, a board knows its load — and
+  `Part.__call__(**pin_nets)` would bind a `thermal=` kwarg as a pin name). **C, L, R, V**:
+  the budget is compiled from `board.py` alone, the array is written in the `final` stage after
+  KRT, and `route_verify.thermal_budget` measures both of its containments on the finished board.
+
+  **"a grid of vias at the stackup's hole-to-hole" is the wrong number and the correction is the
+  point of the technique** (`docs/stitch-plan.md` section 2(h)). Measured on node 2026-09-21: at a
+  0.700 mm pitch two 0.35 mm rings cut antipads of radius `0.175 + 0.2` = 0.375 in the 3V3 plane,
+  so the web is `0.700 - 0.750` = **-0.050 mm** and KiCad deletes the copper between them. The
+  derived pitch is `2 * clearance + min_thickness + ring` = 0.850, one nanometre past it for
+  `clears`' own epsilon — **0.850101** — and it leaves a 0.100101 mm web against the zone's own
+  0.1 mm `min_thickness`. It places the **same number of vias**: a 1.45 mm block admits
+  `1 + floor(1.100 / 0.700)` = 2 per axis and `1 + floor(1.100 / 0.850101)` = 2 per axis. R-T1's
+  number writes identical copper and destroys the plane for nothing.
+
+  The count is `ceil(theta_barrel / (rise_c / watts))` with `theta_barrel = L / (k * A)` on the
+  plating annulus (`stackup.via_theta_c_per_w`, k_cu 385 W/m/K): **231.1 K/W** per 0.3 mm barrel
+  on 2 layers and **334.2 K/W** per 0.2 mm barrel on 4 — the four-layer board is thinner and its
+  barrel is worse, because the annulus goes with the circumference. At 0.35 W in 10 C that is
+  9 barrels on c3_usb (25.68 K/W, 8.99 C) and 12 on node (27.85 K/W, 9.75 C), both measured on
+  built boards.
+
+  **Via-in-pad is not a side effect of this, it is what it is.** The passive rule of R-M4 does not
+  move — `fab.via_in_pad_blockers` still refuses any via overlapping a two-terminal passive's pad,
+  filled or not, and `Thermal()` refuses a passive at compile so the two agree — and the fab
+  package must declare **IPC-4761 Type VII, filled and capped** for the array's barrels, which is
+  a paid option and not JLC's default. `Stackup.via_fill` says the fab offers it and
+  `FAB_NOTES.md` says the order has to ask for it; tenting is a mask dam over the mouth of the
+  hole and not a plug.
+- R-E1 Plane edges stitched when two pours of one net face each other across layers.
+  **R** (pattern), **V**. **Built (S8).** `patterns/stitch.py` carrier `plane`, in the `final`
+  stage; `route_verify.plane_stitch` + `build._stitch_gate` are the **V**.
+
+  **The "every 5 mm" is withdrawn and replaced by a derivation**, because 5 mm had no basis and this
+  does. A stitch pitch is a fraction of the wavelength at the highest edge rate the board carries:
+
+  ```
+  f_knee = 0.5 / t_rise        Johnson & Graham, High-Speed Digital Design 1.3; t_rise is the board's
+  v      = c / sqrt(Dk)        Stackup.dielectric_between, the SERIES Dk of the cavity it measures
+  lambda = v / f_knee
+  pitch  = lambda / 20         the common rule (lambda/10 is the loose one), stated and citable
+  floor  = patterns.stitch.thermal_pitch   hole_to_hole, class clearance, and the antipad neck
+  ```
+
+  Measured 2026-09-21: both stackups here put Dk **4.6** between the layers a facing pair would use
+  (`jlcpcb_4l_1oz` In1/In2 across 1.065 mm of core; `jlcpcb_2l_1oz` F/B across 1.53 mm), so
+  v = **139.779 mm/ns** and a 500 ps edge gives lambda 139.779 mm and a pitch of **6.98895 mm** on
+  either. R-E1's own 5 mm approximates that as lambda/28, for no stated reason. The floor binds only
+  below a **57.2 ps** edge on two layers and **50.1 ps** on four, which is an order faster than
+  anything these boards carry.
+
+  **`t_rise` is the one term the board has to supply, and pcbc will not invent it.**
+  `NetReq(rise_ps=)` has no default in `language.py`, no entry in `PRESETS` and no fallback in
+  `constraints.py` — `docs/stitch-plan.md` section 8 item 3 refuses the four per-kind "pcbc default"
+  guesses a pitch would scale linearly with, and that refusal stands. `ConstraintSet.fastest_edge`
+  folds the minimum over the whole board, because a cavity is shared by every net that crosses it;
+  it is `None` on all five boards here, and a board that says nothing gets a soft refusal naming the
+  keyword instead of a lattice.
+
+  **What made the population exist**, and it was the real cost of the technique: `language.Board`
+  refused `planes=` below three layers and `route.krt_plan` read `job.planes` only above two, so no
+  board could pour one net on two facing layers at all. S8 made the router read the declaration on
+  every stackup (`route_scene.plane_targets`: a declared pour replaces the implicit back pour) and
+  removed the refusal. Measured: every example board's plan is byte-identical, because none of them
+  declares a pour the old router would have ignored.
+
+  **What a lattice costs the planes it ties: nothing measurable.** Every other via pcbc places cuts
+  `pi*(dia/2 + clearance)^2` = 0.4418 mm2 out of each **foreign** plane it crosses; a lattice barrel
+  is on the pour's own net, so the fill flows right up to it and there is no clearance hole. Built
+  with and without the lattice, `plane_area` is byte-identical on both boards measured — the 2-layer
+  fixture (41 barrels) and node with GND on both inner layers (74).
 
 ## 5. The language
 

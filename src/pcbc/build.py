@@ -84,25 +84,51 @@ def _return_gate(routed_text: str, design) -> dict:
     already on disk, in the route step — and deliberately without a `fails` key, because there is
     nothing here a build should stop on: the verdict on all eleven vias of the two boards that have
     any is settled by the **stackup**, and the edits that change it (`Board(planes=...)` on node,
-    `NetReq(layers=...)` on c3_usb) are board decisions rather than routing faults. S5 owns printing
-    them as moves; S1 owns counting them, so that the placer `docs/stitch-plan.md` §8 refuses to
-    build is refused against a measured population and not an assumed one.
+    `NetReq(layers=...)` on c3_usb) are board decisions rather than routing faults. S1 owns counting
+    them, so that the placer `docs/stitch-plan.md` §8 refuses to build is refused against a measured
+    population and not an assumed one.
+
+    **S5 added the other half and it is the valuable one.** `constraints.return_rules` is the same
+    classification made from `board.py` **before any copper exists** — R-Z4's missing **C** — and this
+    gate now carries it (`rules`) beside the vias, prints its moves, and records whether the finished
+    board agreed (`mispredicted`, empty on every board measured 2026-09-21). A via that has already
+    been routed is expensive news; a sentence in `pcbc check --constraints` saying this pair must not
+    change layers costs nothing and arrives before the router runs.
     """
     from .compile import compile_design
+    from .constraints import return_rules
     from .route_verify import referenced_nets, return_lines, return_vias
 
     job = compile_design(design)
     cs = job.constraints
     watched = referenced_nets(cs) if cs is not None else ()
     rows = return_vias(routed_text, cs) if cs is not None else ()
+    rules = return_rules(cs) if cs is not None else ()
     verdicts: dict[str, int] = {}
     for r in rows:
         verdicts[r.verdict] = verdicts.get(r.verdict, 0) + 1
+    # S5's own claim, checked here rather than argued: the **C** predicts the **V**. A rule computed
+    # from `board.py` with no PCB file says `lost` or `net_change` for a net, and every via the router
+    # then put on that net must carry that same verdict; a `kept` net's vias can only be a distance
+    # question (`served`/`far`/`none`), and a `pinned` net should carry no via at all. Measured
+    # 2026-09-21 on the checked-in routed boards, it holds on all eleven: node's seven `net_change`
+    # against a `net_change` rule, c3_usb's four `lost` against a `lost` rule. Reported, never fatal —
+    # the two readings can honestly differ, because the rule reads the pours the board *will* have and
+    # `return_vias` reads the zones KiCad actually filled (blinky's routed board has no zone at all).
+    admits = {"lost": {"lost"}, "net_change": {"net_change"}, "kept": {"served", "far", "none"}, "pinned": set()}
+    by_rule = {r.net: r for r in rules}
+    missed = [
+        f"{r.net} via at ({r.at[0]:g},{r.at[1]:g}) is {r.verdict}, and the compiler said {by_rule[r.net].verdict} from board.py alone"
+        for r in rows
+        if r.net in by_rule and r.verdict not in admits[by_rule[r.net].verdict]
+    ]
     return {
         "watched": list(watched),
         "vias": [r.to_dict() for r in rows],
         "verdicts": dict(sorted(verdicts.items())),
-        "lines": return_lines(rows, watched),
+        "rules": [r.to_dict() for r in rules],
+        "mispredicted": missed,
+        "lines": return_lines(rows, watched) + [r.line() for r in rules],
     }
 
 
@@ -212,6 +238,184 @@ def _barrel_gate(routed_text: str, doc, design) -> dict:
         "short": [r.to_dict() for r in rows if r.add],
         "fails": fails + stalled,
         "lines": parallel_joined_lines(rungs) + parallel_lines(rows),
+    }
+
+
+def _guard_gate(routed_text: str, doc) -> dict:
+    """Technique 3's verify half on the finished board: is the shield actually ground?
+
+    Wired the way `_plane_gate`, `_barrel_gate` and `_thermal_gate` are — one parse of a file already
+    on disk, in the route step, off the sidecar KiCad has already refilled and saved around.
+
+    **Fatal for one thing, and it is the one nothing else on this board can see.** A guard is `GND`
+    copper that is only `GND` because a stitch via ties it to the pour. Take the via away and what is
+    left is a track on a named net, welded to nothing — and KiCad's unconnected-items check is pad to
+    pad, `netcheck.check_copper` reads pad bindings inside footprint blocks and never a segment,
+    `verify_copper` asks about clearance, angle and size, and `copper_bar` counts its millimetres like
+    any other copper. It would pass every gate pcbc has and shield nothing. `docs/stitch-plan.md`
+    section 6 row 3 names the exact trap: blinky's routed board has **zero** `(zone ...)` blocks, so a
+    guard there would put sixteen vias into a pour that was never written and not one line of output
+    would say so.
+
+    **Not fatal: a shield that is short.** `Guard()` is a target under R-S3 — B.6 makes it the pattern
+    that may apply partially — so a run with 21.4 mm of shield where 32.4 mm was possible is one
+    `style:` note carrying its `Coverage`, and the stretches it lost are `Place()` decisions rather
+    than routing faults. Measured on `tests/fixtures/guard/guard.py`: the pattern drops a stretch that
+    got no via *before* writing it, precisely so this gate never has one to fail on, and the two
+    numbers agree by construction rather than by luck.
+
+    The four example boards declare no `Guard()`, so `rows` is empty on every one of them and this
+    returns the sentence that says so.
+    """
+    from .route_emit import seg_piece, via_piece
+    from .route_verify import guard_cover, guard_lines
+
+    pieces = []
+    for i in (doc.items if doc is not None else []):
+        if i.get("reason") != "guard":
+            continue
+        key = i.get("key") or [""]
+        if key[0] == "via":
+            pieces.append(via_piece(i["net"], i["reason"], tuple(key[1]), float(i.get("w") or 0.0), float(i.get("drill") or 0.0), owner=i.get("owner", "")))
+        elif key[0] == "seg":
+            pieces.append(seg_piece(i["net"], i["reason"], key[1], tuple(key[2]), tuple(key[3]), float(i.get("w") or 0.0), owner=i.get("owner", "")))
+    rows = guard_cover(routed_text, pieces)
+    fails = [
+        f"pcbc wrote a guard that is not ground: {r.line()}. Drop the stretch or stitch it: this is a "
+        f"pcbc bug, not a board move"
+        for r in rows
+        if not r.ok
+    ]
+    return {
+        "guards": [r.to_dict() for r in rows],
+        "cover": {r.net: r.mm for r in rows},
+        "fails": fails,
+        "lines": guard_lines(rows),
+    }
+
+
+def _stitch_gate(routed_text: str, doc) -> dict:
+    """Technique 2's verify half on the finished board: does the lattice land in **both** pours?
+
+    Wired the way `_plane_gate`, `_barrel_gate`, `_thermal_gate` and `_guard_gate` are — one parse of
+    a file already on disk, in the route step, off the sidecar KiCad has already refilled and saved
+    around.
+
+    **Fatal for one thing, and it is the one nothing else on this board can see.** A lattice barrel
+    exists to tie two pours of one net together; a barrel whose ring is inside the front pour and
+    inside a clearance hole in the back one ties one plane to nothing, and it still reads as connected
+    everywhere else — KiCad's unconnected-items check is pad to pad, `netcheck.check_copper` reads pad
+    bindings inside footprint blocks and never a via, `verify_copper` asks about clearance, angle and
+    size, and `copper_bar` counts it like any other via. That is pcbc's own copper doing the opposite
+    of what pcbc reports, which is the definition of a bug a build should stop on, and it is the same
+    sentence `_guard_gate` makes about a shield welded to nothing.
+
+    **Not fatal: a lattice that is short.** R-E1 asks for a pitch and `patterns.stitch._plane_specs`
+    makes the whole candidate list the `need`, so a site lost to the copper already on the board is a
+    coarser stitch and not a failure (R-S3's target half). What it costs is stated in the pattern's
+    one `style:` note, in the unit the pitch was derived in — the highest edge the surviving lattice
+    is still a lambda/20 stitch for.
+
+    **And not fatal: the pour area.** A lattice takes plane copper by construction, about
+    `pi*(dia/2 + clearance)^2` per via per crossed plane, and what a plane is worth is the board's.
+    `_plane_gate` already fails a build on a plane that split into islands; the mm2 is reported here
+    and pinned in `test_examples_fab.py::PLANES`, so a flood shows up as a moved number with its
+    arithmetic rather than as a gate nobody can tune.
+
+    Every board in this repo writes no lattice at all — none of the five pours one net on two facing
+    layers — so this returns the sentence that says so on all of them.
+    """
+    from .route_emit import via_piece
+    from .route_verify import plane_stitch, plane_stitch_lines
+
+    pieces = []
+    for i in (doc.items if doc is not None else []):
+        key = i.get("key") or [""]
+        if i.get("reason") != "plane" or key[0] != "via":
+            continue
+        pieces.append(via_piece(i["net"], i["reason"], tuple(key[1]), float(i.get("w") or 0.0), float(i.get("drill") or 0.0), owner=i.get("owner", "")))
+    rows = plane_stitch(routed_text, pieces)
+    fails = [
+        f"pcbc wrote a plane stitch that stitches one plane: {r.line()}. Drop the lattice or pour both "
+        f"layers: this is a pcbc bug, not a board move"
+        for r in rows
+        if not r.ok
+    ]
+    return {
+        "lattices": [r.to_dict() for r in rows],
+        "welded": {r.net: r.welded for r in rows},
+        "fails": fails,
+        "lines": plane_stitch_lines(rows),
+    }
+
+
+def _thermal_gate(routed_text: str, doc, design) -> dict:
+    """Technique 4's verify half on the finished board: is the array where pcbc believes it is?
+
+    Wired the way `_plane_gate` and `_barrel_gate` are — one parse of a file already on disk, in the
+    route step, off the sidecar KiCad has already refilled and saved around.
+
+    **Fatal for two things, and both of them are pcbc contradicting itself rather than a board fact.**
+
+    - A barrel pcbc placed under a land whose ring is **not** inside one primitive of that land, or
+      not inside its net's zone on the plane layer. A via beside the pad still reads as connected —
+      KiCad's unconnected-items check is pad to pad, `netcheck.check_copper` never sees a via, and
+      `verify_copper` asks about clearance, angle and size — and it moves none of the heat the array
+      was placed for. That is the silent failure `docs/stitch-plan.md` section 6 row 4 exists for.
+    - `fab.via_in_pad_blockers` **growing**. A thermal array is via-in-pad by definition, so the
+      board's blocker list is the one number that says whether the statement let a pad through that
+      the fab cannot assemble. It is compared against the blockers of the same board with pcbc's own
+      array vias taken out: the array may add via-in-pad **hits**, and it may not add a single
+      blocker. `via_in_pad_blockers` has a zero diff in this slice and this is what keeps it honest.
+
+    **Not fatal: an array that is short.** `Thermal()` is a target under R-S3, so a land with nine
+    sites and room for eight is eight barrels and one `style:` note carrying the rise it actually
+    leaves. Stopping a build there would stop it on a fact about how much room the land had, which is
+    a `Place()` decision and not a routing fault.
+    """
+    from .compile import compile_design
+    from .fab import via_in_pad, via_in_pad_blockers
+    from .route_emit import via_piece
+    from .route_verify import thermal_budget, thermal_lines
+
+    job = compile_design(design)
+    cs = job.constraints
+    pieces = []
+    for i in (doc.items if doc is not None else []):
+        key = i.get("key") or [""]
+        if i.get("reason") != "thermal" or key[0] != "via":
+            continue
+        pieces.append(via_piece(i["net"], i["reason"], tuple(key[1]), float(i.get("w") or 0.0), float(i.get("drill") or 0.0), owner=i.get("owner", "")))
+    rows = thermal_budget(routed_text, pieces, cs) if cs is not None else ()
+    fails = [
+        f"pcbc put a thermal via where it is not a thermal via: {r.line()}. "
+        f"{r.got - r.in_pad} of {r.got} are outside the land and {r.got - r.in_plane} outside the plane — "
+        f"this is a pcbc bug, not a board move"
+        for r in rows
+        if r.verdict == "adrift"
+    ]
+    # The blocker list with and without the array, so "it did not grow" is a measurement rather than
+    # a hope. `via_in_pad` is keyed on the via's coordinate, which is what the sidecar has.
+    mine = {(round(p.a[0], 4), round(p.a[1], 4)) for p in pieces}
+    hits = via_in_pad(routed_text)
+    blockers = via_in_pad_blockers(hits, design)
+    ours = [h for h in hits if (round(h["via"][0], 4), round(h["via"][1], 4)) in mine]
+    theirs = via_in_pad_blockers([h for h in hits if h not in ours], design)
+    grown = [h for h in blockers if h not in theirs]
+    fails += [
+        f"a thermal via is inside {h['pad']}, which the fab cannot assemble at any via fill "
+        f"(fab.via_in_pad_blockers). Thermal() must never name a passive or a mounting peg"
+        for h in grown
+    ]
+    return {
+        "arrays": [r.to_dict() for r in rows],
+        "verdicts": {r.pad: r.verdict for r in rows},
+        "via_in_pad": len(hits),
+        "via_in_pad_ours": len(ours),
+        "via_in_pad_inside": sum(1 for h in ours if h.get("inside")),
+        "blockers": len(blockers),
+        "fails": fails,
+        "lines": thermal_lines(rows),
     }
 
 
@@ -442,6 +646,16 @@ def build_job(
         # anchor it is supposed to be parallel to (`_barrel_gate`).
         entry["returns"] = _return_gate(final_text, design)
         entry["parallel"] = _barrel_gate(final_text, doc, design)
+        # `docs/stitch-plan.md` S6's array, measured where it was placed: every barrel inside the land
+        # and inside the plane, and `fab.via_in_pad_blockers` no longer than it was without them.
+        entry["thermal"] = _thermal_gate(final_text, doc, design)
+        # Technique 3, and the one gate whose subject is invisible to every other judge on the board:
+        # a shield welded to nothing is a track on a named net, which KiCad's pad-to-pad unconnected
+        # check, `netcheck.check_copper` and `verify_copper` all pass (`_guard_gate`).
+        entry["guards"] = _guard_gate(final_text, doc)
+        # Technique 2, the one `docs/stitch-plan.md` section 8 deferred and S8 built: every lattice
+        # barrel landing in **both** of the pours it exists to tie (`_stitch_gate`).
+        entry["planes_stitched"] = _stitch_gate(final_text, doc)
         # Technique 6's verify half (`docs/stitch-plan.md` S3): what joins each pair of `Ground()`
         # nets, and whether it joins them at one point. Fatal for `multi` and nothing else — see
         # `_bridge_gate` for why each of the other four verdicts is a printed move instead.
@@ -457,6 +671,18 @@ def build_job(
         if entry["parallel"]["fails"]:
             result["steps"].append(entry)
             result["error"] = "a parallel via is not parallel: " + "; ".join(entry["parallel"]["fails"])
+            return result
+        if entry["thermal"]["fails"]:
+            result["steps"].append(entry)
+            result["error"] = "a thermal via is not under its land: " + "; ".join(entry["thermal"]["fails"])
+            return result
+        if entry["guards"]["fails"]:
+            result["steps"].append(entry)
+            result["error"] = "a guard is not welded to its pour: " + "; ".join(entry["guards"]["fails"])
+            return result
+        if entry["planes_stitched"]["fails"]:
+            result["steps"].append(entry)
+            result["error"] = "a plane stitch does not tie both planes: " + "; ".join(entry["planes_stitched"]["fails"])
             return result
         result["steps"].append(entry)
         if not gate["ok"]:

@@ -1,0 +1,137 @@
+{
+ "note": "Golden vectors for route_scene.clear_runs, the dual of free_intervals (docs/r2-design.md A.8, docs/stitch-plan.md S7). Taken on tests/fixtures/guard/guard.py as conftest.placed_board generates it \u2014 a pure function of board.py \u2014 so R3's port replays this file unchanged. Intervals are 4 dp millimetres of the axis' own coordinate, rounded INWARD; u = x + y and v = x - y, so a millimetre along a diagonal is two of its units. Regenerate with PCBC_WRITE_CLEAR_RUNS=1 pytest tests/test_guard.py -k vectors.",
+ "board": "tests/fixtures/guard/guard.py",
+ "eps_mm": 0.0001,
+ "grid": 0.05,
+ "cases": [
+  {
+   "axis": "x",
+   "span": [
+    2.0,
+    38.0
+   ],
+   "offset": 8.8199,
+   "half": 0.0635,
+   "net": "GND",
+   "layer": "F.Cu",
+   "runs": [
+    [
+     2.0,
+     4.9914
+    ],
+    [
+     6.5436,
+     6.8164
+    ],
+    [
+     8.3686,
+     11.8864
+    ],
+    [
+     12.9736,
+     15.1464
+    ],
+    [
+     16.2336,
+     22.9914
+    ],
+    [
+     24.5436,
+     38.0
+    ]
+   ]
+  },
+  {
+   "axis": "x",
+   "span": [
+    2.0,
+    38.0
+   ],
+   "offset": 9.8801,
+   "half": 0.0635,
+   "net": "GND",
+   "layer": "F.Cu",
+   "runs": [
+    [
+     2.0,
+     4.9914
+    ],
+    [
+     6.5436,
+     6.8164
+    ],
+    [
+     8.3686,
+     22.9914
+    ],
+    [
+     24.5436,
+     38.0
+    ]
+   ]
+  },
+  {
+   "axis": "y",
+   "span": [
+    2.0,
+    28.0
+   ],
+   "offset": 12.0,
+   "half": 0.0635,
+   "net": "GND",
+   "layer": "F.Cu",
+   "runs": [
+    [
+     2.0,
+     7.7864
+    ],
+    [
+     8.9336,
+     19.9864
+    ],
+    [
+     21.9136,
+     28.0
+    ]
+   ]
+  },
+  {
+   "axis": "u",
+   "span": [
+    24.0,
+    34.0
+   ],
+   "offset": -9.2254,
+   "half": 0.0635,
+   "net": "GND",
+   "layer": "F.Cu",
+   "runs": [
+    [
+     27.1278,
+     31.1322
+    ]
+   ]
+  },
+  {
+   "axis": "v",
+   "span": [
+    -20.0,
+    -2.0
+   ],
+   "offset": 27.0,
+   "half": 0.0635,
+   "net": "GND",
+   "layer": "F.Cu",
+   "runs": [
+    [
+     -20.0,
+     -11.9428
+    ],
+    [
+     -8.7722,
+     -2.0
+    ]
+   ]
+  }
+ ]
+}

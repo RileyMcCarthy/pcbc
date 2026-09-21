@@ -166,6 +166,23 @@ class PatternCtx:
     `route_verify.pour_raster` has to predict it, while at `final` `gnd_pour` has already written it.
     """
 
+    owned: tuple[Piece, ...] = ()
+    """Every piece pcbc has written on this board **so far in this route**, in emission order.
+
+    Empty for the `pre` stage, which is the first thing that runs; the pre and mid stages' copper at
+    `post`; all of it at `final`. It is not the scene — the scene holds KRT's copper too and cannot
+    tell the two apart — and that distinction is the whole of `docs/r2-design.md` B.6's precondition:
+    **a guard may only be offset from a path pcbc itself routed**, because pcbc cannot offset a path
+    it does not own. Read off the run rather than inferred from the file, because the only provenance
+    signal a board file carries is `(locked yes)` and KRT locks its own constrained-net copper too
+    (`route.lock_copper`), so a board's locked tracks are not pcbc's tracks.
+
+    `route_job` has held exactly this list since S2 — it is what `_lost` checks for survival after
+    every KRT step and what the copper bar reads a reason off — so this is that list reaching the one
+    pattern whose candidate list is derived from it. Everything else here is a question about the
+    board; this is the one question about the *route*.
+    """
+
 
 @dataclass(frozen=True)
 class PatternPlan:
@@ -662,6 +679,7 @@ def pattern_copper(
     stage: str = "pre",
     scene: Scene | None = None,
     verify: bool = True,
+    owned: Sequence[Piece] = (),
 ) -> PatternPlan:
     """Run the stage's patterns over one board, in order, and hand back what KRT still owes.
 
@@ -671,7 +689,7 @@ def pattern_copper(
     """
     t0 = time.perf_counter()
     scene = scene if scene is not None else build_scene(design, job, cs, text)
-    ctx = PatternCtx(scene=scene, design=design, job=job, cs=cs, board=board, stage=stage)
+    ctx = PatternCtx(scene=scene, design=design, job=job, cs=cs, board=board, stage=stage, owned=tuple(owned))
     pieces: list[Piece] = []
     ids: list[int] = []
     moves: list[str] = []

@@ -44,6 +44,7 @@ _DRILL = re.compile(r"\(drill\s+(oval\s+)?([-0-9.e+]+)(?:\s+([-0-9.e+]+))?")
 _LAYERS = re.compile(r"\(layers([^)]*)\)")
 _RRATIO = re.compile(r"\(roundrect_rratio\s+([-0-9.e+]+)\)")
 _MASK_MARGIN = re.compile(r"\(solder_mask_margin\s+([-0-9.e+]+)\)")
+_PROP = re.compile(r"\(property\s+(pad_prop_\w+)\)")
 _NET = re.compile(r'\(net\s+(?:\d+\s+)?"([^"]*)"\)')
 _PRIM_PTS = re.compile(r"\(xy\s+([-0-9.e+]+)\s+([-0-9.e+]+)\)")
 _PRIM_WIDTH = re.compile(r"\(width\s+([-0-9.e+]+)\)")
@@ -75,6 +76,24 @@ class PadGeom:
     cu_layers: frozenset[str]
     mask_layers: frozenset[str]
     mask_margin: float
+    prop: frozenset[str] = frozenset()
+    """KiCad's own `(property pad_prop_*)` tokens on this pad, verbatim and unabridged.
+
+    One token matters to pcbc today and it is the one that says a pad is a **land for heat rather
+    than for a pin**: `pad_prop_heatsink`. Measured across the five boards 2026-09-21, exactly nine
+    pads carry it and they are the nine 1.45 x 1.45 mm blocks KiCad writes for the ESP32-C3-MINI's
+    exposed pad, all numbered 49, all on GND, on c3_usb and on node alike — 18 pads in all and not
+    one anywhere else. That is the entire population `Thermal()` can name on this repo's boards, and
+    reading the property is how the refusal for `Thermal("U1.3")` knows that `U1.3` is a signal pin
+    and not a land (`patterns.stitch._thermal_refuse`).
+
+    Read rather than inferred from size, because size cannot answer it: buck's `L1.1` is 1.2 x 1.45
+    mm — larger in one axis than a block of node's heatsink — and it is an inductor terminal, where a
+    via wicks the joint. The property is a **declaration in the footprint**, which is the only place
+    the fact lives. A `frozenset` and not a bool because KiCad defines four of these tokens
+    (`pad_prop_bga`, `pad_prop_fiducial_glob`, `pad_prop_fiducial_loc`, `pad_prop_testpoint`,
+    `pad_prop_heatsink`, `pad_prop_castellated`) and a reader that collapses them to one question
+    would have to be widened by the next reader rather than asked a second question."""
 
     @property
     def id(self) -> str:
@@ -261,6 +280,7 @@ def pad_geoms(
                 cu_layers=cu,
                 mask_layers=mask,
                 mask_margin=float(mm.group(1)) if mm else 0.0,
+                prop=frozenset(_PROP.findall(pad)),
             )
         )
     return tuple(out)

@@ -156,7 +156,9 @@ def test_an_unknown_kwarg_is_refused_with_the_did_you_mean_line(tmp_path: Path):
 def test_a_kind_foreign_kwarg_and_an_unknown_kind_are_refused_citing_the_line(tmp_path: Path):
     p = _board(tmp_path, "foreign", TWO, 'NetReq("VCC", kind="power", amps=1)\nNetReq("SW", kind="switch_node", pf_max=3)\nNetReq("SIG", kind="spy")\n')
     fails = check_board(p)
-    assert 'NetReq("SW") line 16: kind="switch_node" does not take pf_max=; it takes loop_mm2, amps, max_mm, layers, vias, autoroute, class_name, keep_clear_of, keep_clear_mm, volts, z_se_ohm' in fails, "D: switch_node's own kwargs then A.4's common set"
+    # `rise_ps` is last because S8 appended it to `COMMON_KWARGS`: an edge rate belongs to any net that
+    # has one, and the plane stitch folds the fastest over the whole board (`ConstraintSet.fastest_edge`).
+    assert 'NetReq("SW") line 16: kind="switch_node" does not take pf_max=; it takes loop_mm2, amps, max_mm, layers, vias, autoroute, class_name, keep_clear_of, keep_clear_mm, volts, z_se_ohm, rise_ps' in fails, "D: switch_node's own kwargs then A.4's common set"
     assert 'NetReq("SIG") line 17: unknown kind \'spy\'; known: analog, clock, feedback, generic, i2c, power, sense, spi, switch_node, usb_hs' in fails
     assert len(fails) == 2, fails
     assert set(PRESETS) == {"generic", "power", "analog", "switch_node", "clock", "usb_hs", "spi", "i2c", "sense", "feedback"}
@@ -208,6 +210,13 @@ def test_a_controlled_pair_on_four_layers_wants_its_plane_declared(tmp_path: Pat
     shutil.copytree(EXAMPLES / "node" / "components", tmp_path / "components")
     assert compile_constraints(load_board(tmp_path / "node.py")).refusals == (
         'USB_DP: 90 ohm on F.Cu wants a plane on In1.Cu; Board(planes=[("GND", "In1.Cu")]) declares it',
+        # S6: the same edit, asked for by the second statement on the board that needs a plane. A
+        # `Thermal()` array's whole job is to reach one, and with `planes=[]` node's `U1.49` barrels
+        # would land in bare laminate — the blinky trap one stackup up. Two statements naming one
+        # `Board(planes=...)` edit is the compiler agreeing with itself, and it is worth asserting
+        # that they ask for it in the same words.
+        'Thermal("U1.49") line 153: GND has no plane or pour to reach, so an array under U1.49 would be 0.35 W of vias '
+        'into bare laminate. Board(planes=[("GND", "In1.Cu")]) gives it one',
     )
     assert check_board(EXAMPLES / "node" / "node.py") == []
 
@@ -353,7 +362,7 @@ Guard("AIN0", stitch_mm=2.0)
         ("MISO: bus SCK, MOSI, MISO matched to SCK within 1 mm (Bus line 19) [soft: warning in R1]", "D: Bus() sets the group on generic constraints"),
         ("MISO: length 60 mm (Bus line 19)", "A.2 BusReq.length_mm"),
         ("VCC: chain C1.1 -> R1.1 (Chain line 20)", "A.2 ChainReq, pads as Place(to=) takes them"),
-        ("AIN0: guard stitch 2 mm (Guard line 21; R2 pattern)", "D: Guard records guard_stitch_mm (printed; R2 pattern)"),
+        ("AIN0: guard stitch 2 mm in GND (Guard line 21; R2 pattern)", "D: Guard records BOTH halves of the statement — the pitch and the net the shield is made of (S7; section 2(r))"),
     ])
     job = compile_design(design)
     assert [c.name for c in job.classes] == ["Default", "Power", "USB", "Pair_SENSE_P"], "D: a bare Pair gets class Pair_<p>"
@@ -362,6 +371,11 @@ Guard("AIN0", stitch_mm=2.0)
     assert [g.kind for g in cs.groups] == ["bus", "chain"]
     ain0 = cs.by_net("AIN0")
     assert ain0 is not None and ain0.guard_stitch_mm == 2.0 and ain0.line == 0 and ain0.kind == "generic", "A.1: line 0 when synthesised from Pair/Bus alone"
+    assert ain0.guard_ground == "GND", (
+        "S7 / section 2(r): `Guard(ground=)` reaches the router. Measured 2026-09-21 before the fix, `_compile` stored "
+        "`stitch_mm` alone and this attribute did not exist, so the ground half of every Guard() on every board was dropped "
+        "between `language.Guard` and the pattern that would have to write the copper"
+    )
 
 
 def test_chain_on_the_ds2_addon_validates_its_pads_against_the_net(tmp_path: Path):
@@ -621,24 +635,52 @@ def test_a_board_whose_layer_count_and_stackup_disagree_is_refused(tmp_path: Pat
 
 
 def test_a_plane_the_router_will_never_pour_is_refused_at_the_board_line(tmp_path: Path):
-    """A declaration nothing reads is a lie the board tells its author. `route.krt_plan` takes
-    `planes=` only above two layers and pours `GND` on `B.Cu` itself below that — so `planes=` on a
-    two-layer board pours nothing, and until the `power_moves` review nothing noticed: `Board()`
-    accepted it, the router ignored it, the ampacity measurement exempted the net **because of it**,
-    and `FAB_NOTES.md` called a rail poured that had no pour. Both halves are refusals now."""
+    """A declaration nothing reads is a lie the board tells its author — and **the two-layer half of
+    that refusal is gone, because S8 made the router read it.**
+
+    The refusal was right for the router it was written against: `route.krt_plan` took `planes=` only
+    above two layers and poured `GND` on `B.Cu` itself below that, so a two-layer `planes=` poured
+    nothing, and until the `power_moves` review nothing noticed — `Board()` accepted it, the router
+    ignored it, the ampacity measurement exempted the net **because of it**, and `FAB_NOTES.md` called
+    a rail poured that had no pour.
+
+    S8 (`docs/stitch-plan.md` section 8 item 1) changed the router instead of the author:
+    `route_scene.plane_targets` reads a declared `planes=` on **every** stackup and the implicit back
+    pour is what a board that declares nothing gets, and `krt_plan`'s `gnd_pour` step pours whatever
+    that says. So the sentence stopped being true, and a refusal that has stopped being true is worse
+    than no refusal — this one would now forbid the only way to write down two pours of one net facing
+    each other across the core, which is the population R-E1 has never had. The 2-layer case is
+    therefore asserted to **pass**, and the pour it produces is asserted, so "the router reads it" is
+    checked rather than assumed.
+
+    The layer check keeps its full force: a layer the stackup does not have is a lie no router change
+    can make true.
+    """
+    from pcbc.compile import compile_design
     from pcbc.language import check_board
+    from pcbc.route_scene import plane_targets
 
     two = tmp_path / "two.py"
     two.write_text(
         ROBUST_HEAD.format(layers=2, stackup="jlcpcb_2l_1oz").replace(
             'Board(width=40, height=25, layers=2, stackup="jlcpcb_2l_1oz")',
-            'Board(width=40, height=25, layers=2, stackup="jlcpcb_2l_1oz", planes=[("GND", "B.Cu")])',
+            'Board(width=40, height=25, layers=2, stackup="jlcpcb_2l_1oz", planes=[("GND", "F.Cu"), ("GND", "B.Cu")])',
         )
     )
-    assert check_board(two, pcb=False)[:1] == [
-        "line 5: Board(planes=[['GND', 'B.Cu']], layers=2): a 2-layer board pours only GND on B.Cu, "
-        "which pcbc writes itself — drop planes=, or move to a 4-layer stackup"
-    ], check_board(two, pcb=False)[:1]
+    assert not [f for f in check_board(two, pcb=False) if "planes" in f], check_board(two, pcb=False)
+    assert plane_targets(compile_design(load_board(two))) == (("GND", "F.Cu"), ("GND", "B.Cu")), (
+        "S8: a declared pour is poured on whatever stackup declared it"
+    )
+    # And the implicit pour is still exactly what a board that declares nothing gets, which is what
+    # keeps all four two-layer examples byte-identical across the change.
+    bare = tmp_path / "bare.py"
+    bare.write_text(ROBUST_HEAD.format(layers=2, stackup="jlcpcb_2l_1oz") + 'NetReq("VCC", "GND", kind="power", volts=5, amps=0.1)\n')
+    assert plane_targets(compile_design(load_board(bare))) == (("GND", "B.Cu"),)
+    # And with no power GND there is no implicit pour either, which is the third arm and the one the
+    # blinky trap of `docs/stitch-plan.md` section 7.1 is about.
+    none = tmp_path / "none.py"
+    none.write_text(ROBUST_HEAD.format(layers=2, stackup="jlcpcb_2l_1oz"))
+    assert plane_targets(compile_design(load_board(none))) == ()
     ghost = tmp_path / "ghost.py"
     ghost.write_text(
         ROBUST_HEAD.format(layers=4, stackup="jlcpcb_4l_1oz").replace(
@@ -674,7 +716,14 @@ def test_an_impedance_target_the_fab_cannot_reach_says_so(tmp_path: Path):
     cs = compile_constraints(load_board(board))
     assert cs.refusals == ()
     assert any("not reached: 6 mm of copper only reaches" in line for line in cs.lines), cs.lines
-    assert cs.by_net("VCC").notes == ("VCC: z_se_ohm=5 is not reachable on jlcpcb_4l_1oz F.Cu: 6 mm of copper only reaches 5.28 ohm",)
+    # The second note is S5's (`docs/stitch-plan.md`): this board declares a plane on In1.Cu and none
+    # on In2.Cu, so `VCC` is referenced on F.Cu and referenced to nothing on B.Cu — and
+    # `Constraint.reference` names only the first. The width note above it is about a target the fab
+    # cannot reach; this one is about a field that answers for one layer of two.
+    assert cs.by_net("VCC").notes == (
+        "VCC: z_se_ohm=5 is not reachable on jlcpcb_4l_1oz F.Cu: 6 mm of copper only reaches 5.28 ohm",
+        "VCC: Constraint.reference is In1.Cu (GND), and that is F.Cu's alone; on B.Cu there is no reference at all — the field names one layer's plane and a via changes which plane this net is over",
+    )
 
 
 def test_a_single_name_given_as_a_string_is_one_name_not_its_letters(tmp_path: Path):

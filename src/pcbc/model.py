@@ -162,6 +162,7 @@ class NetReqSpec:
     clock: str | None = None  # spi: the net the others match to
     pf_max: float | None = None  # i2c bus capacitance budget
     loop_mm2: float | None = None
+    rise_ps: float | None = None  # the fastest edge this net carries, ps; no default anywhere
     line: int = 0  # board.py line of the NetReq; 0 when not loaded from a board file
 
 
@@ -219,6 +220,24 @@ class BridgeReq:
     at: tuple[str, ...]
     kind: str = "short"  # short | cap | bead | off_board
     why: str = ""
+    line: int = 0
+
+
+@dataclass(frozen=True)
+class ThermalReq:
+    """`Thermal(pad, watts=...)`: a via array under one exposed pad (R-T1).
+
+    A board fact and not a library fact, which is why it is a statement and not `thermal=` on a
+    `Part` — see `language.Thermal`. Everything here is what the author wrote; the arithmetic (the
+    barrel's K/W, the count, the pitch) is `constraints.ThermalSpec`'s and the sites are
+    `patterns.stitch.sites_lattice`'s.
+    """
+
+    pad: str  # "U1.49" — REF.PADNUM or REF.PINNAME, `_refpin_net`'s resolution
+    watts: float
+    rise_c: float = 10.0
+    across_planes: bool = False
+    fill: bool = False
     line: int = 0
 
 
@@ -294,6 +313,7 @@ class Design:
     isolations: list[IsolationReq] = field(default_factory=list)
     guards: list[GuardReq] = field(default_factory=list)
     bridges: list[BridgeReq] = field(default_factory=list)
+    thermals: list[ThermalReq] = field(default_factory=list)
     nets: dict[str, Net] = field(default_factory=dict)
     instances: list[Instance] = field(default_factory=list)
     sch_places: list[SchPlaceSpec] = field(default_factory=list)

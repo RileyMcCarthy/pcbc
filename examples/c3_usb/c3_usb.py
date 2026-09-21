@@ -17,6 +17,7 @@ from pcbc import (
     Resistor,
     SchPlace,
     SchRegion,
+    Thermal,
     load,
 )
 
@@ -266,3 +267,6 @@ NetReq("EN", "BOOT", "LED", "LED_A", "CC1", "CC2", kind="digital")
 # said, else the third is a stub (`pcbc pcb` asks for these lines).
 Chain("USB_DP", "J1.A6", "U3.1", "U1.27")
 Chain("USB_DN", "J1.A7", "U3.3", "U1.26")
+# The module's exposed pad is nine `pad_prop_heatsink` blocks on GND. Two layers and one pour, so
+# there is no foreign plane to consent to and the pitch is the fab's hole-to-hole alone.
+Thermal("U1.49", watts=0.35)

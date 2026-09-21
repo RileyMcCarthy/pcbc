@@ -31,7 +31,7 @@ import pytest
 from pcbc.ampacity import _via_clusters, power_bottlenecks
 from pcbc.build import _barrel_gate, _return_gate
 from pcbc.compile import compile_design
-from pcbc.constraints import clearance_table
+from pcbc.constraints import clearance_table, return_rules
 from pcbc.language import load_board
 from pcbc.route_scene import _vias as board_vias
 from pcbc.route_scene import plane_targets
@@ -48,6 +48,7 @@ from pcbc.route_verify import (
 from pcbc.stackup import via_amps, vias_per_change
 
 from test_examples_fab import PARALLEL, RETURNS
+from test_return_rules import RULES
 
 ROOT = Path(__file__).resolve().parent.parent
 EXAMPLES = ROOT / "examples"
@@ -278,6 +279,33 @@ def test_the_three_distance_verdicts_are_reachable_and_nothing_in_this_repo_reac
         assert not {r.verdict for r in return_vias(_text(name), _cs(name))} & {"none", "far", "served"}, name
 
 
+def test_the_compiled_verdict_predicts_every_via_the_router_wrote():
+    """S5's claim, on the finished boards: the **C** predicts the **V**.
+
+    `constraints.return_rules` classifies a layer change from `board.py` with no PCB file; this reads
+    the copper KRT actually wrote and asks whether the two agree. Measured 2026-09-21 on the
+    checked-in routed boards they agree on **all eleven** vias — node's seven `net_change` against a
+    `net_change` rule, c3_usb's four `lost` against a `lost` rule — and the prediction is total rather
+    than partial, because a `kept` net's vias can only be a distance question and a `pinned` net
+    should carry no via at all.
+
+    That is what makes the compile-time sentence worth shipping instead of a placer. The verdict was
+    knowable before the router ran; the vias only confirmed it, and each one of them is a via an
+    author would rather have been told about while the net was still a line in `board.py`.
+    """
+    admits = {"lost": {"lost"}, "net_change": {"net_change"}, "kept": {"served", "far", "none"}, "pinned": set()}
+    seen = 0
+    for name in BOARDS:
+        cs = _cs(name)
+        rules = {r.net: r.verdict for r in return_rules(cs)}
+        assert rules == RULES[name], (name, rules)
+        for row in return_vias(_text(name), cs):
+            assert row.net in rules, (name, row.net, "a classified via on a net the compiler never watched")
+            assert row.verdict in admits[rules[row.net]], (name, row.net, row.verdict, rules[row.net])
+            seen += 1
+    assert seen == sum(len(RETURNS[n]) for n in BOARDS), (seen, "every via `RETURNS` records is a via the compiler predicted")
+
+
 def test_the_planes_a_check_reads_are_the_ones_the_file_has_and_blinky_is_why_that_matters():
     """`poured_planes` reads the zones KiCad filled; `plane_targets` reads the compiled job.
 
@@ -451,13 +479,22 @@ def test_both_counts_run_in_the_build_and_the_census_half_can_stop_nothing(name:
     opposite of what `ampacity._via_clusters` will report about it. These five boards are read
     read-only and carry no pcbc stitch copper at all, so the list is empty for want of a rung and the
     census half is unchanged from S1.
+
+    **S5 gives the return gate `rules` and `mispredicted` and still no `fails`.** The rules are the
+    same classification made from `board.py` with no PCB file (`constraints.return_rules`) — R-Z4's
+    **C** — and `mispredicted` is the claim that the two halves agree, empty on every board here.
+    Report-only stays report-only: the edits these moves ask for (`Board(planes=...)` on node,
+    `NetReq(layers=...)` on c3_usb) are board decisions, not routing faults, and a gate cannot repair
+    a decision.
     """
     design = load_board(_board(name))
     text = _text(name)
     ret = _return_gate(text, design)
     par = _barrel_gate(text, None, design)
-    assert set(ret) == {"watched", "vias", "verdicts", "lines"} and set(par) == {"rungs", "groups", "short", "fails", "lines"}, (ret.keys(), par.keys())
+    assert set(ret) == {"watched", "vias", "verdicts", "rules", "mispredicted", "lines"} and set(par) == {"rungs", "groups", "short", "fails", "lines"}, (ret.keys(), par.keys())
     assert "fails" not in ret, name
+    assert ret["mispredicted"] == [], (name, ret["mispredicted"])
+    assert {r["net"]: r["verdict"] for r in ret["rules"]} == RULES[name], (name, ret["rules"])
     assert par["fails"] == [] and par["rungs"] == [], (name, par["fails"], par["rungs"])
     assert [(v["net"], tuple(v["at"]), v["verdict"], v["near"][2] if v["near"] else None) for v in ret["vias"]] == [tuple(r) for r in RETURNS[name]], name
     assert ret["verdicts"] == ({} if not RETURNS[name] else {RETURNS[name][0][2]: len(RETURNS[name])}), (name, ret["verdicts"])

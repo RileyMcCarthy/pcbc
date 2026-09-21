@@ -51,17 +51,21 @@ __all__ = [
     "plane_islands",
     "plane_area",
     "poly_area",
+    "guard_cover",
+    "guard_lines",
     "poured_planes",
     "referenced_nets",
     "pour_raster",
     "return_lines",
+    "plane_stitch",
+    "plane_stitch_lines",
     "return_vias",
     "verify_copper",
     "via_parallelism",
     "zones",
 ]
 
-BRANCH_REASONS = ("fanout", "stitch")
+BRANCH_REASONS = ("fanout", "guard", "plane", "stitch", "thermal")
 """A pattern via that is a **branch** uses the fab's standard via (`stack.via_diameter`); one that
 carries the net's current across layers uses the class via (`Constraint.via`). B.0's rule, and the
 argument is that a branch carries one pad's share — a decoupling cap's ripple, not the rail's 1 A —
@@ -77,6 +81,21 @@ reads that anchor off the board (`_anchor_via`). What this entry decides is the 
 measured against the fab's standard one, because a lone via on a power net is a branch and not a
 trunk changing layers, and holding it to a class via nothing asked for would be a second wrong
 answer on top of the first.
+
+`"plane"` is one of these for `"guard"`'s reason at the other end of the same argument. A lattice
+barrel ties two pours of **one** net and carries no net current across layers — it is the shortest
+possible branch, a via whose two ends are the same conductor — and the net it is on is a `Power`
+class on every board that pours one, so without the entry it would be stitched with 0.6/0.3 or
+0.8/0.4 class barrels. That is not merely oversized: a bigger ring cuts a bigger antipad in the very
+plane the lattice exists to tie, and `route_verify.plane_area` measures the difference
+(pi*(dia/2 + clearance)^2 per via per crossed plane).
+
+`"guard"` is one of these because a stitch via **is** a branch in the exact sense B.0 means: it
+carries no net current across layers at all, it ties a shield to the pour beside it. Without the
+entry the fallback below reads `Constraint.via` for the guard's *ground* net, which is a `Power` class
+on every board that pours one — 0.6/0.3 on `jlcpcb_2l_1oz` against the fab's 0.5/0.3 — so a guard
+would be stitched with power-class barrels for no reason but the name of the net it is made of
+(measured on `tests/fixtures/guard/guard.py`, 2026-09-21).
 
 The `tap` is no longer one of these, and H.1 is why: B.0 said "a branch takes the fab's standard via,
 full stop" and recorded it as the decision its author was least sure of. The answer is the arithmetic
@@ -729,6 +748,18 @@ def same_net_slots(text: str, floor: float, layers: tuple[str, ...] = ("F.Cu", "
                     continue
                 pa, pb, g = closest_points(items[i][2], items[j][2])
                 if not (0.0 < g < floor):
+                    continue
+                # **One shape inside the other is not a slot, and `closest_points` cannot say so.**
+                # It is the minimum over vertex-to-edge pairs in both directions, which measures the
+                # separation of two *boundaries* and has no containment test in it: a 0.5 mm via ring
+                # sitting in the middle of a 1.45 mm pad comes back as a positive 0.0749 mm — the
+                # margin of pad copper left around the barrel — and that is copper, not laminate.
+                # Nothing on these boards had a contained same-net pair until `Thermal()`, which is
+                # via-in-pad by definition, so the false positive arrived with the array: measured
+                # 2026-09-21, it put nine rows into c3_usb's census (22 -> 31) that are the *inside*
+                # of a land. The sampling below cannot catch it because the container is one of the
+                # two items in the pair and it excludes those.
+                if _inside(items[j][2], pa) or _inside(items[i][2], pb):
                     continue
                 filled = False
                 for k in range(1, SAME_NET_SAMPLES + 1):
@@ -1655,6 +1686,427 @@ def parallel_joined_lines(rows: Sequence[Rung]) -> list[str]:
     return [r.line() for r in rows] + [
         f"barrels: {len(rows) - len(bad)} of {len(rows)} rung(s) joined to their anchor on every layer they span"
     ]
+
+
+# --- Technique 3: the guard, verified where it was written ----------------------------------------
+#
+# `docs/stitch-plan.md` section 6 row 3 and S7. A guard is the one pattern whose failure is **invisible
+# to every other judge on the board**: KiCad's unconnected-items check is pad to pad, so a floating
+# track on a named net passes DRC; `netcheck.check_copper` reads pad bindings inside footprint blocks
+# and never a segment or a via; `verify_copper` asks about clearance, angle and size. A shield welded
+# to nothing looks exactly like a shield, and measures like one in the copper bar.
+
+
+@dataclass(frozen=True)
+class GuardRun:
+    """One `Guard()`'s copper as the finished board has it.
+
+    Two different questions, and only the first can fail a build. **Welded** is whether each piece of
+    the shield reaches the ground pour: a guard segment is ground copper only because a stitch via
+    ties it to the plane, so a stretch whose component holds no via inside a filled zone is an island,
+    and that is a pcbc bug rather than a board fact. **Covered** is how much of the run got a shield at
+    all, which is R-S3's target half: a blocked stretch is dropped by design, so a coverage under 1 is
+    a measurement and never a failure.
+    """
+
+    net: str  # the guarded net, from the pieces' owner
+    ground: str
+    layer: str
+    segments: int
+    vias: int
+    welded: int  # vias whose whole ring is inside a filled zone of the ground net
+    reached: int  # segments in a connected component that holds a welded via
+    mm: float  # the shield actually written
+    zoned: bool  # does the ground net have a filled zone on this board at all?
+
+    @property
+    def ok(self) -> bool:
+        return self.zoned and self.welded == self.vias and self.reached == self.segments and self.vias > 0
+
+    def to_dict(self) -> dict:
+        return {
+            "net": self.net, "ground": self.ground, "layer": self.layer, "segments": self.segments,
+            "vias": self.vias, "welded": self.welded, "reached": self.reached, "mm": self.mm, "zoned": self.zoned,
+        }
+
+    def line(self) -> str:
+        if not self.zoned:
+            return f"guard {self.net}: {self.ground} has no filled zone on this board, so all {self.mm:g} mm of the shield is floating copper"
+        if self.ok:
+            return f"guard {self.net}: {self.mm:g} mm of {self.ground} on {self.layer} in {self.segments} stretch(es), all welded by {self.vias} stitch via(s)"
+        return (
+            f"guard {self.net}: {self.segments - self.reached} of {self.segments} stretch(es) and "
+            f"{self.vias - self.welded} of {self.vias} stitch via(s) do not reach the {self.ground} pour — "
+            f"{self.mm:g} mm of copper that shields nothing and that no other check on this board can see"
+        )
+
+
+def guard_cover(text: str, pieces: Sequence[Piece]) -> tuple[GuardRun, ...]:
+    """Every `guard` piece pcbc wrote, against the pour that is supposed to make it ground.
+
+    The via first: its **ring**, `RING_SAMPLES` points of it and its centre, inside a filled zone of
+    its own net — `plane_checks`' own test, asked of a different reason, and asked of the ring because
+    a via half out of the pour is welded by a sliver of annulus or by nothing (finding 12, S5's
+    review). Then the segments: each is welded when its connected component — `_reaches` over
+    `_net_copper` filtered to its layer, the same walk `parallel_joined` uses — contains one of those
+    vias. Per layer, because a guard is a flat thing and a component walk that may leave through
+    another layer would call a stretch welded on the strength of a via at the other end of the board.
+
+    A `Guard()` that wrote nothing at all has no row here and is not a failure: a net KRT routed is
+    B.6's deferral, printed as a note by the pattern, and a run whose every stretch was blocked is
+    R-S3's target half. What this catches is copper pcbc **did** write and cannot account for.
+    """
+    mine = [p for p in pieces if p.reason == "guard"]
+    if not mine:
+        return ()
+    zs = [z for z in zones(text) if z.polys]
+    rows: list[GuardRun] = []
+    for owner in sorted({p.owner for p in mine}):
+        here = [p for p in mine if p.owner == owner]
+        net = owner.split(" guard")[0]
+        ground = here[0].net
+        layer = next((str(p.layer) for p in here if p.kind == "seg"), "F.Cu")
+        pour = [z for z in zs if z.net == ground]
+        vias = [p for p in here if p.kind == "via"]
+        segs = [p for p in here if p.kind == "seg"]
+        welded = [p for p in vias if _ring_in_zone(p, pour)]
+        nodes = _net_copper(text, ground)
+        idx = [i for i, n in enumerate(nodes) if layer in n[1]]
+        sub = [nodes[i] for i in idx]
+        remap = {i: k for k, i in enumerate(idx)}
+        want = {_at4(p.a) for p in welded}
+        dst = [remap[i] for i in idx if nodes[i][0] == "via" and _at4(nodes[i][3][0]) in want]
+        reached = 0
+        for s in segs:
+            src = [remap[i] for i in idx if nodes[i][0] == "seg" and _same_seg(nodes[i][3], s)]
+            if src and dst and _reaches(sub, src, dst):
+                reached += 1
+        rows.append(
+            GuardRun(
+                net=net, ground=ground, layer=layer, segments=len(segs), vias=len(vias),
+                welded=len(welded), reached=reached, mm=round(sum(p.mm for p in segs), 4), zoned=bool(pour),
+            )
+        )
+    return tuple(rows)
+
+
+def _ring_in_zone(p: Piece, pour: Sequence[Zone]) -> bool:
+    """`plane_checks`' containment, factored so the tap branch keeps its byte-identical loop."""
+    r = (p.w or 0.0) / 2.0
+    ring = [p.a] + ([(p.a[0] + r * math.cos(2 * math.pi * k / RING_SAMPLES), p.a[1] + r * math.sin(2 * math.pi * k / RING_SAMPLES)) for k in range(RING_SAMPLES)] if r > 0 else [])
+    return bool(pour) and all(any(in_zone(z, pt) for z in pour) for pt in ring)
+
+
+def _at4(pt: Pt) -> tuple[float, float]:
+    """`copper_bar.bar_key`'s rounding, and it is the only spelling that can match here.
+
+    The sidecar's key is `route_emit.piece_key`, rounded to **4 dp** on purpose — it has to survive
+    KiCad's refill-and-save and `pin_copper_ids`, so it cannot carry the six decimals the file does.
+    Measured 2026-09-21, the board writes the fixture's north flank as `8.819899` where the sidecar
+    says `8.8199`, so a `1e-9` distance test — the one `_nearest_via` can afford, because a via centre
+    round-trips exactly — matched **none** of four guard segments and `guard_cover` reported every
+    stretch as an orphan. Rounding both sides to the key's own precision is exact, and 0.1 um is four
+    orders below anything on this board that could be two different pieces of copper."""
+    return (round(pt[0], 4), round(pt[1], 4))
+
+
+def _same_seg(extra: tuple, p: Piece) -> bool:
+    """Is this parsed segment the piece pcbc wrote? Both ends, in either order (`bar_key`)."""
+    a, b, _w = extra
+    return {_at4(a), _at4(b)} == {_at4(p.a), _at4(p.b or p.a)}
+
+
+def guard_lines(rows: Sequence[GuardRun]) -> list[str]:
+    """One line per guarded net, then the tally — or the sentence that says pcbc wrote none."""
+    if not rows:
+        return ["guards: pcbc wrote no guard copper on this board"]
+    bad = [r for r in rows if not r.ok]
+    return [r.line() for r in rows] + [f"guards: {len(rows) - len(bad)} of {len(rows)} shield(s) welded to their pour on every piece"]
+
+
+
+# --- Technique 2: the plane lattice, verified on the pours it is supposed to tie -------------------
+#
+# `docs/router-plan.md` R-E1 and `docs/stitch-plan.md` section 8 item 1, S8. One claim, and it is the
+# only one on this board that nothing else can make: **every lattice barrel lands in BOTH pours.** A
+# via welded to the front plane and standing in a clearance hole in the back one still reads as
+# connected — KiCad's unconnected-items check is pad to pad, `netcheck.check_copper` reads pad
+# bindings inside footprint blocks and never a via, `verify_copper` asks about clearance, angle and
+# size — and it ties the two planes not at all, which is the entire technique. What the gate must not
+# fail on is the pour *area*: a lattice costs plane copper by construction and `plane_area` is the
+# number that says how much.
+
+
+@dataclass(frozen=True)
+class PlaneStitch:
+    """One net's plane lattice as the finished board has it.
+
+    Three numbers, and only the first can fail a build. **Welded** is how many barrels have their
+    whole ring inside a filled zone of their own net on **every** layer that net is poured on — the
+    claim R-E1 makes and the one nothing else here can check. **Islands** and **area** are what the
+    lattice cost the pours it ties: a plane that came back in two pieces has had a fragment cut off it
+    (D.5), and the mm2 is what `test_examples_fab.py::PLANES` pins so a flood shows up as a moved
+    number rather than as a shrug.
+    """
+
+    net: str
+    layers: tuple[str, ...]  # every layer this net came back poured on, sorted
+    vias: int
+    welded: int  # rings inside a filled zone of this net on every one of `layers`
+    islands: int  # the **worst** island count of any one of `layers`, not their sum
+    area_mm2: float  # the filled copper of every one of `layers`, summed
+    zoned: bool  # did this net come back with a filled zone on two or more layers at all?
+
+    @property
+    def ok(self) -> bool:
+        return self.zoned and self.vias > 0 and self.welded == self.vias
+
+    def to_dict(self) -> dict:
+        return {
+            "net": self.net, "layers": list(self.layers), "vias": self.vias, "welded": self.welded,
+            "islands": self.islands, "area_mm2": self.area_mm2, "zoned": self.zoned,
+        }
+
+    def line(self) -> str:
+        where = " + ".join(self.layers) if self.layers else "nothing"
+        if not self.zoned:
+            return (
+                f"plane {self.net}: {self.vias} lattice via(s) on a net that came back poured on {where} — "
+                f"a lattice needs two facing pours and this board has fewer"
+            )
+        if self.ok:
+            return (
+                f"plane {self.net}: {self.vias} lattice via(s), all landing in {where}; "
+                f"{self.area_mm2:g} mm2 of pour across {len(self.layers)} layer(s), "
+                f"{self.islands} island(s) on the worst of them"
+            )
+        return (
+            f"plane {self.net}: {self.vias - self.welded} of {self.vias} lattice via(s) do not land in "
+            f"every pour they tie ({where}) — copper that stitches one plane to nothing, and no other "
+            f"check on this board can see it"
+        )
+
+
+def plane_stitch(text: str, pieces: Sequence[Piece]) -> tuple[PlaneStitch, ...]:
+    """Every `plane` piece pcbc wrote, against the pours it is supposed to tie together.
+
+    The ring and not the centre, for `plane_checks`' own reason (finding 12): a via half out of the
+    pour is welded by a sliver of annulus or by nothing, so `RING_SAMPLES` points of the ring and the
+    centre all have to be inside. And **every** poured layer of the net rather than any one of them,
+    which is the whole difference between this and `plane_checks`: a tap only has to reach its own
+    plane, while a lattice barrel exists to join two, so "inside a filled zone of its own net,
+    whichever layer" would pass a via that ties the front pour to a clearance hole in the back one.
+
+    The layers come from the **file** (`zones`), not from `Board(planes=)`: a declared pour that
+    poured nothing is not a plane, which is `poured_planes`' own stance and the blinky trap of
+    `docs/stitch-plan.md` section 7.1 read one technique over.
+
+    A board where pcbc wrote no lattice has no row here and is not a failure — that is every board in
+    this repo, because none of the five pours one net on two layers.
+    """
+    mine = [p for p in pieces if p.reason == "plane" and p.kind == "via"]
+    if not mine:
+        return ()
+    zs = [z for z in zones(text) if z.polys]
+    areas = plane_area(text)
+    islands = plane_islands(text)
+    rows: list[PlaneStitch] = []
+    for net in sorted({p.net for p in mine}):
+        here = [p for p in mine if p.net == net]
+        lays = tuple(sorted({z.layer for z in zs if z.net == net}))
+        welded = sum(1 for p in here if all(_ring_in_zone(p, [z for z in zs if z.net == net and z.layer == lay]) for lay in lays))
+        rows.append(
+            PlaneStitch(
+                net=net,
+                layers=lays,
+                vias=len(here),
+                welded=welded if len(lays) >= 2 else 0,
+                islands=max([n for (zn, _lay), n in islands.items() if zn == net], default=0),
+                area_mm2=round(sum(a for (zn, _lay), a in areas.items() if zn == net), 2),
+                zoned=len(lays) >= 2,
+            )
+        )
+    return tuple(rows)
+
+
+def plane_stitch_lines(rows: Sequence[PlaneStitch]) -> list[str]:
+    """One line per stitched net, then the tally — or the sentence that says pcbc wrote none."""
+    if not rows:
+        return ["planes: pcbc wrote no plane-stitch copper on this board"]
+    bad = [r for r in rows if not r.ok]
+    return [r.line() for r in rows] + [f"planes: {len(rows) - len(bad)} of {len(rows)} lattice(s) landing in every pour they tie"]
+
+# --- Technique 4: the thermal array, verified where it was placed ---------------------------------
+#
+# `docs/stitch-plan.md` §6 row 4 and S6. Two claims, and both of them are about copper pcbc **itself**
+# wrote, which is why the gate that runs this is fatal: pcbc's own via-in-pad detector must find every
+# via pcbc deliberately put in a pad, and `fab.via_in_pad_blockers` must not have grown. If the first
+# fails the array is not where it thinks it is; if the second fails, `Thermal()` let a passive through.
+
+
+@dataclass(frozen=True)
+class ThermalArray:
+    """One `Thermal()` land as the finished board has it.
+
+    `in_pad` and `in_plane` are the two containments the technique is made of and they are different
+    questions with different failure modes. A via outside its **pad** is a barrel beside the land
+    rather than under it: it still reaches the plane, still reads as connected, and moves none of the
+    heat the array was placed for, which is the silent failure the whole check exists for. A via
+    outside its **plane** is a barrel welded at one end — on two layers that is the fill retreating
+    from a pocket (`pour_raster` predicts it at placement and this measures it after the refill), and
+    on four it would mean the zone came back unfilled.
+    """
+
+    pad: str  # "U1.49"
+    net: str
+    want: int  # what `constraints.ThermalSpec.need` asked for
+    got: int  # the vias on the board
+    in_pad: int  # of `got`, how many have their whole ring inside one primitive of the land
+    in_plane: int  # of `got`, how many have their whole ring inside the net's zone on the plane layer
+    plane: str
+    pitch_mm: float  # the closest two barrels of the array sit, centre to centre
+    theta_c_per_w: float  # what `got` barrels achieve
+    rise_c: float  # at the declared watts
+    budget_c: float  # what `Thermal(rise_c=)` asked for
+
+    @property
+    def verdict(self) -> str:
+        """`served` | `short` | `none` | `adrift`, worst last-resort first when they collide.
+
+        `adrift` beats the count verdicts because it is the only one that is a **bug**: the other
+        three are statements about how much room the land had, and `adrift` says a via pcbc placed is
+        not where pcbc believes it is.
+        """
+        if self.got and (self.in_pad < self.got or self.in_plane < self.got):
+            return "adrift"
+        if self.got == 0:
+            return "none"
+        return "served" if self.got >= self.want else "short"
+
+    def to_dict(self) -> dict:
+        return {
+            "pad": self.pad,
+            "net": self.net,
+            "want": self.want,
+            "got": self.got,
+            "in_pad": self.in_pad,
+            "in_plane": self.in_plane,
+            "plane": self.plane,
+            "pitch_mm": self.pitch_mm,
+            "theta_c_per_w": self.theta_c_per_w,
+            "rise_c": self.rise_c,
+            "budget_c": self.budget_c,
+            "verdict": self.verdict,
+        }
+
+    def line(self) -> str:
+        return (
+            f"thermal {self.pad}: {self.got} of {self.want} barrel(s) on {self.net}, {self.in_pad} inside the land and "
+            f"{self.in_plane} inside the {self.net} zone on {self.plane}, closest pair {self.pitch_mm:g} mm — "
+            f"{self.theta_c_per_w:g} K/W, {self.rise_c:g} C of a {self.budget_c:g} C budget ({self.verdict})"
+        )
+
+
+def thermal_budget(text: str, pieces: Sequence[Piece], cs: ConstraintSet) -> tuple[ThermalArray, ...]:
+    """Every compiled `Thermal()` measured on the finished board, in `board.py` order.
+
+    The pieces are pcbc's own, off `copper.json`, and the containments are asked of the **saved and
+    refilled** file — which is the only moment both halves exist: at placement the two-layer pour is
+    written but unfilled and `pour_raster` can only predict it.
+
+    **`plane_checks` is deliberately untouched by this** and that is a correction to
+    `docs/stitch-plan.md` §6, which asked for it to be generalised to a reason set and made
+    `joins`-aware. Measured: it cannot be. `plane_checks` walks `Piece`s reconstructed from the
+    sidecar, and a `Piece` carries no `joins` — the field lives on `StitchSpec` and does not survive
+    the round trip. Adding `"stitch"` to its reason set without that is worse than useless: it would
+    ask node's **parallel** rung, whose net is `VBUS` and which is on an unpoured rail by
+    construction, to be inside a `VBUS` zone that does not exist, and fail a build for it. The tap
+    branch keeps its byte-identical body, this function owns the array's two containments, and the
+    two never meet.
+
+    The ring is `RING_SAMPLES` points plus the centre — `plane_checks`' own sampling and its own
+    calibration, so "inside" means the same thing for a tap and for an array.
+    """
+    from .ampacity import board_pad_geoms
+
+    out: list[ThermalArray] = []
+    if cs is None or not cs.thermals:
+        return ()
+    zs = [z for z in zones(text) if z.polys]
+    geoms = board_pad_geoms(text)
+    # **The board's coordinates, not the sidecar's.** `route_emit.piece_key` rounds to 4 dp — a tenth
+    # of a micron, which is a tenth of the finest grid anything here uses and is right for a key that
+    # has to survive KiCad's rewrite. It is not right for a **pitch**: the lattice is laid out to the
+    # nanometre (`patterns.stitch.next_nm`), so a 0.850101 mm pitch read off two 4-dp coordinates
+    # comes back as 0.8501 or 0.8502 depending on where the land happens to sit on the board.
+    # Measured on node 2026-09-21: the same array reported both. The file carries six decimals.
+    exact = {(round(v["at"][0], 4), round(v["at"][1], 4)): v["at"] for v in board_vias(text)}
+    for spec in cs.thermals:
+        ids = set(spec.ids)
+        land = [g for g in geoms if f"{g.ref}.{g.num}" in ids]
+        mine = [p for p in pieces if p.kind == "via" and p.reason == "thermal" and p.net == spec.net and p.owner == spec.pad]
+        zone = [z for z in zs if z.net == spec.net and z.layer == spec.plane]
+        in_pad = in_plane = 0
+        at_exact = [exact.get((round(p.a[0], 4), round(p.a[1], 4)), p.a) for p in mine]
+        for p in mine:
+            ring = _ring_of(p)
+            if any(all(_inside(shape, pt) for pt in ring) for g in land for shape in g.copper):
+                in_pad += 1
+            if zone and all(any(in_zone(z, pt) for z in zone) for pt in ring):
+                in_plane += 1
+        got = len(mine)
+        theta = spec.theta_via.value
+        out.append(
+            ThermalArray(
+                pad=spec.pad,
+                net=spec.net,
+                want=spec.need,
+                got=got,
+                in_pad=in_pad,
+                in_plane=in_plane,
+                plane=spec.plane,
+                pitch_mm=_closest_pair(at_exact),
+                theta_c_per_w=round(theta / got, 2) if got else 0.0,
+                rise_c=spec.rise_of(got),
+                budget_c=round(spec.rise_c, 2),
+            )
+        )
+    return tuple(out)
+
+
+def _ring_of(p: Piece) -> list[Pt]:
+    """A via's ring as `RING_SAMPLES` points plus its centre — `plane_checks`' own sampling."""
+    r = (p.w or 0.0) / 2.0
+    if r <= 0:
+        return [p.a]
+    return [p.a] + [(p.a[0] + r * math.cos(2 * math.pi * k / RING_SAMPLES), p.a[1] + r * math.sin(2 * math.pi * k / RING_SAMPLES)) for k in range(RING_SAMPLES)]
+
+
+def _closest_pair(pts: Sequence[Pt]) -> float:
+    """The nearest two of a handful of points, **6 dp**; 0.0 for fewer than two.
+
+    Six and not four, which is `route_emit.piece_key`'s number, because this is a **pitch**: the
+    lattice is laid out to the nanometre (`patterns.stitch.next_nm`) and 4 dp reports the same
+    0.850101 mm array as 0.8501 or 0.8502 depending on where the land sits on the board. Measured on
+    node 2026-09-21, it reported both.
+
+    Quadratic, and that is the right algorithm here: the largest array any board in this repo places
+    is twelve barrels, and a sweep line would be more code than the thing it measures.
+    """
+    best = 0.0
+    for i, a in enumerate(pts):
+        for b in pts[i + 1 :]:
+            d = math.dist(a, b)
+            if best == 0.0 or d < best:
+                best = d
+    return round(best, 6)
+
+
+def thermal_lines(rows: Sequence[ThermalArray]) -> list[str]:
+    """One line per land, or the sentence that says the board declares none."""
+    if not rows:
+        return ["thermal: this board declares no Thermal() land"]
+    return [r.line() for r in rows]
 
 
 # --- Technique 6: the ground bridge, verified and never written ------------------------------------

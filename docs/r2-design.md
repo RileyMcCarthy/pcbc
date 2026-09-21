@@ -932,13 +932,25 @@ guard AIN0: deferred - the net is routed by KRT, not by a pattern, so pcbc canno
   it does not own. R3 owns this.
 ```
 
-**A guard may apply partially, and it is the only pattern that may.** A guard is a shield, not a
-connection, so a blocked stretch is dropped rather than failing the pattern, and the note says how
-much of the run is guarded:
+**A guard may apply partially.** A guard is a shield, not a connection, so a blocked stretch is
+dropped rather than failing the pattern, and the note says how much of the run is guarded:
 
 ```
 style: AIN0 guarded 18.2 of 24.0 mm; C4 blocks 5.8 mm on the north side (8 stitch vias placed, 2 dropped)
 ```
+
+> **Corrected by `docs/stitch-plan.md`, and both corrections are load-bearing.** The word *only* is
+> gone from the sentence above: section 2(t) restates it as **R-S3** — a spec whose count is an
+> electrical requirement is all-or-nothing, and one whose count is a target applies partially and
+> reports the shortfall — so `Thermal()` is a target too. And the note's shape is `Coverage.line`'s
+> (S4), not the sentence above: every target spec emits exactly one `style:` line built from one
+> `Coverage` record, because `REFUSED` and the report both have room for one.
+>
+> The **offset** is section 2(i)'s, not the one below: `d = next_nm(w/2 + between(g, net) +
+> max(track_min, via_diameter)/2 + EPS_MM)`. The formula below omits the guard track's own
+> half-width and the stitch via's ring — 0.5 mm on a two-layer stackup, so B.6's via cannot sit on
+> B.6's track — and folds in `spacing_w`, which is a crosstalk rule between two *signal* nets and is
+> measured not even monotone.
 
 **Return vias are not placed in R2.** `verify_copper` asserts pcbc placed no via at all on a net
 carrying `Constraint.reference` (D.1 item 6), which is the honest way to defer R-Z4 to R4.

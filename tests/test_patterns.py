@@ -1020,33 +1020,48 @@ def test_the_final_stage_is_the_last_step_of_the_plan_on_both_stackups():
         )
 
 
-def test_the_final_stage_writes_nothing_on_a_board_with_no_population():
-    """`patterns.FINAL` is `("stitch",)`, and on a **placed** board it writes nothing on any example.
+def test_the_final_stage_writes_only_what_a_declaration_asked_for_on_a_placed_board():
+    """`patterns.FINAL` is `("stitch",)`, and on a **placed** board it writes only the thermal arrays.
 
-    S2 asserted this with an empty `FINAL` and it was the architecture's own test: the stage runs for
-    real — `pattern_copper` builds the scene over the finished copper and runs its own self-check —
-    and a fresh build of all five boards came back byte-identical to the same build without it. S4
-    puts a carrier in the stage and the assertion survives here because the **population** is empty on
-    a placed board: the only vias on one are pcbc's own taps and fanouts, and every net that carries
-    them is either poured (and so exempt) or rated by `vias_per_change`.
+    S2 asserted "nothing at all" with an empty `FINAL` and it was the architecture's own test: the
+    stage runs for real — `pattern_copper` builds the scene over the finished copper and runs its own
+    self-check — and a fresh build of all five boards came back byte-identical to the same build
+    without it. S4 put the `parallel` carrier in the stage and the assertion survived unchanged,
+    because its **population** is empty on a placed board: the only vias on one are pcbc's own taps
+    and fanouts, and every net that carries them is either poured (and so exempt) or already rated by
+    `vias_per_change`.
 
-    What that does **not** prove is that the stage writes nothing on a routed board, and on node it
-    writes one rung. That is `test_examples_fab.py`'s to pin, and it pins the rest of the bar
-    unchanged beside it (`docs/stitch-plan.md` §1.2's list). `tests/test_stitch.py` is where the
-    carrier's own arithmetic lives.
+    **S6 is the first slice that moves this test, and the reason is the difference between a
+    population and a declaration.** A `thermal` spec is not discovered from the copper; it is
+    `Thermal("U1.49")` in `board.py`, and the land it names is a footprint pad that exists the moment
+    the board is placed. So the two boards that declare one write their arrays here, on a board with
+    no route on it at all, and the three that do not still write nothing. That is the honest split and
+    it is asserted as one: `blinky`, `buck` and the DS2 Addon are empty for want of a
+    `pad_prop_heatsink` land, not for want of a tuned bound.
+
+    What this does **not** prove is what the stage writes on a routed board, where node also gains a
+    rung and the arrays have KRT's copper to fit around. That is `test_examples_fab.py`'s to pin, and
+    it pins the rest of the bar unchanged beside it (`docs/stitch-plan.md` §1.2's list).
+    `tests/test_stitch.py` and `tests/test_thermal.py` are where the carriers' arithmetic lives.
     """
     from pcbc.patterns import FINAL, _STAGES
 
     assert FINAL == ("stitch",) and _STAGES["final"] is FINAL
+    want = {"c3_usb": 9, "node": 12}
     for name in ALL:
         design = load_board(_board(name))
         job = compile_design(design)
         text = _placed(name).read_text()
         plan = pattern_copper(design, job, job.constraints, text, _uuid_name(name), stage="final")
-        assert plan.text is text and plan.pieces == () and plan.ids == (), name
-        assert plan.census == {} and plan.moves == () and plan.notes == () and plan.refused == {}, name
+        n = want.get(name, 0)
+        assert len(plan.pieces) == n, (name, len(plan.pieces))
+        assert plan.census == ({"thermal": {"segments": 0, "vias": n, "mm": 0.0}} if n else {}), (name, plan.census)
+        assert plan.moves == () and plan.refused == {}, name
+        # `CONNECTS` is False on this module, so an array claims nothing however much copper it wrote.
         assert plan.claimed == frozenset() and plan.done == frozenset() and plan.partial == frozenset(), name
         assert plan.scene is not None, f"{name}: the scene is built, not skipped"
+        if not n:
+            assert plan.text is text and plan.ids == () and plan.notes == (), name
 
 
 def test_every_pattern_module_says_whether_its_copper_connects_the_net_it_claims():

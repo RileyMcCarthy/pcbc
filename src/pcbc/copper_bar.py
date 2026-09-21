@@ -153,7 +153,7 @@ def vias_in_courtyard(text: str, reasons: dict, owners: dict) -> list[dict]:
     return sorted(out, key=lambda h: (h["courtyard"], h["via"]))
 
 
-REDUNDANT = ("stitch",)
+REDUNDANT = ("guard", "plane", "stitch", "thermal")
 """Reasons whose copper is **not part of the net's route** (`docs/stitch-plan.md` R-S1).
 
 Every other reason here writes copper whose absence leaves a pad unreached, so counting its
@@ -171,8 +171,22 @@ wrong thing, and it is the same correction `docs/stitch-plan.md` §6 makes one m
 What it does **not** change: `routed_mm`, `segments` and `vias` still count every piece of copper on
 the net, because a census that hides copper is worse than a ratio that misreads it, and `by_reason` /
 `vias_pattern` still carry every stitch piece exactly. `pattern_mm + leftover_mm + stitch_mm ==
-routed_mm` on every net, which `test_stitch.py` pins. S7's `"guard"` belongs in this tuple for the
-same reason and is left out until there is copper carrying it."""
+routed_mm` on every net, which `test_stitch.py` pins.
+
+**`"guard"` joined them in S7 and it is the case the tuple was named for.** A guard is `GND` copper
+written to shield *another* net: `docs/stitch-plan.md` section 6 says in so many words that a 0.127 mm
+ground guard is not a narrow ground rail, and the same sentence applies here one census over —
+measured on `tests/fixtures/guard/guard.py`, the two flanks of one 16 mm run are 30 mm of `GND`
+copper that moves the `GND` route not one nanometre, so counting them would report a ground net that
+had suddenly grown a detour. Unlike `stitch` and `thermal` it is not even on the net it serves, so
+there is no reading of `detour` under which it belongs.
+
+**`"plane"` joined them in S8 and it is the clearest case of the four.** A lattice barrel's two ends
+are the *same conductor* — two pours of one net, already joined by every through via on the board —
+so its absence leaves nothing unconnected by construction rather than by measurement, which is R-S1
+read off the geometry instead of off a board. It writes no segment at all, so its effect on `detour`
+would run entirely through `vias`; it is held out here so a board that stitches its planes does not
+report its ground net as having changed route."""
 
 
 def copper_bar(text: str, reasons: dict | None = None, owners: dict | None = None, bridges: dict | None = None) -> dict:

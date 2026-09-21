@@ -68,7 +68,9 @@ __all__ = [
     "audit",
     "blocked",
     "build_scene",
+    "Run",
     "clashes",
+    "clear_runs",
     "components",
     "copper_items",
     "free_intervals",
@@ -76,6 +78,7 @@ __all__ = [
     "lane_run_mm",
     "lane_strips",
     "net_open",
+    "net_runs",
     "pad_exits",
     "plane_targets",
     "zone_rules",
@@ -108,6 +111,16 @@ class Item:
     owner: str
     reason: str = ""
     locked: bool = False
+    prop: frozenset[str] = frozenset()
+    """`pads.PadGeom.prop` carried through for a pad item, empty for everything else.
+
+    Only one pattern reads it and only one token is in it on these boards
+    (`pads.PadGeom.prop`): `pad_prop_heatsink`, the footprint's own declaration that a land is
+    there to move heat. It rides on the `Item` rather than being looked up again from the board text
+    because a pattern is handed a scene and nothing else, and re-parsing the footprint inside a
+    candidate loop would be a second reader of what a pad is — which is the drift `pads.py` exists
+    to prevent. Empty is the honest answer for a track, a via, a lane or the edge, none of which
+    KiCad gives properties to."""
 
     def box(self) -> Box:
         boxes = [aabb(s) for s in (self.copper, self.hole, self.mask) if s is not None]
@@ -164,14 +177,57 @@ def krt_grid(job: CompiledJob) -> float:
     return 0.05 if job.layers <= 2 else 0.1
 
 
+def _plane_of(stack: Stackup, pours: tuple[tuple[str, str], ...]) -> dict[str, str]:
+    """`Scene.plane_of`: net -> **the outermost layer it is poured on**, in stackup order.
+
+    One net could only ever be poured on one layer before S8 (`plane_targets`), so this used to be a
+    dict comprehension and the question never came up. It comes up now: a net poured on two facing
+    layers has two answers, and a comprehension would have silently taken whichever the author wrote
+    **last**, making `tap`'s choice of plane a property of the order of a list rather than of the
+    board.
+
+    Outermost — the first in `Stackup.copper_layers()` — for two reasons, one of which is measured.
+    It keeps node's existing answer if node ever declares `GND` on both inner layers: In1.Cu, the
+    layer its 62 taps weld to today, so the experiment moves the pour and not the taps. And it is the
+    layer nearest the pads a tap starts from, which is the shortest barrel that reaches a pour at all.
+    Every via here is a through via, so the choice never decides whether a pad is connected — only
+    which plane the report names and which pour `route_verify.pour_raster` predicts.
+    """
+    order = {lay: i for i, lay in enumerate(stack.copper_layers())}
+    out: dict[str, str] = {}
+    for net, layer in pours:
+        if net not in out or order.get(layer, 99) < order.get(out[net], 99):
+            out[net] = layer
+    return out
+
+
 def plane_targets(job: CompiledJob) -> tuple[tuple[str, str], ...]:
     """(net, layer) for every net that gets a plane or a pour — `krt_plan`'s own rule, factored out
-    so the scene and the tap pattern read the same fact (C.2): the declared `planes=` on four
-    layers, and `("GND", "B.Cu")` on two when GND is a power net."""
+    so the scene and the tap pattern read the same fact (C.2).
+
+    **A declared `planes=` is the board's answer on every stackup; the implicit back pour is what a
+    board that declares nothing gets, and only two layers have one.** That composition is the whole
+    of S8's enabling change (`docs/stitch-plan.md` section 8 item 1) and it was chosen over the two
+    alternatives for a reason that is measurable rather than tidy:
+
+    - *Union* — the declaration plus the implicit `("GND", "B.Cu")` — makes `Board(planes=[("GND",
+      "F.Cu")])` mean *two* pours on a board whose author asked for one, and there is then no way to
+      write down "GND on the front and nothing on the back".
+    - *Implicit wins* would make the declaration decoration, which is the lie `Board` used to refuse.
+
+    Replacement keeps every board that declares nothing byte-identical — measured on all five, the
+    tuple this returns is unchanged — and gives a 2-layer author the one thing S8 needs: **two pours
+    of one net facing each other across the core**, which is the population R-E1 has never had
+    (`docs/stitch-plan.md` section 2(l): before this change `plane_targets` was `(('GND','B.Cu'),)`
+    on four boards and `(('GND','In1.Cu'),('3V3','In2.Cu'))` on node, so no board anywhere poured one
+    net on two facing layers).
+    """
     from fnmatch import fnmatch
 
-    if job.layers > 2:
+    if job.planes:
         return tuple(job.planes)
+    if job.layers > 2:
+        return ()
     # `krt_plan` writes the back pour when GND is one of the power nets, which it reads off the
     # design; the same question asked of the compiled job is whether a `kind="power"` net's
     # patterns match GND. The two agree on every board here, and this form is pure in `job`.
@@ -242,6 +298,7 @@ def pad_items(geoms: Sequence[PadGeom], layers: tuple[str, ...]) -> list[Item]:
                     g.hole if i == 0 else None,  # one item owns the drill; the rest are copper only
                     _mask_of(shape, g.mask_margin),
                     g.id,
+                    prop=g.prop,
                 )
             )
     return out
@@ -475,7 +532,7 @@ class Scene:
         added: list[Item] = []
         n = len(self.items)
         for i, it in enumerate(items):
-            fresh = Item(n + i, it.kind, it.net, it.layers, it.copper, it.hole, it.mask, it.owner, it.reason, it.locked)
+            fresh = Item(n + i, it.kind, it.net, it.layers, it.copper, it.hole, it.mask, it.owner, it.reason, it.locked, it.prop)
             added.append(fresh)
         self.items = self.items + tuple(added)
         self._index(added)
@@ -571,7 +628,7 @@ def build_scene(design: Design, job: CompiledJob, cs: ConstraintSet, pcb_text: s
     outline = (q(content.x0 + e), q(content.y0 + e), q(content.x1 - e), q(content.y1 - e))
     items.append(Item(0, "edge", "", frozenset(layers), rect_shape((outline[0] + outline[2]) / 2.0, (outline[1] + outline[3]) / 2.0, outline[2] - outline[0], outline[3] - outline[1]), None, None, "board edge"))
     ordered = tuple(
-        Item(i, it.kind, it.net, it.layers, it.copper, it.hole, it.mask, it.owner, it.reason, it.locked)
+        Item(i, it.kind, it.net, it.layers, it.copper, it.hole, it.mask, it.owner, it.reason, it.locked, it.prop)
         for i, it in enumerate(sorted(items, key=_sort_key))
     )
     scene = Scene(
@@ -580,7 +637,7 @@ def build_scene(design: Design, job: CompiledJob, cs: ConstraintSet, pcb_text: s
         table=table,
         items=ordered,
         outline=outline,
-        plane_of={net: layer for net, layer in plane_targets(job)},
+        plane_of=_plane_of(stack, plane_targets(job)),
         layers=layers,
         grid=krt_grid(job),
         feet=feet,
@@ -922,6 +979,182 @@ def free_intervals(
         if hi - lo >= scene.grid - _TOL and hi > lo:
             out.append((round(lo, 4), round(hi, 4)))
     return tuple(out)
+
+
+def clear_runs(
+    axis: str,
+    span: tuple[float, float],
+    offset: float,
+    half: float,
+    net: str,
+    scene: Scene,
+    layer: str,
+    *,
+    ignore: frozenset[int] = frozenset(),
+) -> tuple[tuple[float, float], ...]:
+    """The dual of `free_intervals`: which stretches **along** one fixed line are clear.
+
+    `free_intervals` fixes the stretch and asks which perpendicular offsets are free — the question a
+    trunk asks when it is choosing where to sit. A guard has no such choice: `Guard()` names a net,
+    the net has a path, and the offset is arithmetic (`patterns.stitch.guard_offset`). What is left to
+    ask is the other half of the same slab sweep — *given* this line, which parts of it are clear —
+    and that is the question `docs/r2-design.md` B.6's partial rule is made of: a guard drops a
+    blocked stretch instead of failing, so somebody has to say where the blocked stretches are.
+
+    **The epsilon discipline is `free_intervals`' verbatim, and it is copied rather than shared.**
+    `pad = half * scale + need + EPS_MM`, merge with `_TOL`, complement inside the span, drop anything
+    narrower than `scene.grid`, round each surviving endpoint **inward** to 4 dp. Every value returned
+    is therefore one `clears` agrees with, which is what makes this a proposer and `clears` still the
+    judge (`test_guard.py::test_clear_runs_agrees_with_clears` sweeps it at 0.01 mm the way A.8
+    calibrated `free_intervals`). Copied because the two functions differ in exactly one line — which
+    projection is tested against the fixed value and which is returned — and a shared helper
+    parameterised on that line would be longer than both and would put `free_intervals`, which four
+    patterns rest on, inside a refactor this slice has no reason to make.
+
+    `axis` is `"x"`, `"y"`, `"u"` or `"v"`; for a diagonal the world is the same transform, `u = x + y`
+    and `v = x - y`, so `span` and the return are in that coordinate and a millimetre along the leg is
+    **two** of its units — the caller converts, because only the caller knows the leg's own direction.
+    Lanes and the edge are skipped exactly as `free_intervals` skips them: a lane is `lane_ok`'s
+    question and the outline is rule 5's, both asked of the finished candidate by `blocked`.
+
+    `ignore` is `clashes`' own parameter and it exists for one measured reason. `_project` takes an
+    item's **axis-aligned bounding box**, which on a diagonal axis is a strict and sometimes very loose
+    superset: a 45 degree track's box is a square, so its `v` extent spans the whole run and it reports
+    as blocking every millimetre of a `u` sweep beside it. Measured 2026-09-21 on
+    `tests/fixtures/guard/guard.py`, `SIG2`'s own 3.7 mm diagonal leg blocked **all** of its own
+    flank that way, at an offset computed to clear it by 0.19 mm. A caller that has already solved the
+    distance to a piece of copper exactly may say so here; `blocked` still judges the finished
+    candidate against that very copper, so this loosens the **proposal** and never the decision.
+    """
+    if axis not in _AXES:
+        raise ValueError(f"axis is one of {_AXES}, got {axis!r}")
+    scale = math.sqrt(2.0) if axis in ("u", "v") else 1.0
+    lo, hi = min(span), max(span)
+    blocked_spans: list[tuple[float, float]] = []
+    for it in scene.items:
+        if it.kind in ("lane", "edge") or layer not in it.layers or it.id in ignore:
+            continue
+        if bool(net) and it.net == net:
+            continue
+        need = (scene.table.between(net, it.net)[0] if it.kind != "keepout" else 0.0) * scale
+        pad = half * scale + need + EPS_MM
+        along, across = _project(it.box(), axis)
+        # The one line that differs from `free_intervals`: there the obstacle is tested against the
+        # *stretch* and contributes an interval across; here it is tested against the *offset* and
+        # contributes an interval along.
+        if across[1] < offset - pad or across[0] > offset + pad:
+            continue
+        blocked_spans.append((along[0] - pad, along[1] + pad))
+    blocked_spans.sort()
+    merged: list[list[float]] = []
+    for a, b in blocked_spans:
+        if merged and a <= merged[-1][1] + _TOL:
+            merged[-1][1] = max(merged[-1][1], b)
+        else:
+            merged.append([a, b])
+    free: list[tuple[float, float]] = []
+    cursor = lo
+    for a, b in merged:
+        if a > cursor + _TOL:
+            free.append((cursor, min(a, hi)))
+        cursor = max(cursor, b)
+        if cursor >= hi:
+            break
+    if cursor < hi - _TOL:
+        free.append((cursor, hi))
+    out: list[tuple[float, float]] = []
+    for a, b in free:
+        c0 = math.ceil(a * 1e4 - _TOL) / 1e4  # inward: never longer than the truth
+        c1 = math.floor(b * 1e4 + _TOL) / 1e4
+        if c1 - c0 >= scene.grid - _TOL and c1 > c0:
+            out.append((round(c0, 4), round(c1, 4)))
+    return tuple(out)
+
+
+@dataclass(frozen=True)
+class Run:
+    """One unbranched run of a net's own track copper on one layer, as an ordered polyline.
+
+    A *run* is what a guard offsets and what a report measures: the copper between two places where
+    the net stops being a line — a pad, a via, a junction where three tracks meet. It is the scene's
+    answer to the question `route_verify.paths_of` answers about a pattern's `Piece`s, and the two
+    are deliberately the same walk written twice over different inputs, because they are asked at
+    different times: `paths_of` judges copper before it is written and this reads copper that is.
+    """
+
+    net: str
+    layer: str
+    pts: tuple[Pt, ...]  # the centreline, in order
+    ids: tuple[int, ...]  # the scene items it is made of, in path order
+    widths: tuple[float, ...]  # one per leg, in path order
+
+    @property
+    def mm(self) -> float:
+        return sum(math.dist(self.pts[i], self.pts[i + 1]) for i in range(len(self.pts) - 1))
+
+
+def net_runs(scene: Scene, net: str, layer: str | None = None) -> tuple[Run, ...]:
+    """Every run of `net`'s track copper, sorted, with the items each is made of.
+
+    Walked from every endpoint that is not a plain pass-through, exactly as `route_verify.paths_of`
+    walks a pattern's pieces: **a vertex where three tracks meet is a junction and ends the chains
+    that reach it**, which is what a spine rib, a chain tap or a T off a rail looks like. A run with
+    no such endpoint at all is a closed loop, and it starts at its smallest vertex so the answer is a
+    function of the copper rather than of the order the file happened to list it in.
+
+    Sorted throughout — the legs by `(a, b)`, the runs by `(layer, pts)` — and canonicalised so a run
+    reads from its smaller endpoint. Two boards with the same copper written in a different order give
+    the same tuple, which is what a pattern reading this needs and what `free_intervals` gets for free
+    by being closed-form.
+    """
+    want = (layer,) if layer is not None else scene.layers
+    out: list[Run] = []
+    for L in want:
+        legs: list[tuple[Pt, Pt, float, int]] = []
+        for it in scene.items:
+            if it.kind != "track" or it.net != net or it.copper is None or L not in it.layers:
+                continue
+            pts = it.copper.pts
+            if len(pts) != 2:
+                continue  # a track is a capsule over two points; anything else is not one
+            a, b = (pts[0], pts[1]) if pts[0] <= pts[1] else (pts[1], pts[0])
+            legs.append((a, b, round(it.copper.r * 2.0, 4), it.id))
+        if not legs:
+            continue
+        legs.sort(key=lambda g: (g[0], g[1], g[3]))
+        adj: dict[Pt, list[int]] = {}
+        for i, (a, b, _w, _id) in enumerate(legs):
+            adj.setdefault(a, []).append(i)
+            adj.setdefault(b, []).append(i)
+        seen: set[int] = set()
+        starts = [pt for pt in sorted(adj) if len(adj[pt]) != 2] or sorted(adj)[:1]
+        for start in starts:
+            for first in sorted(adj[start]):
+                if first in seen:
+                    continue
+                chain = [start]
+                used: list[int] = []
+                here, leg = start, first
+                while True:
+                    seen.add(leg)
+                    used.append(leg)
+                    a, b, _w, _id = legs[leg]
+                    nxt = b if a == here else a
+                    chain.append(nxt)
+                    here = nxt
+                    if len(adj.get(here, ())) != 2:
+                        break
+                    onward = [j for j in adj[here] if j != leg]
+                    if not onward or onward[0] in seen:
+                        break
+                    leg = onward[0]
+                pts = tuple(chain)
+                ids = tuple(legs[j][3] for j in used)
+                widths = tuple(legs[j][2] for j in used)
+                if pts[0] > pts[-1]:
+                    pts, ids, widths = tuple(reversed(pts)), tuple(reversed(ids)), tuple(reversed(widths))
+                out.append(Run(net=net, layer=L, pts=pts, ids=ids, widths=widths))
+    return tuple(sorted(out, key=lambda r: (r.layer, r.pts)))
 
 
 # --- A.9: who still needs KRT ---------------------------------------------------------------------

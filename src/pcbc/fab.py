@@ -547,6 +547,37 @@ def _owned_copper(pcb: Path) -> tuple[tuple[str, str, float], ...]:
     )
 
 
+def _shield_copper(pcb: Path) -> frozenset:
+    """`copper_bar.bar_key`s of the copper that is not on any rail, off the same sidecar.
+
+    `ampacity.NOT_A_RAIL` names the reasons, and today that is `guard` alone — see its docstring for
+    why this is **not** `copper_bar.REDUNDANT`, which holds two more reasons that are redundant for
+    connectivity and load-bearing for current. This keeps a shield out of
+    `ampacity.power_bottlenecks`, where 27 mm of 0.127 mm ground guard was being reported as 27 mm of
+    under-width ground rail.
+
+    An absent sidecar gives the empty set and the measurement is exactly what it was before, which is
+    what a `PCBC_PATTERNS=off` board has to be judged by. The four example boards declare no
+    `Guard()`, so it is empty on every one of them and they cannot move."""
+    side = pcb.parent / "copper.json"
+    if not side.exists():
+        return frozenset()
+    from .ampacity import NOT_A_RAIL
+    from .copper_bar import bar_key
+    from .route_emit import read_sidecar
+
+    out = set()
+    for i in read_sidecar(side).items:
+        if i.get("reason") not in NOT_A_RAIL:
+            continue
+        key = i.get("key") or [""]
+        if key[0] == "seg":
+            out.add(bar_key("seg", key[1], tuple(key[2]), tuple(key[3]), float(i.get("w") or 0.0)))
+        elif key[0] == "via":
+            out.add(bar_key("via", tuple(key[1])))
+    return frozenset(out)
+
+
 def fab_job(
     job: CompiledJob,
     pcb: Path,
@@ -727,7 +758,7 @@ def fab_job(
     # `test_examples_fab.py`, so it is a ledger that must fall rather than a boolean already true.
     amp = power_ampacity_failures(job, text, owned=_owned_copper(pcb))
     result["ampacity"] = amp
-    result["ampacity_bottleneck"] = power_bottlenecks(job, text)
+    result["ampacity_bottleneck"] = power_bottlenecks(job, text, redundant=_shield_copper(pcb))
     # The measurement only counted while it sat in `FAB_NOTES.md`: the build printed
     # `copper: verified`, `error: null`, exit 0, and an AI reading that shipped buck with 1.21 A of
     # copper on a 2 A rail. `power_moves` carries the non-`ok` rows out as moves, `build.py` puts
@@ -791,6 +822,63 @@ def fab_job(
     return result
 
 
+def _thermal_notes(job: CompiledJob) -> list[str]:
+    """The paragraph a `Thermal()` board has to carry to the fab, or nothing at all.
+
+    **This is the one thing in the whole technique that pcbc cannot do for the author**, and it is the
+    reconciliation `docs/stitch-plan.md` S6 asks for in writing. A thermal array is via-in-pad by
+    definition: every barrel it places sits inside the copper of the land it is cooling, on purpose,
+    and `fab.via_in_pad` will find every one of them with `inside == True`. Two things follow, and
+    they pull in opposite directions.
+
+    - **The passive rule does not move.** `via_in_pad_blockers` refuses any via overlapping a
+      two-terminal passive's pad or a connector's mounting peg, on **any** overlap, filled or not,
+      because the barrel wicks the joint and starves it. `Thermal()` refuses a passive at compile
+      (`constraints._thermal_refusals`) so the two agree, and `build._thermal_gate` compares the
+      blocker list with and without pcbc's own array so a slip shows up as a failed build rather than
+      as a longer list nobody diffed. `via_in_pad_blockers` has a **zero diff** in this slice.
+    - **The fab package has to declare the fill, and only the person ordering can make that true.**
+      `Stackup.via_tenting` closes the solder mask over a barrel's mouth; it does not plug the barrel.
+      What makes a via safe under a reflowed land is IPC-4761 **Type VII — filled and capped**: the
+      hole plugged with non-conductive epoxy, planarised and plated over, so the pad's surface is
+      continuous copper. `Stackup.via_fill` says the fab *offers* it. This paragraph is what says the
+      order must *ask* for it, because JLC's default via covering is tented and an array built tented
+      is a land with n holes in it.
+    """
+    cs = job.constraints
+    if cs is None or not cs.thermals:
+        return []
+    stack = cs.stackup
+    lines = ["", "## Thermal vias (via-in-pad, deliberate)", ""]
+    total = sum(t.need for t in cs.thermals)
+    lines.append(
+        f"{total} via(s) are placed **inside** a pad on purpose, under {len(cs.thermals)} exposed land(s). "
+        f"They are not a DRC accident and they are not optional: they are the pad's heat path."
+    )
+    lines.append("")
+    for t in cs.thermals:
+        lines.append(
+            f"- **{t.pad}** on `{t.net}`: {t.need} x {t.via[0]:g}/{t.via[1]:g} mm through vias to the "
+            f"{t.net} plane on `{t.plane}`. One barrel is {t.theta_via.value:g} K/W "
+            f"(L/(k*A) on the plating annulus, k_cu 385 W/m/K, {stack.board_mm:g} mm board, "
+            f"{stack.via_plating_mm:g} mm plating), so {t.need} in parallel are {t.theta_array():g} K/W "
+            f"and {t.watts:g} W raises the copper {t.rise_of(t.need):g} C against a {t.rise_c:g} C budget."
+        )
+    lines += [
+        "",
+        "**The order must specify via covering = Epoxy Filled & Capped (IPC-4761 Type VII)** for these "
+        f"barrels — {stack.via_drill:g} mm drill, inside the fab's {stack.via_fill_min_drill:g} to "
+        f"{stack.via_fill_max_drill:g} mm filled range. Tenting is a mask dam over the mouth of the hole, "
+        "not a plug: a tented barrel under a reflowed land wicks the paste down the hole and starves the "
+        "joint. Filled and capped is a **paid option and not the default**; a board ordered tented has "
+        "holes in its thermal land.",
+        "",
+        "These are IC / heatsink lands. The passive rule is unchanged and unrelaxed: a via inside a "
+        "resistor's, capacitor's, inductor's or connector-peg pad still fails this gate, filled or not.",
+    ]
+    return lines
+
+
 def _write_notes(out_dir: Path, job: CompiledJob, result: dict) -> None:
     vip = result.get("via_in_pad") or []
     fids = result.get("fiducials") or []
@@ -813,20 +901,30 @@ def _write_notes(out_dir: Path, job: CompiledJob, result: dict) -> None:
     blockers = result.get("via_in_pad_blockers") or []
     if vip:
         inside = sum(1 for h in vip if h.get("inside"))
+        # Two different lists and, until S6 put nine deliberate barrels in one of them, one sentence
+        # over both: the header said "they fail this gate" and then printed `blockers or vip`, so a
+        # board with **no** blocker at all listed its allowed underpad vias under a sentence saying
+        # they failed. c3_usb's two IC-pin grazes read that way before the array arrived and made it
+        # loud. The blockers are named as blockers, and the rest are named as what they are.
         lines.append(
             f"{len(vip)} via(s) touch an SMT pad's copper, {inside} of them wholly inside it. "
-            "USB-C underpad may stay (filled + capped, IPC-4761 Type VII). "
-            "Passives and connector mounting pegs must be dog-boned — they fail this gate:"
+            "USB-C and IC underpad may stay (filled + capped, IPC-4761 Type VII). "
+            "Passives and connector mounting pegs must be dog-boned."
         )
-        for h in (blockers or vip)[:40]:
-            lines.append(f"- {h['pad']} @ ({h['via'][0]:.3f}, {h['via'][1]:.3f})")
+        if blockers:
+            lines.append("")
+            lines.append(f"**{len(blockers)} of them fail this gate** and the board cannot be assembled as it stands:")
+            for h in blockers[:40]:
+                lines.append(f"- {h['pad']} @ ({h['via'][0]:.3f}, {h['via'][1]:.3f})")
         allowed = [h for h in vip if h not in blockers]
-        if allowed and blockers:
-            lines.append(
-                f"{len(allowed)} underpad via(s) remain (USB-C / IC); order filled + capped."
-            )
+        if allowed:
+            lines.append("")
+            lines.append(f"{len(allowed)} underpad via(s) are allowed (USB-C / IC); order filled + capped:")
+            for h in allowed[:40]:
+                lines.append(f"- {h['pad']} @ ({h['via'][0]:.3f}, {h['via'][1]:.3f})")
     else:
         lines.append("- None detected.")
+    lines += _thermal_notes(job)
     lines += ["", "## BOM LCSC", ""]
     if miss:
         lines.append("Missing LCSC on footprint property: " + ", ".join(miss))

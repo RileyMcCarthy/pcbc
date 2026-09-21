@@ -41,6 +41,7 @@ from .model import (
     PlaceSpec,
     RegionSpec,
     SchPlaceSpec,
+    ThermalReq,
 )
 
 _current: Design | None = None
@@ -142,18 +143,21 @@ def Board(
             f"Board(layers={int(layers)}, stackup={stackup!r}): {stackup} is a {stack.layers}-layer stackup; "
             f"write layers={stack.layers}, or pick a {int(layers)}-layer stackup"
         )
-    # A declaration the router never reads is a lie the board tells its author. `route.krt_plan`
-    # takes `planes=` only when `job.layers > 2` and pours `GND` on `B.Cu` itself below that, so
-    # `planes=` on two layers pours nothing at all — and until the `power_moves` review, nothing
-    # anywhere noticed: `Board()` accepted it, the router ignored it, the ampacity measurement
-    # exempted the net on the strength of it, and `FAB_NOTES.md` reported a rail as poured that had
-    # no pour. Both halves are refusals now, each naming the edit.
+    # **The 2-layer refusal is gone, and what removed it is the router reading the declaration.**
+    # It was added when `route.krt_plan` took `planes=` only above two layers and poured `GND` on
+    # `B.Cu` itself below that, so a 2-layer `planes=` reached no step at all: `Board()` accepted it,
+    # the router ignored it, the ampacity measurement exempted the net on the strength of it, and
+    # `FAB_NOTES.md` reported a rail as poured that had no pour. "A declaration the router never
+    # reads is a lie the board tells its author" was the right refusal for that router.
+    #
+    # S8 made the router read it (`route_scene.plane_targets`, `route.krt_plan`): a declared pour is
+    # poured on whatever stackup declared it, and the implicit back pour is what a board that
+    # declares nothing gets. So the sentence no longer describes this code, and a refusal that has
+    # stopped being true is worse than no refusal — it would now forbid the only way to write down
+    # the thing R-E1 needs, **two pours of one net facing each other across the core on two layers**
+    # (`docs/stitch-plan.md` section 8 item 1). The layer check below stays: a layer the stackup does
+    # not have is still a lie, and it is one no router change can make true.
     declared = tuple((str(n), str(l)) for n, l in (planes or ()))
-    if declared and int(layers) <= 2:
-        raise ValueError(
-            f"Board(planes={[list(p) for p in declared]}, layers={int(layers)}): a 2-layer board pours only "
-            f"GND on B.Cu, which pcbc writes itself — drop planes=, or move to a 4-layer stackup"
-        )
     copper = set(stack.copper_layers())
     for net, lay in declared:
         if lay not in copper:
@@ -436,6 +440,7 @@ def NetReq(
     clock: str | None = None,
     pf_max: float | None = None,
     loop_mm2: float | None = None,
+    rise_ps: float | None = None,
     autoroute: bool | str | None = None,
     class_name: str | None = None,
 ) -> NetReqSpec:
@@ -457,6 +462,13 @@ def NetReq(
     keep_clear_mm = _num(keep_clear_mm, "keep_clear_mm", who, positive=True)
     pf_max = _num(pf_max, "pf_max", who, positive=True)
     loop_mm2 = _num(loop_mm2, "loop_mm2", who, positive=True)
+    # **No default, no preset value, and no per-kind table** — `docs/stitch-plan.md` section 8
+    # item 3 refuses `DEFAULT_RISE_PS` and it is right: an edge rate is a fact about the parts on
+    # this board, the way `Thermal(watts=)` is, and four "pcbc default" guesses entering the
+    # constraint compiler would be four invented numbers that a pitch then scales linearly with.
+    # A net that does not say carries no edge rate, and the plane stitch that wants one refuses
+    # by name rather than guessing (`patterns.stitch.stitch_pitch`).
+    rise_ps = _num(rise_ps, "rise_ps", who, positive=True, hi=1e6)
     if vias_max is not None and (isinstance(vias_max, bool) or not isinstance(vias_max, int) or vias_max < 0):
         raise ValueError(f"{who}: vias_max={vias_max!r} must be a whole number of vias, 0 or more")
     if layers is not None and not tuple(layers):
@@ -489,6 +501,7 @@ def NetReq(
         clock=clock,
         pf_max=pf_max,
         loop_mm2=loop_mm2,
+        rise_ps=rise_ps,
         line=_line(),
     )
     _doc().netreqs.append(spec)
@@ -650,6 +663,63 @@ def Bridge(a: str, b: str, *, at: str | Sequence[str], kind: str = "short", why:
         raise ValueError(f'{who}: at= names one part, e.g. at="R11"; only kind="off_board" takes two pads')
     spec = BridgeReq(a=a, b=b, at=pads, kind=kind, why=str(why), line=_line())
     _doc().bridges.append(spec)
+    return spec
+
+
+def Thermal(pad: str, *, watts: float, rise_c: float = 10.0, across_planes: bool = False, fill: bool = False) -> ThermalReq:
+    """A via array under one exposed pad, so the heat it carries has somewhere to go (R-T1).
+
+    `pad` is `"REF.PADNUM"` or `"REF.PINNAME"` — `Thermal("U1.49")` and `Thermal("U1.GND")` name the
+    same land — resolved by `constraints._refpin_net`, which is the resolver `Chain()` already uses,
+    so the two statements cannot disagree about what `"U1.49"` means.
+
+    **`watts` is a board fact, not a library fact, and that is why this is a statement rather than
+    `thermal=` on a `Part`.** The same LDO dissipates 40 mW on one board and 900 mW on the next; what
+    a part knows is its package, and what the board knows is the load. There is a mechanical reason
+    too: `Part.__call__(**pin_nets)` binds every keyword as a **pin name**, so a `thermal=` kwarg on a
+    part would silently become a pin called "thermal" and bind a net called `0.35`.
+
+    `rise_c` is the copper rise this array is budgeted for, defaulting to the 10.0 that
+    `CurrentSpec.temp_rise_c` already defaults to so the thermal model and the current model share one
+    number rather than inventing a second. **It is not a junction rise and this is not `theta_JA`:**
+    pcbc knows the barrel (`stackup.via_theta_c_per_w`) and knows nothing about the package, the
+    spreading in the plane it lands on, or the air above the board. The count is
+    `ceil(theta_barrel / (rise_c / watts))` and the sentence the report prints says exactly that much
+    and no more.
+
+    `across_planes=True` consents to carving antipads in a plane this pad's net does **not** join. On
+    four layers every via is a through via, so an array of twelve GND barrels under a pad punches
+    twelve holes in the 3V3 plane below it whether anybody meant to or not — finding 10's lesson (one
+    row of taps slotted that plane and turned a 1.80 mm path across it into 8.09 mm) at nine times the
+    scale. The default is to refuse and name the arithmetic; the pitch that keeps the webs alive is
+    derived rather than chosen (`patterns.stitch.thermal_pitch`), so consenting is a decision about
+    the plane and not about a tolerance.
+
+    `fill=True` places every site that fits instead of the `n` the budget asks for. The budget is a
+    floor — more copper is more conductance — so this cannot make the array worse, only larger; it is
+    the switch for a pad whose real dissipation is not known and whose land is free anyway.
+
+    **A thermal array is via-in-pad by definition**, so the fab package has to say so: see
+    `Stackup.via_fill` for the difference between tenting a barrel and plugging it, and
+    `fab._write_notes` for the paragraph the order has to carry. pcbc refuses the array outright on a
+    **passive's** pad, where no amount of filling saves the joint, and `fab.via_in_pad_blockers` is
+    unchanged by this statement — it must stay the judge it was.
+    """
+    who = f'Thermal("{pad}")'
+    pad = str(pad)
+    if "." not in pad:
+        raise ValueError(f"{who}: write REF.PAD or REF.PIN, e.g. U1.49")
+    watts = _num(watts, "watts", who, positive=True)
+    rise_c = _num(rise_c, "rise_c", who, positive=True)
+    spec = ThermalReq(
+        pad=pad,
+        watts=float(watts),
+        rise_c=float(rise_c),
+        across_planes=bool(across_planes),
+        fill=bool(fill),
+        line=_line(),
+    )
+    _doc().thermals.append(spec)
     return spec
 
 
@@ -857,6 +927,7 @@ def load_board(path: str | Path) -> Design:
         "Isolation": Isolation,
         "Guard": Guard,
         "Bridge": Bridge,
+        "Thermal": Thermal,
         "AUTO": AUTO,
         "Net": Net_,
         "Power": Power,
@@ -949,4 +1020,4 @@ def check_board(path: str | Path, pcb: bool = True, notes: list[str] | None = No
     return fails
 
 
-_CONSTRUCTORS.update({"NetReq": NetReq, "Pair": Pair, "Bus": Bus, "Chain": Chain, "Isolation": Isolation, "Guard": Guard, "Bridge": Bridge})
+_CONSTRUCTORS.update({"NetReq": NetReq, "Pair": Pair, "Bus": Bus, "Chain": Chain, "Isolation": Isolation, "Guard": Guard, "Bridge": Bridge, "Thermal": Thermal})

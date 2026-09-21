@@ -251,13 +251,32 @@ def widest_path(adj: dict[tuple, set[tuple]], amps: dict[tuple, float], sources:
     return best
 
 
-def power_bottlenecks(job: CompiledJob, text: str) -> dict[str, dict]:
+def power_bottlenecks(job: CompiledJob, text: str, *, redundant: frozenset = frozenset()) -> dict[str, dict]:
     """Per power net with a declared current: the worst pad-to-pad path, as a JSON-able dict.
 
     A net that carries a zone is reported with `zoned` true and no path walk: a plane is the rail's
     conductor and "the narrowest track" is not the question being asked of it. That is also the
     exemption `job.planes` was meant to give and could not — it is `()` on buck, c3_usb and ds2 while
-    every one of those boards has a poured `GND` in the routed file (finding 1)."""
+    every one of those boards has a poured `GND` in the routed file (finding 1).
+
+    `redundant` is `copper_bar.bar_key`s of copper that is **not on the rail being measured**, read off
+    `routed/copper.json` by the caller — today `NOT_A_RAIL`, which is the `guard` reason and nothing
+    else. Measured on `tests/fixtures/guard/guard.py`: the two flanks of one 16 mm run are 27.04 mm of
+    0.127 mm `GND` copper, and without this `under_mm` on `GND` reads **27.727 mm** of under-width
+    rail where the board really has **0.683** — a ground plane reported as three quarters necked
+    because a shield was counted as a rail.
+
+    **It is deliberately not `copper_bar.REDUNDANT`**, and `docs/stitch-plan.md` section 6 says
+    otherwise: it asks for the `stitch` reason here too. That sentence predates S4, which made a
+    parallel rung load-bearing *for this very measurement* — the slice's acceptance is that
+    `BOTTLENECK["node"]["VBUS"]`'s `carries` **rises** off 0.527 A because the rung is counted, which
+    is the whole point of placing it. `REDUNDANT` is a route-metric set: those reasons are redundant
+    for **connectivity**, which is what `detour` measures. A rung and a thermal barrel are redundant
+    for connectivity and fully load-bearing for current; a guard is the only one of the three that is
+    not on the net whose current is in question at all.
+
+    Empty by default, so a caller with no sidecar — `PCBC_PATTERNS=off`, or a board routed before
+    this existed — measures exactly what it measured before."""
     cs = job.constraints
     if cs is None:
         return {}
@@ -285,6 +304,12 @@ def power_bottlenecks(job: CompiledJob, text: str) -> dict[str, dict]:
             # The census reads the routed board, where every real pour is a zone, so nothing is lost.
             zoned = bool(census[name].get("zone"))
             nodes = net_nodes(text, name, pads, dt=cur.temp_rise_c, stack=cs.stackup, plane_h=cur.plane_h_mm)
+            if redundant:
+                # Filtered before `_adjacency` and before `under_mm`, so a shield is neither counted
+                # as narrow rail nor offered to the widest-path walk as a rung of one. The key is
+                # rebuilt from the node's own shape rather than carried, because `net_nodes` is the
+                # one reader of the board's copper here and `bar_key` is the one spelling of a piece.
+                nodes = [n for n in nodes if _bar_key_of(n) not in redundant]
             under = round(sum(n.mm for n in nodes if n.key[0] == "seg" and n.amps < math.inf and n.mm and _narrow(n, cls)), 3)
             row = Bottleneck(
                 net=name,
@@ -304,8 +329,35 @@ def power_bottlenecks(job: CompiledJob, text: str) -> dict[str, dict]:
     return out
 
 
+NOT_A_RAIL = ("guard",)
+"""Pattern reasons whose copper is not on the rail `power_bottlenecks` is measuring.
+
+One entry, and the shortness is the argument. `copper_bar.REDUNDANT` holds three — `guard`, `stitch`,
+`thermal` — because none of them is part of a net's **route**, which is the question `detour` asks. Two
+of those three are nonetheless part of a net's **conduction**: a parallel rung is a second barrel
+carrying the rail's current beside the first (that is the entire technique, and S4's acceptance is
+that this function's answer moves because of it), and a thermal barrel is copper under a pad of the
+net it is on. A guard is neither: it is `GND` copper placed to shield a different net, at
+`stack.track_min` because B.6 says a shield's width is the process floor, and it conducts nothing the
+rail cares about."""
+
+
 def _narrow(node: Node, cls: float) -> bool:
     return node.shape.r * 2.0 + 1e-9 < cls
+
+
+def _bar_key_of(node: Node) -> tuple:
+    """`copper_bar.bar_key` for one node, rebuilt from its shape — the one spelling of a piece."""
+    from .copper_bar import bar_key
+
+    pts = node.shape.pts
+    if node.key[0] == "seg" and len(pts) == 2:
+        return bar_key("seg", sorted(node.layers)[0], pts[0], pts[1], node.shape.r * 2.0)
+    if node.key[0] == "via":
+        cx = sum(p[0] for p in pts) / len(pts)
+        cy = sum(p[1] for p in pts) / len(pts)
+        return bar_key("via", (cx, cy))
+    return ("pad", node.key)
 
 
 def _walk(row: Bottleneck, nodes: list[Node], pads: list, net: str) -> Bottleneck:

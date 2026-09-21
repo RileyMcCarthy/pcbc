@@ -26,7 +26,7 @@ from pcbc.language import load_board
 from pcbc.patterns import FINAL, PatternCtx, _STAGES, pattern_copper
 from pcbc.patterns import stitch as st
 from pcbc.route import bar_key
-from pcbc.route_emit import piece_key, seg_piece, via_piece, write_pieces
+from pcbc.route_emit import REASONS, piece_key, seg_piece, via_piece, write_pieces
 from pcbc.route_geom import EPS_MM, is_octilinear, q
 from pcbc.route_scene import ZoneRule, build_scene, zone_rules
 from pcbc.route_verify import BRANCH_REASONS, parallel_joined, verify_copper
@@ -78,14 +78,35 @@ def test_the_final_stage_runs_exactly_this_module():
     from pcbc.patterns import _modules
 
     assert _modules()["stitch"] is st
-    assert st.REASON == "stitch" and st.CONNECTS is False and st.CARRIERS == ("parallel",)
+    # S8's `"plane"` is the fourth carrier and it goes **last**, which is C.1's rule and not a
+    # preference: `parallel` has a ring of eight sites within 1 mm of one fixed point, `thermal` owns a
+    # pad land nothing else wants, `guard` owns a corridor beside one run — and `plane` owns the whole
+    # board, a lattice and an edge ring over every square millimetre two pours of one net face each
+    # other across. Most freedom, so it steps around the other three rather than the other way about.
+    assert st.REASON == "stitch" and st.CONNECTS is False and st.CARRIERS == ("parallel", "thermal", "guard", "plane")
+    # S6: two carriers, **two reasons**, and the second is not decoration. `parallel_joined` walks
+    # every `reason == "stitch"` via and asks what anchor it is a twin of; an array barrel has none,
+    # so under one shared reason c3_usb's first S6 build put nine "a parallel via is not parallel"
+    # failures into `build._barrel_gate` and stopped. `patterns.FINAL` registers the module and
+    # `route_emit._census` keys on the piece, which is why the two can differ at all.
+    assert st.THERMAL_REASON == "thermal" and "thermal" in REASONS and "stitch" in REASONS
+    # S7's third carrier gets a third reason for the same reason again: a guard barrel has no anchor
+    # either, and `route_verify.BRANCH_REASONS` has to judge it as the fab's standard via rather than
+    # as the ground net's class one. `route_emit.REASONS` has carried the name since R1.
+    assert st.GUARD_REASON == "guard" and "guard" in REASONS
 
 
 def test_a_carrier_this_module_does_not_ship_raises_instead_of_writing_nothing():
-    """`thermal` (S6) and `guard` (S7) have no site generator here. Silently emitting nothing is how
-    a pattern comes to pass its own tests by doing nothing, so `run` refuses to be asked."""
+    """Silently emitting nothing is how a pattern comes to pass its own tests by doing nothing, so
+    `run` refuses to be asked about a carrier with no site generator.
+
+    S4 asserted this with `thermal`, S6 shipped that, S7 shipped `guard` — so `CARRIERS` is now the
+    whole set and the assertion has to be made with a name that is not in it. The **rule** is what is
+    being pinned, not the name of whichever carrier had not landed yet: the next one that is designed
+    before it is built must fail here rather than write silence."""
     ctx, _ = _ctx("node")
-    spec = st.StitchSpec(carrier="thermal", net="VBUS", sites=(), need=1, required=True, via=(0.35, 0.2), joins=("F.Cu", "B.Cu"), owner="x", why="", bound=0)
+    assert st.CARRIERS == ("parallel", "thermal", "guard", "plane"), "C.1's least free first, and `run` dispatches on it"
+    spec = st.StitchSpec(carrier="edge", net="VBUS", sites=(), need=1, required=True, via=(0.35, 0.2), joins=("F.Cu", "B.Cu"), owner="x", why="", bound=0)
     with pytest.raises(ValueError, match="not a carrier this module ships"):
         st.run(ctx, spec)
 
@@ -157,7 +178,10 @@ def test_the_population_is_an_under_rated_group_on_an_unpoured_rail():
     """One spec per under-rated **group**, with `vias_per_change`'s own arithmetic in it."""
     ctx, _ = _ctx("node", (_anchor(),))
     specs = st.specs(ctx)
-    assert len(specs) == 1, [s.owner for s in specs]
+    # S6: node declares one `Thermal()` too, and `specs` returns the carriers in `CARRIERS`' order —
+    # C.1's least-free-first, which is the stage's order because `pattern_copper` adds each spec's
+    # copper to the scene before the next one runs.
+    assert [x.carrier for x in specs] == ["parallel", "thermal"], [x.owner for x in specs]
     s = specs[0]
     assert (s.carrier, s.net, s.need, s.required) == ("parallel", "VBUS", 1, True)
     assert s.via == (0.35, 0.2) and s.at == OPEN and s.joins == ("F.Cu", "B.Cu")
@@ -180,14 +204,18 @@ def test_a_poured_net_is_exempt_and_the_exemption_is_read_from_the_compiled_job(
     """
     ctx, _ = _ctx("node", (_anchor(), _anchor((9.0, 9.0), "GND"), _anchor((12.0, 12.0), "3V3")))
     assert ctx.scene.plane_of == {"GND": "In1.Cu", "3V3": "In2.Cu"}
-    assert [s.net for s in st.specs(ctx)] == ["VBUS"]
+    assert [s.net for s in st.specs(ctx) if s.carrier == "parallel"] == ["VBUS"]
+    # And the exemption is the parallel carrier's alone: a `thermal` spec's net **must** be poured
+    # (`constraints._thermal_refusals` refuses the statement otherwise), so the two populations
+    # cannot overlap on any board — which is why `specs`' order is arithmetic rather than a tuning.
+    assert [s.net for s in st.specs(ctx) if s.carrier == "thermal"] == ["GND"]
 
 
 def test_a_group_that_is_already_rated_gets_no_spec_at_all():
     """`add = vias_per_change - len(group)`, floored at zero. Two barrels 0.9 mm apart are one
     cluster carrying 1.054 A of a 1 A rail, so there is nothing to ask for."""
     ctx, _ = _ctx("node", (_anchor(), _anchor((OPEN[0] + 0.9, OPEN[1]))))
-    assert st.specs(ctx) == ()
+    assert [s.carrier for s in st.specs(ctx)] == ["thermal"], "node's declared array is the only spec left"
 
 
 def test_four_of_the_five_boards_have_no_population_and_it_is_arithmetic_not_luck():
@@ -196,10 +224,10 @@ def test_four_of_the_five_boards_have_no_population_and_it_is_arithmetic_not_luc
     singleton is rated. Asked here of the **placed** boards, where the only vias are pcbc's own."""
     for name in ("blinky", "buck", "c3_usb"):
         ctx, _ = _ctx(name)
-        assert st.specs(ctx) == (), name
+        assert [s for s in st.specs(ctx) if s.carrier == "parallel"] == [], name
     ctx, _ = _ctx("c3_usb", (via_piece("VBUS", "leftover", OPEN, 0.5, 0.3, owner="VBUS via"),))
     assert vias_per_change(0.5, 0.3, ctx.scene.stack.via_plating_mm, 10.0) == 1 and via_amps(0.3) == 0.707
-    assert st.specs(ctx) == (), "a 0.5 A rail through one 0.3 mm barrel is rated, so there is nothing to stitch"
+    assert [s for s in st.specs(ctx) if s.carrier == "parallel"] == [], "a 0.5 A rail through one 0.3 mm barrel is rated, so there is nothing to stitch"
 
 
 # --- the rung -------------------------------------------------------------------------------------
@@ -232,7 +260,10 @@ def test_the_rungs_own_copper_passes_pcbcs_self_check():
     rule, the leg-length rule and every clearance of the copper just written."""
     ctx, text = _ctx("node", (_anchor(),))
     plan = pattern_copper(load_board(_board("node")), ctx.job, ctx.cs, text, "node", stage="final")
-    assert plan.moves == () and len(plan.pieces) == 3, plan.moves
+    # Three pieces for the rung and twelve barrels for node's declared array: the whole `final` stage
+    # on this board, judged in one pass by the check `pattern_copper` raises on.
+    assert plan.moves == () and len(plan.pieces) == 15, plan.moves
+    assert [p.reason for p in plan.pieces].count("thermal") == 12, plan.census
     assert verify_copper(plan.scene, plan.pieces, ctx.cs, ids=plan.ids) == []
 
 
@@ -286,9 +317,24 @@ def test_a_target_spec_applies_partially_and_says_so_in_one_style_line():
     res = st.run(ctx, target)
     assert res.refusal is None and len(res.pieces) == 6, len(res.pieces)
     assert len(res.notes) == 1, res.notes
-    assert res.notes[0] == "style: stitch VBUS via at (44,36): 2 of 7 placed, 1.581 A of 1 A (above its floor)", res.notes[0]
-    cover = st.Coverage(want=7, got=2, measure=1.581, target=1.0, unit="A", floor_ok=True, why="VBUS via at (44,36)")
+    # S6 adds the clause after the semicolon, and it is the half that makes the note actionable: a
+    # target emits **one** note and no refusal, so without it "2 of 7 placed" is a number nobody can
+    # act on. It is the same measurement `_refuse` would have printed — `Clash.have`, `Clash.need`
+    # and the rule of A.4 that decided it — compressed to the single worst blocker.
+    assert res.notes[0] == (
+        "style: stitch VBUS via at (44,36): 2 of 7 placed, 1.581 A of 1 A (above its floor); "
+        "all 32 sites tried, worst blocker VBUS via at (44,36) [VBUS] at 44,36 leaving 0.500 mm of 0.500 mm (rule: hole_to_hole)"
+    ), res.notes[0]
+    cover = st.Coverage(
+        want=7, got=2, measure=1.581, target=1.0, unit="A", floor_ok=True, why="VBUS via at (44,36)",
+        blocked="all 32 sites tried, worst blocker VBUS via at (44,36) [VBUS] at 44,36 leaving 0.500 mm of 0.500 mm (rule: hole_to_hole)",
+    )
     assert cover.line() == res.notes[0]
+    # And the verdict word follows the **unit**, because the two carriers measure in opposite
+    # directions: a rail wants more amperes than its target, a land wants fewer degrees than its
+    # budget, and one sentence for both prints "above its floor" on an array that is overheating.
+    hot = st.Coverage(want=9, got=4, measure=57.78, target=10.0, unit="C", floor_ok=False, why="U1.49")
+    assert hot.line() == "style: stitch U1.49: 4 of 9 placed, 57.78 C of 10 C (over its budget)", hot.line()
 
 
 def test_two_rungs_of_one_spec_are_judged_against_each_other_and_must_make_one_line():
@@ -324,7 +370,7 @@ def test_a_site_that_would_merge_two_groups_is_not_a_site():
     already computed and still to run, becomes a statement about a board that no longer exists."""
     other = (OPEN[0] + 1.6, OPEN[1])
     ctx, _ = _ctx("node", (_anchor(), _anchor(other)))
-    specs = st.specs(ctx)
+    specs = tuple(sp for sp in st.specs(ctx) if sp.carrier == "parallel")
     assert [sp.at for sp in specs] == [OPEN, other], [sp.at for sp in specs]
     assert st._merges(ctx.scene, specs[0], TWIN) is True, "0.8 mm from its own anchor and 0.8 mm from the other group's"
     assert st._merges(ctx.scene, specs[0], (43.2, 36.0)) is False
@@ -369,14 +415,22 @@ def test_the_window_is_empty_on_two_layers_and_the_refusal_names_the_stackup():
 
 
 def test_the_real_two_layer_boards_never_reach_that_refusal():
-    """And they do not reach it because they have no population at all, which is the honest reason:
-    `REFUSED` is unchanged on blinky, buck and c3_usb because `specs` yields nothing on them, not
-    because a bound was tuned until the refusal stopped firing."""
+    """And they do not reach it because they have no **parallel** population at all, which is the
+    honest reason: `REFUSED` gains no `stitch` entry on blinky, buck or c3_usb because `specs` yields
+    no parallel spec on them, not because a bound was tuned until the refusal stopped firing.
+
+    c3_usb writes copper here from S6 on, and it is the other carrier's: nine barrels under the land
+    `Thermal("U1.49")` names. The two are asserted apart rather than together, because "this board
+    writes nothing" and "this board has no under-rated barrel" stopped being the same sentence when a
+    second carrier joined the module."""
     for name in ("blinky", "buck", "c3_usb"):
         ctx, text = _ctx(name)
         plan = pattern_copper(load_board(_board(name)), ctx.job, ctx.cs, text, name, stage="final")
-        assert (plan.pieces, plan.moves, plan.notes) == ((), (), ()), name
-        assert plan.text == text, f"{name}: the final stage rewrote a board it wrote nothing on"
+        assert plan.moves == () and plan.refused == {}, name
+        assert all(p.reason == "thermal" for p in plan.pieces), (name, plan.census)
+        if name != "c3_usb":
+            assert (plan.pieces, plan.notes) == ((), ()), name
+            assert plan.text == text, f"{name}: the final stage rewrote a board it wrote nothing on"
 
 
 # --- parallel_joined -------------------------------------------------------------------------------
@@ -494,7 +548,16 @@ def test_redundant_copper_is_counted_everywhere_except_in_the_route_it_is_not_pa
     the net's route, so counting it against the airwire says the route got worse when not one
     nanometre of it moved. Measured on node's placed board: the detour is identical with and without
     the rung, and `pattern_mm + leftover_mm + stitch_mm == routed_mm` on every net."""
-    assert REDUNDANT == ("stitch",)
+    # S6 adds `"thermal"` for the same reason and it is the same rule: an array barrel is redundant
+    # thermal conductance on top of an electrical connection the tap already made, so its copper is on
+    # the board, in `by_reason` and in `vias_pattern`, and not in the net's route. S7 adds `"guard"`,
+    # which is the case the tuple was named for and the only one of the three that is not even on the
+    # net it serves: a shield is `GND` copper placed beside a *different* net.
+    # S8 adds `"plane"`, the clearest of the four: a lattice barrel's two ends are the **same
+    # conductor** — two pours of one net, already joined by every through via on the board — so its
+    # absence leaves nothing unconnected by construction rather than by measurement. Re-pinned here
+    # with that sentence rather than left to drift.
+    assert REDUNDANT == ("guard", "plane", "stitch", "thermal")
     _d, _j, _s, text = _scene("node", (_anchor(),))
     pieces = _rung(OPEN, TWIN)
     reasons = {bar_key(p): "stitch" for p in pieces}

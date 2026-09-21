@@ -290,14 +290,25 @@ def _class_width(job: CompiledJob, name: str) -> float:
     return float(c.width_mm.value) if c is not None else 0.0
 
 
-PATTERN_NECK_OK = ("tap", "fanout")
-"""The two reasons whose copper is allowed to be narrower than its class.
+PATTERN_NECK_OK = ("fanout", "guard", "tap")
+"""The reasons whose copper is allowed to be narrower than its class.
 
-R-I3's allowance is for **the last millimetre into a pad**, and those are the two patterns that write
-only that: `tap._width` and `fanout` neck an escape stub to the pad's own across dimension, which
-`TAP_NECKED` counts and `test_examples_fab.py` pins. Everything else pcbc writes — a hop, a spine
-trunk, a backbone link, a chain, a bus member — is written at the class width or not at all (B.0: a
-pattern never degrades), so a narrow one is a bug in the pattern rather than a fact about the board."""
+R-I3's allowance is for **the last millimetre into a pad**, and two of these are the patterns that
+write only that: `tap._width` and `fanout` neck an escape stub to the pad's own across dimension,
+which `TAP_NECKED` counts and `test_examples_fab.py` pins. Everything else pcbc writes — a hop, a
+spine trunk, a backbone link, a chain, a bus member — is written at the class width or not at all
+(B.0: a pattern never degrades), so a narrow one is a bug in the pattern rather than a fact about the
+board.
+
+`guard` is here for a different reason and a stronger one: **a guard is not on the rail at all.**
+`docs/r2-design.md` B.6 specifies its width as `stack.track_min` because a shield carries no current
+— it is a ground track beside another net, tied to the pour by stitch vias — so comparing it to the
+ground net's *class* width asks how much current a thing designed to carry none can carry. Measured
+2026-09-21 on `tests/fixtures/guard/guard.py` with its `GND` declared at 0.5 A instead of 0.1: the
+gate returned **"GND guard copper 0.127 mm < the 0.4 mm GND class (0.5 A, IPC asks 0.15 mm)"** and
+stopped the build, on copper whose absence changes the rail by nothing. It is the same correction
+`copper_bar.REDUNDANT` makes one census over and `ampacity.power_bottlenecks` makes one gate over: a
+0.127 mm ground guard is not a narrow ground rail."""
 
 
 def power_ampacity_failures(

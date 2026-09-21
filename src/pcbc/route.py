@@ -28,6 +28,7 @@ from .compile import CompiledJob, compile_design
 from .copper import unrouted_nets
 from .model import Design
 from .project import copy_with_siblings
+from .route_scene import plane_targets
 from .sexp import matching_paren, stable_uuid
 
 if TYPE_CHECKING:  # `patterns` sits on top of `route_scene`/`route_emit`, never on this module
@@ -123,6 +124,23 @@ def _class(job: CompiledJob, name: str):
 
 def _fmt(v: float) -> str:
     return f"{v:g}"
+
+
+def _uniq(names: list[str]) -> list[str]:
+    """`names` with repeats dropped, first occurrence kept.
+
+    One net may be poured on two layers since S8 (`route_scene.plane_targets`), so
+    `[n for n, _ in pours]` is `["GND", "GND"]` on a board with a facing pair. The `planes` step
+    wants the repeat — `route_planes.py` pairs `--nets` with `--plane-layers` positionally, so
+    dropping it would pour the second layer for whatever net came next — and every *other* reader of
+    that list wants the set: `plane_taps` routes a net, and `signals` writes one `!NET` per name.
+    Two different questions, one list, so the repeat is kept where it is an index and dropped where
+    it is a name."""
+    out: list[str] = []
+    for n in names:
+        if n not in out:
+            out.append(n)
+    return out
 
 
 def _net_names(design: Design, patterns) -> list[str]:
@@ -313,9 +331,19 @@ def krt_plan(job: CompiledJob, design: Design, placed: Path, work: Path, home: P
         step(f"pair_{names[0].lower()}", "route_diff.py", args)
 
     # 3. Planes first on four layers: the pours, then every pad on a plane net welded to its plane.
-    plane_nets = [n for n, _ in job.planes] if job.planes and job.layers > 2 else []
-    if plane_nets:
-        step("planes", "route_planes.py", ["--nets", *plane_nets, "--plane-layers", *[layer for _, layer in job.planes], "--clearance", _fmt(default_clear)])
+    #
+    # **What `planes=` means here is `route_scene.plane_targets`, not `job.planes`** (S8's enabling
+    # change, `docs/stitch-plan.md` section 8 item 1). Until S8 this line read `job.planes and
+    # job.layers > 2`, so a declaration on a two-layer board reached no router step at all — which is
+    # what `language.Board` refused outright, correctly, because a declaration the router never reads
+    # is a lie the board tells its author. The refusal is gone and the reading is here: a declared
+    # pour is poured on whatever stackup declared it, and a board that declares nothing gets the
+    # implicit back pour below. The two-layer *position* is unchanged and deliberately so — see the
+    # `gnd_pour` step at the bottom of this function.
+    pours = plane_targets(job) if job.layers > 2 else ()
+    plane_nets = _uniq([n for n, _ in pours])
+    if pours:
+        step("planes", "route_planes.py", ["--nets", *[n for n, _ in pours], "--plane-layers", *[layer for _, layer in pours], "--clearance", _fmt(default_clear)])
 
     # 4. pcbc's post stage: every SMD pad on a plane net welded to its plane by a tap of its own
     # (B.3), between `planes` and `signals` on both stackups. The order is measured, not tidy: of
@@ -336,10 +364,21 @@ def krt_plan(job: CompiledJob, design: Design, placed: Path, work: Path, home: P
     signals = ["--nets", "*", *[f"!{n}" for n in constrained], *[f"!{n}" for n in plane_nets], *[f"!{n}" for n in sorted(done) if n not in constrained and n not in plane_nets], "--layers", *layers, "--track-width", _fmt(stack.track_min), "--max-ripup", "5", "--no-bga-zones", *at_width]
     step("signals", "route.py", signals)
 
-    # 6. Two layers: pour GND on the back and tie what the pour could not reach.
-    if job.layers <= 2 and "GND" in power:
-        step("gnd_pour", "route_planes.py", ["--nets", "GND", "--plane-layers", "B.Cu", "--clearance", _fmt(default_clear)])
-        step("finalize", "route.py", signals)
+    # 6. Two layers: pour the plane nets and tie what the pour could not reach.
+    #
+    # The **position** is what makes two layers different, not the net list: a front pour written
+    # before `signals` would eat every routing channel the board has, so on two layers the pours go
+    # down last and `route_verify.pour_raster` is what makes a pattern's earlier via safe (D.5).
+    # S8 changed only *which* pours: `plane_targets` reads a declared `Board(planes=)` on this
+    # stackup too, so a board may now say `planes=[("GND","F.Cu"),("GND","B.Cu")]` and get both —
+    # which is the facing pair R-E1 needs and which no board could express before. A board that
+    # declares nothing gets `("GND","B.Cu")` exactly as it always did, and `pours` is then the
+    # one-tuple this line used to hardcode.
+    if job.layers <= 2:
+        back = plane_targets(job)
+        if back and all(n in power for n, _ in back):
+            step("gnd_pour", "route_planes.py", ["--nets", *[n for n, _ in back], "--plane-layers", *[layer for _, layer in back], "--clearance", _fmt(default_clear)])
+            step("finalize", "route.py", signals)
 
     # 7. pcbc's final stage: the copper whose absence leaves nothing unconnected (`patterns.FINAL`,
     # `docs/stitch-plan.md` R-S1). It is last on both stackups — after `signals` on four layers,
@@ -517,7 +556,13 @@ def route_job(design: Design, placed: Path, *, out: Path, name: str = "board") -
             # The stage comes out of the command, not off the step's name: `krt_plan` put it there
             # and the plan is the only description of the route (`pcbc_step`).
             stage = cmd[cmd.index("--stage") + 1]
-            sub = pattern_copper(design, job, job.constraints, current.read_text(), name, stage=stage)
+            # `owned` is every piece pcbc has written so far in this route, and it is handed over for
+            # one reason: `docs/r2-design.md` B.6's precondition. A guard may only be offset from a
+            # path **pcbc itself routed**, and nothing in the board file says which tracks those are —
+            # KRT locks its own constrained-net copper too (`lock_copper`), so `(locked yes)` is not a
+            # provenance. This list is, it already exists here, and it is the same list `_lost` holds
+            # KRT to after every step.
+            sub = pattern_copper(design, job, job.constraints, current.read_text(), name, stage=stage, owned=owned)
             plans[stage] = sub
             produced.write_text(sub.text)
             owned += list(sub.pieces)

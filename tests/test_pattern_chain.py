@@ -254,7 +254,7 @@ def test_a_pair_net_chain_is_skipped_with_a_printed_note_and_never_in_silence():
     dp = next(s for s in chain_specs(ctx) if s.net == "USB_DP")
     assert chain_run(ctx, dp).notes == (
         "style: chain USB_DP: skipped, carries a Pair, and R2 routes no pairs at all — J1.A6, U3.1, U1.27 is R4's "
-        "(Chain line 267)",
+        "(Chain line 268)",  # c3_usb's Chain moved one line when S6's `Thermal` joined its import block
     ), chain_run(ctx, dp).notes
     plan, _d, _j, _t = _mid("c3_usb")
     assert len([n for n in plan.notes if n.startswith("style: chain")]) == 2, plan.notes

@@ -17,7 +17,7 @@ import fnmatch
 from dataclasses import asdict, dataclass, field, replace
 
 from .layout import resolve_regions
-from .model import BridgeReq, BusReq, ChainReq, Design, GuardReq, IsolationReq, NetReqSpec, PairReq
+from .model import BridgeReq, BusReq, ChainReq, Design, GuardReq, IsolationReq, NetReqSpec, PairReq, ThermalReq
 from .stackup import (
     IPC2221_TABLE_6_1,
     IEC60664_TABLE_F5_PD2,
@@ -45,6 +45,8 @@ from .stackup import (
     microstrip_z0,
     pair_gap_mm,
     via_amps,
+    via_theta_c_per_w,
+    vias_for_theta,
     vias_per_change,
     width_for_z0,
 )
@@ -67,12 +69,16 @@ __all__ = [
     "IsolationSpec",
     "KeepAway",
     "PairSpec",
+    "RETURN_VERDICTS",
+    "ReturnRule",
     "RuleArea",
     "Source",
     "ViaSpec",
     "VoltageSpec",
     "clearance_table",
     "compile_constraints",
+    "return_rule",
+    "return_rules",
     "slug",
 ]
 
@@ -100,7 +106,7 @@ SOFT = " [soft: warning in R1]"
 KIND_ALIASES = {"digital": "generic", "default": "generic"}
 
 # Kwargs every kind accepts (A.4); `z_se_ohm` and `volts` are "on any kind" (D, notes on the table).
-COMMON_KWARGS = ("max_mm", "layers", "vias", "autoroute", "class_name", "keep_clear_of", "keep_clear_mm", "volts", "z_se_ohm")
+COMMON_KWARGS = ("max_mm", "layers", "vias", "autoroute", "class_name", "keep_clear_of", "keep_clear_mm", "volts", "z_se_ohm", "rise_ps")
 
 # The four-layer tuple today's power class carries on every board (byte-identical projection).
 POWER_LAYERS = ("F.Cu", "B.Cu", "In1.Cu", "In2.Cu")
@@ -190,7 +196,38 @@ class Constraint:
     current: CurrentSpec | None
     voltage: VoltageSpec | None
     loop_mm2: Derived | None  # switch_node hot-loop budget, or the power decap-loop budget
+    rise_ps: float | None
+    """The fastest edge this net carries, in picoseconds, exactly as `NetReq(rise_ps=)` wrote it.
+
+    **Carried, never derived, and never defaulted.** It is the one number in this dataclass with no
+    `Derived` around it and no fallback behind it, and both are deliberate: an edge rate is a fact
+    about the parts a board is built from — what an ESP32's USB PHY or a buck's gate driver actually
+    does — the way `Thermal(watts=)` is a fact about what a pad must move. `docs/stitch-plan.md`
+    section 8 item 3 refuses `DEFAULT_RISE_PS` and the four per-kind guesses that came with it, and
+    the refusal holds here: `PRESETS` sets no `rise_ps`, `_numbers` reads only what the line wrote,
+    and a board that says nothing has `None` on every net.
+
+    Its one consumer is the plane-stitch pitch (`patterns.stitch.stitch_pitch`), which needs a
+    wavelength and therefore a frequency. `ConstraintSet.fastest_edge` folds this over the whole
+    board, because a cavity between two pours is shared by every net that crosses it and the pitch
+    that suppresses its resonance is set by the **fastest** edge in it, not by any one net's.
+    """
     guard_stitch_mm: float | None
+    guard_ground: str | None
+    """The net a `Guard()` shields this one **with**, or None when no `Guard()` names it.
+
+    `Guard(net, *, stitch_mm=2.5, ground="GND")` has carried `ground=` since R1 and, measured
+    2026-09-21, it never reached the router: `_compile` stored `stitch_mm` alone, so a board that
+    said `Guard("AIN0", ground="VSS")` compiled to a guard pcbc would have written in `GND`
+    (`docs/stitch-plan.md` section 2(r)). Two halves of one statement, one of them silently dropped,
+    is the failure mode the ConstraintSet exists to prevent — every number the router reads is
+    compiled once, here — so the second half is stored beside the first.
+
+    It is a separate field rather than a default read at the pattern, because `"GND"` is
+    `language.Guard`'s default and not the compiler's fact: a board with one `Ground("VSS")` and no
+    `GND` at all would have a guard carrier reaching for a net that does not exist, and the refusal
+    for that is made here where the netlist is (`_compile`), not in a pattern that has only a scene.
+    """
     isolation_side: str | None  # Region name
     autoroute: bool | str  # unchanged meaning for route.py
     soft: tuple[str, ...]  # rule kinds written as warnings in R1: subset of SOFT_RULES
@@ -248,6 +285,440 @@ class BridgeSpec:
     why: str
 
 
+@dataclass(frozen=True)
+class ThermalSpec:
+    """One `Thermal()` compiled: the land it names, the heat it has to move, and the count that moves it.
+
+    Everything here is derivable from `board.py` and the stackup with no PCB file — the barrel's K/W
+    is `stackup.via_theta_c_per_w` over `board_mm`, the drill and the plating; the count is
+    `vias_for_theta`; the net is the netlist's. What is **not** here is the pitch and the sites,
+    because both are questions about the board's own geometry: the pitch has to clear the antipads a
+    foreign pour cuts (`patterns.stitch.thermal_pitch`) and a site has to be inside a pad primitive
+    this file has never read. So this spec is the **budget** and the pattern is the **placement**,
+    which is the same split `ViaSpec.per_change` and `patterns.stitch.specs` already have for the
+    parallel carrier.
+
+    `planes` is the pours this array's barrels will cross that are **not** its own net's — the
+    foreign planes `across_planes=` is consent for. It is computed here rather than in the pattern
+    because it is a fact about `Board(planes=)` and the stackup, and because the refusal for
+    withholding that consent has to arrive in `pcbc check`, before a millimetre of copper.
+    """
+
+    req: ThermalReq
+    pad: str  # "U1.49" as the author wrote it
+    ref: str  # "U1"
+    nums: tuple[str, ...]  # the pad numbers it resolves to: ("49",)
+    net: str
+    watts: float
+    rise_c: float
+    across_planes: bool
+    fill: bool
+    via: tuple[float, float]  # (diameter, drill) — the stackup's standard via, `BRANCH_REASONS`' own
+    theta_via: Derived  # one barrel, K/W
+    need: int  # how many barrels the budget asks for
+    plane: str  # the layer this pad's net is poured on
+    planes: tuple[tuple[str, str], ...]  # the foreign pours a through barrel crosses
+
+    @property
+    def ids(self) -> tuple[str, ...]:
+        """The pad ids a scene knows this land by: `("U1.49",)`. `pads.PadGeom.id`'s spelling."""
+        return tuple(f"{self.ref}.{num}" for num in self.nums)
+
+    def theta_array(self) -> float:
+        """`n` barrels in parallel, K/W, 2 dp — what the array the budget asked for achieves."""
+        return round(self.theta_via.value / max(self.need, 1), 2)
+
+    def rise_of(self, got: int) -> float:
+        """The copper rise `got` barrels leave at `watts`, C, 2 dp. `got = 0` is the pad alone, which
+        this model has nothing to say about, so it reports the budget being missed by all of it."""
+        if got <= 0:
+            return round(self.theta_via.value * self.watts, 2)
+        return round((self.theta_via.value / got) * self.watts, 2)
+
+    def to_dict(self) -> dict:
+        return {
+            "pad": self.pad,
+            "net": self.net,
+            "watts": self.watts,
+            "rise_c": self.rise_c,
+            "across_planes": self.across_planes,
+            "fill": self.fill,
+            "via": list(self.via),
+            "theta_via": self.theta_via.value,
+            "need": self.need,
+            "plane": self.plane,
+            "planes": [list(p) for p in self.planes],
+        }
+
+    def line(self) -> str:
+        """The report line: the budget, its arithmetic, and what the array it asks for achieves."""
+        return (
+            f"Thermal {self.pad}: {self.need} x {self.via[0]:g}/{self.via[1]:g} via on {self.net} "
+            f"({self.theta_via.line()}; {self.watts:g} W within {self.rise_c:g} C wants "
+            f"{self.theta_array():g} K/W, so {self.rise_of(self.need):g} C) [Thermal line {self.req.line}]"
+        )
+
+
+def _thermal_refusals(design: Design, stack: Stackup, pours: tuple[tuple[str, str], ...], refusals: list[str]) -> tuple[ThermalSpec, ...]:
+    """Every `Thermal()` compiled, or a refusal naming the edit — before any copper exists.
+
+    Four of the five refusals `docs/stitch-plan.md` section 3 lists are here, and one is not, because
+    one of them is a question about **geometry** and this file has never opened a footprint: "the pad
+    carries no `pad_prop_heatsink` and is narrower than `pitch + dia`" is
+    `patterns.stitch._land_refusal`'s, beside the primitives it measures. Splitting them that way is
+    the same split `Bridge()` already has — the netlist facts here, the instance facts in
+    `circuit.check_design` — and the rule behind all three is that a refusal lives where its
+    measurement lives.
+    """
+    from .fab import passive_refs
+
+    out: list[ThermalSpec] = []
+    seen: dict[str, int] = {}
+    for th in design.thermals:
+        who = f'Thermal("{th.pad}") line {th.line}'
+        ref, _, pin = th.pad.partition(".")
+        if not any(i.ref == ref for i in design.instances):
+            refusals.append(f"{who}: no part {ref}")
+            continue
+        net = _refpin_net(design, ref, pin)
+        if net is None:
+            refusals.append(f"{who}: {ref} has no pad or pin {pin!r}")
+            continue
+        if th.pad in seen:
+            refusals.append(f"{who}: {th.pad} already has a Thermal() on line {seen[th.pad]}; one land, one array")
+            continue
+        seen[th.pad] = th.line
+        # R-M4, and it is the one refusal in this statement that no amount of fab money buys off: a
+        # via inside a two-terminal passive's pad wicks the joint whatever the barrel is filled with,
+        # and `fab.via_in_pad_blockers` refuses the board for it. Refused here so the author reads it
+        # from `pcbc check` instead of from a fab gate three stages later, and `via_in_pad_blockers`
+        # keeps a zero diff — it must stay the judge, not become a list this statement edits.
+        if ref in passive_refs(design):
+            refusals.append(
+                f"{who}: {ref} is a two-terminal passive, and a via inside a passive's pad wicks the joint "
+                f"whatever the fab fills it with (fab.via_in_pad_blockers refuses the board for it). "
+                f"Drop the line; a passive that has to shed heat sheds it through its own copper, so widen "
+                f"the track with NetReq(\"{net}\", amps=...) instead"
+            )
+            continue
+        # The array's whole job is to reach a plane. Without one the vias land in nothing, which on a
+        # two-layer board is `krt_plan` writing no `gnd_pour` at all — the blinky trap, where sixteen
+        # stitch vias would have gone into a pour that was never written.
+        plane = next((lay for pnet, lay in pours if pnet == net), "")
+        if not plane:
+            refusals.append(
+                f"{who}: {net} has no plane or pour to reach, so an array under {th.pad} would be "
+                f"{th.watts:g} W of vias into bare laminate. "
+                + (
+                    f'Board(planes=[("{net}", "In1.Cu")]) gives it one'
+                    if stack.layers > 2
+                    else f'NetReq("{net}", kind="power") is what makes krt_plan write the back pour'
+                )
+            )
+            continue
+        # A barrel that is not plugged is a hole under a reflowed pad. `Stackup.via_tenting` closes
+        # the mask over it and leaves the tube open underneath, which is the distinction `via_fill`
+        # exists to carry.
+        if stack.via_fill == "none":
+            refusals.append(
+                f'{who}: stackup "{stack.name}" does not fill its vias, and tenting is a mask dam rather '
+                f"than a plug — solder wicks down an open barrel and starves the joint. "
+                f"Board(stackup=...) on a stackup whose via_fill is set is the edit"
+            )
+            continue
+        if not (stack.via_fill_min_drill - 1e-9 <= stack.via_drill <= stack.via_fill_max_drill + 1e-9):
+            refusals.append(
+                f'{who}: stackup "{stack.name}" fills {stack.via_fill_min_drill:g} to {stack.via_fill_max_drill:g} mm '
+                f"and its standard via is {stack.via_drill:g} mm, so these barrels cannot be plugged. "
+                f"Board(stackup=...) on a stackup whose standard via is inside that range is the edit"
+            )
+            continue
+        foreign = tuple((pnet, lay) for pnet, lay in pours if pnet != net)
+        if foreign and not th.across_planes:
+            anti = ", ".join(f"{pnet} on {lay}" for pnet, lay in foreign)
+            refusals.append(
+                f"{who}: every via here is a through via, so {vias_for_theta(stack.board_mm, stack.via_drill, th.watts, th.rise_c, stack.via_plating_mm)} "
+                f"of them punch {vias_for_theta(stack.board_mm, stack.via_drill, th.watts, th.rise_c, stack.via_plating_mm)} antipads in {anti}, "
+                f"which this net does not join. That is finding 10 at nine times the scale — one row of taps at a "
+                f"footprint's own pitch already slotted a plane and turned a 1.80 mm path across it into 8.09 mm. "
+                f"Thermal(\"{th.pad}\", watts={th.watts:g}, across_planes=True) consents to it, and the pitch the array "
+                f"is then placed at is derived so the webs survive rather than chosen"
+            )
+            continue
+        theta = via_theta_c_per_w(stack.board_mm, stack.via_drill, stack.via_plating_mm)
+        need = vias_for_theta(stack.board_mm, stack.via_drill, th.watts, th.rise_c, stack.via_plating_mm)
+        nums = _pad_nums(design, ref, pin)
+        out.append(
+            ThermalSpec(
+                req=th,
+                pad=th.pad,
+                ref=ref,
+                nums=nums,
+                net=net,
+                watts=th.watts,
+                rise_c=th.rise_c,
+                across_planes=th.across_planes,
+                fill=th.fill,
+                via=(stack.via_diameter, stack.via_drill),
+                theta_via=Derived(
+                    theta,
+                    "K/W",
+                    Source(
+                        "via_theta",
+                        f"{stack.name} {stack.board_mm:g} mm board, {stack.via_drill:g} mm drill, {stack.via_plating_mm:g} mm plating",
+                        f"L/(k*A) on the plating annulus, k_cu {385:g} W/m/K",
+                    ),
+                ),
+                need=need,
+                plane=plane,
+                planes=foreign,
+            )
+        )
+    return tuple(out)
+
+
+def _pad_nums(design: Design, ref: str, pin: str) -> tuple[str, ...]:
+    """`"49"` or `"GND"` as the pad numbers it names on this part — `route_verify._station_pads`'
+    resolution, asked of the design instead of of a routed file so it is available at compile."""
+    for inst in design.instances:
+        if inst.ref != ref:
+            continue
+        if pin in inst.part.pins:
+            return tuple(inst.part.pins[pin].pads)
+        for _pname, p in inst.part.pins.items():
+            if pin in p.pads:
+                return (pin,)
+        return ()
+    return ()
+
+
+# --- R-Z4's C, which has never existed --------------------------------------------------------
+#
+# `docs/router-plan.md` tagged R-Z4 **R, V** — route it, verify it — until this slice.
+# `docs/stitch-plan.md` S5 says the tag was short by one: before any copper exists there is a **C**, a
+# statement the *compiler* can make about what a layer change would do to a return current, and on
+# these boards it is the valuable half. `route_verify.return_vias` is the V and it reads a finished
+# board; everything below is the C and it reads `board.py`. The doc now reads **C, R, V**.
+#
+# **This slice places zero copper and that is the finding, not a shortfall** (`docs/stitch-plan.md`
+# §8 item 2). Measured 2026-09-21, the population of return vias on all five boards is **empty for a
+# structural reason no routing improvement fixes**: on node a layer change changes the reference
+# *net* (`GND` on In1.Cu -> `3V3` on In2.Cu) and a via joins one net to itself, so no via anywhere
+# carries that current; on c3_usb it **loses** the reference entirely, because B.Cu is the pour's own
+# layer and a two-layer board has no second plane to reach. Shipping a placer against that would mean
+# widening a tolerance until something landed, or dropping a via that connects nothing while the
+# tool's own report blessed it. So what ships is the sentence, and the sentence is worth more than
+# the via: it tells an AI, **before a millimetre of copper is routed**, that these two pairs must not
+# change layers. Nothing said that today, and both boards ship with the pair allowed on both layers.
+
+
+RETURN_VERDICTS = ("lost", "net_change", "kept", "pinned")
+"""What a layer change does to a net's return current, worst first — and "worst" is an order, not a
+taste.
+
+- `lost` — one of the two layers has **no** reference at all. The return has nothing to follow onto
+  and the impedance is uncontrolled on that side too, so it is the larger statement of the two
+  failures and it wins a tie.
+- `net_change` — both layers have a reference and the two are **different nets**. The return exists
+  and no via can carry it there.
+- `kept` — every layer this net may use is referenced to one net. A via beside the signal's would
+  carry the return across; this is the only verdict under which a return-via *placer* would have
+  anything to do, and **no net on any of the five boards reaches it**.
+- `pinned` — the net cannot change layer at all: one layer, or `via.allowed` False. Nothing to
+  classify, which is a different answer from "nothing went wrong" and is printed as one.
+
+Two of the four are spelled exactly as `route_verify.return_vias` spells them, deliberately: the C
+predicts the V or it is not worth printing, and `tests/test_route_verify_stitch.py` holds the two
+vocabularies together on every classified via of every board.
+"""
+
+
+@dataclass(frozen=True)
+class ReturnRule:
+    """What a via on one referenced net would do to its return current — computed from `board.py`.
+
+    Pure in the `ConstraintSet`: `stackup.reference_of` on each layer of `Constraint.layers`, against
+    the planes the board will have. No PCB file, no copper, no distance — which is the point, because
+    measured 2026-09-21 **not one of the eleven vias `return_vias` classifies is a distance question
+    either**. Both boards are settled by the stackup, and the stackup is compiled.
+    """
+
+    net: str
+    layers: tuple[str, ...]  # the layers this net may use, `Constraint.layers`
+    refs: tuple[tuple[str, tuple[str, str] | None], ...]  # (layer, (reference layer, reference net) | None)
+    change: tuple[str, str] | None  # the layer pair the verdict is about; None when `pinned`
+    verdict: str  # one of RETURN_VERDICTS
+    why: str
+    move: str  # ends in a board.py edit, or "" for `kept` / `pinned`, which ask for none
+
+    def to_dict(self) -> dict:
+        return {
+            "net": self.net,
+            "layers": list(self.layers),
+            "refs": [[lay, list(r) if r else None] for lay, r in self.refs],
+            "change": list(self.change) if self.change else None,
+            "verdict": self.verdict,
+            "why": self.why,
+            "move": self.move,
+        }
+
+    def line(self) -> str:
+        """The report line, in `blocking.move_line`'s one sentence shape so a compile finding and a
+        routing failure read the same (E.2) — `<net>: <what> cannot reach <goal>. In the way: <...>.
+        <the board.py edit>`. `kept` and `pinned` have no failure to report and say so plainly."""
+        from .blocking import move_line
+
+        if self.verdict in ("kept", "pinned"):
+            return f"{self.net}: returns {self.verdict}, {self.why}"
+        assert self.change is not None
+        a, b = self.change
+        goal = next((f"{r[1]} on {r[0]}" for _lay, r in self.refs if r), "a reference plane")
+        return move_line(self.net, f"the return current crossing {a}->{b}", goal, f"{self.why} ({self.verdict})", self.move)
+
+
+def _plane_move(stack: Stackup, want_net: str, ref_layers: tuple[str, ...], planes: tuple[tuple[str, str], ...]) -> str:
+    """`Board(planes=[...])` with `want_net` under every layer in `ref_layers` — the declaration that
+    would make a layer change keep one reference net. Ordered by the stackup's own layer order so the
+    edit is byte-identical run to run, and every plane the board already declares that is not one of
+    the two is carried through rather than silently dropped."""
+    order = stack.copper_layers()
+    keep = [(net, lay) for net, lay in planes if lay not in ref_layers]
+    out = keep + [(want_net, lay) for lay in ref_layers]
+    body = ", ".join(f'("{net}", "{lay}")' for net, lay in sorted(out, key=lambda p: order.index(p[1])))
+    return f"Board(planes=[{body}])"
+
+
+def return_rule(stack: Stackup, planes: tuple[tuple[str, str], ...], c: Constraint) -> ReturnRule | None:
+    """Classify one constraint's layer change, or None when the compiler gave it no `reference`.
+
+    The population this watches is `route_verify.referenced_nets`' — `wants_reference` is set only
+    for `kind == "usb_hs"` or a declared `z_se_ohm` (below), so measured 2026-09-21 it is
+    `USB_DN`/`USB_DP` on c3_usb and node and **empty on blinky, buck and ds2**. `cs.by_net("GND")
+    .reference` is `None` on all five, which is also why `route_verify`'s D.1 item 6 needs no change
+    for any of this: a return via's net *is* the reference net, so item 6 never had one to block.
+
+    Every referenced net on all five boards is allowed on exactly **two** layers (`F.Cu`, `B.Cu`), so
+    there is exactly one pair per net and `RETURN_VERDICTS`' ordering is never exercised here. It is
+    written down so a board with an inner signal layer gets a defined, deterministic answer rather
+    than the first one the loop happened to reach.
+    """
+    if not c.reference:
+        return None
+    refs = tuple((lay, stack.reference_of(lay, planes)) for lay in c.layers)
+    by_layer = dict(refs)
+    if len(c.layers) < 2 or not c.via.allowed:
+        why = (
+            f"{c.net} may only use {c.layers[0] if c.layers else 'no layer'}, so no via changes its reference"
+            if len(c.layers) < 2
+            else f"vias are refused on {c.net} ({', '.join(c.layers)} are allowed but nothing may cross between them), so no via changes its reference"
+        )
+        return ReturnRule(c.net, tuple(c.layers), refs, None, "pinned", why, "")
+
+    order = {"lost": 0, "net_change": 1, "kept": 2}
+    best: tuple[int, tuple[str, str], str] | None = None
+    for i, a in enumerate(c.layers):
+        for b in c.layers[i + 1 :]:
+            fr, to = by_layer[a], by_layer[b]
+            if fr is None or to is None:
+                verdict = "lost"
+            elif fr[1] != to[1]:
+                verdict = "net_change"
+            else:
+                verdict = "kept"
+            if best is None or order[verdict] < order[best[2]]:
+                best = (order[verdict], (a, b), verdict)
+    assert best is not None
+    _rank, (a, b), verdict = best
+    fr, to = by_layer[a], by_layer[b]
+
+    if verdict == "kept":
+        assert fr is not None
+        why = f"{a} and {b} are both referenced to {fr[1]}, so a {fr[1]} via beside the signal's carries the return across"
+        return ReturnRule(c.net, tuple(c.layers), refs, (a, b), verdict, why, "")
+
+    if verdict == "net_change":
+        assert fr is not None and to is not None
+        why = (
+            f"{a} is referenced to {fr[1]} on {fr[0]} and {b} to {to[1]} on {to[0]}, the reference changes net across the via, "
+            f"and a via joins one net to itself, so no return via anywhere carries this current"
+        )
+        ref_layers = tuple(dict.fromkeys(r[0] for _lay, r in refs if r))
+        fixes = [
+            f"{_plane_move(stack, fr[1], ref_layers, planes)} puts one net under both layers, at the cost of {to[1]}'s plane.",
+            f"Left as they are, the return wants a capacitor between {fr[1]} and {to[1]} at the crossing, which is Bridge()'s "
+            f"shape and not a via's — and Bridge() ties two Ground() nets, so {to[1]} declared with Power() is not one today "
+            f"(measured 2026-09-21: Bridge(\"{fr[1]}\", \"{to[1]}\") is refused with 'a bridge ties two grounds').",
+        ]
+        return ReturnRule(c.net, tuple(c.layers), refs, (a, b), verdict, why, " ".join(fixes))
+
+    # lost
+    gone, other, kept = (a, b, to) if fr is None else (b, a, fr)
+    if kept is None:
+        why = f"neither {a} nor {b} has a plane above or below it, so there is no reference on this board to return to"
+    elif kept[0] == gone:
+        why = (
+            f"{gone} is the {kept[1]} pour's own layer, which cannot be its own reference; {other} was referenced to "
+            f"{kept[1]} on {gone} and there is no second plane to reach"
+        )
+    else:
+        why = f"{gone} has no plane above or below it, and the via leaves {other}'s {kept[1]} on {kept[0]} behind"
+    with_ref = tuple(lay for lay, r in refs if r)
+    # `"GND"` where `kept` is None is not invented here: it is the spelling the compiler's own
+    # existing refusal for this exact situation already uses ("... wants a plane on In1.Cu;
+    # Board(planes=[("GND", "In1.Cu")]) declares it"), so the two moves ask for the same edit.
+    want_net = kept[1] if kept else "GND"
+    lost_fixes = []
+    if with_ref:
+        layers_txt = ", ".join(f'"{lay}"' for lay in with_ref)
+        lost_fixes.append(f"NetReq(layers=[{layers_txt}]) on line {c.line} keeps it on the layer{'' if len(with_ref) == 1 else 's'} that has one.")
+    elif stack.layers <= 2:
+        lost_fixes.append('NetReq("GND", kind="power") is what makes krt_plan write the back pour this net would reference.')
+    if stack.layers > 2:
+        # One neighbour, not both: `gone` needs *a* plane, and declaring two would be a larger edit
+        # than the fault asks for.
+        want = stack.plane_below(gone) or stack.plane_above(gone)
+        if want:
+            lost_fixes.append(f"{_plane_move(stack, want_net, (want,), planes)} gives {gone} one.")
+    else:
+        lost_fixes.append(
+            f'Board(layers=4, stackup="jlcpcb_4l_1oz", planes=[("{want_net}", "In1.Cu")]) gives the net a second '
+            f"plane, which is a different board rather than a one-line edit."
+        )
+    return ReturnRule(c.net, tuple(c.layers), refs, (a, b), verdict, why, " ".join(lost_fixes))
+
+
+def return_rules(cs: ConstraintSet) -> tuple[ReturnRule, ...]:
+    """One rule per net the compiler gave a `Constraint.reference`, in net order.
+
+    Pure in the set and therefore in `board.py`: `cs.planes` is compiled, `cs.stackup` is compiled,
+    and nothing here opens a file. `tests/test_return_rules.py` asserts every verdict on all five
+    boards with no `layout/` directory present at all.
+    """
+    return tuple(r for c in cs.constraints if (r := return_rule(cs.stackup, cs.planes, c)) is not None)
+
+
+def _return_caveat(rule: ReturnRule, spelling: str, reference_name: str) -> str:
+    """The `Constraint.notes` caveat: `Constraint.reference` is **one layer's** plane.
+
+    A separate sentence from `ReturnRule.line()` because it corrects a different thing. The line is
+    about the return current; this is about the compiled field. `Constraint.reference` is a single
+    layer name taken from `layers[0]` (`_numbers`, `_reference_for`), it is what the `z_se` line
+    prints "over" and what R3/R4 will read to pick a rule — and on both boards that carry one the net
+    is allowed on a second layer where the answer is different. Nothing said so before this slice.
+
+    `spelling` is how the net is named: the sorted pair for a pair, so both members produce the same
+    text and `_report`'s note de-duplication prints it once rather than per member.
+    """
+    tail = ", ".join(
+        f"on {lay} it is {r[1]} on {r[0]}" if r else f"on {lay} there is no reference at all"
+        for lay, r in rule.refs[1:]
+    )
+    return (
+        f"{spelling}: Constraint.reference is {reference_name}, and that is {rule.layers[0]}'s alone; {tail} — the field names "
+        f"one layer's plane and a via changes which plane this net is over"
+    )
+
+
 @dataclass
 class DruRule:  # moved here from compile.py; compile re-exports it
     name: str
@@ -282,12 +753,59 @@ class ConstraintSet:
     lines: tuple[str, ...]  # the report, one number per line, sorted by net
     isolation_specs: tuple[IsolationSpec, ...] = ()  # the numbers behind `isolations`
     bridges: tuple[BridgeSpec, ...] = ()  # one per `Bridge()`; no geometry, see `BridgeSpec`
+    thermals: tuple[ThermalSpec, ...] = ()  # one per `Thermal()`; the budget, not the placement
+    planes: tuple[tuple[str, str], ...] = ()
+    """(net, layer) for every pour this board will **have** — not only what `Board(planes=)` says.
+
+    The same question `route_scene.plane_targets` answers off a `CompiledJob`, asked here because a
+    return path is a question about the reference **net** and the ConstraintSet had no net-to-layer
+    map at all: `Constraint.reference` is a bare layer name, and on two layers it is not even a layer
+    (`"B.Cu pour"`). Without this, classifying a layer change needed a PCB file, and the whole value
+    of `docs/stitch-plan.md` S5 is that it does not.
+
+    On four layers it is `Board(planes=)` verbatim. On two it is the back `GND` pour `krt_plan`
+    schedules when `GND` is a power net — which `Board` refuses to let an author declare, deliberately
+    ("a declaration the router never reads is a lie the board tells its author"). Measured 2026-09-21
+    it agrees with `route_scene.plane_targets` on all five boards, and
+    `tests/test_return_rules.py::test_the_compiled_planes_are_the_route_plans_own` holds them
+    together so the two readings of one idea cannot drift.
+
+    **Not `CompiledJob.planes`**, which is `Board(planes=)` verbatim on every stackup and is therefore
+    `()` on all four two-layer boards here. The two differ exactly where it matters — the 2L pour — so
+    reading the wrong one would silently classify c3_usb's pair as having no reference on either layer
+    instead of on one.
+    """
 
     def by_net(self, name: str) -> Constraint | None:
         for c in self.constraints:
             if c.net == name:
                 return c
         return None
+
+    def fastest_edge(self) -> tuple[str, float] | None:
+        """`(net, rise_ps)` for the fastest edge any `NetReq(rise_ps=)` on this board declares, or
+        `None` when not one net declares one.
+
+        **A board-level fold, because the thing it is asked about is board-level.** The consumer is
+        the plane-stitch pitch (`patterns.stitch.stitch_pitch`), and the cavity between two pours of
+        one net is shared by every signal that crosses it: the pitch that keeps a cell's first
+        resonance above the knee has to be set by the *fastest* edge in the cavity, not by the edge
+        of whichever net happens to be nearest. Taking the minimum `rise_ps` is that sentence as
+        arithmetic.
+
+        The tie-break is the net name so the answer is a property of the board and not of the order
+        the `NetReq` lines were written in, which is the same rule every other ordered thing in this
+        compiler follows.
+
+        `None` is the honest answer and it is a **refusal**, not a default: measured 2026-09-21,
+        every one of the five boards returns `None`, because nothing in this repo has ever declared an
+        edge rate and `docs/stitch-plan.md` section 8 item 3 refuses to invent one per kind.
+        """
+        found = [(c.rise_ps, c.net) for c in self.constraints if c.rise_ps is not None]
+        if not found:
+            return None
+        ps, net = min(found, key=lambda r: (r[0], r[1]))
+        return (net, float(ps))
 
     def to_dict(self) -> dict:
         return {
@@ -298,8 +816,10 @@ class ConstraintSet:
             "isolations": [asdict(i) for i in self.isolations],
             "isolation_specs": [_to_json(asdict(i)) for i in self.isolation_specs],
             "bridges": [_to_json(asdict(b)) for b in self.bridges],
+            "thermals": [t.to_dict() for t in self.thermals],
             "rule_areas": [asdict(a) for a in self.rule_areas],
             "canary_net": self.canary_net,
+            "planes": [list(p) for p in self.planes],
             "refusals": list(self.refusals),
             "lines": list(self.lines),
         }
@@ -488,7 +1008,7 @@ def _given(req: NetReqSpec) -> list[str]:
     out: list[str] = []
     for name in (
         "z_diff_ohm", "z_se_ohm", "volts", "amps", "temp_rise_c", "max_mm", "length_mm", "match_mm", "uncoupled_mm", "pair", "vias",
-        "vias_max", "layers", "reference", "keep_clear_of", "keep_clear_mm", "clock", "pf_max", "loop_mm2", "autoroute", "class_name",
+        "vias_max", "layers", "reference", "keep_clear_of", "keep_clear_mm", "clock", "pf_max", "loop_mm2", "rise_ps", "autoroute", "class_name",
     ):
         v = getattr(req, name)
         if name == "temp_rise_c":
@@ -540,6 +1060,7 @@ class _Numbers:
     current: CurrentSpec | None
     voltage: VoltageSpec | None
     loop: Derived | None
+    rise_ps: float | None
     autoroute: bool | str
     soft: tuple[str, ...]
     notes: tuple[str, ...]
@@ -753,7 +1274,9 @@ def compile_constraints(design: Design) -> ConstraintSet:
                 current=num.current,
                 voltage=num.voltage,
                 loop_mm2=num.loop,
+                rise_ps=num.rise_ps,
                 guard_stitch_mm=None,
+                guard_ground=None,
                 isolation_side=None,
                 autoroute=num.autoroute,
                 soft=num.soft,
@@ -784,7 +1307,7 @@ def compile_constraints(design: Design) -> ConstraintSet:
             net=net, kind="generic", class_name="Default", line=0, width_mm=num.width, clearance_mm=num.clearance,
             lane_clearance_mm=num.lane_clearance, via=num.via, layers=num.layers, reference=None, z_se=None, pair=None, group=None,
             airwire_max_mm=None, length_max_mm=None, keep_away=(), spacing_w=3, current=None, voltage=None, loop_mm2=None,
-            guard_stitch_mm=None, isolation_side=None, autoroute=True, soft=(), notes=(), req_index=-1,
+            rise_ps=None, guard_stitch_mm=None, guard_ground=None, isolation_side=None, autoroute=True, soft=(), notes=(), req_index=-1,
         )
 
     for bus_req in design.buses:
@@ -832,12 +1355,25 @@ def compile_constraints(design: Design) -> ConstraintSet:
         if c.group is None or c.group.kind != "bus":
             constraints[ch.net] = replace(c, group=spec)
 
+    # -- guards: the shielded net, the pitch, and the net the shield is made of -------------------
+    #
+    # Both halves of the statement, because until `docs/stitch-plan.md` S7 only one of them arrived:
+    # `ground=` was parsed by `language.Guard`, stored on `GuardReq`, and then dropped here, so the
+    # router had no way to write a guard in anything but whatever net a pattern defaulted to. The
+    # refusal below is the mirror of the one above it and lives here for the same reason — this is
+    # the one place that holds the netlist, and a pattern is handed a scene.
     for gd in design.guards:
         if gd.net not in design.nets:
             refusals.append(f'Guard("{gd.net}") line {gd.line}: no net "{gd.net}"')
             continue
+        if gd.ground not in design.nets:
+            refusals.append(
+                f'Guard("{gd.net}") line {gd.line}: no net "{gd.ground}" to make the guard out of'
+                f'{_closest(gd.ground, net_names)}'
+            )
+            continue
         synthesised(gd.net)
-        constraints[gd.net] = replace(constraints[gd.net], guard_stitch_mm=gd.stitch_mm)
+        constraints[gd.net] = replace(constraints[gd.net], guard_stitch_mm=gd.stitch_mm, guard_ground=gd.ground)
 
     # -- bridges: the one point two grounds are tied at, and nothing else ------------------------
     #
@@ -885,6 +1421,12 @@ def compile_constraints(design: Design) -> ConstraintSet:
                     pads = (on[br.a][0], on[br.b][0])
         bridge_specs.append(BridgeSpec(req=br, a=br.a, b=br.b, kind=br.kind, at=br.at, tie_ref=tie_ref, pads=tuple(pads), why=br.why))
 
+    # -- thermals: the budget under one land, and the four refusals that precede it ---------------
+    #
+    # After the pours are known, because three of the four refusals are questions about them. See
+    # `_thermal_refusals` for why the fifth — the one about the land's own geometry — is the
+    # pattern's and not this file's.
+    #
     # -- isolations: sides from Place() lines, the corridor, the numbers -------------------------
     rule_areas: list[RuleArea] = []
     iso_specs: list[IsolationSpec] = []
@@ -909,6 +1451,39 @@ def compile_constraints(design: Design) -> ConstraintSet:
                 synthesised(net)
                 constraints[net] = replace(constraints[net], isolation_side=iso.b)
 
+    # -- the pours this board will have, and the caveat they put on `Constraint.reference` ---------
+    #
+    # `krt_plan` writes the back pour when GND is one of the power nets; asked of the compiled
+    # constraints that is "GND compiled to kind=power", which is the same question with the globs
+    # already expanded. `route_scene.plane_targets` asks it of a `CompiledJob` and the two agree on
+    # all five boards (measured 2026-09-21; the test that holds them together is named in the field's
+    # docstring). `Board` refuses `planes=` on two layers, so this is the only place the 2L pour is
+    # written down before geometry exists.
+    pours = (
+        planes
+        if stack.layers > 2
+        else ((("GND", "B.Cu"),) if any(c.net == "GND" and c.kind == "power" for c in constraints.values()) else ())
+    )
+    # The caveat goes on the net's own `notes` so it prints beside its numbers rather than at the
+    # bottom of the report, and it is spelled with the **sorted** pair name for a pair so both members
+    # write byte-identical text and `_report` prints it once (the width note next to it does the same
+    # thing with the NetReq's own order; sorted is the spelling that does not depend on which member
+    # the compiler reached first).
+    by_net_ref: dict[str, str] = {}
+    for _idx, nets, num in numbers:
+        if num.reference_name:
+            for n in nets:
+                by_net_ref.setdefault(n, num.reference_name)
+    for name, c in list(constraints.items()):
+        rule = return_rule(stack, pours, c)
+        if rule is None or rule.verdict in ("kept", "pinned"):
+            continue
+        spelling = "/".join(sorted((c.net, c.pair.partner))) if c.pair is not None else c.net
+        note = _return_caveat(rule, spelling, by_net_ref.get(name, c.reference or "it"))
+        if note not in c.notes:
+            constraints[name] = replace(c, notes=c.notes + (note,))
+
+    thermal_specs = _thermal_refusals(design, stack, pours, refusals)
     ordered = tuple(constraints[n] for n in sorted(constraints))
     cs = ConstraintSet(
         stackup=stack,
@@ -922,6 +1497,8 @@ def compile_constraints(design: Design) -> ConstraintSet:
         lines=(),
         isolation_specs=tuple(iso_specs),
         bridges=tuple(bridge_specs),
+        thermals=thermal_specs,
+        planes=pours,
     )
     return replace(cs, lines=tuple(_report(cs, design, numbers, notes_lines, has_switch_node)))
 
@@ -1309,6 +1886,7 @@ def _compile_req(
         current=current,
         voltage=voltage,
         loop=loop,
+        rise_ps=req.rise_ps,
         autoroute=autoroute,
         soft=tuple(dict.fromkeys(soft)),
         notes=tuple(notes),
@@ -1506,7 +2084,10 @@ def _report(cs: ConstraintSet, design: Design, numbers, notes_lines: list[str], 
             lines.append(f"{n}: loop {c.loop_mm2.line()}")
         if c.guard_stitch_mm is not None:
             gd = next((g for g in design.guards if g.net == n), None)
-            lines.append(f"{n}: guard stitch {_g(c.guard_stitch_mm)} mm (Guard line {gd.line if gd else 0}; R2 pattern)")
+            lines.append(
+                f"{n}: guard stitch {_g(c.guard_stitch_mm)} mm in {c.guard_ground or '?'} "
+                f"(Guard line {gd.line if gd else 0}; R2 pattern)"
+            )
         if c.isolation_side is not None:
             iso = next((i for i in design.isolations if c.isolation_side in (i.a, i.b)), None)
             lines.append(f"{n}: isolation side {c.isolation_side} (Isolation {iso.a}/{iso.b} line {iso.line})" if iso else f"{n}: isolation side {c.isolation_side}")
@@ -1516,6 +2097,14 @@ def _report(cs: ConstraintSet, design: Design, numbers, notes_lines: list[str], 
             if note not in seen_notes:
                 seen_notes.add(note)
                 lines.append(note)
+    # R-Z4's **C** (`docs/stitch-plan.md` S5): one line per net the compiler gave a reference, saying
+    # what a layer change does to its return current and what edit would change the answer. It sits
+    # here, after the per-net numbers and before the board-level specs, because it *is* a statement
+    # about a net — and it is printed for `kept` and `pinned` too, because "nothing to report" and
+    # "nothing went wrong" read the same in an empty report and are not the same fact.
+    lines.extend(r.line() for r in return_rules(cs))
+    for spec in cs.thermals:
+        lines.append(spec.line())
     for spec in cs.bridges:
         tag = f"Bridge {spec.a}/{spec.b}"
         where = f"Bridge line {spec.req.line}"

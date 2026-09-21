@@ -288,7 +288,7 @@ nothing joins them.
 ```
 Printed as a **move, exit 0** (R1's H.3 promotion procedure and `--strict-power`'s precedent). Promote to a failure only in the PR that shows ds2 green — stopping a shipping board on a defect the author has not been told about teaches `--force`.
 
-**What is deliberately NOT in the language.** No `Stitch()`. No `NetReq(rise_ps=)` / `DEFAULT_RISE_PS`. No declaration for parallel vias (`NetReq(amps=)` already compiles `ViaSpec.per_change`; a second source for one number is exactly what the house rules forbid, and it would let an author silence a current fault without fixing it). No declaration for return vias (`reference` is already compiled). **Two new statements total** — smaller than all three proposals.
+**What is deliberately NOT in the language.** No `Stitch()` (still true after S8 — the edge rate went on `NetReq`, where every other net number already lives). No `DEFAULT_RISE_PS` (still true; `NetReq(rise_ps=)` itself ships with S8, with no default anywhere — see section 8 item 3). No declaration for parallel vias (`NetReq(amps=)` already compiles `ViaSpec.per_change`; a second source for one number is exactly what the house rules forbid, and it would let an author silence a current fault without fixing it). No declaration for return vias (`reference` is already compiled). **Two new statements total** — smaller than all three proposals.
 
 ---
 
@@ -423,12 +423,43 @@ The idiom is `build._plane_gate` / `_chain_gate` (`build.py:21`, `build.py:47`, 
 ## 8. What I would NOT build
 
 **1. Plane / edge stitching (R-E1) — the whole carrier, the `Stitch()` statement, the pitch derivation.**
+
+> **CORRECTED BY S8, 2026-09-21 — built.** The measurement below is right and the conclusion was
+> overturned by the user, who ruled that the four example boards are tests and the routing risk is
+> acceptable. What S8 then measured says the risk was smaller than this paragraph assumed:
+> **every example board's route plan is byte-identical**, because the change (`route_scene
+> .plane_targets`: a declared `planes=` is the board's answer on every stackup, the implicit back
+> pour is the default) only moves copper where a board declares a pour the old router ignored, and
+> none of them does. The `Board()` refusal quoted below is **removed**, and removed rather than
+> relaxed: it had stopped being true of this router, and it would now forbid the only way to write
+> down the facing pair R-E1 needs.
+>
+> Three things this paragraph got right and one it got wrong. Right: no board had the population;
+> the derivation belongs in `router-plan.md` (it is there); the 5 mm was folklore. Wrong: *"in order
+> to serve zero boards"* — a board can now declare the pair, and node's experiment showed the
+> technique works on four layers (74 barrels, both planes still one island). What stopped **node**
+> was not the stitch but the pour: `3V3` loses its plane, 51.311 mm of a 1 A rail drops to 0.0889 mm,
+> and KRT then puts a GND via inside a passive's pad so `fab.via_in_pad_blockers` refuses the board.
+> node ships unchanged, and `tests/test_planes.py` records why.
+>
+> `Stitch()` was **not** built either: the edge rate is `NetReq(rise_ps=)`, one number in the place
+> every other net number already lives, with no default anywhere — which keeps item 3 below intact.
 Measured: `plane_targets` gives four boards `(('GND','B.Cu'),)` and node `(('GND','In1.Cu'),('3V3','In2.Cu'))`. **No board pours one net on two facing layers.** Worse, the refusal's own move is currently an *error*: `language.Board` raises on `planes=` with `layers <= 2`, deliberately, with the comment *"a declaration the router never reads is a lie the board tells its author"* — and that comment is right. So shipping R-E1 means first landing a routing change (`Board` validation + `plane_targets` + `krt_plan`'s `gnd_pour`) on four boards that ship, which is **larger and riskier than the stitching feature it would enable**, in order to serve zero boards. R-E1's own words are "deferred until a board needs it". Take them. Document the derivation (λ/20 at the knee, `dielectric_between`, the floor from `antipad_clash`) in `router-plan.md` so the sixth board starts from arithmetic rather than from folklore — but ship none of it.
 
 **2. Return-via *placement* (the R half of R-Z4).**
 Zero population, and zero for a structural reason that no amount of routing improvement fixes: node changes the reference **net**, c3_usb **loses** the reference. The honest output is the refusal and its move, and the move is real and checkable. Shipping a placer here would mean either widening `RETURN_MM` until something lands, or placing a via on the GND side of node's crossing and calling it half-done — both are copper that connects nothing while the tool's own report blesses it. The `net_change` case belongs to technique 6 and should be handed over **by name** in the refusal text.
 
 **3. `NetReq(rise_ps=)` and `DEFAULT_RISE_PS`.**
+
+> **HALF CORRECTED BY S8, 2026-09-21.** The refusal is of `DEFAULT_RISE_PS` and it stands, word for
+> word: there is no per-kind table, no preset value and no fallback anywhere, and the one number with
+> a spec behind it is still quoted from memory and still not read off a spec in any session, so it is
+> not in the code either. What S8 **did** add is the keyword with no default at all — the author
+> states the fastest edge their parts really produce, the way `Thermal(watts=)` states what a pad must
+> move, and `ConstraintSet.fastest_edge` folds it over the board. A board that says nothing gets a
+> soft refusal naming the keyword (measured: that is all five boards here). "The only consumer is the
+> plane stitch, which is not built" is the sentence the user overturned; the rest is unchanged.
+
 ELECTRICAL CORRECTNESS proposes edge-rate defaults for five kinds, of which four (`clock`, `spi`, `i2c`, `switch_node`) are labelled "pcbc default" — i.e. guesses — and the pitch scales linearly with them. That is four invented numbers, entering the constraint compiler, to serve zero boards (the only consumer is the plane stitch, which is not built). Against the house rule that numbers come from the compiler and never from a guess. The one number with a spec behind it (USB 2.0 HS 500 ps) is quoted from memory in two separate designs and has not been read off the spec in any session.
 
 **4. Any copper ground tie, and any gate exemption for one.**

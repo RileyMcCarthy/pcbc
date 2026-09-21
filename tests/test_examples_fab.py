@@ -107,7 +107,19 @@ PLANES = {
     # still **one island**, which is the number the whole `final` stage is gambling on: the gate's
     # `--refill-zones` is the only thing that reads the board after this stage, `antipad_clash`
     # predicts the neck per candidate and `plane_islands` measures it after, and neither moved.
-    "node": {("GND", "In1.Cu"): 2532.85, ("3V3", "In2.Cu"): 2520.4},
+    # node re-pinned again 2026-09-21 for S6, and only the **foreign** plane moves: `("3V3","In2.Cu")`
+    # 2520.4 -> **2515.05**, `("GND","In1.Cu")` byte-identical at 2532.85. The array is on GND, so its
+    # twelve barrels land *in* the GND plane and carve nothing out of it; every one of them is a
+    # foreign via in the 3V3 plane below and takes an antipad out of that one. The arithmetic:
+    # 12 x pi * (0.175 + 0.2)^2 = **5.3014 mm2** of discs against a measured **5.35**, and the 0.9 %
+    # over is KiCad's own outer arc approximation — at its 0.005 mm default an r = 0.375 antipad is a
+    # ~19-gon **circumscribing** the circle, which is (n/pi)*tan(pi/n) = 1.009 times the disc's area,
+    # and the direction is the safe one (it clears more than the rule asks, never less).
+    # Both planes are still **one island**, which is the number the whole `final` stage is gambling
+    # on: no two antipads touch (closest centres 0.850101 mm against a 0.75 mm antipad diameter — a
+    # 0.100101 mm web against the zone's own 0.1 mm `min_thickness`), `antipad_clash` predicted it per
+    # candidate and `plane_islands` measured it after the gate refilled.
+    "node": {("GND", "In1.Cu"): 2532.85, ("3V3", "In2.Cu"): 2515.05},
 }
 
 # Finding 14: how many of each board's `track_width` warnings are pcbc's own tap stubs. `tap._width`
@@ -157,14 +169,17 @@ PASSIVE_PADS = {"blinky": 4, "buck": 18, "c3_usb": 26, "node": 42}
 VIAS_PATTERN = {
     "blinky": {"tap": 1},
     "buck": {"tap": 6},
-    "c3_usb": {"fanout": 5, "tap": 34},
+    # S6: c3_usb declares `Thermal("U1.49")` and gains nine barrels under the ESP32's exposed land.
+    # They carry their own reason rather than `stitch`, because `route_verify.parallel_joined` walks
+    # every `stitch` via asking what anchor it is a twin of, and an array barrel has none.
+    "c3_usb": {"fanout": 5, "tap": 34, "thermal": 9},
     # S4: node gains the stitching slice's first copper — one `parallel` rung on `VBUS`, a 0.35/0.2
     # twin beside the barrel at (28,33.4). Three of its `VBUS` via groups are under-rated and one has
     # a site; the other two are refused (`STITCH_REFUSED`). The other three boards gain nothing, and
     # for a structural reason rather than a tuned one: blinky and buck carry no via at all on an
     # unpoured power net, and c3_usb's 0.5 A sits under one 0.3 mm barrel's 0.707 A, so
     # `vias_per_change` is 1 and every group it has is already rated.
-    "node": {"stitch": 1, "tap": 62},
+    "node": {"stitch": 1, "tap": 62, "thermal": 12},
 }
 
 
@@ -236,12 +251,16 @@ RUNGS = {
 OWNS = {
     "blinky": {"hop": (5, 0), "tap": (1, 1)},
     "buck": {"spine": (10, 0), "tap": (6, 6)},
-    "c3_usb": {"fanout": (5, 5), "hop": (11, 0), "spine": (9, 0), "tap": (34, 34)},
+    # S6's array is `(0, n)`: a barrel and **no** segment. A rung needs two links because
+    # `ampacity._via_clusters` would otherwise count a twin joined to nothing; an array via is already
+    # inside its own land's copper on one layer and inside its own net's pour on the other, so a
+    # segment would be a third path between two points already shorted.
+    "c3_usb": {"fanout": (5, 5), "hop": (11, 0), "spine": (9, 0), "tap": (34, 34), "thermal": (0, 9)},
     # S4's rung is `(2, 1)`: one via and **one link segment on each of the two layers it spans**,
     # unconditionally and at the class width. That 2 is the whole of `docs/stitch-plan.md` §2(e) —
     # `ampacity._via_clusters` is single-linkage on distance with no connectivity test, so a bare
     # twin joined to nothing would double the reported ampacity of a board carrying no more current.
-    "node": {"hop": (11, 0), "spine": (9, 0), "stitch": (2, 1), "tap": (62, 62)},
+    "node": {"hop": (11, 0), "spine": (9, 0), "stitch": (2, 1), "tap": (62, 62), "thermal": (0, 12)},
 }
 
 # R1 (docs/r1-design.md E, H.3): the soft rules' hits per example, {rule name: KiCad warnings}, recorded
@@ -356,7 +375,21 @@ is safe. What closes node's via half is two placements this board has no room fo
 # clearance question neither pcbc (`route_scene._pair_clashes` skips same-net pairs) nor KiCad (which
 # exempts them outright) asks. A **ceiling**, and the class is pre-existing rather than the spine's:
 # the `PCBC_PATTERNS=off` boards measure buck 3, c3_usb 17, node 22 against these.
-SAME_NET = {"blinky": 0, "buck": 1, "c3_usb": 22, "node": 16}
+# **Re-pinned 2026-09-21 for S6, downward, because the check was over-reporting and the array is what
+# exposed it.** `closest_points` is the minimum over vertex-to-edge pairs in both directions: it
+# measures the separation of two *boundaries* and has no containment test in it, so a shape inside
+# another comes back as a positive gap. A `Thermal()` barrel is via-in-pad by definition and a 0.5 mm
+# ring in a 1.45 mm land reported 0.0749 mm — the margin of land copper around the barrel, which is
+# copper and not laminate — nine times on c3_usb. Adding the containment skip removes those nine and
+# **seventeen that were already there**: every one of them a track landing on its own pad, where the
+# track's flank runs beside the pad's edge at the point the two overlap.
+#
+# Measured on the S4 boards and the S6 boards, which give **identical** surviving sets: c3_usb 22 ->
+# **5**, node 16 -> **2**, and the array adds **none**. What survives is exactly the finding the check
+# was built for (S7 review, finding 16): node's leftover sitting 0.0501 mm from the locked `VBUS`
+# spine on a board whose process floor is 0.0889 mm, with real laminate between them. blinky's 0
+# cannot fall; buck's 1 is left as the ceiling it is until a build measures it.
+SAME_NET = {"blinky": 0, "buck": 1, "c3_usb": 5, "node": 2}
 
 # Finding 10: the leftover's own half of the trade, per spined net — `(spine mm, leftover mm)`. The
 # per-net `routed_mm` and `detour` are over **all** the copper on a net, so a spine that adds to
@@ -462,6 +495,32 @@ PARALLEL = {
             ((40.6, 16.05), 1, 1),
         ),
     },
+}
+
+
+# `docs/stitch-plan.md` S6's array, as the finished board has it: `{pad: (want, got, in_pad,
+# in_plane, closest pair mm, K/W, C, verdict)}`. Exact, and every number in it is a different claim.
+#
+# `want` is the compiler's, from `board.py` and the stackup alone: `ceil(theta_barrel / (rise/W))`
+# with `theta_barrel = L/(k*A)` on the plating annulus. `got` is what fitted. `in_pad` and `in_plane`
+# are the two containments the technique is made of and the only fatal thing in
+# `build._thermal_gate`: a barrel outside its land still reads as connected to every check on the
+# board — KiCad's unconnected-items is pad to pad, `netcheck.check_copper` never sees a via, and
+# `verify_copper` asks about clearance, angle and size — and moves none of the heat it was placed
+# for. The pitch is `patterns.stitch.thermal_pitch`'s derived number to the nanometre, read off the
+# **board file** rather than the 4-dp sidecar.
+#
+# Measured 2026-09-21, and both boards reach their budget:
+#   c3_usb  2 layers, one GND pour, no foreign plane. 231.1 K/W per 0.3 mm barrel over a 1.6 mm
+#           board, 9 wanted at 0.35 W in 10 C, 36 sites, **9 placed**, 25.68 K/W, 8.99 C.
+#   node    4 layers. 334.2 K/W per 0.2 mm barrel over 1.5862 mm — **worse per via on the thinner
+#           board**, because the drill is 0.2 and the annulus goes with the circumference — 12
+#           wanted, 36 sites, **12 placed**, 27.85 K/W, 9.75 C.
+THERMAL = {
+    "blinky": {},
+    "buck": {},
+    "c3_usb": {"U1.49": (9, 9, 9, 9, 0.800101, 25.68, 8.99, "served")},
+    "node": {"U1.49": (12, 12, 12, 12, 0.850101, 27.85, 9.75, "served")},
 }
 
 
@@ -577,6 +636,40 @@ def test_example_builds_to_fab(tmp_path: Path, name: str):
             "path C_IN1.1->R_EN.1). Place() the parts either side of that copper closer together, "
             'or change amps= on the NetReq that already declares "VIN"'
         ], fab_step["power"]
+    # `docs/stitch-plan.md` S6 and section 6 row 4: the array measured where it was placed, and the
+    # two things the gate is allowed to fail on. `via_in_pad` **grows** by exactly the array — that is
+    # the point of the technique — and `via_in_pad_blockers` does not grow at all, which is the half
+    # that keeps `Thermal()` from ever naming a passive. `fab.via_in_pad_blockers` has a zero diff in
+    # this slice and this is what holds it.
+    thermal = route["thermal"]
+    got = {
+        r["pad"]: (r["want"], r["got"], r["in_pad"], r["in_plane"], r["pitch_mm"], r["theta_c_per_w"], r["rise_c"], r["verdict"])
+        for r in thermal["arrays"]
+    }
+    assert got == THERMAL[name], (name, thermal["arrays"])
+    assert thermal["fails"] == [], (name, thermal["fails"])
+    assert thermal["blockers"] == 0, (name, "a via inside a passive's pad fails the fab gate at any via fill")
+    assert thermal["via_in_pad_ours"] == thermal["via_in_pad_inside"] == sum(v[1] for v in THERMAL[name].values()), (
+        name, thermal, "pcbc's own via-in-pad detector must find every via pcbc deliberately put in a pad, wholly inside it"
+    )
+    if THERMAL[name]:
+        notes = (tmp_path / "layout" / name / "fab" / "FAB_NOTES.md").read_text()
+        assert "## Thermal vias (via-in-pad, deliberate)" in notes, name
+        assert "Epoxy Filled & Capped (IPC-4761 Type VII)" in notes, (
+            name, "the array is unassemblable tented, and only the person ordering can make the fill true"
+        )
+        assert "The passive rule is unchanged and unrelaxed" in notes, name
+    # `docs/router-plan.md` R-E1 and `docs/stitch-plan.md` section 8 item 1, S8: the plane lattice.
+    # **Every board here writes none, and for a structural reason rather than a tuned bound** — not one
+    # of the five pours a single net on two facing layers, which is section 2(l)'s measurement re-taken
+    # after S8 made the router read `planes=` on both stackups (four boards `(('GND','B.Cu'),)`, node
+    # `(('GND','In1.Cu'),('3V3','In2.Cu'))`, two pours of two *different* nets). The gate runs on every
+    # board anyway, because the sentence it prints is what says so. `tests/test_planes.py` owns the
+    # board that does get a lattice.
+    assert route["planes_stitched"]["lattices"] == [], (name, route["planes_stitched"])
+    assert route["planes_stitched"]["fails"] == [], (name, route["planes_stitched"]["fails"])
+    assert route["planes_stitched"]["lines"] == ["planes: pcbc wrote no plane-stitch copper on this board"], name
+    assert "plane" not in route["copper_bar"]["totals"]["vias_pattern"], (name, "no facing pair, no lattice")
     taps = [m for m in route["pattern_moves"] if m.startswith("tap ")]
     if name == "node":
         assert taps[0].splitlines()[0] == (
@@ -661,10 +754,18 @@ def test_example_builds_to_fab(tmp_path: Path, name: str):
     # pcbc wrote that is not joined to the anchor it is supposed to be parallel to, which is copper
     # doing the opposite of what `ampacity._via_clusters` will report about it. A rail that is still
     # short stays a printed move (`RUNGS`, `STITCH_REFUSED`).
-    assert set(route["returns"]) == {"watched", "vias", "verdicts", "lines"} and "fails" not in route["returns"], (name, route["returns"])
+    #
+    # S5 added the **C** to the gate (`rules`): the same classification made from `board.py` with no
+    # PCB file, which is the half that can reach an author before the router runs. `mispredicted` is
+    # the claim that the two agree, and it must be empty — a rule that says `lost` from the stackup
+    # and a finished board that says otherwise means one of the two is reading the wrong pours.
+    assert set(route["returns"]) == {"watched", "vias", "verdicts", "rules", "mispredicted", "lines"} and "fails" not in route["returns"], (name, route["returns"])
     assert set(route["parallel"]) == {"rungs", "groups", "short", "fails", "lines"}, (name, route["parallel"])
     assert set(route["returns"]["verdicts"]) <= {"served", "far", "none", "net_change", "lost"}, (name, route["returns"]["verdicts"])
     assert len(route["returns"]["vias"]) == sum(route["returns"]["verdicts"].values()), (name, route["returns"])
+    assert {r["verdict"] for r in route["returns"]["rules"]} <= {"lost", "net_change", "kept", "pinned"}, (name, route["returns"]["rules"])
+    assert [r["net"] for r in route["returns"]["rules"]] == route["returns"]["watched"], (name, "one rule per watched net, in net order")
+    assert route["returns"]["mispredicted"] == [], (name, route["returns"]["mispredicted"], "the C predicts the V: a verdict computed from board.py alone is the verdict the finished board carries")
     from pcbc.fab import board_pads, mask_flashes, passive_refs, via_in_pad, via_in_pad_blockers
     from pcbc.route_emit import append_items, via as via_text
 

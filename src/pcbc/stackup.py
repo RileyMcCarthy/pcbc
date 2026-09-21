@@ -132,6 +132,32 @@ class Stackup:
     # until S5's review nothing in pcbc wrote it or checked it: the stanza on every routed board was
     # KiCad 10's own default (`docs/r2-measurements.md` S5r, finding 3).
     via_tenting: bool = True
+    via_fill: str = "none"
+    """What this fab will put **inside** a barrel, as opposed to over its mouth. `"none"` by default.
+
+    `via_tenting` above and this field are two different facts about the same hole and the whole of
+    `Thermal()`'s fab story is in the difference. **Tenting is a mask dam, not a plug**: the mask
+    closes the opening and the barrel underneath is still a hollow, plated tube open to the paste
+    above it, so a tented via inside a reflowed pad wicks the joint down the hole and the pad comes
+    out starved. What makes a via safe in a pad is IPC-4761 **Type VII — filled and capped**: the
+    barrel plugged with a non-conductive epoxy, planarised, and plated over so the pad's surface is
+    continuous copper.
+
+    `"epoxy_capped"` on the JLC presets, which is `docs/router-plan.md` section 3's own row read as
+    a field — *"via-in-pad | filled and capped, 0.15 to 0.55 | refused on passives at fab, allowed on
+    IC pins"*. It says the fab **offers** it, at a price, and **not** that an order has it: JLC's
+    default via covering is tented, and Type VII is a line on the order form. That is why the
+    declaration lands in `FAB_NOTES.md` (`fab._write_notes`) and not only in a refusal — the person
+    who places the order is the only one who can make it true, and a thermal array is unassemblable
+    without it."""
+    via_fill_min_drill: float = 0.15
+    via_fill_max_drill: float = 0.55
+    """The drill range the fill process covers, `docs/router-plan.md` section 3's 0.15 to 0.55.
+
+    Both JLC standard vias are inside it — 0.3 mm on two layers and 0.2 mm on four — so no board
+    here is refused by this pair and the fixture is where it bites. It is carried because the two
+    ends are real: under the floor the epoxy will not draw into the hole, and over the ceiling it
+    shrinks away from the cap."""
     mask_over_substrate_mm: float = 0.0305  # JLC impedance page: 1.2 mil
     mask_over_trace_mm: float = 0.0152  # 0.6 mil
     mask_dk: float = 3.8
@@ -223,6 +249,42 @@ class Stackup:
             return h, "B.Cu pour"
         return None
 
+    def reference_of(self, layer: str, planes: tuple[tuple[str, str], ...]) -> tuple[str, str] | None:
+        """(reference layer, reference **net**) for copper on `layer`; None where it has no plane.
+
+        `height_to_reference` with the net named — the half every caller had to add back for itself.
+        `constraints._reference_for` looks it up to print "In1.Cu (GND)"; `route_verify
+        ._layer_references` builds a `{layer: net}` map off the zones a finished board really poured
+        and does the same. Neither could share the other, so the one question with two answers was
+        asked twice.
+
+        The net is not decoration here, it is the whole answer. A **return path** is a question about
+        the reference net: a via joins one net to itself, so copper whose reference is `GND` on one
+        layer and `3V3` on the other cannot have that current carried across by any via anywhere.
+        The height decides impedance; the net decides whether a return via can exist at all.
+
+        `planes` is what the board will **have**, not only what `Board(planes=)` declares — on two
+        layers that is the back `GND` pour `krt_plan` writes (`route_scene.plane_targets`), which
+        `Board` refuses to let an author write down at all. `two_layer_pour=True`'s pseudo-layer
+        `"B.Cu pour"` is deliberately not used: it is a printed name rather than a layer, so it
+        cannot be compared with `Constraint.layers`, and the pour's *net* would still have to come
+        from somewhere else.
+
+        Measured 2026-09-21 across the five boards, with the pour in `planes`:
+
+            node    4L  planes=[("GND","In1.Cu"),("3V3","In2.Cu")]
+                        F.Cu -> ("In1.Cu","GND")  0.2104 mm
+                        B.Cu -> ("In2.Cu","3V3")  0.2104 mm      two layers, two NETS
+            blinky/buck/c3_usb/ds2  2L  pour ("GND","B.Cu")
+                        F.Cu -> ("B.Cu","GND")    1.53 mm
+                        B.Cu -> None                             the pour's own layer is not its own reference
+        """
+        found = self.height_to_reference(layer, planes, two_layer_pour=False)
+        if found is None:
+            return None
+        _h, ref = found
+        return ref, next(net for net, lay in planes if lay == ref)
+
 
 # JLC's own 1 oz / 2 oz track / clearance minima (mm), for the report only: pcbc's limits below
 # are the ones every board is held to. Key: (two_layer, copper_oz) -> (track, clearance).
@@ -265,7 +327,7 @@ def _four_layer(prepreg: str, h: float, dk: float, core: float) -> tuple[Copper 
     )
 
 
-_FOUR_LAYER_LIMITS = dict(track_min=0.0889, clearance_min=0.0889, via_drill=0.2, via_diameter=0.35, annular_min=0.075, mask_bridge_min=0.10)
+_FOUR_LAYER_LIMITS = dict(track_min=0.0889, clearance_min=0.0889, via_drill=0.2, via_diameter=0.35, annular_min=0.075, mask_bridge_min=0.10, via_fill="epoxy_capped")
 _FITTED = "fitted to JLC04161H-{code} rows (JITX), 2026-09-19"
 _INTERPOLATED = "interpolated between 7628 and 1080 fits; capture JLC rows to replace"
 
@@ -321,6 +383,7 @@ STACKUPS: dict[str, Stackup] = {
         z_bias_diff=1.0,
         z_bias_source="uncalibrated: formula only",
         mask_bridge_min=0.10,
+        via_fill="epoxy_capped",
     ),
 }
 
@@ -861,6 +924,69 @@ def vias_per_change(amps: float, drill_mm: float, plating_mm: float = 0.018, tem
     if amps <= 0:
         return 1
     return max(1, math.ceil(amps / via_amps(drill_mm, plating_mm, temp_rise_c) - 1e-9))
+
+
+# ---------------------------------------------------------------------------------------------
+# C.7b One barrel as a heat path: Fourier conduction down the plated wall
+# ---------------------------------------------------------------------------------------------
+
+K_CU_W_PER_MK = 385.0
+"""Thermal conductivity of the electrodeposited copper a barrel is plated with, W/(m*K).
+
+The handbook value for pure copper at room temperature, which is what every thermal-via note in the
+industry uses and what makes `via_theta_c_per_w` comparable with a vendor's number. It is the one
+constant in this function that is not pcbc's own: the length is the stackup's `board_mm`, the wall
+thickness is the stackup's `via_plating_mm` (JLC's published "average hole plating 18 um") and the
+drill is the stackup's standard via."""
+
+
+def via_theta_c_per_w(board_mm: float, drill_mm: float, plating_mm: float = 0.018) -> float:
+    """One plated barrel's thermal resistance through the board, K/W, 1 dp.
+
+    `L / (k * A)` — Fourier conduction along the barrel — with `A` the **annulus of plating**,
+    `pi * ((drill/2 + plating)^2 - (drill/2)^2)`, and not the hole's area: the hole is air (or, on a
+    filled board, epoxy, whose conductivity is a fiftieth of copper's and is deliberately not counted,
+    which is the conservative direction). This is the same shape of arithmetic as `via_barrel_mil2`
+    two functions up — the same annulus, the same two stackup numbers — because the current rating and
+    the heat rating are the same piece of metal asked two questions.
+
+    Measured 2026-09-21 on the two stackups these boards use, with `via_plating_mm` 0.018:
+
+        jlcpcb_2l_1oz   board 1.6    mm, drill 0.3  ->  231.1 K/W
+        jlcpcb_4l_1oz   board 1.5862 mm, drill 0.2  ->  334.2 K/W
+
+    A four-layer barrel is **worse** per via than a two-layer one even though the board is thinner,
+    because the drill is 0.2 rather than 0.3 and the plating annulus goes with the circumference. It
+    is why node needs twelve vias where c3_usb needs nine for the same watt and the same rise, and it
+    is the one number in `Thermal()` a reader is most likely to assume goes the other way.
+
+    What this is **not**: a junction-to-ambient figure. `theta_JA` folds in the package, the spreading
+    in the copper the array lands on, the board's area and the air over it; pcbc knows none of those
+    and says so (`language.Thermal`). What this answers is the barrel alone, which is the part the
+    router decides and the part a via array changes.
+    """
+    r = drill_mm / 2.0
+    area_mm2 = math.pi * ((r + plating_mm) ** 2 - r * r)
+    if area_mm2 <= 0.0 or board_mm <= 0.0:
+        return 0.0
+    return round((board_mm * 1e-3) / (K_CU_W_PER_MK * area_mm2 * 1e-6), 1)
+
+
+def vias_for_theta(board_mm: float, drill_mm: float, watts: float, rise_c: float, plating_mm: float = 0.018) -> int:
+    """How many parallel barrels hold a `watts` load inside a `rise_c` budget: `ceil(theta / (rise/W))`.
+
+    `n` barrels in parallel are `theta_via / n`, which is the whole model and is why a **count** is
+    the answer rather than a size — the same reason `vias_per_change` above is a count. Measured
+    2026-09-21 at 0.35 W and the 10 C budget `CurrentSpec.temp_rise_c` already defaults to:
+    c3_usb `ceil(231.1 / 28.571) = 9`, node `ceil(334.2 / 28.571) = 12`.
+
+    At least 1, for `vias_per_change`'s reason: a pad that needs no help still gets the via that says
+    the model was asked."""
+    if watts <= 0 or rise_c <= 0:
+        return 1
+    target = rise_c / watts
+    theta = via_theta_c_per_w(board_mm, drill_mm, plating_mm)
+    return max(1, math.ceil(theta / target - 1e-9))
 
 
 # ---------------------------------------------------------------------------------------------

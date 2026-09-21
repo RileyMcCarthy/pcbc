@@ -38,8 +38,18 @@ __all__ = [
     "write_sidecar",
 ]
 
-REASONS = ("fanout", "hop", "chain", "tap", "spine", "bus", "guard", "stitch")
-"""Every reason pcbc's own copper can carry (B.0). `leftover` is the router's, not a pattern's."""
+REASONS = ("fanout", "hop", "chain", "tap", "spine", "bus", "guard", "stitch", "thermal", "plane")
+"""Every reason pcbc's own copper can carry (B.0). `leftover` is the router's, not a pattern's.
+
+`"stitch"` and `"thermal"` are both `patterns/stitch.py`'s and they are two entries on purpose: a
+census keyed on the module would say "10 stitch vias" where a board has one parallel rung and nine
+barrels under a heatsink land, and one of `route_verify`'s two size rules applies to each
+(`patterns.stitch.THERMAL_REASON`).
+
+`"plane"` is `patterns/stitch.py`'s fourth and last, and it is separate for the same reason: a
+lattice barrel tying two pours of one net has no anchor and no link, so counting it as `"stitch"`
+would put it in front of `route_verify.parallel_joined`'s "is this twin joined to its anchor" check,
+which is fatal (`patterns.stitch.PLANE_REASON`)."""
 
 
 @dataclass(frozen=True)

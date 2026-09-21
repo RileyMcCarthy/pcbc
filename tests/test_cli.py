@@ -121,18 +121,35 @@ def test_check_constraints_json_prints_the_constraintset_with_its_keys(tmp_path:
     assert main(["check", str(board), "--constraints", "--json"]) == 0
     doc = json.loads(capsys.readouterr().out)
     assert sorted(doc) == [
-        "bridges", "canary_net", "classes", "constraints", "groups", "isolation_specs", "isolations", "lines", "refusals", "rule_areas", "stackup",
+        "bridges", "canary_net", "classes", "constraints", "groups", "isolation_specs", "isolations", "lines", "planes", "refusals", "rule_areas", "stackup", "thermals",
     ], (
         "A.1 ConstraintSet.to_dict(): the fields of the frozen dataclass (isolation_specs is S2's additive carrier of the C.8 numbers; "
-        "bridges is S3's, and it is the one spec in the file with no number in it — a `Bridge()` compiles to a part the board already places)"
+        "bridges is S3's, and it is the one spec in the file with no number in it — a `Bridge()` compiles to a part the board already places; "
+        "planes is S5's, the (net, layer) pours the board will HAVE — `Board(planes=)` on four layers and the back GND pour krt_plan writes "
+        "on two, which `Board` refuses to let an author declare. Without it the ConstraintSet had no net-to-layer map at all and classifying "
+        "a layer change needed a PCB file, which is exactly what `docs/stitch-plan.md` S5 exists not to need; "
+        "thermals is S6's, one per `Thermal()` — the barrel's K/W and the count a watt needs, both computable from board.py and the stackup "
+        "alone, with the pitch and the sites deliberately left to the pattern because both are questions about a land's own geometry)"
     )
+    assert doc["planes"] == [["GND", "B.Cu"]], "the DS2 Addon is two layers with GND a power net, so krt_plan writes it a back pour"
+    assert doc["thermals"] == [], "the DS2 Addon is TSSOP-16 with no pad_prop_heatsink land anywhere, so it declares no Thermal() and the key is an empty list rather than absent"
     assert doc["stackup"] == "jlcpcb_2l_1oz" and doc["canary_net"] == "3V3" and doc["refusals"] == []
     assert doc["lines"] == DS2_CONSTRAINT_LINES, "the same lines as the text report (cs.lines; the rules line is the CLI's, from job.dru)"
     assert sorted(doc["constraints"][0]) == [
-        "airwire_max_mm", "autoroute", "class_name", "clearance_mm", "current", "group", "guard_stitch_mm", "isolation_side", "keep_away",
-        "kind", "lane_clearance_mm", "layers", "length_max_mm", "line", "loop_mm2", "net", "notes", "pair", "reference", "req_index",
-        "soft", "spacing_w", "via", "voltage", "width_mm", "z_se",
-    ], "A.1 Constraint, plus S2's additive req_index"
+        "airwire_max_mm", "autoroute", "class_name", "clearance_mm", "current", "group", "guard_ground", "guard_stitch_mm", "isolation_side",
+        "keep_away", "kind", "lane_clearance_mm", "layers", "length_max_mm", "line", "loop_mm2", "net", "notes", "pair", "reference",
+        "req_index", "rise_ps", "soft", "spacing_w", "via", "voltage", "width_mm", "z_se",
+    ], (
+        "A.1 Constraint, plus S2's additive req_index and S7's guard_ground. `Guard(net, ground=)` has taken a ground net since R1 and, "
+        "measured 2026-09-21, `constraints._compile` stored only `stitch_mm`: a board saying `Guard(\"AIN0\", ground=\"VSS\")` compiled "
+        "to a guard the router would have written in whatever net the pattern defaulted to (`docs/stitch-plan.md` section 2(r) predicted "
+        "this pin would move and said to move it in the same commit as the geometry). Half a statement reaching the router is the failure "
+        "the ConstraintSet exists to prevent, so the field is the fix and this line is the ledger of it. "
+        "S8 adds `rise_ps`, and it is the only field here with no `Derived` around it and no default behind it: an edge rate is a fact "
+        "about the parts a board is built from, the way `Thermal(watts=)` is, and `docs/stitch-plan.md` section 8 item 3 refuses the "
+        "per-kind `DEFAULT_RISE_PS` guesses that a stitch pitch would then scale linearly with. It is `None` on every net of every board "
+        "in this repo (measured 2026-09-21), which is why the plane stitch refuses by name instead of inventing a pitch"
+    )
     assert doc["constraints"][0]["width_mm"] == {
         "value": 0.25, "unit": "mm", "formula": "pcbc_floor", "ref": "amps < 0.2",
         "note": "ipc2221_ext 0.1 A 10 C 1 oz 0.150; ipc2152_fit x board 1.092 x plane 0.593 at 1.53 mm B.Cu pour 0.003; below 0.274 A the IPC-2152 fit extrapolates",
@@ -154,7 +171,9 @@ def test_check_constraints_exit_code_is_checks_and_a_caveat_is_not_a_failure(tmp
         'NetReq("VCC", kind="switch_node", pf_max=3)\n'
         'Place("R1", at=(5, 5)); SchPlace("R1", left=20, top=20)\n'
     )
-    msg = 'NetReq("VCC") line 5: kind="switch_node" does not take pf_max=; it takes loop_mm2, amps, max_mm, layers, vias, autoroute, class_name, keep_clear_of, keep_clear_mm, volts, z_se_ohm'
+    # `rise_ps` is last: S8 appended it to `constraints.COMMON_KWARGS`, because an edge rate belongs to
+    # whichever net has one and the plane stitch folds the fastest of them over the whole board.
+    msg = 'NetReq("VCC") line 5: kind="switch_node" does not take pf_max=; it takes loop_mm2, amps, max_mm, layers, vias, autoroute, class_name, keep_clear_of, keep_clear_mm, volts, z_se_ohm, rise_ps'
     assert main(["check", str(bad), "--constraints"]) == 1, "S5 acceptance: a refusal is 1"
     captured = capsys.readouterr()
     assert captured.err.splitlines() == [msg] and captured.out == ""

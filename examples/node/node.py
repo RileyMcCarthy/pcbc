@@ -2,7 +2,7 @@
 # buffered by an op-amp into an ADC pin, and a MOSFET switching a load.
 # 33 parts, six groups - the hardest sheet so far. The AI writes the netlist
 # and one SchPlace() per part; the tool draws everything else.
-from pcbc import Board, Capacitor, Chain, Ground, Keepout, Led, Net, NetReq, Place, Power, Resistor, SchPlace, SchRegion, load
+from pcbc import Board, Capacitor, Chain, Ground, Keepout, Led, Net, NetReq, Place, Power, Resistor, SchPlace, SchRegion, Thermal, load
 
 VBUS, V33, GND = Power("VBUS"), Power("3V3"), Ground("GND")
 USB_DP, USB_DN, CC1, CC2 = Net("USB_DP"), Net("USB_DN"), Net("CC1"), Net("CC2")
@@ -146,3 +146,8 @@ NetReq("T_DIV", "T_OUT", kind="analog")
 NetReq("LOAD", kind="power", volts=3.3, amps=1)
 Chain("USB_DP", "J1.B6", "U3.6", "U1.27")  # the pair's feed order: connector, ESD, module; a third pad off the line is a stub
 Chain("USB_DN", "J1.A7", "U3.4", "U1.26")
+# The module's exposed pad is nine `pad_prop_heatsink` blocks on GND; 0.35 W is the C3's own
+# figure for a Wi-Fi duty cycle this board runs. `across_planes=True` consents to the twelve
+# antipads a through array cuts in the 3V3 plane on In2.Cu, which the derived pitch keeps a
+# web between: see `patterns.stitch.thermal_pitch`.
+Thermal("U1.49", watts=0.35, across_planes=True)

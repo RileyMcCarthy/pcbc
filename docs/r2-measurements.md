@@ -1282,3 +1282,138 @@ so it is a census and not a rule; node's tightest is 0.050 mm between KRT's left
 - **One pinned number did not reproduce**: finding 11 gives `ipc2221_amps(0.532)` as 1.515 A and
   finding 4 gives 1.513 A for the same width. pcbc's own curve says **1.513**, and that is what the
   docs and the assertion carry.
+
+## Power, in the build's own words
+
+The S7 review's first finding was that `power_ampacity_failures` read each net's **widest** track, so
+no neck could ever fail it; `ampacity.py` replaced that with the honest number — the widest-bottleneck
+path between every pair of a net's pads, vias included — and found three of the five boards under
+their declared current. That was the measurement. What it did **not** do was reach the build.
+
+Measured on the finished boards before this change, with `PCBC_REQUIRE_KICAD=1 PCBC_REQUIRE_KRT=1`:
+
+| board | net | declared | narrowest series copper | carries | under class |
+|---|---|---|---|---|---|
+| buck | `VIN` | 2.0 A | 0.3905 mm track, `C_IN1.1->R_EN.1` | 1.21 A | 19.39 mm |
+| c3_usb | `VBUS` | 0.5 A | 0.1270 mm track | 0.54 A | 24.07 mm |
+| node | `VBUS` | 1.0 A | one 0.2 mm via, 0.527 A | 0.74 A | 6.48 mm |
+
+and the build that produced them said, in full: `ok: true`, `error: null`, route step
+`{"copper": "verified"}`, fab step `{"error": null}`, exit **0**. The three rows lived in
+`fab/report.json` under `ampacity_bottleneck` and as three lines of `FAB_NOTES.md`. An AI reading the
+build's own output — which is the reader this tool is written for — would ship buck with 1.21 A of
+copper on a 2 A rail and never see a word about it.
+
+**`ampacity.power_moves` is the missing half.** `bottleneck_lines` stays the *ledger*: every power
+net, passing or not, in `FAB_NOTES.md` for a person reading the electrics. `power_moves` is the
+*move*: only the nets whose verdict is not `ok`, each naming the edits that fix it, carried out of
+`fab_job` as `power_moves`, into the build's fab step as `power`, to the top of the build result as
+`power`, and onto stderr by `pcbc build`. blinky prints nothing; buck, c3_usb and node print one line
+each, verbatim on buck:
+
+```
+power: VIN: declared 2 A, carries 1.21 A through its narrowest 0.3905 mm track at 13.75,9.075 on
+F.Cu (19.394 mm of this net is narrower than its 0.781 mm class; path C_IN1.1->R_EN.1). Place() the
+parts either side of that copper closer together, or change amps= on the NetReq that already
+declares "VIN"
+```
+
+Every clause of that sentence was wrong in the first version of it, and a 25-finding adversarial
+review of the change is what found each one (`docs/power-moves-review.md` is the ledger: 25
+findings raised, 15 confirmed by adversarial verifiers, all 15 fixed). What the line says now, and
+why:
+
+1. **It names the neck's coordinate, not the pad pair the walk ended on.** `where` is a pad pair,
+   and every pair whose path crosses one neck ties at that neck's amps, so the reported pair is the
+   first in sorted order among the tied ones: provenance, never a location. buck's is
+   `C_IN1.1->R_EN.1` — `R_EN` is a 100 k enable pull-up drawing 0.12 mA — while its 2 A path is
+   `J_IN.1->U1.3`. "Move those two parts closer" named two parts that are not on the rail, and both
+   are already `Place(to=)`d to different pins of the regulator. `Bottleneck.at_mm` carries the
+   narrowest piece's own midpoint and layer, and the pair stays on the line as `path ...`.
+2. **Every edit is an edit to a line the board already has.** A second `NetReq("VIN", amps=...)` is
+   refused twice before the board is drawn — `kind="generic"` takes no `amps=`, and the net is
+   already named by another `NetReq` — and a second bare `Board()` raises at load. The move now says
+   *change* `amps=` on the NetReq that declares the net, and *add* a tuple to the `Board(planes=...)`
+   that exists.
+3. **The pour clause appears only where pcbc actually pours.** `route.krt_plan` reads `planes=` only
+   when `job.layers > 2` and writes the `GND` back pour itself below that. So on buck the first
+   version's `Board(planes=[("VIN", "B.Cu")])` would have poured **no copper at all** — while
+   `power_bottlenecks` marked `VIN` zoned on the strength of the declaration and stopped measuring
+   it. The tool would have talked an author into silencing its own warning. The clause is now
+   offered only for a free **inner** layer of a four-layer board: not on two layers at all, not on a
+   layer another net already pours (node pours `GND` on `In1.Cu` and `3V3` on `In2.Cu`, and its
+   `VBUS` move said `In1.Cu`), and not on an outer layer, where the parts are standing.
+4. **`NetReq(amps=)` is left out where it cannot work.** `need_mm` is `max(IPC-2221, IPC-2152)` and
+   is usually a curve value, but at the bottom `ipc2221_width_mm` clamps to `WIDTH_FLOOR_MM`
+   (0.15 mm), and no current an author can declare moves a constant. c3_usb's `VBUS` is that case:
+   it carries 0.536 A of its declared 0.5 A, so "declare what it carries" was a sentence arguing
+   with itself, and taking it below 0.2 A would have narrowed the class pcbc writes from 0.4 mm to
+   0.25 mm while the same line kept printing. That row now ends "No board.py edit widens it: the
+   copper is the leftover router's and R3 owns its width", which is the true answer.
+5. **An unmeasured net is not a shortfall.** `_walk` returns the row untouched for a net with fewer
+   than two pads, leaving `carries` at `math.inf` and `width_mm` at 0.0 — and the floor test,
+   `0.0 < need_mm`, was then always true. The ledger papered over it ("carries 0 A" among rows where
+   every net appears); the move turned it into a claim about copper nobody measured, with an empty
+   location, and `--strict-power` failed the build on it. `_verdict` now returns such a row `ok`.
+
+**Built, all five, `pcbc build --force`, exit 0 on every one** (blinky and ds2 say nothing; the copy
+of the DS2 Addon was built in a temp dir, never in the MaD checkout):
+
+```
+buck    power: VIN: declared 2 A, carries 1.21 A through its narrowest 0.3905 mm track at
+        13.75,9.075 on F.Cu (19.394 mm ... 0.781 mm class; path C_IN1.1->R_EN.1). Place() the parts
+        either side of that copper closer together, or change amps= on the NetReq that already
+        declares "VIN"
+c3_usb  power: VBUS: carries 0.536 A of 0.5 A on the curve but its narrowest 0.127 mm track at
+        21.475,16.925 on F.Cu is under pcbc's 0.15 mm floor, which is a constant and not a curve
+        point (24.068 mm ... 0.4 mm class; path C_VBUS.1->J1.A4B9). No board.py edit widens it: the
+        copper is the leftover router's and R3 owns its width
+node    power: VBUS: declared 1 A, carries 0.527 A through its narrowest single via at 27.8,36.3 on
+        B.Cu/F.Cu/In1.Cu/In2.Cu (6.476 mm ... 0.4 mm class; path C_VBUS.1->J1.A4B9). Place() the
+        parts either side of that copper closer together, or change amps= on the NetReq that
+        already declares "VBUS"
+```
+
+Three boards, three shapes, and **no pour clause on any of them** — buck and c3_usb because two
+layers pour nothing from `planes=`, node because both its inner layers already carry one. The clause
+only appears on a four-layer board with an inner layer free, which is the only place it is true.
+
+Three further things the same review changed, none of them in the sentence:
+
+- **The exemption is the zone in the file, and nothing else.** `power_bottlenecks` used to read
+  `census[net]["zone"] or net in job.planes`. The second half is a *predictive* exemption and it is
+  the other half of finding 3 above: a declared plane that pours nothing stops the net being
+  measured. Dropped. Every net that really pours is already a zone in the routed board, so no
+  example's verdict moves.
+- **A plane declaration the router will never honour is refused at the `Board()` line.** `planes=`
+  on a two-layer board, and a layer the stackup does not have. Both were accepted silently, and the
+  first was the trap the pour move would have walked an author into.
+- **One spelling for every environment switch.** `PCBC_STRICT_PATTERNS` has always taken
+  1/true/yes/on; `PCBC_STRICT_POWER` matched `"1"` exactly, so `PCBC_STRICT_POWER=true` was a silent
+  no-op — the worst thing a strictness flag can be.
+
+**It is a move and not a gate, by default.** `--strict-power` (`PCBC_STRICT_POWER=1`) makes
+`fab_job` return it as the stage's error, exactly as `--strict-patterns` does for a pattern refusal.
+The default is the move because the copper that necks is the router's leftover and R3's maze router
+owns it: a gate that stops three of five example boards on a fault the tool cannot yet repair teaches
+an author to reach for `--force`, and a build that is routinely forced is a build with no gates at
+all. **This is the one call in the change that is the board owner's rather than the tool's**, and it
+is one flag either way.
+
+**What the first full run of the suite found, and it was mine.** The `--strict-power` test drove
+`main(["build", ..., "--strict-power"])`, which set `PCBC_STRICT_POWER=1` on the **process** — the
+way `--strict-patterns` already did — and pytest runs one process, so buck, c3_usb and node each
+failed their own build hundreds of tests later with the move as their error. `cmd_build` now scopes
+both flags to the single `build_job` call and puts the previous value back, and two tests pin that:
+one that the flag is gone when the build returns, one that a value the caller set on purpose
+survives. The leak was latent in `--strict-patterns` from S4 and nothing had called it twice in one
+process; a user's second `main()` call would have hit it.
+
+Pinned: `test_ampacity.py` (the three verdicts; where the pour clause is offered and where it is
+not; a declared plane that never exempts an unpoured net; an unmeasured net; the coordinate rather
+than the pair; a poured net; a row with no verdict key), `test_constraints.py` (the two `Board()`
+refusals, with node's own declaration as the control), `test_cli.py` (stderr, the JSON, the flag,
+the env spellings, that the flag does not outlive its build, that a value the caller set survives,
+and silence when there is nothing to say), `test_examples_fab.py` (the move list equals `UNDER` per
+board, buck's line verbatim, and `--strict-power` turning that same board's build into an error
+while still writing the ledger it stopped on).

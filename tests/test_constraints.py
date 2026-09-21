@@ -620,6 +620,47 @@ def test_a_board_whose_layer_count_and_stackup_disagree_is_refused(tmp_path: Pat
     ]
 
 
+def test_a_plane_the_router_will_never_pour_is_refused_at_the_board_line(tmp_path: Path):
+    """A declaration nothing reads is a lie the board tells its author. `route.krt_plan` takes
+    `planes=` only above two layers and pours `GND` on `B.Cu` itself below that — so `planes=` on a
+    two-layer board pours nothing, and until the `power_moves` review nothing noticed: `Board()`
+    accepted it, the router ignored it, the ampacity measurement exempted the net **because of it**,
+    and `FAB_NOTES.md` called a rail poured that had no pour. Both halves are refusals now."""
+    from pcbc.language import check_board
+
+    two = tmp_path / "two.py"
+    two.write_text(
+        ROBUST_HEAD.format(layers=2, stackup="jlcpcb_2l_1oz").replace(
+            'Board(width=40, height=25, layers=2, stackup="jlcpcb_2l_1oz")',
+            'Board(width=40, height=25, layers=2, stackup="jlcpcb_2l_1oz", planes=[("GND", "B.Cu")])',
+        )
+    )
+    assert check_board(two, pcb=False)[:1] == [
+        "line 5: Board(planes=[['GND', 'B.Cu']], layers=2): a 2-layer board pours only GND on B.Cu, "
+        "which pcbc writes itself — drop planes=, or move to a 4-layer stackup"
+    ], check_board(two, pcb=False)[:1]
+    ghost = tmp_path / "ghost.py"
+    ghost.write_text(
+        ROBUST_HEAD.format(layers=4, stackup="jlcpcb_4l_1oz").replace(
+            'Board(width=40, height=25, layers=4, stackup="jlcpcb_4l_1oz")',
+            'Board(width=40, height=25, layers=4, stackup="jlcpcb_4l_1oz", planes=[("GND", "In5.Cu")])',
+        )
+    )
+    assert check_board(ghost, pcb=False)[:1] == [
+        "line 5: Board(planes=[('GND', 'In5.Cu')]): jlcpcb_4l_1oz has no copper layer In5.Cu; "
+        "it has B.Cu, F.Cu, In1.Cu, In2.Cu"
+    ], check_board(ghost, pcb=False)[:1]
+    # node's own declaration is the control: four layers, both layers real, and no refusal.
+    ok = tmp_path / "ok.py"
+    ok.write_text(
+        ROBUST_HEAD.format(layers=4, stackup="jlcpcb_4l_1oz").replace(
+            'Board(width=40, height=25, layers=4, stackup="jlcpcb_4l_1oz")',
+            'Board(width=40, height=25, layers=4, stackup="jlcpcb_4l_1oz", planes=[("GND", "In1.Cu")])',
+        )
+    )
+    assert not [f for f in check_board(ok, pcb=False) if "planes" in f], check_board(ok, pcb=False)
+
+
 def test_an_impedance_target_the_fab_cannot_reach_says_so(tmp_path: Path):
     """`z_se_ohm=5` solved to the 6 mm bisection ceiling and printed 'target 5' as if it were met."""
     board = tmp_path / "unreachable.py"

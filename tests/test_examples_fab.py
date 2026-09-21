@@ -357,6 +357,43 @@ def test_example_builds_to_fab(tmp_path: Path, name: str):
     for net, (carries, under) in sorted(BOTTLENECK[name].items()):
         assert got[net][0] >= carries - 1e-9 and got[net][1] <= under + 1e-9, (name, net, got[net], (carries, under), "BOTTLENECK: a floor that rises and a ceiling that falls")
     assert sorted(n for n, r in bottleneck.items() if r["verdict"] not in ("ok",)) == UNDER[name], (name, {n: r["verdict"] for n, r in bottleneck.items()})
+    # And the same shortfall in the **build's own output**, which is the half that was missing: the
+    # measurement lived in `fab/report.json` and `FAB_NOTES.md` while `pcbc build` printed
+    # `copper: verified`, `error: null` and exited 0 on three boards with a rail under its declared
+    # current. One move per `UNDER` net, in the fab step and at the top of the result.
+    fab_step = next(s for s in result["steps"] if s.get("stage") == "fab")
+    assert [m.split(":")[0] for m in fab_step["power"]] == UNDER[name], (name, fab_step["power"])
+    assert result.get("power", []) == fab_step["power"], (name, result.get("power"))
+    assert (name == "blinky") == ("power" not in result), (name, "a board with nothing to say says nothing")
+    if name == "buck":
+        # And the author who wants the stop gets it, on the same board and the same copper:
+        # `--strict-power` (`PCBC_STRICT_POWER=1`) turns every one of those moves into the fab
+        # gate's error. Re-run of the fab stage alone, on the board the build already routed.
+        import os
+
+        from pcbc.fab import fab_job
+
+        was = os.environ.get("PCBC_STRICT_POWER")
+        os.environ["PCBC_STRICT_POWER"] = "1"
+        try:
+            strict = fab_job(job, routed_pcb, out_dir=tmp_path / "strict", design=load_board(board))
+        finally:
+            os.environ.pop("PCBC_STRICT_POWER", None) if was is None else os.environ.update({"PCBC_STRICT_POWER": was})
+        assert strict["error"] == "power: " + "; ".join(fab_step["power"]), strict["error"]
+        assert "## Power, end to end" in (tmp_path / "strict" / "FAB_NOTES.md").read_text(), "a stopped build still writes the ledger it stopped on"
+        # Verbatim, because every clause of it was wrong once. The **coordinate** and not the pad
+        # pair: `C_IN1.1->R_EN.1` is an alphabetical tie member — `R_EN` is a 100 k enable pull-up
+        # drawing 0.12 mA — while the 2 A path is `J_IN.1->U1.3`, so "move those two parts closer"
+        # named two parts not on the rail. **No pour clause**: buck is two layers, where
+        # `route.krt_plan` reads `planes=` not at all, so that edit would have poured no copper and
+        # marked `VIN` zoned, silencing this very line. And an **edit to the NetReq that exists**:
+        # a second `NetReq("VIN", ...)` is refused twice over before the board is drawn.
+        assert fab_step["power"] == [
+            "VIN: declared 2 A, carries 1.21 A through its narrowest 0.3905 mm track at "
+            "13.75,9.075 on F.Cu (19.394 mm of this net is narrower than its 0.781 mm class; "
+            "path C_IN1.1->R_EN.1). Place() the parts either side of that copper closer together, "
+            'or change amps= on the NetReq that already declares "VIN"'
+        ], fab_step["power"]
     taps = [m for m in route["pattern_moves"] if m.startswith("tap ")]
     if name == "node":
         assert taps[0].splitlines()[0] == (

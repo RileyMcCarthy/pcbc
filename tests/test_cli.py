@@ -1,4 +1,5 @@
 import json
+import os
 import shutil
 from pathlib import Path
 
@@ -243,3 +244,77 @@ def test_check_constraints_on_an_example_prints_every_number_with_its_source(tmp
     assert lines[:-2] == expected, lines[:-2]
     assert lines[-2] == "classes: Default 0.16/0.16, Power 0.781/0.2 via 0.8/0.4, SwitchNode 0.3/0.2 via 0.6/0.3, Analog 0.2/0.2 via 0.6/0.3"
     assert lines[-1].startswith("rules: ") and "canary on net " in lines[-1]
+
+
+# ---------------------------------------------------------------------------------------------
+# A rail that cannot carry its declared current is the one thing a *passing* build says that a
+# reader must not scroll past. Until now it said it only in `fab/report.json` and `FAB_NOTES.md`
+# while the build printed `copper: verified`, `error: null` and exited 0 (docs/r2-measurements.md,
+# "Power, in the build's own words").
+# ---------------------------------------------------------------------------------------------
+
+
+def test_build_prints_the_power_moves_on_stderr_and_still_exits_zero(monkeypatch, capsys):
+    """The default: a move, loudly, and exit 0. The copper that necks is KRT's leftover and R3's
+    maze router owns it — a gate that stops three of five example boards on a fault the tool cannot
+    yet repair teaches an author to reach for `--force`, which is worse than a move they read."""
+    move = 'VIN: declared 2 A, carries 1.21 A ... NetReq("VIN", amps=...)'
+    monkeypatch.setattr("pcbc.cli.build_job", lambda *a, **k: {"ok": True, "error": None, "power": [move]})
+    assert main(["build", str(BLINKY)]) == 0
+    cap = capsys.readouterr()
+    assert f"power: {move}" in cap.err, cap.err
+    assert json.loads(cap.out)["power"] == [move], "and in the JSON the next tool reads"
+
+
+def test_strict_power_asks_for_the_stop(monkeypatch, capsys):
+    """`--strict-power` (or `PCBC_STRICT_POWER=1`) is the author saying "I want the move to stop the
+    build"; `fab_job` turns the moves into its own error. The flag is the only thing the CLI does —
+    the decision lives in the fab gate, next to the measurement it is made of."""
+    monkeypatch.delenv("PCBC_STRICT_POWER", raising=False)
+    seen = {}
+    monkeypatch.setattr(
+        "pcbc.cli.build_job",
+        lambda *a, **k: seen.setdefault("env", os.environ.get("PCBC_STRICT_POWER")) and None or {"ok": True, "error": None},
+    )
+    assert main(["build", str(BLINKY)]) == 0
+    assert seen["env"] is None, "the default is a move, not a gate"
+    seen.clear()
+    assert main(["build", str(BLINKY), "--strict-power"]) == 0
+    assert seen["env"] == "1", seen
+    # And it does not outlive its build. A flag set on the process instead of scoped to the call
+    # turned buck's, c3_usb's and node's own builds into errors later in the same pytest session —
+    # which is exactly what a second `main()` call in one process would do to a user.
+    assert "PCBC_STRICT_POWER" not in os.environ, "a strict flag that outlives its build is a leak"
+
+
+def test_strict_flags_put_back_what_was_there_before(monkeypatch):
+    """Including a value the caller set on purpose: the flag restores, it does not delete."""
+    monkeypatch.setenv("PCBC_STRICT_PATTERNS", "keep-me")
+    monkeypatch.setattr("pcbc.cli.build_job", lambda *a, **k: {"ok": True, "error": None})
+    assert main(["build", str(BLINKY), "--strict-patterns", "--strict-power"]) == 0
+    assert os.environ["PCBC_STRICT_PATTERNS"] == "keep-me", os.environ.get("PCBC_STRICT_PATTERNS")
+    assert "PCBC_STRICT_POWER" not in os.environ
+
+
+def test_build_with_no_power_move_says_nothing_about_power(monkeypatch, capsys):
+    monkeypatch.setattr("pcbc.cli.build_job", lambda *a, **k: {"ok": True, "error": None})
+    assert main(["build", str(BLINKY)]) == 0
+    assert "power" not in capsys.readouterr().err
+
+
+def test_strict_power_reads_the_same_spellings_every_other_switch_does(monkeypatch, tmp_path: Path):
+    """`PCBC_STRICT_PATTERNS` has always accepted 1/true/yes/on (`patterns.hard_refusals`), and the
+    first version of this one matched `"1"` exactly — so `PCBC_STRICT_POWER=true` was a silent
+    no-op. A silent no-op on a strictness flag is the worst kind: the author believes the gate is
+    armed and the build says nothing."""
+    from pcbc.fab import _ON
+
+    assert _ON == ("1", "true", "yes", "on")
+    from pcbc.patterns import hard_refusals  # noqa: F401  — the spelling this one is copied from
+
+    import inspect
+
+    from pcbc import fab, patterns
+
+    assert 'os.environ.get("PCBC_STRICT_POWER", "").lower() in _ON' in inspect.getsource(fab.fab_job)
+    assert '("1", "true", "yes", "on")' in inspect.getsource(patterns.hard_refusals)

@@ -141,12 +141,31 @@ def Board(
             f"Board(layers={int(layers)}, stackup={stackup!r}): {stackup} is a {stack.layers}-layer stackup; "
             f"write layers={stack.layers}, or pick a {int(layers)}-layer stackup"
         )
+    # A declaration the router never reads is a lie the board tells its author. `route.krt_plan`
+    # takes `planes=` only when `job.layers > 2` and pours `GND` on `B.Cu` itself below that, so
+    # `planes=` on two layers pours nothing at all — and until the `power_moves` review, nothing
+    # anywhere noticed: `Board()` accepted it, the router ignored it, the ampacity measurement
+    # exempted the net on the strength of it, and `FAB_NOTES.md` reported a rail as poured that had
+    # no pour. Both halves are refusals now, each naming the edit.
+    declared = tuple((str(n), str(l)) for n, l in (planes or ()))
+    if declared and int(layers) <= 2:
+        raise ValueError(
+            f"Board(planes={[list(p) for p in declared]}, layers={int(layers)}): a 2-layer board pours only "
+            f"GND on B.Cu, which pcbc writes itself — drop planes=, or move to a 4-layer stackup"
+        )
+    copper = set(stack.copper_layers())
+    for net, lay in declared:
+        if lay not in copper:
+            raise ValueError(
+                f"Board(planes=[({net!r}, {lay!r})]): {stackup} has no copper layer {lay}; "
+                f"it has {', '.join(sorted(copper))}"
+            )
     spec = BoardSpec(
         size_mm=(w, h),
         layers=int(layers),
         stackup=stackup,
         pcb=pcb,
-        planes=tuple((str(n), str(l)) for n, l in (planes or ())),
+        planes=declared,
         padding=_padding4(padding),
     )
     _doc().board = spec

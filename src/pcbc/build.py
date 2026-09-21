@@ -262,7 +262,17 @@ def build_job(
         src = routed if routed.exists() else placed if placed.exists() else seed
         job = compile_design(design)
         step = fab_job(job, src, out_dir=layout / "fab", design=design)
-        result["steps"].append({"stage": "fab", "fab": step.get("fab"), "error": step.get("error")})
+        # `power` is a move, not a gate (`ampacity.power_moves`): the rails whose narrowest series
+        # copper cannot carry what `NetReq(amps=)` declares, each naming the edits that fix it. It
+        # rides in the build's own output because the shortfall used to live only in `FAB_NOTES.md`
+        # while the build printed `copper: verified` and exited 0 — an AI reading that shipped buck
+        # with 1.21 A of copper on a 2 A rail. `--strict-power` makes it stop the build instead.
+        moves = step.get("power_moves") or []
+        result["steps"].append(
+            {"stage": "fab", "fab": step.get("fab"), "power": moves, "error": step.get("error")}
+        )
+        if moves:
+            result["power"] = moves
         if step.get("error"):
             result["error"] = step["error"]
             return result

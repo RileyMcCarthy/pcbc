@@ -718,8 +718,14 @@ def ipc2221_width_mm(
     area = (amps / (k * (dt**0.44))) ** (1 / 0.725)
     thick_mil = OZ_MIL * copper_oz
     width_mil = area / thick_mil
-    return round(max(0.15, width_mil * 0.0254), 3)
+    return round(max(WIDTH_FLOOR_MM, width_mil * 0.0254), 3)
 
+
+WIDTH_FLOOR_MM = 0.15
+"""pcbc's manufacturability floor, and **not** a point on any curve: `ipc2221_width_mm` never
+returns less than this however small the current. A rail whose copper is under it is under a
+constant, so no `NetReq(amps=)` an author can write will clear that verdict — which is why
+`ampacity.power_moves` leaves the amps edit out of the move when the floor is what it is under."""
 
 IPC2152_MIN_AMPS = 0.274  # the universal-chart fit's range (C.6): 0.274 to 26 A,
 IPC2152_MAX_AMPS = 26.0  # on boards 0.72 to 2.36 mm thick. Outside it the fit extrapolates and

@@ -78,7 +78,7 @@ def test_a_net_is_as_good_as_its_narrowest_series_copper_and_not_its_widest():
     wide = power_bottlenecks(job, _board("0.781").replace("VBUS", "VIN"))["VIN"]
     assert wide["verdict"] == "ok" and wide["carries"] == 1.999 and wide["under_mm"] == 0.0
     assert bottleneck_lines({"VIN": r}) == [
-        "VIN: J1.1->U1.1 carries 1.21 A of 2 A through its narrowest 0.3905 mm track "
+        "VIN: J1.1->U1.1 carries 1.21 A of 2 A through its narrowest 0.3905 mm track at 15,1 on F.Cu "
         "(10 mm under the 0.781 mm class, IPC asks 0.781 mm) [under current]"
     ]
 
@@ -189,3 +189,159 @@ def test_same_net_copper_closer_than_the_floor_is_counted_unless_copper_fills_it
         "(start 0 0.45) (end 10 0.45) (width 0.4) (layer \"F.Cu\") (net 2)",
     )
     assert same_net_slots(other, 0.0889) == [], "a different-net pair is the clearance table's question, not this one"
+
+
+def _row(**kw) -> dict:
+    row = {
+        "net": "VIN",
+        "amps": 2.0,
+        "carries": 1.21,
+        "width_mm": 0.3905,
+        "kind": "track",
+        "where": "C_IN1.1->R_EN.1",
+        "at_mm": "17.4,10.8 on F.Cu",
+        "need_mm": 0.781,
+        "class_mm": 0.781,
+        "under_mm": 19.394,
+        "zoned": False,
+        "verdict": "under current",
+    }
+    row.update(kw)
+    return row
+
+
+def test_power_moves_says_only_what_is_wrong_and_what_to_edit():
+    """The half the measurement was missing: the build printed `copper: verified` and exited 0 while
+    `fab/report.json` held a 2 A rail carrying 1.21 A. `bottleneck_lines` is the ledger — every power
+    net, passing or not. `power_moves` is the move — only the nets that fail, each naming the edits."""
+    from pcbc.ampacity import power_moves
+
+    rows = {
+        "VIN": _row(),
+        "5V": _row(net="5V", carries=1.999, amps=2.0, under_mm=0.0, verdict="ok"),
+        "GND": _row(net="GND", zoned=True, verdict="under current"),
+    }
+    got = power_moves(rows, ("F.Cu", "In1.Cu", "In2.Cu", "B.Cu"))
+    assert len(got) == 1, got
+    assert got[0] == (
+        "VIN: declared 2 A, carries 1.21 A through its narrowest 0.3905 mm track at 17.4,10.8 on F.Cu "
+        "(19.394 mm of this net is narrower than its 0.781 mm class; path C_IN1.1->R_EN.1). "
+        "Place() the parts either side of that copper closer together, or pour it: "
+        'add ("VIN", "In1.Cu") to your Board(planes=...), or change amps= on the NetReq that '
+        'already declares "VIN"'
+    ), got[0]
+    # Every edit is an edit to a line the board already has. A second `NetReq("VIN", ...)` is
+    # refused twice over — `kind="generic"` takes no `amps=`, and the net is already named by
+    # another NetReq — and a second bare `Board()` raises at load, before `check` runs.
+    assert "NetReq(\"VIN\", amps=" not in got[0] and "Board(planes=[(" not in got[0], got[0]
+    # A poured net is exempt for the same reason `power_bottlenecks` does not walk it: the plane is
+    # the conductor. A passing net says nothing at all, which is what makes the list readable.
+    assert power_moves({"GND": _row(net="GND", zoned=True)}, ("F.Cu", "B.Cu")) == []
+    assert power_moves({"5V": _row(net="5V", verdict="ok")}, ("F.Cu", "B.Cu")) == []
+
+
+def test_the_pour_move_is_only_offered_where_pcbc_actually_pours():
+    """Three ways this move was wrong before it was right, and the third is the one that matters.
+
+    It named `In1.Cu` to a two-layer board, which is a second error to debug. It named `In1.Cu` to
+    node, which is where node's `GND` plane is — a second plane over the ground plane, on a board
+    whose own D.5 check then asks why `GND` is in two pieces. And on two layers it named `B.Cu` at
+    all: `route.krt_plan` reads `planes=` only when `job.layers > 2`, so that edit pours **no
+    copper whatever** while `power_bottlenecks` would have marked the net zoned and stopped
+    measuring it. A move that makes the warning go away and the board no better is worse than none.
+    """
+    from pcbc.ampacity import power_moves
+
+    two = power_moves({"VIN": _row()}, ("F.Cu", "B.Cu"))[0]
+    assert "Board(planes" not in two and "pour" not in two, two
+    assert "Place()" in two and 'change amps= on the NetReq that already declares "VIN"' in two, two
+    four = power_moves({"VIN": _row()}, ("F.Cu", "In1.Cu", "In2.Cu", "B.Cu"))[0]
+    assert 'add ("VIN", "In1.Cu") to your Board(planes=...)' in four, four
+    # node's own stackup: both inner layers already poured, so there is no plane layer to offer.
+    node = power_moves(
+        {"VBUS": _row(net="VBUS")},
+        ("F.Cu", "In1.Cu", "In2.Cu", "B.Cu"),
+        (("GND", "In1.Cu"), ("3V3", "In2.Cu")),
+    )[0]
+    assert "Board(planes" not in node and "In1.Cu" not in node and "In2.Cu" not in node, node
+    # One inner free: that one, and never an outer layer of a four-layer board, where the parts are.
+    one = power_moves({"VIN": _row()}, ("F.Cu", "In1.Cu", "In2.Cu", "B.Cu"), (("GND", "In1.Cu"),))[0]
+    assert 'add ("VIN", "In2.Cu") to your Board(planes=...)' in one, one
+
+
+def test_a_declared_plane_never_exempts_a_net_that_has_no_zone():
+    """The other half of the same trap, in the measurement rather than the move: `zoned` is the zone
+    in the routed **file** and not `Board(planes=...)`. A predictive exemption would have let the
+    pour move silence a two-layer rail that was never poured — and on a four-layer board a pour that
+    failed would go unmeasured, which is the case the exemption exists to catch."""
+    job = compile_design(load_board(EXAMPLES / "node" / "node.py"))
+    assert job.planes, "node declares two planes, so this test is asking something"
+    bare = _board("0.127").replace("VBUS", "3V3")
+    assert power_bottlenecks(job, bare)["3V3"]["verdict"] == "under current", "declared, not poured, still measured"
+
+
+def test_power_moves_separates_the_curve_from_the_floor_and_the_open():
+    """The three verdicts are three different faults and the move has to read as three different
+    sentences. c3_usb's `VBUS` is `under floor` — 0.127 mm carries 0.536 A of its 0.5 A on the IPC
+    curve with 7 % margin, and is under pcbc's own 0.150 mm manufacturability floor. An `open` is a
+    tool bug: the copper gate already refuses an unrouted net, so nothing an author edits fixes it."""
+    from pcbc.ampacity import power_moves
+
+    floor = power_moves(
+        {"VBUS": _row(net="VBUS", amps=0.5, carries=0.536, width_mm=0.127, need_mm=0.15, class_mm=0.4, under_mm=24.068, verdict="under floor")},
+        ("F.Cu", "B.Cu"),
+    )[0]
+    assert "carries 0.536 A of 0.5 A on the curve" in floor and "under pcbc's 0.15 mm floor" in floor, floor
+    assert "declared 0.5 A, carries" not in floor, floor
+    opened = power_moves({"VIN": _row(carries=None, kind="open", verdict="open")}, ("F.Cu", "B.Cu"))[0]
+    assert "no copper joins C_IN1.1->R_EN.1" in opened and "report it" in opened, opened
+    assert "Place()" not in opened, "an open rail is not something a Place() line fixes"
+
+
+def test_power_moves_survives_a_row_with_no_verdict_key():
+    """`bottleneck_lines` reads `r['verdict']` and would KeyError; a row that predates the field is
+    `ok` by the dataclass's own default, and a move that raises is worse than a move that is quiet."""
+    from pcbc.ampacity import power_moves
+
+    row = _row()
+    row.pop("verdict")
+    assert power_moves({"VIN": row}, ("F.Cu", "B.Cu")) == []
+
+
+def test_an_unmeasured_net_is_not_a_shortfall():
+    """A net with fewer than two pads is never walked, so `carries` stays `math.inf` and `width_mm`
+    stays 0.0 — and the floor test, `0.0 < need_mm`, was always true, stamping it `under floor`.
+    `bottleneck_lines` papered over it ("carries 0 A" inside a ledger where every net appears);
+    `power_moves` turned it into a claim about copper nobody measured, with an empty location, and
+    under `--strict-power` it failed the build on a net with no measured shortfall at all."""
+    import math
+    from dataclasses import asdict
+
+    from pcbc.ampacity import Bottleneck, _verdict, power_moves
+
+    unwalked = Bottleneck(
+        net="VREF", amps=0.5, carries=math.inf, width_mm=0.0, kind="track", where="",
+        need_mm=0.4, class_mm=0.4, under_mm=0.0, zoned=False,
+    )
+    assert _verdict(unwalked).verdict == "ok", "nothing was measured, so nothing is wrong"
+    assert power_moves({"VREF": asdict(_verdict(unwalked))}, ("F.Cu", "B.Cu")) == []
+    # And the branch still fires on a row that WAS walked and really is under the floor.
+    walked = Bottleneck(**{**asdict(unwalked), "carries": 0.6, "width_mm": 0.127, "where": "A.1->B.1"})
+    assert _verdict(walked).verdict == "under floor", walked
+
+
+def test_the_move_names_where_the_copper_is_and_not_the_pair_that_found_it():
+    """`where` is a pad pair, and every pair whose path crosses one neck ties at that neck's amps —
+    so the reported pair is the first in sorted order among the tied ones. buck's is
+    `C_IN1.1->R_EN.1`, a 100 k enable pull-up drawing 0.12 mA, while its 2 A path is `J_IN.1->U1.3`.
+    "Move those two parts closer" named two parts that are not on the rail; the coordinate is."""
+    from pcbc.ampacity import power_moves
+
+    got = power_moves({"VIN": _row()}, ("F.Cu", "B.Cu"))[0]
+    assert "at 17.4,10.8 on F.Cu" in got and "path C_IN1.1->R_EN.1" in got, got
+    assert "those two parts" not in got, got
+    # A row from before the field, or a via with no hull: the pair is all there is, and it says so.
+    row = _row()
+    row.pop("at_mm")
+    old = power_moves({"VIN": row}, ("F.Cu", "B.Cu"))[0]
+    assert "on the C_IN1.1->R_EN.1 path" in old and "path C_IN1.1->R_EN.1)" not in old, old

@@ -1092,6 +1092,11 @@ answer is to move that pattern's share into pcbc — not a third workaround.
 - `--strict-patterns` / `PCBC_STRICT_PATTERNS=1` makes every refusal fatal. R3 flips the default.
 - `PCBC_PATTERNS=off` restores today's plan **exactly** — one env check around one call. It is the
   difference between a bad pattern being a rollback and being a revert.
+- `--strict-power` / `PCBC_STRICT_POWER=1` is the same hatch for a different fault: a rail whose
+  narrowest series copper cannot carry its declared current (`ampacity.power_moves`). The default
+  is a printed move and exit 0, because the copper that necks is the leftover router's and R3
+  owns it — a gate that stops three of the five example boards on a fault the tool cannot yet
+  repair teaches an author to reach for `--force`. R3 flips this default too.
 
 ---
 

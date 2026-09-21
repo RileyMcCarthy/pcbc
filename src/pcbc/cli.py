@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import os
 import json
 import sys
@@ -35,6 +36,11 @@ def main(argv: list[str] | None = None) -> int:
         "--strict-patterns",
         action="store_true",
         help="fail the build on any pattern refusal, not only a hard one (docs/r2-design.md C.6)",
+    )
+    bd.add_argument(
+        "--strict-power",
+        action="store_true",
+        help="fail the build when a rail cannot carry its declared current, instead of printing it as a move",
     )
     bd.set_defaults(func=cmd_build)
 
@@ -102,17 +108,42 @@ def cmd_check(args: argparse.Namespace) -> int:
     return 0
 
 
+@contextlib.contextmanager
+def _env(values: dict[str, str]):
+    """Set these environment variables for the block and put the old ones back, whatever happens."""
+    before = {k: os.environ.get(k) for k in values}
+    os.environ.update(values)
+    try:
+        yield
+    finally:
+        for k, old in before.items():
+            if old is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = old
+
+
 def cmd_build(args: argparse.Namespace) -> int:
     path = Path(args.board)
     if not path.exists():
         print(f"no such file: {path}", file=sys.stderr)
         return 2
-    if getattr(args, "strict_patterns", False):
-        # C.6's escape hatch, the other way round: a refusal is a printed move and a fall-through to
-        # KRT in R2, and this says "I want the move to stop the build". R3 flips the default.
-        os.environ["PCBC_STRICT_PATTERNS"] = "1"
-    result = build_job(path, upto=args.upto, force=args.force)
+    # C.6's escape hatches: a refusal (and, since `power_moves`, a rail under its declared current)
+    # is a printed move and a fall-through in R2, and these say "I want the move to stop the build".
+    # R3 flips both defaults. Scoped to this one call rather than set on the process: a flag that
+    # outlives its build turned three example boards' own builds into errors inside one pytest
+    # session, which is the same leak a user gets from a second `main()` call in one process.
+    strict = {
+        "PCBC_STRICT_PATTERNS": getattr(args, "strict_patterns", False),
+        "PCBC_STRICT_POWER": getattr(args, "strict_power", False),
+    }
+    with _env({k: "1" for k, on in strict.items() if on}):
+        result = build_job(path, upto=args.upto, force=args.force)
     print(json.dumps(result, indent=2, default=str))
+    # On stderr as well as in the JSON: a rail that cannot carry its declared current is the one
+    # thing a passing build says that a reader must not scroll past (`ampacity.power_moves`).
+    for line in result.get("power") or []:
+        print(f"power: {line}", file=sys.stderr)
     if result.get("error"):
         print(result["error"], file=sys.stderr)
         return 1

@@ -6,18 +6,20 @@ import csv
 import io
 import json
 import math
+import os
 import re
 import shutil
 import subprocess
 from pathlib import Path
 
-from .ampacity import bottleneck_lines, power_bottlenecks
+from .ampacity import bottleneck_lines, power_bottlenecks, power_moves
 from .apply import write_dru
 from .check import check_job
 from .compile import CompiledJob
 from .copper import power_ampacity_failures, unrouted_nets, vias_on_no_via_nets
 from .dru import soft_kind
 from .project import copy_with_siblings
+from .route import copper_layers
 from .silk import silk_job
 from .geom import footprint_box_local
 from .sexp import (
@@ -45,6 +47,12 @@ def _default_fab_dir(pcb: Path) -> Path:
     if pcb.parent.name in ("routed", "placed"):
         return pcb.parent.parent / "fab"
     return pcb.parent / "fab"
+
+
+_ON = ("1", "true", "yes", "on")
+"""How every pcbc environment switch is read (`patterns.hard_refusals`). One spelling across the
+tool: `PCBC_STRICT_POWER=true` meaning "off" is a silent no-op, and a silent no-op on a strictness
+flag is the worst kind."""
 
 
 def copper_gerber_layers(n: int) -> str:
@@ -720,8 +728,20 @@ def fab_job(
     amp = power_ampacity_failures(job, text, owned=_owned_copper(pcb))
     result["ampacity"] = amp
     result["ampacity_bottleneck"] = power_bottlenecks(job, text)
+    # The measurement only counted while it sat in `FAB_NOTES.md`: the build printed
+    # `copper: verified`, `error: null`, exit 0, and an AI reading that shipped buck with 1.21 A of
+    # copper on a 2 A rail. `power_moves` carries the non-`ok` rows out as moves, `build.py` puts
+    # them in the build's own output and the CLI prints them on stderr, and `--strict-power`
+    # (`PCBC_STRICT_POWER=1`) turns them into this gate's error for an author who wants the stop.
+    result["power_moves"] = power_moves(
+        result["ampacity_bottleneck"], copper_layers(job.layers), job.planes
+    )
     if amp:
         result["error"] = "; ".join(amp)
+        _write_notes(out_dir, job, result)
+        return result
+    if result["power_moves"] and os.environ.get("PCBC_STRICT_POWER", "").lower() in _ON:
+        result["error"] = "power: " + "; ".join(result["power_moves"])
         _write_notes(out_dir, job, result)
         return result
 

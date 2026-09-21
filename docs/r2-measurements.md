@@ -1417,3 +1417,247 @@ the env spellings, that the flag does not outlive its build, that a value the ca
 and silence when there is nothing to say), `test_examples_fab.py` (the move list equals `UNDER` per
 board, buck's line verbatim, and `--strict-power` turning that same board's build into an error
 while still writing the ledger it stopped on).
+
+---
+
+## S6 — chain, and the hard refusal that was standing in for a gate
+
+The `chain` pattern shipped with one **hard** refusal — the only one in the repo — and a hard refusal
+aborts the build before KRT runs (`route.py` lines 447 and 493). It fired on the DS2 Addon's
+`Chain("VDDA", "J2.1", "C4.1", "U1.12")`, which is the *only* declared chain in the repo that is not
+a pair, so the one board with the feature no longer built. This section is what happened when that
+was measured instead of argued, and what replaced it. Everything below was re-derived on 2026-09-20
+against the checked-in placed and routed boards; the DS2 Addon's tree was read and never written.
+
+### The link the pattern cannot write, and why that part is correct
+
+ds2's `VDDA` chain makes link 1 and refuses link 2. On the build's own path (`pre` hops, then the
+fanout, then `mid`) link 1 is **14.3841 mm** over 5 pieces from `J2.1` into `C4.1`; on the
+placed-board-only path the unit tests drive it is 14.5012 mm over 3. The geometry around link 2, off
+the placed board after pre and fanout:
+
+| item | box (mm) | note |
+|---|---|---|
+| `C4.1` | 19.880..20.780 x 5.966..6.916 | centre (20.330, 6.4411), F.Cu |
+| `U1.12` | 22.6585..23.0015 x 8.4645..10.1955 | centre (22.830, 9.330), F.Cu |
+| `C5.1 [3V3]` | 21.730..22.630 x 5.966..6.916 | between them, at `C4.1`'s own `y` |
+| `C5.2 [GND]` | 23.280..24.180 x 5.966..6.916 | |
+| `U1 lane top` | 20.0..25.0 x 7.1711..8.4645 | `fanout`'s reserved lane, F.Cu **and** B.Cu |
+| `U1.12` escape | (22.83,9.33)->(22.83,8.05), via dia 0.5 | already down when the chain runs |
+
+Exits: 3 from `C4.1`, 2 from `U1.12`. Airwire `C4.1 -> U1.12` = **3.8204 mm**. Five candidates reach
+the clearance judge and every one is blocked by real copper with a real number — the table is in
+`chain.ELBOWS`' docstring. **It is not an enumeration bug.** `link_candidates` builds every candidate
+point out of `ax, ay, bx, by` and `elbows` puts its corner at `(bx, ay)` or `(ax, by)`, so all 96
+candidate points across all 3 x 2 exit pairs lie inside the two exits' own bounding box
+(x 20.3300..22.8300, y 5.6410..10.5206). The route this link needs leaves that box on **both** axes.
+A fixed ~7-shape enumeration between pad exits structurally cannot express it, that is R3's maze
+router's job, and refusing is the correct behaviour.
+
+**Three things the refusal's own story got wrong**, all found by re-running it rather than reading it:
+
+1. The `0.075 mm of air where the Power class needs 0.200` in `ELBOWS`' docstring is real but is
+   **never printed**. `_link` keeps the worst clash by `need - have`, and that is a different `L-h*`
+   candidate running along `y` 6.4411 straight *through* `C5.1`'s pad at **-0.350**. The move line is
+   therefore derived from the wrong candidate too: it says `Place("C5", toward="up")`, while the near
+   miss wants `C5` 0.125 mm to the **left**.
+2. One candidate sits at exactly the limit — but only on a path pcbc does not run, and the review
+   of the review caught that. Driving the mid stage **straight at the placed board** (no `pre`, no
+   fanout), that candidate's worst clash is `U1.13` at a true gap of 0.20009999999999903 mm against
+   `need + EPS_MM` = 0.2001: one ulp short, ~1e-15 mm, not a tie lost in a squared comparison.
+   Re-measured on the **real** sequence (`pre` -> fanout -> `mid`), the fanout copper is down, link 1
+   lands elsewhere, and the same net's clashes become 0.1192, 0.0750, -0.1399, -0.2856, -0.3321 and
+   -0.3500 against 0.200. The closest is short by **0.0809 mm, eight hundred times `EPS_MM`**. So the
+   claim "had it cleared, this chain would be complete" holds for the probe and **not for the build**.
+   `EPS_MM` refuses nothing on the board pcbc actually produces, and is not shaved.
+3. The "0.650 mm corridor between `C5.1` and `C5.2` that misses by `EPS_MM`" story, which the design
+   notes carried, refuses nothing: `route_scene.pad_exits` only ever emits exits on a pad's own
+   centre axes, so `x` 22.955 is not a point any candidate can contain. Anyone reading it as "it
+   misses by a tenth of a micron" chases the wrong fix. The 0.0001 mm that *is* real is item 2.
+
+### The outcome: the pattern is written and not registered
+
+S6 set out to route chains. It ships the **check** and not the pattern, and a real build is what
+decided that. `chain` is absent from `patterns.MID`; `chain.py` and its 17 tests stay whole and are
+driven directly, so nothing rots.
+
+Four configurations were built on ds2 — a board that builds today — and every one broke it:
+
+| what the chain wrote on ds2 | outcome |
+|---|---|
+| the whole population, 51 seg / 98.6 mm | `GND` and `VSS` unrouted |
+| implicit links bounded to `CHAIN_HOP_MM`, 18 seg / 30.8 mm | `GND` and `VSS` unrouted |
+| the one declared chain only, 5 seg / 14.4 mm | copper **verified**, then the `GND` plane in 2 islands |
+| every link bounded, 13 seg / 16.4 mm on three short local runs | `GND` and `VSS` unrouted |
+
+**The last row is the one that decided it.** 16.4 mm of short, local, entirely legal copper on the
+far side of a 47 x 25.4 mm board. None of it within 3.4 mm of the tap that fails; none of it on the
+layer of the plane that splits. Locked copper moves KRT, and KRT's own copper closes the escape two
+stages later. That is not a bound problem, and four bounds proved it: the failure moved rather than
+went away. The other four boards agree in the smaller way — registered, `test_examples_fab` fails on
+buck, c3_usb and node (node's `angles` 102 against a ceiling of 100), and only blinky is untouched.
+
+`spine.WIDE_MM` is the precedent and it is the same board: S7 measured that ds2's 0.25 mm power nets
+could not take a spine either, because locked copper takes the corridors its constrained nets need,
+and excluded them rather than tuning until they passed. What this needs is a router that can search,
+which is R3's.
+
+**`CHAIN_HOP_MM` stayed anyway**, applied to every link, declared or not. `route_checks` already owns
+the number with the sentence attached — "a chain hop the placement made: its corridor is checked; a
+longer one is the router's" — and `hop.HOP_MM` exists for the same reason. A declaration says which
+order the author wants; it does not give a fixed ~7-shape enumeration a search it does not have. On
+ds2 that turns the declared `VDDA` into a distance refusal at link 1 (13.04 mm against 8), and the
+refusal's own last clause is the architecture: "the run is the router's and the order is read back
+off the finished board instead".
+
+Built, all five, `pcbc build --force`, **exit 0 on every one**, with the new gate running:
+
+| board | copper | chains checked |
+|---|---|---|
+| blinky | verified | none declared |
+| buck | verified | none declared |
+| c3_usb | verified | `USB_DP` spur, `USB_DN` spur |
+| node | verified | `USB_DP` held, `USB_DN` spur |
+| ds2 | verified | `VDDA` **held** |
+
+Suite: **517 passed** with `PCBC_REQUIRE_KICAD=1 PCBC_REQUIRE_KRT=1`, from 492 before the slice.
+
+**Three declared chains in this repo are violated on their own boards and nothing had ever looked.**
+c3_usb's `USB_DP` and `USB_DN` and node's `USB_DN` route connector to module while the ESD part sits
+on a spur off the run — c3_usb's `USB_DN` never comes within 2.58 mm of `U3.3`'s pad. They are pair
+nets, so R4 owns that copper and the gate reports rather than stops (C.6's argument, the same one
+`--strict-power` makes). They are real, they predate S6, and connectivity cannot see them: a netlist
+gate is order-blind by construction, which is the whole reason R-X4 was specified with a **V** half.
+
+### What KRT does instead, and the measurement that retired the hard refusal
+
+The justification for `hard` was, verbatim from `Refusal.hard`: falling through to KRT "would produce
+copper that violates the intent rather than merely a worse route, because KRT would branch". On the
+checked-in routed board, KRT routes `C4.1 -> U1.12` the long way round — out to `x` 26.3, up the
+right-hand edge and back left into the fanout via:
+
+```
+(20.35,6.45) -> (22.75,4.05) -> (25.8,4.05) -> [four 0.05 mm staircase jogs] -> (26.3,4.45)
+             -> (26.3,6.9) -> (25.15,8.05) -> (22.85,8.05) -> (22.83,9.33)
+```
+
+**14.7663 mm over 11 segments and 10 direction changes** (six real corners; four are sub-0.08 mm grid
+jogs) for a 3.8204 mm airwire — a **3.87x** detour. The whole net is 29.4483 mm of copper, 43
+segments and one via.
+
+And the order **holds**. The `VDDA` graph has three degree-1 vertices — `J2.1` at (8.9,12.7),
+`C4.1`'s pad at (20.33,6.4411), `U1.12` at (22.83,9.33) — and exactly one degree-3 vertex, at
+(20.35,6.45), which is **inside `C4.1`'s own pad copper**:
+
+- 0.021891 mm from the pad centre (**not** the 12.6 um an earlier note claimed);
+- **0.4300 mm inside** the roundrect outline;
+- **1.1185 mm** of the trunk's centre line lies inside the pad's copper (0.5687 in, 0.5498 out).
+
+So KRT did not branch away from the cap: it ran **one straight 45-degree trace across the cap's pad**
+— the two through-edges leave that vertex at -45.00 and 135.00 degrees, exactly collinear — and
+tacked on 21.9 um of bookkeeping copper to the pad centre. The declared order is in the board.
+
+**The premise was not merely unproven; it was contradicted on the one board that could test it.** And
+worse: the invariant the abort protected was checked **nowhere**. `docs/router-plan.md` line 202 tags
+R-X4 "**P** (chain), **V**" and nothing in `route_verify.py`, `dru.py`, `copper.py`, `review.py`,
+`check.py` or `build.py` read a declared order off a finished board. `verify_copper` is called once,
+from `patterns/__init__.py`, on `plan.pieces` — pcbc's own copper, inside the pattern stage.
+`netcheck.check_copper` is KiCad DRC plus netlist connectivity, which is order-blind by construction.
+`route_checks.check_chains` is a placement check over pad centres and says **nothing** about this
+chain at all, because it measures a straight centre-line corridor and this link runs at 49.1 degrees.
+The build-aborting refusal was the only thing in the repo with an opinion about chain order, and it
+had that opinion about **one net in five**.
+
+### Three things the measurement does *not* say, recorded because they were nearly claimed
+
+1. **"KRT does not branch" is false as a general claim.** Degree>=3 track junctions that are *not*
+   inside a pad of their own net, counted on the checked-in routed boards: blinky 0, buck 4
+   (all `GND`), c3_usb 12, node 17, **ds2 8** — and the c3_usb and node counts include `USB_DN` and
+   `USB_DP` themselves, the declared chains. KRT tees mid-trace on multi-pad nets routinely, on the
+   very board this argument is being made about. What ds2 shows is that on **this net** the branch
+   landed inside the station's pad, which is an outcome and not a property.
+2. **The routed board was produced without any chain copper.** Its steps are the pre-R2 chain
+   (`00_fanout` ... `05_finalize`) and the only locked `VDDA` segment in it is the fanout escape, so
+   KRT had a free hand over the net. Under a soft refusal pcbc hands KRT a **14.3841 mm locked link-1
+   track** from `J2.1` into `C4.1` that KRT has never seen, and KRT could legally tee off the middle
+   of it. Nothing measures that configuration, and this slice does not pretend to.
+3. **Which is exactly why the answer is a verifier and not a different assumption.** The gate reads
+   the board that is actually produced, whatever KRT does with whatever input it is given. That turns
+   the question from "what will KRT do" into "what did KRT do", which is this project's own rule.
+
+### The verifier: `route_verify.chain_order`
+
+One verdict per declared `Chain()`, read off the routed board:
+
+1. **Joined** — for each consecutive pair of the declared order there is a path through touching
+   copper: every track, via and **pad** of the net, because a pad is copper and a run that lands on a
+   third pad of the same net and leaves it is a path the board really has.
+2. **Through, not past** — for each *intermediate* stop, removing that pad's copper **region** must
+   disconnect its two neighbours. A stop still bypassed once its pad is gone was never in the path.
+
+**One honest note on the citation.** R-X4's own text scopes itself to a *high-speed* net, while this
+gate reads every declared `Chain()` — ds2's `VDDA` is Power class. The widening is deliberate: B.2's
+rule is "the chain goes through its pads in order", and a bypass cap fed as a spur is the same defect
+as a signal stub whatever the class. It is worth writing down because it cuts the other way too — the
+invariant the hard refusal was enforcing was already broader than the rule it cited.
+
+**Region, not node, and that is the whole design.** A graph cut-vertex reading of "the stop is in the
+path" **fails ds2**: the two through-edges at (20.35,6.45) are collinear, so deleting the vertex
+leaves `J2.1` connected to `U1.12` and `C4.1` reads as a leaf on a 21.9 um stub. Removing the pad's
+copper instead cuts the trunk into two arms 1.12 mm apart with nothing between them, which is what
+the copper physically is.
+
+A track is cut where its centre line crosses the station's outline, found by ternary search plus two
+bisections (`CHAIN_BISECT` = 64): the distance from a point to a convex hull is convex along a line,
+so the interval within `d` of one pad primitive is single and closed. Both ends are taken from the
+inside, so the check never removes more copper than the pad covers.
+
+**The tolerance is `stackup.clearance_min`** — the pad is dilated by it before removal, so a junction
+just *outside* a stop still counts as feeding through. It is `chain.stub_need`'s own number (S6
+decision 1) and the one `route.py` hands KRT as `--same-net-pad-clearance`, on the argument that
+copper closer together than a fab's minimum clearance is not two separable things. **It decides
+nothing here**: swept 0.0 -> 2.0 mm, every one of the five declared chains keeps its verdict. The
+nearest flip is node's `USB_DN` at 2.5 mm and c3_usb's at 3.0 mm — 28x and 24x their own process
+floors (0.0889 and 0.127 mm).
+The gap between the closest pass (0.43 mm *inside* a pad) and the closest fail is about 3 mm wide.
+
+### What the gate found the moment it existed
+
+| board | chain | verdict |
+|---|---|---|
+| ds2 | `VDDA` (`Chain line 97`) | **held** |
+| c3_usb | `USB_DP` | held |
+| c3_usb | `USB_DN` | **spur** — `U3.3` is off the feed |
+| node | `USB_DP` | held |
+| node | `USB_DN` | **spur** — `U3.4` is off the feed |
+
+Identical on each board's `routed/` and `fab/` files. c3_usb's `J1.A7 -> U1.26` copper reaches
+`U1.26` through the via at (17.45,19.45) and `U3.3`/`U3.4` hang off that via on a branch; removing
+`U3.3`'s pad leaves the two ends joined. **Two of the four pair chains in this repo ship with their
+declared order violated**, and nothing had ever said so.
+
+**Fatal for the chains pcbc routes, reported for the ones B.2 hands away.** A `Chain()` on a
+`PairSpec` net is skipped by the pattern with a printed note — "pairs are R4's" — so R2 writes none of
+that copper and KRT writes all of it. Failing the build on it would stop two boards on a fault no part
+of R2 can repair, which is `--strict-power`'s argument in C.6 and gets the same answer: it is a note,
+loudly. Repairing them is a board change *plus* R4's pair router. What changed is that they are no
+longer invisible.
+
+### The escape hatch, and a field with no producer
+
+`Refusal.hard` now has **no producer anywhere in the codebase**: `hop`, `spine`, `tap` and `chain` all
+pass `hard=False`. The field and `hard_refusals()` stay wired, for two reasons that are written into
+`Refusal`'s docstring rather than left to be rediscovered — the two cases the flag genuinely exists
+for are real and unimplemented (`vias=False`, a single-layer net), and `--strict-patterns`
+(`PCBC_STRICT_PATTERNS=1`) reads the same path to make every refusal fatal on demand.
+`test_pattern_chain.py` asserts both halves: nothing is hard without the flag, and with it every
+refusal on ds2 becomes one.
+
+Pinned: `tests/test_route_verify_chains.py` (ds2 held on the board KRT actually routed; the junction's
+0.4300 mm and 1.1185 mm; the synthetic tee that walks the trunk round the pad at 0.3050 mm clearance
+and fails with its move verbatim; `_chain_gate` silent on the real board and stopping the build on the
+mutated one, in `test_examples_fab.py`'s "a gate that cannot fail is not a gate" style; the four pair
+chains as notes; the tolerance sweep and the two boards where it finally flips; a poured net and a
+`Chain()` member that names no pad; determinism) and `tests/test_pattern_chain.py` (every chain
+refusal soft, declared or not; `hard_refusals` empty without the flag and complete with it; ds2's
+refusal still pinned verbatim, now soft).

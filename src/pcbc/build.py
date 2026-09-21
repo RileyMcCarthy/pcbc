@@ -44,6 +44,38 @@ def _plane_gate(routed_text: str, doc) -> dict:
     }
 
 
+def _chain_gate(routed_text: str, design) -> dict:
+    """R-X4's verify half, run in the product: every declared `Chain()`'s order, read off the copper.
+
+    The gate the chain pattern's hard refusal was standing in for. Until this function the pattern
+    refused a link it could not write and **nothing** read the finished board to ask whether the
+    order the author declared had survived in it: `docs/router-plan.md` line 202 tags R-X4 "**P**
+    (chain), **V**" and only the P existed (`docs/r2-measurements.md`, S6). Wired the way `_plane_gate`
+    is — one parse of a file already on disk, in the route step, with a move for its error.
+
+    **Fatal for the chains pcbc routes, reported for the ones B.2 hands away.** A `Chain()` on a net
+    carrying a `PairSpec` is skipped by the pattern with a printed note — "pairs are R4's" — so R2
+    writes none of that copper and KRT writes all of it; failing the build on it would stop a board
+    on a fault the tool cannot yet repair, which is `--strict-power`'s argument in C.6 and the same
+    answer. It is reported rather than swallowed, and the report is not hypothetical: measured
+    2026-09-20, c3_usb's `USB_DN` and node's `USB_DN` ship with their declared order violated on
+    their own checked-in boards — `U3.3` and `U3.4` hang off the feed instead of sitting in it. R4
+    owns routing a pair, and it owns those two lines.
+    """
+    from .compile import compile_design
+    from .route_verify import chain_order
+
+    job = compile_design(design)
+    rows = chain_order(routed_text, design, job.constraints) if job.constraints is not None else ()
+    bad = [r for r in rows if r.verdict in ("spur", "open")]
+    return {
+        "checked": {r.net: r.verdict for r in rows},
+        "fails": [f"{r.net} chain {' -> '.join(r.stations)} ({r.where}): {r.detail} (R-X4). {r.move}" for r in bad if r.owner == "chain"],
+        "notes": [f"{r.net} chain {' -> '.join(r.stations)} ({r.where}): {r.detail} (R-X4), and R2 routes no pair at all, so this copper is KRT's and R4's. {r.move}" for r in bad if r.owner != "chain"]
+        + [f"{r.net} chain ({r.where}): {r.detail}" for r in rows if r.verdict in ("poured", "unresolved")],
+    }
+
+
 def rules_summary(job: CompiledJob) -> dict:
     """What `job.dru` holds, for the one report line `constraints.py` cannot print itself (it sits
     below `dru.py`, so it never sees the rules): every rule pcbc wrote, how many are errors, how many
@@ -253,6 +285,14 @@ def build_job(
         except KicadMissing as exc:
             gate = {"ok": True, "fails": []}
             entry["copper"] = f"unchecked: {exc}"
+        # R-X4's **V**, outside the `try` because it needs no KiCad: one parse of the routed file,
+        # asking whether each declared `Chain()`'s order is in the copper KRT finished. The chain
+        # pattern's refusal is soft (C.6) precisely because this runs.
+        entry["chains"] = _chain_gate(routed.read_text(), design)
+        if entry["chains"]["fails"]:
+            result["steps"].append(entry)
+            result["error"] = "a declared chain is not fed in its order: " + "; ".join(entry["chains"]["fails"])
+            return result
         result["steps"].append(entry)
         if not gate["ok"]:
             result["error"] = "copper is not board.py's netlist, or fails KiCad DRC: " + "; ".join(gate["fails"])

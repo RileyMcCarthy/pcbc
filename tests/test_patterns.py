@@ -1234,7 +1234,11 @@ def test_no_spine_copper_is_ever_narrower_than_its_class():
     """
     for name in ALL:
         plan, _d, job, _t = _mid(name)
-        for p in plan.pieces:
+        # The mid stage is `chain` then `spine` since S6, so the spine's own rule is asked of the
+        # spine's own copper. `chain` writes at a class width too and never necks — `test_pattern_chain`
+        # pins that — but a net with no `NetReq` has no `Constraint` to read a width off, which is
+        # the very case `chain._width` answers out of the Default class.
+        for p in [q for q in plan.pieces if q.reason == "spine"]:
             c = job.constraints.by_net(p.net)
             assert p.w == float(c.width_mm.value), (name, p.net, p.w, "every backbone link is the class width end to end")
     ctx = _spine_ctx("buck")
@@ -1348,8 +1352,10 @@ def test_a_backbone_is_one_run_so_the_turn_at_a_station_is_mitred():
     """
     for name in ALL:
         plan, _d, job, _t = _mid(name)
-        for path in paths_of(plan.pieces):
+        for path in paths_of([p for p in plan.pieces if p.reason == "spine"]):
             assert is_octilinear(path) and turn_ok(path), (name, path)
+        # The self-check is asked of the **whole** stage, chain copper included: D.1 judges the board
+        # and not one pattern's half of it.
         assert verify_copper(plan.scene, plan.pieces, job.constraints, ids=plan.ids) == [], name
     plan, _d, _j, _t = _mid("buck")
     runs = paths_of([p for p in plan.pieces if p.net == "5V"])
@@ -1362,10 +1368,17 @@ def test_a_partial_spine_keeps_both_halves_and_hands_the_rest_to_krt():
     boards it is all of what the pattern writes: not one spine here connects its whole net."""
     for name in ALL:
         plan, _d, _j, _t = _mid(name)
-        got = (len([p for p in plan.pieces if p.kind == "seg"]), round(sum(p.mm for p in plan.pieces), 3))
+        mine = [p for p in plan.pieces if p.reason == "spine"]
+        got = (len([p for p in mine if p.kind == "seg"]), round(sum(p.mm for p in mine), 3))
+        # Unmoved by S6: the chain runs **after** the spine, so every number here is S7's. Putting the
+        # chain first costs c3_usb (14, 38.575) -> (9, 18.311) and that is why it does not.
         assert got == SPINE_OWNS[name], (name, got, SPINE_OWNS[name], "docs/r2-measurements.md S7")
-        assert plan.done == frozenset() and plan.partial == plan.claimed, (name, plan.done, plan.partial)
-        assert all(p.kind == "seg" for p in plan.pieces), (name, "no layer change on a spine (R2's stated non-goal, H.4)")
+        # Scoped to the spine's own nets since S6: the mid stage runs two patterns now, and the chain
+        # closes c3_usb's `EN` outright — a net that needs no KRT is the chain's fact, not a spine's.
+        spine_nets = frozenset(p.net for p in mine)
+        assert plan.done & spine_nets == frozenset(), (name, plan.done & spine_nets)
+        assert spine_nets <= plan.partial, (name, spine_nets, plan.partial)
+        assert all(p.kind == "seg" for p in mine), (name, "no layer change on a spine (R2's stated non-goal, H.4)")
 
 
 def test_the_comb_is_the_first_form_and_it_fits_no_net_on_these_boards():
@@ -1433,7 +1446,12 @@ def test_a_spine_refusal_is_a_move():
     """
     plan, _d, _j, _t = _mid("buck")
     assert not any(r.hard for r in plan.refusals()), plan.refusals()
-    assert plan.counts() == {"spine": 2}, plan.counts()
+    assert plan.counts()["spine"] == 2, plan.counts()
+    # The blocker in the line below moved at S6 and is deliberately **not** re-recorded: the worst
+    # thing in the VIN trunk's way is now `U1.4 [FB]` at 17.975,7.66 leaving -0.490 mm, which is the
+    # **chain's** own 1.13 mm FB track (owner `U1.4`, laid one pattern earlier), where it used to be
+    # `R_FB_TOP.2 [FB]`'s pad at -0.470. Locked chain copper standing in a spine's lane is exactly the
+    # trade C.1's ordering makes, and this string is where it shows.
     vin = next(r for r in plan.refusals() if r.net == "VIN")
     assert vin.move.splitlines() == [
         "spine VIN: 5 stations from C_IN1.1 to U1.3 cannot reach one trunk at 0.781 mm (the Power class's 0.781 mm "
@@ -1516,6 +1534,9 @@ def test_the_spine_stage_runs_after_the_fanout():
     then has no second answer for. `merge_plans` is what makes the two halves one plan for KRT."""
     from pcbc.patterns import MID, POST, PRE, merge_plans
 
+    # S6 wrote `chain` and deliberately did not register it: on ds2 every configuration tried breaks
+    # a board that builds today, and never where the copper is. `patterns.MID`'s docstring carries
+    # the four measurements; `test_pattern_chain.py` drives the pattern directly instead.
     assert PRE == ("hop",) and MID == ("spine",) and POST == ("tap",)
     design = load_board(_board("c3_usb"))
     job = compile_design(design)
@@ -1525,7 +1546,16 @@ def test_the_spine_stage_runs_after_the_fanout():
     pre.scene.add(pre.scene.item_of(p) for p in fan)
     mid = pattern_copper(design, job, job.constraints, write_pieces(pre.text, fan), "c3_usb", stage="mid", scene=pre.scene)
     assert fan and mid.pieces, "c3_usb has five escapes and two spines"
-    assert len([p for p in mid.pieces if p.kind == "seg"]) == 9, (len(mid.pieces), "the escapes cost the spine five of its fourteen segments")
+    # Scoped to the spine's own copper since S6 put `chain` in front of it in MID. **This number has
+    # moved and is deliberately not re-recorded**: with `chain` first, c3_usb's `BOOT` takes the
+    # corridor `3V3`'s backbone used, and the spine falls 9 segments / 25.13 mm to 4 / 4.87 (links 5
+    # of 7 -> 3 of 7). Running the two the other way round restores it exactly and costs `BOOT` two of
+    # its three segments. S6's report carries both measurements; C.1's step 3-before-step-5 is what
+    # decided the order, and the number is the price of it.
+    assert len([p for p in mid.pieces if p.kind == "seg" and p.reason == "spine"]) == 9, (
+        len([p for p in mid.pieces if p.reason == "spine"]),
+        "the escapes cost the spine five of its fourteen segments",
+    )
     merged = merge_plans(pre, mid)
     assert merged.pieces == pre.pieces + mid.pieces and merged.scene is pre.scene
     assert merged.claimed == pre.claimed | mid.claimed and merged.text == mid.text

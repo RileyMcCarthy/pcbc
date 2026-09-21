@@ -65,8 +65,31 @@ __all__ = [
 class Refusal:
     """Why a pattern emitted nothing, and what the AI can do about it.
 
-    `hard` is fatal even in R2 (C.6): only where honouring the refusal would break a constraint KRT
-    structurally cannot hold — a net with `vias=False`, a single-layer net, a declared `Chain()`.
+    `hard` is fatal even in R2 (C.6): it aborts the route stage before KRT is run at all
+    (`route.py`). It exists for the case where honouring the refusal would break a constraint KRT
+    structurally **cannot** hold whatever it does with the net — a net whose `NetReq` sets
+    `vias=False`, or a net that lives on one layer — because there the fall-through does not produce
+    a worse route, it produces copper the author forbade.
+
+    **Nothing in this codebase sets it today, and that is deliberate rather than an oversight.**
+    Every producer passes `hard=False`: `hop`, `spine`, `tap`, and — since S6's review — `chain`.
+    The field and `hard_refusals` are kept because the two cases above are real and unimplemented,
+    and because `--strict-patterns` (`PCBC_STRICT_PATTERNS=1`) reads the same path to make every
+    refusal fatal on demand. A dead field with a live reason is better than a rediscovered one.
+
+    **A declared `Chain()` was the one thing that set it, and the justification did not survive being
+    measured.** The argument was that falling through to KRT "would produce copper that violates the
+    intent rather than merely a worse route, because KRT would branch". On the only board in the repo
+    with a declared chain that is not a pair — the DS2 Addon's `Chain("VDDA", "J2.1", "C4.1",
+    "U1.12")` — KRT honours the order: it runs one straight 45-degree trace **across** `C4.1`'s pad,
+    with 1.1185 mm of that trace's centre line inside the pad's own copper and its junction 0.4300 mm
+    inside it (`docs/r2-measurements.md`, S6). The refusal was aborting the build on a prediction
+    about KRT that the board contradicts. Worse, the invariant it was protecting was checked
+    **nowhere**: R-X4's `**V**` half did not exist. It exists now — `route_verify.chain_order`, run
+    on the routed board by `build._chain_gate` — so a declared order that really is violated fails
+    the build on a measurement instead of on an assumption, and the refusal that could not know is
+    soft.
+
     Everything else is soft: the move is printed, the net falls through to KRT, the build passes,
     and the **count** is pinned per board so a new refusal is a test failure rather than a drift.
     """
@@ -513,7 +536,38 @@ answer for. Running it after means the spine sees every escape as an obstacle an
 which is the direction the dependency actually runs.
 
 It costs one extra stage name and one merge (`merge_plans`), and it is measured rather than assumed:
-`docs/r2-measurements.md` S7 records both orders on the two boards that have a fanout at all."""
+`docs/r2-measurements.md` S7 records both orders on the two boards that have a fanout at all.
+
+**`chain` is written and is deliberately NOT in this tuple.** `patterns/chain.py` exists, its unit
+tests run against it directly, and `route_verify.chain_order` — the finished-board half S6 was really
+for — is wired into the build. The pattern itself does not run, because a real build says it must not
+yet. On ds2, a board that builds today, every configuration tried breaks it, and never where the
+copper is:
+
+| what the chain wrote on ds2 | outcome |
+|---|---|
+| the whole population, 51 seg / 98.6 mm | `GND` and `VSS` unrouted |
+| implicit links bounded to `CHAIN_HOP_MM`, 18 seg / 30.8 mm | `GND` and `VSS` unrouted |
+| the one declared chain only, 5 seg / 14.4 mm | copper verified, then the `GND` plane in **2 islands** |
+| every link bounded, 13 seg / 16.4 mm on three short local runs | `GND` and `VSS` unrouted |
+
+The last row is the one that decided it: 16.4 mm of short, local, legal copper on the far side of a
+47 x 25.4 mm board, none of it within 3.4 mm of the tap that fails and none of it on the layer of the
+plane that splits. Locked copper moves KRT, and KRT's own copper closes the escape two stages later.
+The other four boards agree in the smaller way: with the chain registered, `test_examples_fab`
+fails on buck, c3_usb and node (node's `angles` 102 against a ceiling of 100), and only blinky is
+untouched.
+
+There is precedent for the shape of this, and it is `spine.WIDE_MM`: S7 measured that ds2's 0.25 mm
+power nets could not take a spine either, because locked copper takes the corridors its constrained
+nets structurally need, and excluded them on the measurement rather than tuning until it passed.
+This is the same board saying the same thing one pattern later.
+
+What would change it is a router that can search, not a bound that can be tuned: four bounds were
+tried and the failure moved rather than went away. R3's maze router is where this belongs, and
+`chain.py` is kept whole — not deleted and not behind a runtime flag — so that slice starts from the
+pattern, its 17 tests and this table rather than from scratch.
+"""
 
 
 POST = ("tap",)
@@ -532,9 +586,9 @@ _STAGES = {"pre": PRE, "mid": MID, "post": POST}
 
 
 def _modules() -> dict:
-    from . import hop, spine, tap
+    from . import chain, hop, spine, tap
 
-    return {"hop": hop, "spine": spine, "tap": tap}
+    return {"chain": chain, "hop": hop, "spine": spine, "tap": tap}
 
 
 def pattern_copper(
@@ -637,7 +691,11 @@ def merge_plans(first: PatternPlan, second: PatternPlan) -> PatternPlan:
 
 
 def hard_refusals(plan: PatternPlan) -> tuple[Refusal, ...]:
-    """The refusals that are fatal even in R2 (C.6), and under `--strict-patterns` all of them."""
+    """The refusals that are fatal even in R2 (C.6), and under `--strict-patterns` all of them.
+
+    No pattern sets `hard` today (see `Refusal`), so without the env var this returns `()` on every
+    board in the repo. It is the `--strict-patterns` path that keeps it wired, and the two
+    unimplemented cases `Refusal.hard` names that keep it worth having."""
     import os
 
     strict = os.environ.get("PCBC_STRICT_PATTERNS", "").lower() in ("1", "true", "yes", "on")

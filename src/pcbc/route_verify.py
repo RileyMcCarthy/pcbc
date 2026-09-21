@@ -19,14 +19,17 @@ from typing import Sequence
 
 from .constraints import ConstraintSet
 from .route_emit import Piece
-from .route_geom import MICRO_MM, Box, Pt, aabb, clears, clip_len_in_box, is_octilinear, legs_ok, q, seg_lengths, turn_ok, via_shape
+from .route_geom import MICRO_MM, Box, Pt, Shape, aabb, clears, clip_len_in_box, hull_dist2, is_octilinear, legs_ok, q, seg_lengths, track_shape, turn_ok, via_shape
 from .route_scene import Item, Scene, clashes
 from .sexp import matching_paren
 
 __all__ = [
+    "CHAIN_BISECT",
     "POUR_CELL_MM",
+    "ChainVerdict",
     "PourRaster",
     "Zone",
+    "chain_order",
     "in_zone",
     "lane_overrun",
     "via_in_lane",
@@ -678,3 +681,400 @@ def same_net_slots(text: str, floor: float, layers: tuple[str, ...] = ("F.Cu", "
                 layer = sorted(items[i][1] & items[j][1])[0]
                 out.append({"net": net, "layer": layer, "gap": g, "a": items[i][3], "b": items[j][3], "at": [round(pa[0], 4), round(pa[1], 4)]})
     return sorted(out, key=lambda r: (r["gap"], r["net"], r["layer"], r["a"], r["b"]))
+
+
+# --- R-X4: a declared chain's order, measured in the copper KRT finished --------------------------
+#
+# `docs/router-plan.md` line 202 tags R-X4 "**P** (chain), **V**" — a pattern *and* a verification —
+# and until this section only the P existed. The chain pattern refused a link it could not write and
+# nothing anywhere read the finished board to ask whether the order the author declared had survived
+# in it. That absence is what made the pattern's refusal **hard**: the refusal was standing in for a
+# gate that was never built, on the premise that KRT would branch and nobody would notice. The
+# premise is now measured instead of assumed (`docs/r2-measurements.md`, S6), the refusal is soft,
+# and this is the gate.
+#
+# What it is not. It is not a connectivity check — `netcheck.check_copper` is KiCad's own netlist
+# gate and it is order-blind by construction, which is exactly the hole. It is not
+# `route_checks.check_chains` either: that measures a straight centre-line corridor between pad
+# centres at **placement** time, before any copper exists, and on ds2's `VDDA` it says nothing at all.
+#
+# One honest note on the citation. R-X4's own text scopes itself to a **high-speed** net ("a track
+# that branches to a third pad on a high-speed net is a chain order violation"), while this checks
+# every declared `Chain()` — including ds2's `VDDA`, which is Power class. That is deliberate and it
+# is wider than the line it is named after: B.2's rule is "the chain goes through its pads in order",
+# and a bypass cap fed as a spur is the same defect as a signal stub whatever the class. The widening
+# is recorded rather than smuggled, because it also means the old hard refusal was protecting an
+# invariant broader than the rule anyone had written down for it.
+
+
+CHAIN_BISECT = 64
+"""Bisection steps used to find where a track's centre line crosses a station's pad outline.
+
+The distance from a point to a convex hull is a convex function of the point, so along a straight
+centre line the set of parameters within `d` of one pad primitive is a single closed interval: a
+ternary search finds a point inside it and two bisections find its ends. 64 steps of each puts the
+ends within `(2/3)**64` (1.6e-12) and `2**-64` of the true crossing — eleven orders below the
+nanometre grid every coordinate on the board is quantised to, so the answer is a function of the
+geometry and not of the iteration count.
+
+Both ends are taken from the **inside** of the interval (the last parameter known to be within `d`),
+so the copper this check removes is never more than the copper the pad covers. Erring that way makes
+the check report a spur rather than silently accept one."""
+
+
+@dataclass(frozen=True)
+class ChainVerdict:
+    """One declared `Chain()`, judged against the routed board.
+
+    `verdict` is one of:
+
+    - `"held"` — every consecutive pair is joined, and the feed passes **through** every stop
+      between the first and the last.
+    - `"spur"` — a stop is connected to the net but the feed goes round it: `detail` names which.
+    - `"open"` — two consecutive stops are not joined by copper at all. The netlist gate normally
+      catches this first; it is here because a chain whose order cannot be judged must say so rather
+      than pass.
+    - `"poured"` — the net carries a filled zone, so every pad of it is connected through the plane
+      and "the order" is not a question the copper can answer. Reported, never failed.
+    - `"unresolved"` — a `Chain()` member names no pad of that net on the board. `pcbc check` refuses
+      this before the board is drawn; it is reported here rather than silently skipped.
+
+    `owner` is `"chain"` when pcbc's own chain pattern was allowed to route this net and `"R4"` when
+    B.2 hands it away (a net carrying a `PairSpec`). It is the whole of what the build gate does with
+    a violation — see `build._chain_gate`."""
+
+    net: str
+    where: str  # "Chain line 97"
+    stations: tuple[str, ...]  # pad ids in the declared order: ("J2.1", "C4.1", "U1.12")
+    verdict: str
+    owner: str  # "chain" | "R4"
+    detail: str = ""
+    move: str = ""
+
+    def to_dict(self) -> dict:
+        return {
+            "net": self.net,
+            "where": self.where,
+            "stations": list(self.stations),
+            "verdict": self.verdict,
+            "owner": self.owner,
+            "detail": self.detail,
+            "move": self.move,
+        }
+
+
+def _at(a: Pt, b: Pt, t: float) -> Pt:
+    return (a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t)
+
+
+def _within_span(a: Pt, b: Pt, shape: Shape, d: float) -> tuple[float, float] | None:
+    """The parameters of the centre line `a -> b` lying within `d` mm of `shape`'s copper, or None.
+
+    One interval and never two, because `shape` is convex: see `CHAIN_BISECT`.
+    """
+    lim = (shape.r + d) ** 2
+    box = aabb(shape)
+    if min(a[0], b[0]) > box[2] + d or max(a[0], b[0]) < box[0] - d:
+        return None
+    if min(a[1], b[1]) > box[3] + d or max(a[1], b[1]) < box[1] - d:
+        return None
+
+    def f(t: float) -> float:
+        return hull_dist2((_at(a, b, t),), shape.pts) - lim
+
+    lo, hi = 0.0, 1.0
+    for _ in range(CHAIN_BISECT):
+        m1 = lo + (hi - lo) / 3.0
+        m2 = hi - (hi - lo) / 3.0
+        if f(m1) <= f(m2):
+            hi = m2
+        else:
+            lo = m1
+    inner = (lo + hi) / 2.0
+    if f(inner) > 0.0:
+        if f(0.0) <= 0.0:
+            inner = 0.0
+        elif f(1.0) <= 0.0:
+            inner = 1.0
+        else:
+            return None
+    t0 = 0.0 if f(0.0) <= 0.0 else _edge(f, inner, 0.0)
+    t1 = 1.0 if f(1.0) <= 0.0 else _edge(f, inner, 1.0)
+    return (t0, t1)
+
+
+def _edge(f, good: float, bad: float) -> float:
+    for _ in range(CHAIN_BISECT):
+        mid = (good + bad) / 2.0
+        if f(mid) <= 0.0:
+            good = mid
+        else:
+            bad = mid
+    return good
+
+
+def _outside(a: Pt, b: Pt, w: float, shapes: Sequence[Shape], d: float) -> tuple[tuple[Pt, Pt, float], ...]:
+    """This track cut into the pieces of it that lie outside every one of `shapes`, dilated by `d`.
+
+    A pad may draw several primitives (a custom pad is several `Shape`s), so the intervals are merged
+    before the complement is taken; the pieces come back in centre-line order.
+    """
+    spans = [s for s in (_within_span(a, b, sh, d) for sh in shapes) if s is not None]
+    if not spans:
+        return ((a, b, w),)
+    spans.sort()
+    merged: list[list[float]] = [list(spans[0])]
+    for t0, t1 in spans[1:]:
+        if t0 <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], t1)
+        else:
+            merged.append([t0, t1])
+    gaps: list[tuple[float, float]] = []
+    cur = 0.0
+    for t0, t1 in merged:
+        if t0 > cur:
+            gaps.append((cur, t0))
+        cur = max(cur, t1)
+    if cur < 1.0:
+        gaps.append((cur, 1.0))
+    return tuple((_at(a, b, t0), _at(a, b, t1), w) for t0, t1 in gaps)
+
+
+def _net_copper(text: str, net: str) -> tuple[tuple[str, frozenset[str], Shape, tuple], ...]:
+    """Every track and via on one net, as `(kind, layers, shape, extra)`, in file order.
+
+    A via's layers are the whole copper stack when it spans `F.Cu` to `B.Cu`, which every via R2 or
+    KRT writes on these boards does (`_via_rules` item 8 asserts it of pcbc's own). A via that does
+    not is read as the two layers it names, which under-connects rather than over-connects — the
+    direction that reports a spur rather than inventing a path through one.
+    """
+    from .ampacity import ALL_CU, _SEG, _VIA
+    from .copper import net_table
+
+    names = net_table(text)
+    out: list[tuple[str, frozenset[str], Shape, tuple]] = []
+    for m in _SEG.finditer(text):
+        n = names.get(int(m.group(7))) if m.group(7) else m.group(8)
+        if n != net:
+            continue
+        a = (float(m.group(1)), float(m.group(2)))
+        b = (float(m.group(3)), float(m.group(4)))
+        w = float(m.group(5))
+        out.append(("seg", frozenset({m.group(6)}), track_shape(a, b, w), (a, b, w)))
+    for m in _VIA.finditer(text):
+        n = names.get(int(m.group(7))) if m.group(7) else m.group(8)
+        if n != net:
+            continue
+        at = (float(m.group(1)), float(m.group(2)))
+        span = (m.group(5), m.group(6))
+        layers = ALL_CU if span == ("F.Cu", "B.Cu") else frozenset(span)
+        out.append(("via", layers, via_shape(at, float(m.group(3))), (at,)))
+    return tuple(out)
+
+
+def _reaches(nodes: Sequence[tuple[str, frozenset[str], Shape, tuple]], src: Sequence[int], dst: Sequence[int]) -> bool:
+    """Is any of `src` joined to any of `dst` through touching copper?
+
+    Two pieces touch when `clears(a, b, 0.0)` is False — a gap under `EPS_MM`, which is pcbc's own
+    "these are one conductor". Copper pcbc and KRT write meets exactly, so the epsilon decides
+    nothing here; it is the same one every other clearance answer on the board is given with.
+    """
+    boxes = [aabb(s) for _k, _l, s, _e in nodes]
+    want = set(dst)
+    seen = set(src)
+    if seen & want:
+        return True
+    stack = list(src)
+    while stack:
+        i = stack.pop()
+        bi, li, si = boxes[i], nodes[i][1], nodes[i][2]
+        for j in range(len(nodes)):
+            if j in seen or not (li & nodes[j][1]):
+                continue
+            bj = boxes[j]
+            if bi[0] > bj[2] or bj[0] > bi[2] or bi[1] > bj[3] or bj[1] > bi[3]:
+                continue
+            if clears(si, nodes[j][2], 0.0):
+                continue
+            seen.add(j)
+            if j in want:
+                return True
+            stack.append(j)
+    return False
+
+
+def _station_pads(design, net: str, member: str, pads: dict) -> tuple[str, ...]:
+    """One `Chain()` member, `"REF.PIN"`, as the pad ids it names on this board.
+
+    `patterns.chain._members`' resolution, read off the routed file instead of off a scene: a member
+    is a pin name as `Place(to=)` takes it, one pin may own several pads, and every pad it names is a
+    station. Sorted by `(ref, pad number)` — the order `patterns.terminals` puts them in — so the
+    stations a multi-pad pin contributes are in the same order here and there.
+    """
+    ref, _, pin = member.partition(".")
+    inst = next((i for i in getattr(design, "instances", ()) if i.ref == ref), None)
+    nums: tuple[str, ...] = (pin,)
+    if inst is not None and pin in inst.part.pins:
+        nums = tuple(inst.part.pins[pin].pads)
+    got = [f"{ref}.{num}" for num in nums if f"{ref}.{num}" in pads and pads[f"{ref}.{num}"].net == net]
+    return tuple(sorted(got, key=lambda pid: (pid.split(".")[0], _padnum(pid.split(".", 1)[1]))))
+
+
+def _padnum(num: str) -> tuple[int, str]:
+    return (int(num), "") if num.isdigit() else (1 << 30, num)
+
+
+def _toward(dx: float, dy: float) -> str:
+    """`route_checks._quantise`'s answer and the vocabulary `Place(toward=)` accepts, in KiCad's
+    y-down frame. `patterns.chain._toward`'s body, so a gate's move and a refusal's move speak the
+    same four words."""
+    if abs(dx) >= abs(dy):
+        return "right" if dx >= 0 else "left"
+    return "down" if dy >= 0 else "up"
+
+
+def chain_order(text: str, design, cs: ConstraintSet, *, floor: float | None = None) -> tuple[ChainVerdict, ...]:
+    """R-X4's verify half: did every **declared** `Chain()`'s order survive in the finished copper?
+
+    One verdict per `Chain()` in board order. The question is asked of the routed board and of
+    nothing else — not of pcbc's own pieces, which `verify_copper` already judges, and not of the
+    placement, which `route_checks.check_chains` already judges.
+
+    **The definition, in two halves.**
+
+    1. *Joined.* For each consecutive pair `(p_i, p_i+1)` of the declared order there is a path
+       through touching copper — every track, via and **pad** of the net — from one to the other.
+    2. *Through, not past.* For each **intermediate** stop `p_i` the feed passes through that pad's
+       own copper: with `p_i`'s pad copper removed from the board, `p_i-1` no longer reaches
+       `p_i+1`. A stop that is still bypassed once its pad is gone was never in the path; it hangs
+       off it, which is the stub B.2 forbids and R-X4 names.
+
+    Removing a pad means removing its copper *region*, not its node in a graph, and that distinction
+    is the whole of why this check passes the one board it exists for. On ds2's routed `VDDA` the
+    graph has a degree-3 vertex at (20.35, 6.45) whose two through-edges are exactly collinear at
+    -45 degrees: as a graph it is not a junction the feed turns at, and deleting the vertex leaves
+    `J2.1` connected to `U1.12`, so a cut-vertex reading of "the pad is in the path" **fails** a
+    board on which the feed does run straight across the cap's pad. Measured (2026-09-20): that
+    vertex is **0.4300 mm inside** `C4.1`'s own pad copper and **1.1185 mm** of the trunk's centre
+    line lies inside it. Remove the region and the two arms of the trunk are 1.12 mm apart with
+    nothing between them; the feed is cut, and the verdict is `held`, which is the truth.
+
+    **The tolerance, and why it is not load-bearing.** A pad's copper is dilated by
+    `stackup.clearance_min` before it is removed, so a junction sitting just *outside* a stop still
+    counts as feeding through it. The number is the process floor — the same one `chain.stub_need`
+    takes for R-X4's pattern half (S6 decision 1) and the one `route.py` hands KRT as
+    `--same-net-pad-clearance` — on the argument that copper closer together than a fab's minimum
+    clearance is not two separable things. It decides nothing on any board in this repo: swept from
+    0.0 mm to 2.0 mm, every one of the five declared chains keeps its verdict, and the nearest flip
+    is node's `USB_DN` at 2.5 mm and c3_usb's at 3.0 mm — 28x and 24x their own process floors
+    (0.0889 and 0.127 mm). The measured
+    gap between the closest pass (ds2's junction, 0.43 mm inside the pad) and the closest genuine
+    spur (c3_usb's `U3.3`, off the trunk by millimetres) is about 3 mm wide. `floor` overrides it, for
+    the sweep that measures that and for nothing else — the product never passes it.
+
+    **What it does not answer.** A net with a filled zone is `poured` and skipped: every pad of a
+    poured net is joined through the plane, so the copper cannot say what order the feed takes. A via
+    is an atom — it is removed when its centre lies in the dilated pad and kept otherwise — so a
+    via-in-pad reads as part of the pad and a via beside one reads as a separate node; no board here
+    has a via near a chain station. And the check reads what the file says, so a chain member that
+    names no pad on the board is `unresolved` rather than absent.
+    """
+    from .ampacity import board_pad_geoms
+
+    floor = float(cs.stackup.clearance_min if floor is None else floor)
+    poured = {z.net for z in zones(text) if z.polys}
+    by_net: dict[str, dict] = {}
+    for p in board_pad_geoms(text):
+        by_net.setdefault(p.net, {})[p.id] = p
+    out: list[ChainVerdict] = []
+    for ch in getattr(design, "chains", ()):
+        where = f"Chain line {ch.line}"
+        c = cs.by_net(ch.net)
+        owner = "R4" if (c is not None and c.pair is not None) else "chain"
+        pads = by_net.get(ch.net, {})
+        stations: list[str] = []
+        missing = ""
+        for member in ch.pads:
+            got = _station_pads(design, ch.net, member, pads)
+            if not got:
+                missing = member
+                break
+            stations.extend(got)
+        if missing:
+            out.append(ChainVerdict(ch.net, where, tuple(stations), "unresolved", owner, f"{missing} names no pad of {ch.net} on this board", ""))
+            continue
+        if ch.net in poured:
+            out.append(ChainVerdict(ch.net, where, tuple(stations), "poured", owner, f"{ch.net} carries a filled zone, so every pad of it is joined through the plane and the copper cannot say what order the feed takes", ""))
+            continue
+        out.append(_judge(text, ch, tuple(stations), pads, owner, where, floor))
+    return tuple(out)
+
+
+def _judge(text: str, ch, stations: tuple[str, ...], pads: dict, owner: str, where: str, floor: float) -> ChainVerdict:
+    """The two halves of `chain_order`'s definition, for one chain.
+
+    **Every** pad of the net is a node, not only the stations: a pad is copper, and a run that lands
+    on some third pad of the same net and leaves it is a path the board really has. Leaving the
+    others out would break such a path and report `held` — a violation missed — which is the one
+    direction a gate must not err in.
+    """
+    cop = list(_net_copper(text, ch.net))
+    n = len(stations) - 1
+
+    def graph(pieces, without: str = "") -> tuple[list, dict[str, list[int]]]:
+        nodes = list(pieces)
+        where_: dict[str, list[int]] = {}
+        for pid in sorted(pads):
+            if pid == without:
+                continue
+            where_[pid] = []
+            for s in pads[pid].copper:
+                where_[pid].append(len(nodes))
+                nodes.append(("pad", pads[pid].cu_layers, s, (pid,)))
+        return nodes, where_
+
+    nodes, idx = graph(cop)
+    for i in range(n):
+        if not _reaches(nodes, idx[stations[i]], idx[stations[i + 1]]):
+            return ChainVerdict(
+                ch.net, where, stations, "open", owner,
+                f"no copper joins {stations[i]} to {stations[i + 1]}, so link {i + 1} of {n} of this chain is not on the board",
+                f'Route it or drop it: {_chain_call(ch)} declares a feed pcbc did not finish and KRT did not close.',
+            )
+    for i in range(1, len(stations) - 1):
+        pid = stations[i]
+        want = pads[pid]
+        cut: list[tuple[str, frozenset[str], Shape, tuple]] = []
+        for kind, layers, shape, extra in cop:
+            if not (layers & want.cu_layers):
+                cut.append((kind, layers, shape, extra))
+                continue
+            if kind == "via":
+                at = extra[0]
+                if any(hull_dist2((at,), s.pts) <= (s.r + floor) ** 2 for s in want.copper):
+                    continue
+                cut.append((kind, layers, shape, extra))
+                continue
+            a, b, w = extra
+            for p0, p1, ww in _outside(a, b, w, want.copper, floor):
+                cut.append(("seg", layers, track_shape(p0, p1, ww), (p0, p1, ww)))
+        graph_cut, cidx = graph(cut, without=pid)
+        if _reaches(graph_cut, cidx[stations[i - 1]], cidx[stations[i + 1]]):
+            prev, nxt = stations[i - 1], stations[i + 1]
+            ref = pid.split(".")[0]
+            mid = ((pads[prev].at[0] + pads[nxt].at[0]) / 2.0, (pads[prev].at[1] + pads[nxt].at[1]) / 2.0)
+            toward = _toward(mid[0] - pads[pid].at[0], mid[1] - pads[pid].at[1])
+            return ChainVerdict(
+                ch.net, where, stations, "spur", owner,
+                f"the copper joins {prev} to {nxt} without crossing {pid}'s pad, so {pid} hangs off the feed instead of sitting in it",
+                f'Place("{ref}", toward="{toward}") moves it into the corridor between {prev} and {nxt}; '
+                f"or {_chain_call(ch)} is asking for an order this copper does not take — drop {ref} from the chain and feed it locally instead.",
+            )
+    return ChainVerdict(ch.net, where, stations, "held", owner, "", "")
+
+
+def _chain_call(ch) -> str:
+    """The `Chain(...)` line this chain is — the edit a gate's move ends in. `chain._chain_call`'s
+    answer, off the `ChainReq` rather than off a `ChainSpec`, so the gate quotes the author's own
+    spelling (`U1.VIN`) and not the pad it resolved to."""
+    return f'Chain("{ch.net}", ' + ", ".join(f'"{p}"' for p in ch.pads) + ")"

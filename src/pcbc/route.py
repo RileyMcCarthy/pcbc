@@ -447,8 +447,11 @@ def route_job(design: Design, placed: Path, *, out: Path, name: str = "board") -
     fatal = hard_refusals(plan)
     if fatal:
         # C.6: a soft refusal is a printed move and a fall-through to KRT, and the build passes; a
-        # hard one is intent KRT structurally cannot honour. `--strict-patterns` makes every refusal
-        # hard, and R3 flips that default.
+        # hard one is intent KRT structurally cannot honour. **No pattern sets `hard` today** — the
+        # last producer was `chain`, and S6's review replaced it with a gate that reads the routed
+        # board (`route_verify.chain_order`, run by `build._chain_gate`) rather than an abort that
+        # predicts the router. So this branch is `--strict-patterns`' today, and R3 flips that
+        # default.
         result["error"] = "pattern refused:\n" + "\n".join(r.move for r in fatal)
         return result
     last: Path | None = None

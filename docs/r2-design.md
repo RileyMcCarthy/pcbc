@@ -684,15 +684,28 @@ measures against, so the placement check and the router cannot disagree about wh
 
 - **No stub (R-X4).** A link's pieces must not pass within `between(net, net) + w/2 + pad_half` of
   a *later* member's pad on the same layer. The chain goes through pads in order, never past one
-  and back.
+  and back. *(S6: the distance is `stackup.clearance_min + w/2` — see the five decisions below.)*
+  R-X4 has a **verify** half as well as a pattern half (`docs/router-plan.md` line 202 tags it
+  "**P** (chain), **V**"), and S6 built it: `route_verify.chain_order` reads the routed board and
+  asks whether each declared order survived in the finished copper, `build._chain_gate` runs it in
+  the route stage, and a violated order fails the build with a move.
 - **The order is the order.** A chain that cannot fit link *i* emits links `0..i-1` and refuses
   with the failing link named. It never re-orders to close the net: the order is the AI's intent.
 
 Chains on nets carrying a `PairSpec` are **skipped with a printed note**, not silently: pairs are
 R4's.
 
-**Refusal** (hard when the chain was declared with `Chain()`, soft for an implicit one — a
-declared chain is intent KRT structurally cannot honour, because KRT would branch):
+**Refusal** — **soft, declared or not.** This section originally said *hard* for a declared
+`Chain()`, on the grounds that "a declared chain is intent KRT structurally cannot honour, because
+KRT would branch". S6 measured it and the sentence did not survive (`docs/r2-measurements.md`, S6):
+on the only board in the repo with a declared chain that is not a pair, KRT runs a single straight
+45-degree trace **across** `C4.1`'s pad — 1.1185 mm of its centre line inside the pad's own copper,
+its junction 0.4300 mm inside the outline — and the declared order is in the finished board. A hard
+refusal aborts the build before KRT, so the claim was not merely unproven; it was stopping a build on
+a prediction the board contradicts. And the invariant it protected was checked nowhere at all: R-X4's
+**V** half did not exist, so one net in five had a gate and the other four had nothing. The refusal
+is soft, R-X4's verification is real (above), and `--strict-patterns` is the author's switch for
+wanting the stop anyway:
 
 ```
 chain VDDA: link 2 of 3, C4.1 at (12.40,8.05) -> U1.12 at (15.10,9.65), does not fit on F.Cu at 0.25 mm.
@@ -1086,9 +1099,20 @@ answer is to move that pattern's share into pcbc — not a third workaround.
   `test_examples_fab.py`, the way `SOFT` already is, so a new refusal is a test failure and cannot
   drift into being ignored.
 - **Hard refusal** (fatal in both modes): only where honouring the refusal would break a
-  constraint KRT structurally cannot hold — a net with `vias=False`, a single-layer net, or a
-  declared `Chain()`. Those are the cases where falling through to KRT produces copper that
-  violates the intent rather than merely a worse route.
+  constraint KRT structurally cannot hold — a net with `vias=False`, or a single-layer net. Those
+  are the cases where falling through to KRT produces copper that violates the intent rather than
+  merely a worse route, because no route KRT can choose satisfies them.
+  - **A declared `Chain()` was on that list and S6 took it off** (`docs/r2-measurements.md`, S6).
+    The argument for it — "KRT would branch" — is contradicted on the one board that can test it:
+    KRT feeds ds2's `VDDA` straight through `C4.1`'s pad and the declared order holds. The right
+    answer to "did the order survive?" is to **read the finished board**, not to abort before the
+    router runs on the assumption that it will not: `route_verify.chain_order` does that and
+    `build._chain_gate` fails the build on it, which is the R-X4 **V** the plan had always asked for
+    and nobody had written.
+  - **So nothing in the codebase sets `hard` today.** `hop`, `spine`, `tap` and `chain` all pass
+    `hard=False`. The field and `hard_refusals()` stay because the two cases above are real and
+    unimplemented, and because `--strict-patterns` reads the same path; the docstring says so, so it
+    is a dead field with a live reason rather than one somebody rediscovers.
 - `--strict-patterns` / `PCBC_STRICT_PATTERNS=1` makes every refusal fatal. R3 flips the default.
 - `PCBC_PATTERNS=off` restores today's plan **exactly** — one env check around one call. It is the
   difference between a bad pattern being a rollback and being a revert.
@@ -1547,8 +1571,55 @@ node 420 -> <= 354 segments, off45 63 -> <= 32, micro 161 -> <= 90, 501.5 -> <= 
 **Acceptance**: the DS2 Addon's `Chain("VDDA", "J2.1", "C4.1", "U1.12")` is carried by the pattern
 in feed order and `route_checks.check_chains` agrees; node's SCL, SDA and T_OUT are carried or
 refused with a named blocker; a declared chain that cannot fit is a **hard** refusal and
-`--strict-patterns` is not needed to see it; ds2 worst detour <= 1.84 held; no bar number worse
-anywhere.
+`--strict-patterns` is not needed to see it; **ds2 worst detour not worse than 3.23**; no bar number
+worse anywhere.
+
+> **Three clauses of that line are wrong, and the slice's own measurements are what say so** (S6 and
+> its review in `docs/r2-measurements.md`). ds2's `VDDA` is **not** carried: link 2 needs a
+> six-corner 14.7663 mm detour for a 3.8204 mm airwire and no candidate in a fixed exit-to-exit shape
+> set can express it, which is R3's. `check_chains` does not agree with the pattern about it either —
+> it reports **nothing**, because it measures a straight centre-line corridor and this link runs at
+> 49.1 degrees. And "a declared chain that cannot fit is a **hard** refusal" is the sentence S6's
+> review retired outright: it aborts the build on a prediction about KRT that the routed board
+> contradicts, while the invariant it claimed to protect was checked nowhere. The refusal is soft and
+> R-X4's **V** half is built (`route_verify.chain_order`). What the acceptance was reaching for — the
+> author's declared order actually being on the board — is now a gate rather than a hope.
+
+> **The 1.84 in this line until S6 was fiction, and four slices chased it.** It enters at S1 as a
+> *target* (`3.23 -> <= 1.84`), is repeated as an S4 acceptance and again here as "held" — a word
+> that claims a standing measurement. ds2's worst detour has measured `REFP_F` **3.23** at every
+> recording since: S1b, S4, S5, S7 and S7r. It has never been below it, and **no test pins it** —
+> ds2 is not in `test_examples_fab.py::BAR` at all. The number here is now the one the board
+> actually has, so the slice is judged against a measurement rather than a wish.
+
+**Five things the S6 survey found that this section got wrong or left out**, each decided here so
+the implementation is not deciding them silently:
+
+1. **`between(net, net)` is `0.0`.** `ClearanceTable.between` returns `(0.0, "same net")` for a net
+   against itself, so B.2's no-stub distance collapses to `w/2 + pad_half` — "must not touch a later
+   pad". **Decision: R-X4 uses `stackup.clearance_min`**, the number `route.py` already hands KRT as
+   `--same-net-pad-clearance` and the one `ClearanceTable.via_to_same_net_smd_pad` returns for
+   exactly this same-net-pad question. A link passing within the process floor of a later member is
+   copper a fab may bridge, which *is* the stub the rule forbids, and a rule that fires only on exact
+   overlap is a rule quantised geometry can step around.
+2. **`blocked()` cannot express this rule at all.** `route_scene._pair_clashes` skips the copper rule
+   for same-net pairs by design, so the standard clash path can never report a later chain member.
+   R-X4 is an explicit test in `chain.py` that synthesises its own `Clash` for the refusal line, not
+   a tightened `need` handed to `blocked()`.
+3. **Four of the five declared chains are pair nets** (c3_usb and node's `USB_DP`/`USB_DN`), so this
+   section's own skip rule means the pattern routes **exactly one** declared chain in the repo:
+   ds2's `VDDA`. The four skips are printed notes and are pinned as such.
+4. **The implicit rule sweeps 21 nets**, including ds2's `VSS` (9 pads corner to corner on a
+   47 x 25.4 mm board) and node's `SCL`/`SDA` (first links ~39 mm). Every BAR ceiling is met with
+   **zero margin**. The implicit population is claimed and tried, not pre-filtered by length — the
+   acceptance wants SCL and SDA *refused with a named blocker*, and a 39 mm in-plane link across
+   node will name real copper — but the measurement per board decides what ships, exactly as the
+   spine's did.
+5. **The width of a net with no `NetReq` is a decision, not an inheritance.** `hop._width` falls back
+   to `stack.track_min` (0.0889 mm on node), which is the fab floor and not a class. A declared chain
+   always has a `Constraint` (`constraints.py` calls `synthesised()` for it); an implicit one may
+   not. **Decision: `synthesised(net)`'s Default class width**, because B.0 says a pattern writes at
+   the class width or not at all, and the fab floor is not a class.
 
 ### S7 — spine (4 days)
 

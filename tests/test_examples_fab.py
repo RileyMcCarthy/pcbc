@@ -456,6 +456,16 @@ def test_example_builds_to_fab(tmp_path: Path, name: str):
     # And the same two questions asked inside `pcbc build`, so they run on a user's board and not
     # only here (finding 11).
     assert route["planes"]["fails"] == [] and route["planes"]["islands"] == {f"{n} {L}": 1 for n, L in PLANES[name]}, (name, route["planes"])
+    # R-X4's **V** half, same wiring: every declared `Chain()` on this board was read off the copper
+    # KRT finished (`route_verify.chain_order` via `build._chain_gate`). The **verdicts** are pinned
+    # against the checked-in boards in `test_route_verify_chains.py`, not here, because this test
+    # routes the board afresh and a verdict is a property of the copper KRT chose this run; what is
+    # asserted here is that the gate ran on every chain and that no build gets past it with a
+    # violated order it owns. c3_usb and node's chains are `USB_DP`/`USB_DN`, which carry a `Pair`,
+    # so B.2 hands them to R4 and the gate reports rather than stops — `notes`, never `fails`.
+    declared = {ch.net for ch in load_board(board).chains}
+    assert set(route["chains"]["checked"]) == declared, (name, route["chains"], declared)
+    assert route["chains"]["fails"] == [], (name, route["chains"]["fails"], "R-X4: a declared order pcbc routes must be in the copper")
     from pcbc.fab import board_pads, mask_flashes, passive_refs, via_in_pad, via_in_pad_blockers
     from pcbc.route_emit import append_items, via as via_text
 

@@ -81,10 +81,37 @@ BAR = {
     # KRT and KiCad are both pinned to an exact version, so the board is a function of this repo: a
     # count that moves is a routing change somebody should read, not noise. The assertion is `<=`, so
     # an improvement passes silently and only a regression fails — which is what a ceiling is for.
-    "blinky": {"vias": 0, "off45": 0, "micro": 0, "detour": 1.04, "angles": 0},
-    "buck": {"vias": 1, "off45": 1, "micro": 96, "detour": 2.55, "angles": 28},
-    "c3_usb": {"vias": 7, "off45": 11, "micro": 188, "detour": 1.70, "angles": 130},
-    "node": {"vias": 11, "off45": 25, "micro": 54, "detour": 1.82, "angles": 102},
+#
+# **Re-recorded 2026-09-21 for `docs/quality-plan.md` slice 1, the whole-board string-pull
+# (`route_relax.py`), and every number in this table either falls or holds.** The relaxer is the
+# last step of the route and it rewrites the geometry of `leftover`, `hop`, `fanout` and `tap`
+# copper without moving a via, a layer, a width or a net order, so `vias` is byte-identical on all
+# four boards and the shape columns are the whole of the move:
+#
+#   micro   buck 96 -> **7**, c3_usb 188 -> **85**, node 54 -> **28**, blinky 0 -> 0
+#   angles  buck 28 -> **20**, c3_usb 130 -> **116**, node 102 -> **96**
+#   off45   buck 1 -> **0**, c3_usb 11 -> **9**, node 25 -> **18**
+#   detour  buck 2.55 -> **2.51**, c3_usb 1.70 -> **1.69**, blinky 1.04 -> **1.03**, node 1.82 held
+#
+# Whole-board turning, the number slice 1 exists for, measured against the same build with
+# `relax=False`: buck **50.91 -> 18.32** deg/mm, ds2 **23.53 -> 14.74**, c3_usb 49.59 -> 33.09, node
+# 35.92 -> 28.61 — against the hand-routed DS2 Addon's 17.2. buck and ds2 beat the hand board
+# outright; c3_usb and node are what slice 2's mitre is for. (That instrument counts turning at
+# every degree-2 vertex of one net on one layer at one width — a branch at a via is not a corner,
+# which is `route_verify.paths_of`'s reading. It is **not** the one `docs/quality-plan.md` section 1
+# used, whose prototype table reads ds2 24.1 -> 12.1 on the same copper.)
+#
+# **`detour` falling is the surprising one and it is small for a reason.** Relaxation recovers the
+# non-monotone slack inside a homotopy class and cannot change which side of an obstacle a route
+# passes (`docs/quality-plan.md` C1), so buck's 0.04 and c3_usb's 0.01 are the whole of what it can
+# reach; the detour class is `docs/topo-plan.md`'s and not this slice's. The three big-looking
+# per-net falls in DETOURS below — buck's `EN` 1.09 -> 0.95, c3_usb's `BOOT` 1.18 -> 0.94, node's
+# `GATE` 1.03 -> 0.94 — are **not** that; they are the trim changing what the ratio measures, and
+# the comment there says how.
+    "blinky": {"vias": 0, "off45": 0, "micro": 0, "detour": 1.03, "angles": 0},
+    "buck": {"vias": 1, "off45": 0, "micro": 7, "detour": 2.51, "angles": 20},
+    "c3_usb": {"vias": 7, "off45": 9, "micro": 85, "detour": 1.69, "angles": 116},
+    "node": {"vias": 11, "off45": 18, "micro": 28, "detour": 1.82, "angles": 96},
 }
 
 # D.5 as a number a deleted fragment can move. `plane_islands` cannot see the failure it is
@@ -98,7 +125,14 @@ BAR = {
 PLANES = {
     "blinky": {("GND", "B.Cu"): 917.25},
     "buck": {("GND", "B.Cu"): 935.59},
-    "c3_usb": {("GND", "B.Cu"): 1053.06},
+    # Re-recorded 2026-09-21 for slice 1: **1053.06 -> 1053.10 mm2**, +0.04, which is 80 % of this
+    # assertion's own 0.05 tolerance and would have reddened the suite on the next change that
+    # touched a track. The pour flows around copper, and the relaxer straightens copper: a staircase
+    # and the taut run that replaces it exclude different slivers of zone. node's `("GND","In1.Cu")`
+    # moves the other way by 0.01 (2532.85 -> 2532.84) and its `("3V3","In2.Cu")` not at all, which
+    # is what a four-layer board with the signal copper on the outside should do. Both boards are
+    # still **one island per plane**, and no via moved, so `plane_checks` has nothing new to say.
+    "c3_usb": {("GND", "B.Cu"): 1053.10},
     # node re-pinned 2026-09-21 for S4, **with its arithmetic**: one parallel rung on `VBUS` is one
     # through via crossing both inner planes, and a foreign via takes a disc of `pi * (dia/2 +
     # clearance)^2` out of each. At node's numbers that is `pi * (0.175 + 0.2)^2` = **0.4418 mm2**,
@@ -119,7 +153,7 @@ PLANES = {
     # on: no two antipads touch (closest centres 0.850101 mm against a 0.75 mm antipad diameter — a
     # 0.100101 mm web against the zone's own 0.1 mm `min_thickness`), `antipad_clash` predicted it per
     # candidate and `plane_islands` measured it after the gate refilled.
-    "node": {("GND", "In1.Cu"): 2532.85, ("3V3", "In2.Cu"): 2515.05},
+    "node": {("GND", "In1.Cu"): 2532.84, ("3V3", "In2.Cu"): 2515.05},
 }
 
 # Finding 14: how many of each board's `track_width` warnings are pcbc's own tap stubs. `tap._width`
@@ -149,13 +183,28 @@ COURTYARD = {"blinky": 0, "buck": 0, "c3_usb": 1, "node": 0}
 # `USB_DN`'s improvement is **not** attributed to `VBUS` (finding 18): pcbc writes no `VBUS` copper on
 # c3_usb at all, and `VBUS`'s own detour is unmoved. The net whose corridor changed is `3V3`, whose
 # 25.1 mm backbone is locked before KRT's signals step and whose own detour rose to pay for it.
+#
+# **Re-recorded 2026-09-21 for slice 1, and the direction is down on fourteen nets and up on none.**
+# Most moves are tenths — buck's `5V` 1.14 -> 1.13 and `GND` 1.3 -> 1.29, c3_usb's `CC1` 1.2 -> 1.13
+# and `VBUS` 1.70 -> 1.69, node's `CC2` 1.24 -> 1.19, `EN` 1.09 -> 1.06, `SDA` 1.09 -> 1.08 and
+# `BOOT` 1.12 -> 1.08 — because a string-pull takes the wiggle out of a route it cannot re-plan.
+#
+# **Three nets fall below 1.0 and that is not a 13 % shorter route; it is the measurement changing
+# what it measures.** `detour` is routed copper over the airwire between **pad centres**, and the
+# `trim` in `route_relax._moves` retracts a run's end from the pad's centre to `clearance_min` inside
+# its copper — so the numerator drops and the denominator cannot. Measured, on the step files either
+# side of the relax step: buck's `EN` 1.8935 -> **1.6435 mm** over 4 segments -> 2 (1.09 -> 0.95),
+# c3_usb's `BOOT` 5.1648 -> **4.1148 mm** over 9 -> 4 (1.18 -> 0.94), node's `GATE` 2.4375 ->
+# **2.2320 mm** over 6 -> 3 (1.03 -> 0.94). Every millimetre removed is a doubled-back spur or a stub
+# into a pad the run already reaches. c3_usb's `LED_A` at 0.79 and node's plane nets have read below
+# 1.0 since long before this slice, so the ratio was never a pure statement about shape.
 DETOURS = {
-    "blinky": {"LED": 1.04},
-    "buck": {"5V": 1.14, "BOOT": 1.0, "EN": 1.09, "FB": 1.01, "GND": 1.3, "SW": 1.52, "VIN": 2.55},
-    "c3_usb": {"3V3": 1.53, "BOOT": 1.18, "CC1": 1.2, "CC2": 1.08, "EN": 1.04, "GND": 1.48, "LED": 1.19, "LED_A": 0.79, "USB_DN": 1.65, "USB_DP": 1.56, "VBUS": 1.7},
+    "blinky": {"LED": 1.03},
+    "buck": {"5V": 1.13, "BOOT": 1.0, "EN": 0.95, "FB": 1.01, "GND": 1.29, "SW": 1.52, "VIN": 2.51},
+    "c3_usb": {"3V3": 1.53, "BOOT": 0.94, "CC1": 1.13, "CC2": 1.08, "EN": 1.04, "GND": 1.48, "LED": 1.19, "LED_A": 0.79, "USB_DN": 1.65, "USB_DP": 1.56, "VBUS": 1.69},
     "node": {
-        "3V3": 0.13, "BOOT": 1.12, "CC1": 1.0, "CC2": 1.24, "DRV": 1.08, "EN": 1.09, "GATE": 1.03, "GND": 0.43,
-        "LED": 1.12, "LED_A": 1.0, "LOAD": 1.0, "SCL": 1.04, "SDA": 1.09, "T_DIV": 1.03, "T_OUT": 1.72,
+        "3V3": 0.13, "BOOT": 1.08, "CC1": 1.0, "CC2": 1.19, "DRV": 1.08, "EN": 1.06, "GATE": 0.94, "GND": 0.43,
+        "LED": 1.12, "LED_A": 1.0, "LOAD": 1.0, "SCL": 1.04, "SDA": 1.08, "T_DIV": 1.03, "T_OUT": 1.72,
         "USB_DN": 1.82, "USB_DP": 1.53, "VBUS": 1.26,
     },
 }
@@ -248,19 +297,34 @@ RUNGS = {
 
 # D.4: what pcbc owns, exact per board — {reason: (segments, vias)}. A pattern that stops claiming a
 # net shows up here before it shows up in the bar.
+#
+# **Exact and not a ceiling, deliberately, and slice 1 is the case for keeping it that way.** A
+# segment count that falls looks like an improvement and can equally be a pattern that stopped
+# claiming a net — the two are indistinguishable from the number alone, which is why this one has to
+# be read rather than passed.
+#
+# Re-recorded 2026-09-21 for `docs/quality-plan.md` slice 1 (`route_relax.py`), and **only `hop`
+# moves, on three boards**: blinky 5 -> **3**, c3_usb 11 -> **8**, node 11 -> **10**. `hop` is in
+# `route_relax.RELAXABLE`, so the relaxer rewrites those runs, and `copper.json`'s step labels say
+# how many pieces it rewrote: all 3 of blinky's, 5 of c3_usb's 8, 4 of node's 10. The **vias are
+# unchanged on every board and so is every other reason** — `spine`, `stitch`, `thermal` and
+# `plane` are outside `RELAXABLE` by C4, and buck's `tap` and `spine` copper came out of the pass
+# untouched. The copper is not merely re-segmented: blinky's `hop` is the whole of that board's
+# 0.3252 mm saving, 22.8154 -> **22.493 mm**, so the count fell because the run is shorter and
+# straighter, not only because collinear legs merged.
 OWNS = {
-    "blinky": {"hop": (5, 0), "tap": (1, 1)},
+    "blinky": {"hop": (3, 0), "tap": (1, 1)},
     "buck": {"spine": (10, 0), "tap": (6, 6)},
     # S6's array is `(0, n)`: a barrel and **no** segment. A rung needs two links because
     # `ampacity._via_clusters` would otherwise count a twin joined to nothing; an array via is already
     # inside its own land's copper on one layer and inside its own net's pour on the other, so a
     # segment would be a third path between two points already shorted.
-    "c3_usb": {"fanout": (5, 5), "hop": (11, 0), "spine": (9, 0), "tap": (34, 34), "thermal": (0, 9)},
+    "c3_usb": {"fanout": (5, 5), "hop": (8, 0), "spine": (9, 0), "tap": (34, 34), "thermal": (0, 9)},
     # S4's rung is `(2, 1)`: one via and **one link segment on each of the two layers it spans**,
     # unconditionally and at the class width. That 2 is the whole of `docs/stitch-plan.md` §2(e) —
     # `ampacity._via_clusters` is single-linkage on distance with no connectivity test, so a bare
     # twin joined to nothing would double the reported ampacity of a board carrying no more current.
-    "node": {"hop": (11, 0), "spine": (9, 0), "stitch": (2, 1), "tap": (62, 62), "thermal": (0, 12)},
+    "node": {"hop": (10, 0), "spine": (9, 0), "stitch": (2, 1), "tap": (62, 62), "thermal": (0, 12)},
 }
 
 # R1 (docs/r1-design.md E, H.3): the soft rules' hits per example, {rule name: KiCad warnings}, recorded
@@ -302,11 +366,29 @@ OWNS = {
 # the class width or refuses: buck 39 -> **23**, c3_usb 51 -> **40**, node 15 -> **14**. Nothing else
 # moves. What remains is the leftover: KRT still routes the links the backbone could not make, plus
 # GND's own leftover on every board and node's whole USB pair (`width_usb`, an R4 item).
+#
+# **Re-recorded 2026-09-21 for slice 1, and `width_power` falls on all three boards that have any:
+# buck 23 -> 8, c3_usb 40 -> 25, node 14 -> 12.** Not one millimetre of copper got wider — the
+# relaxer cannot change a width, structurally, because width is part of the chain key
+# (`route_relax.Chain`). What fell is the **hit count**: `track_width` fires once per segment, and a
+# necked run that KRT left as eleven staircase legs is one warning after the legs merge into one
+# leg. So this is the clearest case in the file of C9's complaint — a dimensionless hit count that
+# moves when copper is redrawn and says nothing about how much copper is under-width. The
+# millimetres are in BOTTLENECK, and they barely move (buck's `VIN` 19.394 -> 19.12 mm).
+#
+# The other four keys are per-**net** verdicts rather than per-segment hits — `vias_usb_*` is a via
+# count against a budget, `skew_*` and `uncoupled_*` are one hit per pair — and every one of them is
+# byte-identical through this slice, which is what `_skip_nets` skipping the pairs is supposed to
+# guarantee.
+#
+# It stays `==` here for one more slice. `docs/quality-plan.md` section 6 says this assertion must
+# become `<=` and names it a prerequisite for slice 2; that change belongs with the mitre pass that
+# needs it, not with a slice whose numbers all move in the safe direction anyway.
 SOFT = {
     "blinky": {"width_power": 0},
-    "buck": {"width_power": 23},
-    "c3_usb": {"width_power": 40, "vias_usb_dn": 0, "vias_usb_dp": 1, "skew_usb_dn_usb_dp": 1, "uncoupled_usb": 1},
-    "node": {"width_usb": 46, "width_power": 14, "vias_usb_dn": 0, "vias_usb_dp": 0, "skew_usb_dn_usb_dp": 1, "uncoupled_usb": 1},
+    "buck": {"width_power": 8},
+    "c3_usb": {"width_power": 25, "vias_usb_dn": 0, "vias_usb_dp": 1, "skew_usb_dn_usb_dp": 1, "uncoupled_usb": 1},
+    "node": {"width_usb": 46, "width_power": 12, "vias_usb_dn": 0, "vias_usb_dp": 0, "skew_usb_dn_usb_dp": 1, "uncoupled_usb": 1},
 }
 
 # Findings 5, 8, 15 and 17: what each spine actually joined and how much of the net it wrote, off the
@@ -344,11 +426,18 @@ SPINE_NETS = {
 # `PCBC_PATTERNS=off` board the spine moves two of them a long way — buck's `5V` 0.707 -> 1.999 A and
 # its `VIN` 0.536 -> 1.21 A (its 2 A path `J_IN.1 -> U1.3` goes 0.127 -> 0.781 mm) — and leaves the
 # two nets it refused exactly where they were.
+#
+# **Re-recorded 2026-09-21 for slice 1: every `carries` is byte-identical and every `under_mm`
+# falls.** buck's `VIN` 19.394 -> **19.12 mm**, c3_usb's `VBUS` 24.068 -> **23.998**, node's `VBUS`
+# 6.476 -> **6.436**. That pairing is the honest reading of the relaxer's effect on current: it
+# cannot change a width, so the narrowest copper on a path is the same copper carrying the same
+# amperes, and all it does is make the under-width run **shorter** by taking the wiggle out of it.
+# Nothing here becomes `ok` and nothing here gets worse; `UNDER` below is unchanged on all four.
 BOTTLENECK = {
     "blinky": {},
-    "buck": {"5V": (1.999, 0.0), "VIN": (1.21, 19.394)},
-    "c3_usb": {"3V3": (1.231, 0.0), "VBUS": (0.536, 24.068)},
-    "node": {"LOAD": (1.231, 0.0), "VBUS": (0.527, 6.476)},
+    "buck": {"5V": (1.999, 0.0), "VIN": (1.21, 19.12)},
+    "c3_usb": {"3V3": (1.231, 0.0), "VBUS": (0.536, 23.998)},
+    "node": {"LOAD": (1.231, 0.0), "VBUS": (0.527, 6.436)},
 }
 UNDER = {
     "blinky": [],
@@ -389,7 +478,17 @@ is safe. What closes node's via half is two placements this board has no room fo
 # was built for (S7 review, finding 16): node's leftover sitting 0.0501 mm from the locked `VBUS`
 # spine on a board whose process floor is 0.0889 mm, with real laminate between them. blinky's 0
 # cannot fall; buck's 1 is left as the ceiling it is until a build measures it.
-SAME_NET = {"blinky": 0, "buck": 1, "c3_usb": 5, "node": 2}
+#
+# **A build measured it, 2026-09-21: buck is 0 after slice 1.** The one slot was `EN`'s leading leg
+# `(16.45,7.65)-(16.85,7.25)` passing **0.0605 mm from `U1.5`'s own pad** on a board whose floor is
+# 0.127 — and that leg is exactly the one `route_relax._moves`' trim drops, because the run reaches
+# `U1.5` anyway and the leg was the doubled-back spur into it. The slot goes with the copper.
+# c3_usb's 5 and node's 2 are unmoved to the last digit — c3_usb's are two tracks running beside a
+# pad of their own net (`BOOT` against `U1.23` at 0.0072 mm and against `SW_BOOT.1` at 0.1133) and
+# three beside a via of it (two `GND` at 0.1000 and 0.1023, `USB_DN` at 0.1137), node's two are its
+# leftover 0.0501 and 0.0509 mm from the locked `VBUS` spine, which the pass may not move. A ceiling, so this stays `<=`: a slot that appears is a
+# clearance question somebody has to answer, and one that disappears is not.
+SAME_NET = {"blinky": 0, "buck": 0, "c3_usb": 5, "node": 2}
 
 # Finding 10: the leftover's own half of the trade, per spined net — `(spine mm, leftover mm)`. The
 # per-net `routed_mm` and `detour` are over **all** the copper on a net, so a spine that adds to
@@ -398,56 +497,67 @@ SAME_NET = {"blinky": 0, "buck": 1, "c3_usb": 5, "node": 2}
 # 24.786) the trade is 0.87 leftover millimetres saved per millimetre of spine on buck's `5V`, 0.37
 # on c3_usb's `3V3`, 1.16 on node's `VBUS` — and **-1.88** on buck's `VIN`, which writes 3.38 mm and
 # costs 6.37. `docs/r2-measurements.md` S7 records why that one is kept.
+#
+# **Re-recorded 2026-09-21 for slice 1. Every `spine mm` is byte-identical and every `leftover mm`
+# falls**, which is the cleanest statement of what the relaxer is and is not allowed to touch: a
+# `spine` is outside `route_relax.RELAXABLE` (C4) and comes out of the pass untouched to the last
+# digit, while `leftover` is KRT's route and pcbc owns only its shape. buck's `5V` 11.586 ->
+# **11.16** and `VIN` 50.675 -> **49.942**, c3_usb's `3V3` 31.09 -> **30.998** and `VBUS` 43.833 ->
+# **43.704**, node's `VBUS` 14.521 -> **14.43**. That is 1.471 mm of leftover removed across the
+# three boards, and it improves the trade this dict was built to show without a millimetre of new
+# spine.
 LEFTOVER = {
     "blinky": {},
-    "buck": {"5V": (14.618, 11.586), "VIN": (3.383, 50.675)},
+    "buck": {"5V": (14.618, 11.16), "VIN": (3.383, 49.942)},
     # c3_usb's `VBUS` is the control: its 3.2 mm is the **fanout's**, not a spine's — the spine
     # refused all six of its links — and its leftover is the whole rest of the net.
-    "c3_usb": {"3V3": (25.132, 31.09), "VBUS": (3.2, 43.833)},
-    "node": {"VBUS": (8.819, 14.521)},
+    "c3_usb": {"3V3": (25.132, 30.998), "VBUS": (3.2, 43.704)},
+    "node": {"VBUS": (8.819, 14.43)},
 }
 
 
 # `docs/stitch-plan.md` S1 — the two populations, counted before anything is designed around them.
-# Both dicts are recorded against the **checked-in** routed boards (2026-09-20), including the DS2
-# Addon's, read-only; `tests/test_route_verify_stitch.py` is where they are asserted, because a
-# coordinate is a property of the copper KRT chose on the run that wrote that file and this test
-# re-routes from scratch. What the build test asserts is that both counts ran inside `pcbc build`.
+#
+# **Both dicts are recorded against a FRESH BUILD as of 2026-09-21, and that is the change.** They
+# used to be recorded against the **checked-in** routed boards in `examples/**/layout/`, which is
+# gitignored build output and was stale: `tests/test_route_verify_stitch.py` now builds every board
+# it reads (`conftest.routed_board`) instead of reading that directory, and the two dicts moved the
+# moment it did. Three separate defects in one session came from numbers pinned against those
+# artifacts — a test asserting buck has 5 vias where a fresh build has 7 among them — so the rule now
+# is that nothing in this file is pinned against a file pcbc did not produce on the run that read it.
 #
 # RETURNS: every via on a net carrying `Constraint.reference`, as (net, at, verdict, nearest
-# reference-net via in mm). **Not one of the eleven is a distance question.** node is four layers
-# with GND on In1.Cu and 3V3 on In2.Cu, so a through via takes the track from copper referenced to
-# GND to copper referenced to 3V3 — the return has to change *net*, and no via joins two nets.
-# c3_usb is two layers with one pour, so the via lands the track in the GND pour's own layer and
-# there is no second plane to reach. blinky, buck and ds2 declare no controlled-impedance net at
-# all, so the population there is **empty and stays empty** — that is the entry, not a missing row.
-# This is why `docs/stitch-plan.md` §8 ships no return-via placer: the population is zero for a
-# structural reason no routing improvement fixes.
+# reference-net via in mm). **Not one of the five is a distance question.** c3_usb is two layers with
+# one pour, so the via lands the track in the GND pour's own layer and there is no second plane to
+# reach. blinky, buck and ds2 declare no controlled-impedance net at all, so the population there is
+# **empty and stays empty** — that is the entry, not a missing row. This is why `docs/stitch-plan.md`
+# §8 ships no return-via placer: the population is zero for a structural reason no routing
+# improvement fixes.
 #
-# **Re-measured on fresh builds in a temp directory, 2026-09-20, and the verdicts hold where the
-# counts do not.** node's `USB_DN` and `USB_DP` come out of `pcbc build` with **no via at all** — the
-# pair never leaves F.Cu — so node's seven rows below are a property of the stale checked-in artifact
-# (`docs/stitch-plan.md` §2(o): that routed directory has no `patterns_post` step, so it predates
-# S5). c3_usb comes out with **five**, still every one of them `lost`. The count is the router's; the
-# verdict is the stackup's, and it is the verdict this dict exists to record.
+# **Re-recorded 2026-09-21 off fresh builds, and both moves were predicted in this comment a day
+# before the test could act on them.** `docs/stitch-plan.md` §2(o) and the paragraph that stood here
+# both said the checked-in artifacts were stale and told S4 to re-measure; `conftest.routed_board`
+# is what finally made that possible in the test rather than in a temp directory beside it.
+#
+#   node  **7 rows -> 0.** `USB_DN` and `USB_DP` come out of `pcbc build` with no via at all — the
+#         pair never leaves F.Cu — so the seven `net_change` rows were a property of a routed
+#         directory that has no `patterns_post` step and therefore predates S5. node's *rule* is
+#         still `net_change` on both nets (`RULES`), which is the half that is the stackup's; what
+#         is gone is the copper that confirmed it.
+#   c3_usb **4 rows -> 5**, every one still `lost`, every coordinate different. The count is the
+#         router's and the verdict is the stackup's, and it is the verdict this dict exists to
+#         record. Its nearest reference-net via goes 1.6279 -> **2.2472 mm** with it.
 RETURNS = {
     "blinky": (),
     "buck": (),
     "c3_usb": (
-        ("USB_DN", (15.05, 1.15), "lost", 2.9547),
-        ("USB_DN", (17.45, 19.45), "lost", 3.1851),
-        ("USB_DP", (15.05, 2.75), "lost", 1.6279),
-        ("USB_DP", (19.5, 20.35), "lost", 4.4433),
+        ("USB_DN", (15.45, 1.9), "lost", 2.2472),
+        ("USB_DN", (19.0, 21.05), "lost", 3.6953),
+        ("USB_DP", (14.65, 1.95), "lost", 2.6005),
+        ("USB_DP", (19.7, 21.45), "lost", 3.5009),
+        ("USB_DP", (20.55, 20.6), "lost", 2.3259),
     ),
-    "node": (
-        ("USB_DN", (16.3, 12.5), "net_change", 2.1932),
-        ("USB_DN", (18.1, 14.3), "net_change", 2.3537),
-        ("USB_DN", (30.2, 29.7), "net_change", 1.8028),
-        ("USB_DN", (30.8, 38.5), "net_change", 4.9649),
-        ("USB_DN", (31.9, 31.5), "net_change", 3.6688),
-        ("USB_DP", (29.75, 36.5), "net_change", 3.6719),
-        ("USB_DP", (30.75, 36.5), "net_change", 4.5774),
-    ),
+    "node": (),
     "ds2": (),
 }
 
@@ -455,38 +565,47 @@ RETURNS = {
 # `need` is `stackup.vias_per_change(amps, drill, plating, temp_rise)` — R1 has compiled that number
 # since `ViaSpec.per_change` and nothing had ever compared it to the vias a finished board has.
 #
-# **Technique 1's whole population is node's `VBUS`**: four singleton groups of a 0.2 mm drill, each
-# carrying `via_amps(0.2)` = 0.527 A of a 1 A rail, each wanting `vias_per_change(1.0, 0.2)` = 2 —
-# four rungs. Every other group on every other board is `n >= need` by arithmetic: c3_usb's 0.5 A and
-# ds2's 0.1 A both sit under one 0.3 mm barrel's 0.707 A, so `need` is 1 and a singleton is rated.
-# blinky and buck carry no via at all on an unpoured power net, so their entry is `{}` and means it.
+# **Technique 1's whole population is node's `VBUS`.** Every other group on every other board is
+# `n >= need` by arithmetic: c3_usb's 0.5 A and ds2's 0.1 A both sit under one 0.3 mm barrel's
+# 0.707 A, so `need` is 1 and a singleton is rated. blinky and buck carry no via at all on an
+# unpoured power net, so their entry is `{}` and means it.
 #
 # The **poured** rails are exempt for the reason `power_bottlenecks` exempts them: the plane is the
 # conductor and a via into it is a tap carrying one pad's share. That exemption is load-bearing, not
-# tidy — without it buck's `GND` reads five under-rated groups against its 2 A and node's `GND` and
-# `3V3` read sixteen and seven, all of them taps into the pour that carries the current.
+# tidy — without it, on a fresh build, buck's `GND` reads **7** under-rated groups against its 2 A
+# and node's `GND` and `3V3` read **42** and **15**, all of them taps into the pour that carries the
+# current.
 #
-# **The count is four here and three on a fresh build**, measured 2026-09-20 in a temp directory:
-# node's `VBUS` comes out of `pcbc build` with three vias at (27.8,36.3), (28,33.4) and (31.3,38.5),
-# still all singletons, still all short by one. `docs/stitch-plan.md` §2(o) tells S4 to re-measure
-# rather than copy the four, and this is the measurement that says why: the *count* is the router's,
-# the *shortfall per group* is the stackup's — `vias_per_change(1.0, 0.2)` is 2 whatever KRT does.
+# **Re-recorded 2026-09-21 off fresh builds, and every board with an entry moved.** The old rows came
+# from `examples/**/layout/`, gitignored build output that was several slices behind the code:
+#
+#   node   4 singleton groups -> **3 groups, one of them a pair**. The pair at (28,33.4) is
+#          `docs/stitch-plan.md` S4's own rung — the stitch twin 0.9 mm from its anchor, which
+#          `_via_clusters` reads as one cluster of two — so this dict now shows the technique
+#          working rather than only the need for it: one of the three groups is rated, and it is
+#          rated because pcbc placed a via. The other two are (27.8,36.3) and (31.3,38.5), still
+#          singletons, still short by one, and **exactly** the two names in `STITCH_REFUSED` as
+#          walled in by KRT's copper. The rungs still owed fall 4 -> **2**.
+#   c3_usb `3V3`'s two groups are gone and `VBUS`'s three are now **four**, at entirely different
+#          coordinates. Every one is still `need = 1`, which is the arithmetic and not the router.
+#   ds2    13 groups -> **14**: `VDDA` now carries **two** vias where the stale board carried one,
+#          and four anchors move — 3V3's (19.05,16.5) -> (20.05,19.3) and (22.2,7.55) ->
+#          (22.18,7.55), VSS's (22.85,16.35) -> (22.83,16.35) and (23.2,13.2) -> (22.85,13.35), so
+#          0.02 to 2.97 mm. Every `need` is still 1, which is the structural claim
+#          `docs/stitch-plan.md` §4 makes about ds2 and the one thing here no build can change.
 PARALLEL = {
     "blinky": {},
     "buck": {},
-    "c3_usb": {
-        "3V3": (((16.25, 11.9), 1, 1), ((18.4, 9.7), 1, 1)),
-        "VBUS": (((17.35, 20.45), 1, 1), ((18.35, 23.55), 1, 1), ((19.5, 23.95), 1, 1)),
-    },
-    "node": {"VBUS": (((26.9, 34.7), 1, 2), ((28.0, 38.6), 1, 2), ((32.3, 34.9), 1, 2), ((32.3, 36.4), 1, 2))},
+    "c3_usb": {"VBUS": (((17.4, 18.6385), 1, 1), ((18.0, 16.9), 1, 1), ((31.75, 10.75), 1, 1), ((31.75, 12.65), 1, 1))},
+    "node": {"VBUS": (((27.8, 36.3), 1, 2), ((28.0, 33.4), 2, 2), ((31.3, 38.5), 1, 2))},
     "ds2": {
-        "3V3": (((19.05, 16.5), 1, 1), ((22.2, 7.55), 1, 1)),
-        "VDDA": (((22.85, 8.05), 1, 1),),
+        "3V3": (((20.05, 19.3), 1, 1), ((22.18, 7.55), 1, 1)),
+        "VDDA": (((21.25, 6.25), 1, 1), ((22.83, 8.05), 1, 1)),
         "VSS": (
             ((4.65, 18.85), 1, 1),
             ((8.35, 15.15), 1, 1),
-            ((22.85, 16.35), 1, 1),
-            ((23.2, 13.2), 1, 1),
+            ((22.83, 16.35), 1, 1),
+            ((22.85, 13.35), 1, 1),
             ((30.1, 3.25), 1, 1),
             ((30.9, 4.05), 1, 1),
             ((35.4, 7.9), 1, 1),
@@ -630,9 +749,17 @@ def test_example_builds_to_fab(tmp_path: Path, name: str):
         # `route.krt_plan` reads `planes=` not at all, so that edit would have poured no copper and
         # marked `VIN` zoned, silencing this very line. And an **edit to the NetReq that exists**:
         # a second `NetReq("VIN", ...)` is refused twice over before the board is drawn.
+        #
+        # Re-recorded 2026-09-21 for slice 1. Two numbers in the sentence move and neither is the
+        # verdict: the narrowest **position** 13.75,9.075 -> **13.8,9.175**, because the relaxer
+        # rewrote the leftover run that neck is on and the narrowest point of the new run is a
+        # different point of the same track; and the under-width length 19.394 -> **19.12 mm**, the
+        # same run being shorter. The width (0.3905), the current (1.21 A), the class (0.781) and
+        # the path (`C_IN1.1->R_EN.1`) are byte-identical, which is the point — the relaxer changes
+        # no width and re-orders no net, so the rail is as short of its declaration as it was.
         assert fab_step["power"] == [
             "VIN: declared 2 A, carries 1.21 A through its narrowest 0.3905 mm track at "
-            "13.75,9.075 on F.Cu (19.394 mm of this net is narrower than its 0.781 mm class; "
+            "13.8,9.175 on F.Cu (19.12 mm of this net is narrower than its 0.781 mm class; "
             "path C_IN1.1->R_EN.1). Place() the parts either side of that copper closer together, "
             'or change amps= on the NetReq that already declares "VIN"'
         ], fab_step["power"]

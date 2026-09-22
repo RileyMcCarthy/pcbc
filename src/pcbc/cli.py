@@ -55,6 +55,12 @@ def main(argv: list[str] | None = None) -> int:
     pc.add_argument("--constraints", action="store_true", help="also print the constraint report the placement was checked against")
     pc.set_defaults(func=cmd_pcb)
 
+    ro = sub.add_parser("route", help="Routing questions about a placed board (today: --channels)")
+    ro.add_argument("board")
+    ro.add_argument("--channels", action="store_true", help="the congestion map: every channel between two obstacles, what fits through it, and the pads with no way out")
+    ro.add_argument("--json", action="store_true", help="with --channels: the block that goes into copper.json")
+    ro.set_defaults(func=cmd_route)
+
     rv = sub.add_parser("review", help="HTML: schematic, copper, 3D")
     rv.add_argument("board")
     rv.add_argument("--no-open", action="store_true")
@@ -280,6 +286,57 @@ def cmd_pcb(args: argparse.Namespace) -> int:
         for line in lines:
             print(f"  {line}")
     return 1 if result.get("error") else 0
+
+
+def cmd_route(args: argparse.Namespace) -> int:
+    """`pcbc route --channels`: the congestion map of a placed board.
+
+    It places the board first — `pcb_job` is check + seed + place, a pure function of `board.py` with
+    no KiCad and no router in it — and then measures the air between the obstacles. That is the whole
+    point of the command: the answer is available *before* anything is routed, which is when a
+    `Place()` line can still be written.
+    """
+    import time
+
+    from .route_channel import channels, channels_doc, class_widths, moves, escapes, report
+    from .route_scene import build_scene
+
+    path = Path(args.board)
+    if not path.exists():
+        print(f"no such file: {path}", file=sys.stderr)
+        return 2
+    if not args.channels:
+        print("pcbc route today ships only --channels (the congestion map).", file=sys.stderr)
+        print("To route a board, use: pcbc build --upto route", file=sys.stderr)
+        return 2
+    try:
+        result = pcb_job(path)
+    except ValueError as exc:
+        print(f"placement: {exc}", file=sys.stderr)
+        return 2
+    if result.get("check"):
+        print("check failed:")
+        for f in result["check"]:
+            print(f"  - {f}")
+        return 2
+    design = load_board(path)
+    job = compile_design(design)
+    text = Path(result["placed"]).read_text()
+    t0 = time.perf_counter()
+    scene = build_scene(design, job, job.constraints, text)
+    widths = class_widths(job)
+    layers_of = {c.net: c.layers for c in (job.constraints.constraints if job.constraints is not None else ())}
+    maps = channels(scene)
+    if args.json:
+        print(json.dumps(channels_doc(scene, widths=widths, layers_of=layers_of, maps=maps), indent=2))
+        return 0
+    print(f"placed: {result['placed']}")
+    for line in report(scene, widths=widths, layers_of=layers_of, maps=maps):
+        print(line)
+    print(f"({time.perf_counter() - t0:.3f} s, no router and no KiCad)")
+    # A sealed pad is a placement refusal, so the command exits non-zero the way `pcbc pcb` does when
+    # it has moves: this is meant to be run in a loop that edits `board.py` until it is quiet.
+    return 1 if moves(escapes(scene, maps, widths, layers_of=layers_of)) else 0
 
 
 def cmd_search(args: argparse.Namespace) -> int:

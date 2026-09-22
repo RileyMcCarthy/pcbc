@@ -578,6 +578,14 @@ def test_the_fixture_builds_to_fab_with_the_plane_gate_verified(tmp_path: Path):
     cuts in a **foreign** plane, and a lattice barrel is on the pour's own net — the fill flows right
     up to it and there is no clearance hole at all. Built with and without the lattice, the same
     board's `plane_area` is byte-identical: `GND B.Cu` 1137.97 and `GND F.Cu` 1066.28 both times.
+
+    **`GND F.Cu` is re-recorded 1066.28 -> 1066.22 for `docs/quality-plan.md` slice 1**, and that is
+    the string-pull rather than the lattice: built with the relaxer disabled the fixture measures
+    1066.28 / 1137.97 to the last digit, and with it 1066.22 / 1137.97. The pass moves 6 of this
+    board's 17 chains and takes 1.1842 mm out of them; F.Cu's is the only pour whose area moves at
+    all, and a pour flows around copper — a staircase and the taut run that replaces it exclude different slivers of zone. The
+    direction is not systematic: on c3_usb the same pass takes `GND B.Cu` **up** 1053.06 -> 1053.10.
+    Both boards are still one island per plane and every lattice barrel still lands in its pour.
     """
     from pcbc.build import build_job
 
@@ -588,11 +596,11 @@ def test_the_fixture_builds_to_fab_with_the_plane_gate_verified(tmp_path: Path):
     route = next(s for s in result["steps"] if s.get("stage") == "route")
     assert route["planes_stitched"]["fails"] == [], route["planes_stitched"]["lines"]
     assert route["planes_stitched"]["lines"] == [
-        "plane GND: 41 lattice via(s), all landing in B.Cu + F.Cu; 2204.25 mm2 of pour across 2 layer(s), 1 island(s) on the worst of them",
+        "plane GND: 41 lattice via(s), all landing in B.Cu + F.Cu; 2204.19 mm2 of pour across 2 layer(s), 1 island(s) on the worst of them",
         "planes: 1 of 1 lattice(s) landing in every pour they tie",
     ], route["planes_stitched"]["lines"]
     assert route["planes"]["islands"] == {"GND B.Cu": 1, "GND F.Cu": 1}, route["planes"]["islands"]
-    assert route["planes"]["area_mm2"] == {"GND B.Cu": 1137.97, "GND F.Cu": 1066.28}, route["planes"]["area_mm2"]
+    assert route["planes"]["area_mm2"] == {"GND B.Cu": 1137.97, "GND F.Cu": 1066.22}, route["planes"]["area_mm2"]
     assert route["copper_bar"]["totals"]["vias_pattern"] == {"plane": 41, "tap": 5}
     assert route["refusals"] == [], "a board that declares an edge rate has nothing to refuse"
     assert any(n.startswith("style: stitch GND plane: 41 of 50 placed, 0.5 GHz of 1 GHz") for n in route["notes"]), route["notes"]

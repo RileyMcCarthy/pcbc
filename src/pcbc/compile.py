@@ -61,6 +61,7 @@ class CompiledJob:
     skip_autoroute_patterns: list[str]
     krt: dict
     constraints: ConstraintSet | None = None
+    net_order: str | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -86,6 +87,7 @@ class CompiledJob:
             "dru": [asdict(r) for r in self.dru],
             "skip_autoroute_patterns": self.skip_autoroute_patterns,
             "krt": self.krt,
+            "net_order": self.net_order,
             "constraints": self.constraints.to_dict() if self.constraints is not None else None,
             "rule_areas": [asdict(a) for a in self.constraints.rule_areas] if self.constraints is not None else [],
         }
@@ -201,6 +203,7 @@ def compile_design(design: Design) -> CompiledJob:
         skip_autoroute_patterns=skip,
         krt=krt,
         constraints=cs,
+        net_order=board.net_order,
     )
 
 

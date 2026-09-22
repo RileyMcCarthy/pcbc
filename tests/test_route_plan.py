@@ -151,3 +151,88 @@ def test_a_constrained_nets_copper_is_locked_and_kept_out_of_later_steps():
     assert lock_copper(out, {"AIN0"}) == out  # idempotent
     plan = dict(_plan("node"))
     assert _args(plan["signals"], "--nets")[:3] == ["*", "!T_DIV", "!T_OUT"]
+
+
+# ---------------------------------------------------------------------------------------------
+# `Board(net_order=)`: the one router knob a board declares (docs/quality-plan.md slice 4)
+# ---------------------------------------------------------------------------------------------
+
+
+def _plan_of(board: Path) -> list[tuple[str, list[str]]]:
+    design = load_board(board)
+    return krt_plan(compile_design(design), design, Path("placed.kicad_pcb"), Path("routed"), Path("/krt"))
+
+
+DECLARING = (
+    "from pcbc import *\n"
+    'VCC = Power("VCC"); GND = Ground("GND")\n'
+    'Resistor("R1", "1k", package="0603", mpn="X", lcsc="C1", p1=VCC, p2=GND)\n'
+    'Resistor("R2", "1k", package="0603", mpn="X", lcsc="C1", p1=VCC, p2=GND)\n'
+    'NetReq("VCC", "GND", kind="power", volts=5, amps=1)\n'
+    'Board(width=40, height=25, layers=2, stackup="jlcpcb_2l_1oz", net_order="original")\n'
+    'Place("R1", at=(5, 5)); SchPlace("R1", left=20, top=20)\n'
+    'Place("R2", at=(15, 5)); SchPlace("R2", left=60, top=20)\n'
+)
+
+
+def test_the_declared_net_order_reaches_the_wildcard_steps_and_no_others(tmp_path: Path):
+    """`Board(net_order=)` on a board that declares it, and the scope is a measurement not a taste.
+
+    Given to every `route.py` step instead -- `local_hops`, the constrained `*_nets` steps,
+    `plane_taps` -- the DS2 Addon stops being a board: `kicad_drc` returns two `items_not_allowed`
+    errors and a `solder_mask_bridge`, where the same board with the flag on `signals` alone is
+    identical to base on every violation type (114 warnings, 0 errors, both arms, measured
+    2026-09-21). The constrained steps route on an otherwise empty board and have no congestion for
+    an order to negotiate, so the two wildcard steps are the only ones whose order can matter.
+
+    A synthetic board and not buck, because **no board in this repo declares it** and the reason is
+    in `docs/quality-plan.md` slice 4: buck is the one board it wins on, and it wins by routing the
+    2 A `VIN` rail through two layer changes on a single 0.3 mm via each -- `via_parallelism` reads
+    0.707 A carried against 3 needed, at `(18.2, 8.45)` and `(18.25, 5.75)`, where base buck changes
+    layer on that rail **not at all**.
+    """
+    board = tmp_path / "declaring.py"
+    board.write_text(DECLARING)
+    got = {name: ("--ordering" in cmd and _args(cmd, "--ordering")) for name, cmd in _plan_of(board)}
+    assert got == {"signals": ["original"], "gnd_pour": False, "finalize": ["original"]}, got
+
+
+def test_a_board_that_declares_no_net_order_passes_the_flag_nowhere():
+    """The default is KRT's own, and pcbc says nothing rather than repeating it: a board that
+    declares nothing must produce the command it produced before `net_order` existed. **No board in
+    this repo declares one**, so all five are byte-identical to base on a fresh build and not one
+    recorded number moves; this is the cheap half of that check."""
+    for board in ("blinky", "buck", "c3_usb", "node"):
+        for name, cmd in _plan(board):
+            assert "--ordering" not in cmd, (board, name)
+
+
+def test_a_net_order_the_router_does_not_have_is_refused_at_declaration(tmp_path: Path):
+    """A typo in `net_order=` must not become a KRT step that exits non-zero halfway through a build.
+
+    The four names are KRT's own `--ordering` choices, pinned against `route.KRT_SHA`. The refusal
+    lists them and **recommends none**: `"original"` is the only one that measured a win anywhere
+    (buck, -9.7 % copper) and it pays for that win with two under-rated vias on a 2 A rail, so a
+    refusal that named it would be advice this repo has measured against.
+    """
+    from pcbc.language import check_board
+
+    head = (
+        "from pcbc import *\n"
+        'VCC = Power("VCC"); GND = Ground("GND")\n'
+        'Resistor("R1", "1k", package="0603", mpn="X", lcsc="C1", p1=VCC, p2=GND)\n'
+        'Board(width=40, height=25, layers=2, stackup="jlcpcb_2l_1oz", net_order={order})\n'
+        'Place("R1", at=(5, 5)); SchPlace("R1", left=20, top=20)\n'
+    )
+    good = tmp_path / "good.py"
+    good.write_text(head.format(order='"original"'))
+    assert not [f for f in check_board(good, pcb=False) if "net_order" in f]
+    bad = tmp_path / "bad.py"
+    bad.write_text(head.format(order='"shortest"'))
+    fail = check_board(bad, pcb=False)[0]
+    assert "Board(net_order='shortest')" in fail
+    assert "'mps', 'inside_out', 'original', 'bus'" in fail
+    # And it recommends nothing: the value that measured fastest also measured unsafe, so the move
+    # is "drop it, and measure any other choice against the via parallelism report".
+    assert "drop the argument" in fail and "under-rated vias on a 2 A rail" in fail
+    assert "pcbc build --strict-power" in fail  # a pointer at a flag that exists (cli.py:41)

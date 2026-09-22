@@ -38,24 +38,28 @@ def _board(name: str) -> Path:
 
 # A **routed** board is not a pure function of `board.py`: it needs KiCad and KRT and minutes of
 # work, and `examples/**/layout/` is gitignored build output that a clean checkout does not have.
-# So every test here that reads one is marked `kicad` + `krt` — which is what those markers already
-# promise — and skips when the artifact is absent rather than raising `FileNotFoundError` in the
-# fast job. Measured: at 77d596b a clean `git archive` checkout failed 45 tests in
-# `test_patterns.py` and 4 here, and CI runs `pytest` **before** its first `pcbc build` in both
-# jobs, so the suite was green only on a machine that had built the boards before.
+# So every test here is marked `kicad` + `krt` — which is what those markers already promise — and
+# `_routed` **builds** the board rather than reading that directory at all. Measured: at 77d596b a
+# clean `git archive` checkout failed 45 tests in `test_patterns.py` and 4 here, and CI runs
+# `pytest` **before** its first `pcbc build` in both jobs, so the suite was green only on a machine
+# that had built the boards before — and was asserting that machine's numbers when it was.
 pytestmark = [
     pytest.mark.kicad,
     pytest.mark.krt,
-    pytest.mark.skipif(
-        not (EXAMPLES / "c3_usb" / "layout" / "c3_usb" / "routed" / "layout.kicad_pcb").exists(),
-        reason="needs routed boards: run `pcbc build` on the examples first",
-    ),
-]
+]  # no skipif: `_routed` BUILDS the board (conftest.routed_board), so nothing on disk is needed.
 
 def _routed(name: str) -> Path:
-    if name == "ds2":
-        return DS2 / "layout" / "ds2_addon" / "routed" / "layout.kicad_pcb"
-    return EXAMPLES / name / "layout" / name / "routed" / "layout.kicad_pcb"
+    """Built, never read out of `examples/**/layout/`.
+
+    That directory is gitignored build output, a clean checkout does not have it, and whatever is in
+    it is whatever somebody last built — on this machine its buck carries 71 segments where a fresh
+    build carries 73. Three of the dicts this file asserts were pinned against it and were wrong
+    before anything in this session touched the router; `conftest.routed_board` builds the board
+    once per session instead (`kicad` + `krt`, which is what this file is already marked).
+    """
+    from conftest import routed_board
+
+    return routed_board(name, _board(name))
 
 
 def _ask(name: str, text: str | None = None, **kw):
@@ -91,16 +95,35 @@ def test_the_junction_that_makes_ds2_pass_is_inside_the_caps_copper_and_not_a_ju
     """Why the check removes a pad's **region** and not its node in a graph.
 
     Walk ds2's `VDDA` as a graph of track endpoints and it has one degree-3 vertex, at
-    (20.35, 6.45). Read that as a T and the conclusion inverts: the two "through" edges leave it at
-    -45.00 and 135.00 degrees — exactly collinear — and the third is a 0.0219 mm stub to the pad
-    centre, so as a graph `C4.1` is a **leaf**, and deleting the vertex leaves `J2.1` connected to
-    `U1.12`. A cut-vertex reading of "the stop is in the path" fails the one board where the feed
-    demonstrably runs across the cap's pad.
+    (20.35, 6.45). Read that as a T and the conclusion inverts: two of its three edges are the feed
+    passing through — they leave at 135.00 and 0.00 degrees, a plain 45-degree corner — and the
+    third is a 0.0219 mm stub to the pad centre, so as a graph `C4.1` is a **leaf**, and deleting the
+    vertex leaves `J2.1` connected to `U1.12`. A cut-vertex reading of "the stop is in the path"
+    fails the one board where the feed demonstrably runs across the cap's pad.
+
+    (Those two angles were -45.00 and 135.00 — exactly collinear — on the checked-in artifact this
+    test used to read, and they are collinear on no board pcbc builds: with the relaxer disabled the
+    second edge leaves at **45.00** degrees, toward (20.55,6.65), and slice 1 re-lays it at **0.00**
+    along `y` 6.45. So the "exactly collinear" reading was a property of a file nobody had rebuilt.
+    None of it matters to the verdict: what makes `C4.1` a leaf is the 21.9 um stub, and what makes
+    the verdict `held` is that the feed's own copper covers 0.9987 mm of centre line inside the pad.)
 
     What is actually there is one straight trace crossing the pad plus 21.9 um of redundant copper.
     The numbers below are the tolerance's justification: the junction sits **0.4300 mm inside**
-    `C4.1`'s copper, and **1.1185 mm** of the trunk's centre line is inside it — against a 0.1270 mm
+    `C4.1`'s copper, and **0.9987 mm** of the trunk's centre line is inside it — against a 0.1270 mm
     process floor. Nothing about this verdict is close.
+
+    **Re-measured 2026-09-21 against a board this test builds** (`conftest.routed_board`) rather than
+    against `examples/**/layout/`. The junction, the 21.9 um stub and the 0.4300 mm depth are
+    byte-identical — they are where `C4.1` is and where KRT lands on it — but the **trunk changed
+    shape twice over**. Its second leg used to read `(20.35,6.45)-(22.75,4.05)`, a segment on no
+    board pcbc builds and the stale artifact's; with the relaxer disabled the same leg is a 0.2828 mm
+    step to `(20.55,6.65)`; and `docs/quality-plan.md` slice 1 pulls that step and the two legs after it
+    (0.2828 + 0.1 + 0.5657 mm) into a straight run along `y` 6.45 and one diagonal out (0.5 +
+    0.2828). So the copper across the pad is `(19.45,7.35)-(20.35,6.45)` and
+    `(20.35,6.45)-(20.85,6.45)`, carrying 0.5687 + 0.4300 mm of centre line inside the pad where
+    the stale pair carried 1.1185. The verdict is `held` on all three, and a *test* reading a file
+    nobody had rebuilt is the same defect this suite exists to catch.
     """
     import math
     import re
@@ -119,7 +142,7 @@ def test_the_junction_that_makes_ds2_pass_is_inside_the_caps_copper_and_not_a_ju
     )
     assert hull_dist2((junction,), pts) == 0.0, "inside the hull, so inside the copper"
     assert round(edge + c4.r, 4) == 0.4300, (edge + c4.r, "the junction is 0.43 mm inside C4.1's copper")
-    trunk = [((19.45, 7.35), (20.35, 6.45)), ((20.35, 6.45), (22.75, 4.05))]
+    trunk = [((19.45, 7.35), (20.35, 6.45)), ((20.35, 6.45), (20.85, 6.45))]
     for a, b in trunk:
         assert re.search(rf"\(start {a[0]} {a[1]}\)\s*\(end {b[0]} {b[1]}\)", text), (a, b, "the trunk moved")
     inside = 0.0
@@ -127,24 +150,30 @@ def test_the_junction_that_makes_ds2_pass_is_inside_the_caps_copper_and_not_a_ju
         n = 200000
         hit = sum(1 for k in range(n) if hull_dist2(((a[0] + (b[0] - a[0]) * (k + 0.5) / n, a[1] + (b[1] - a[1]) * (k + 0.5) / n),), pts) <= c4.r**2)
         inside += math.dist(a, b) * hit / n
-    assert round(inside, 3) == 1.118, (inside, "1.1185 mm of trunk centre line inside the pad")
+    assert round(inside, 3) == 0.999, (inside, "0.9987 mm of trunk centre line inside the pad")
 
 
 # --- the gate can fail -----------------------------------------------------------------------------
 
 
 TEE = (
-    ("(start 19.45 7.35)\n\t\t(end 20.35 6.45)", "(start 19.45 7.35)\n\t\t(end 19.45 4.05)"),
-    ("(start 20.35 6.45)\n\t\t(end 22.75 4.05)", "(start 19.45 4.05)\n\t\t(end 22.75 4.05)"),
-    ("(start 20.35 6.45)\n\t\t(end 20.33 6.4411)", "(start 19.45 6.4411)\n\t\t(end 20.33 6.4411)"),
+    ("(start 19.45 7.35)\n\t\t(end 20.35 6.45)", "(start 19.45 7.35)\n\t\t(end 21.05 7.35)"),
+    ("(start 20.35 6.45)\n\t\t(end 20.85 6.45)", "(start 21.05 7.35)\n\t\t(end 21.05 6.45)"),
+    ("(start 20.85 6.45)\n\t\t(end 21.05 6.25)", "(start 21.05 6.45)\n\t\t(end 21.05 6.25)"),
+    ("(start 20.35 6.45)\n\t\t(end 20.33 6.4411)", "(start 20.33 7.35)\n\t\t(end 20.33 6.4411)"),
 )
 """ds2's routed `VDDA` with the trunk walked round `C4.1` instead of across it.
 
-The same three tracks, re-routed as an L down `x` 19.45 and along `y` 4.05 — 0.3050 mm clear of the
-pad's copper at its nearest — with the cap reached by a 0.8800 mm tee off the middle of the vertical
-leg. Nothing else on the board moves: same nets, same widths, same layer, same connectivity, and the
-netlist is still exactly the netlist `board.py` declares, which is the point. This is the failure
-KiCad's own gate is blind to by construction."""
+The same four tracks, re-routed as an L along `y` 7.35 and down `x` 21.05 — **0.1450 mm** clear of
+the pad's copper at its nearest, against ds2's 0.1270 mm process floor — with the cap reached by a
+0.9089 mm tee off the middle of the horizontal leg. Nothing else on the board moves: same nets, same
+widths, same layer, same connectivity, and the netlist is still exactly the netlist `board.py`
+declares, which is the point. This is the failure KiCad's own gate is blind to by construction.
+
+Rebuilt 2026-09-21 against the copper pcbc now produces: the old patch named
+`(20.35,6.45)-(22.75,4.05)`, a segment that exists on no board this repo can build, so it silently
+replaced nothing and the "failing" arm was the passing board. A patch that does not apply is a test
+that asserts nothing, which is why all four replacements are counted before any is made."""
 
 
 @pytest.mark.skipif(not HAS_DS2, reason="the DS2 Addon is not checked out here")
@@ -196,25 +225,32 @@ def test_the_build_gate_can_fail_and_does_not_on_the_board_as_routed():
 
 def test_the_pair_chains_r2_routes_none_of_are_reported_and_never_fatal():
     """B.2 skips a `Chain()` on a `PairSpec` net — "pairs are R4's" — so R2 writes none of that
-    copper and KRT writes all of it. The gate still reads them, and two of the four are violated on
-    their own checked-in boards: c3_usb's `U3.3` and node's `U3.4` hang off the feed rather than
-    sitting in it, while both `USB_DP` chains hold.
+    copper and KRT writes all of it. The gate still reads them, and **three of the four are violated
+    on boards pcbc builds**: both of c3_usb's, and node's `USB_DN`, hang off the feed rather than
+    sitting in it; only node's `USB_DP` holds.
+
+    **Re-recorded 2026-09-21 and c3_usb's `USB_DP` is the one that moved: `held` -> `spur`.** It is
+    not slice 1's doing — `route_relax._skip_nets` skips every net carrying a `PairSpec`, and these
+    verdicts are identical with the relaxer disabled — it is the difference between the checked-in
+    `examples/**/layout/` artifact this test used to read and a board `pcbc build` produces. The
+    count of violated pair chains was understated by one for as long as that artifact was stale,
+    which is the direction that matters: the gate was reporting *less* than the copper deserved.
 
     They are **notes and not fails**, on `--strict-power`'s argument in C.6: stopping a board on a
     fault the tool cannot yet repair teaches an author to reach for `--force`. Fixing them is a board
     change plus R4's pair router, and nothing in R2 can take either. What the gate can do is stop
     them being invisible, which is what this test pins.
     """
-    for name, held, spur in (("c3_usb", "USB_DP", "USB_DN"), ("node", "USB_DP", "USB_DN")):
+    for name, want in (("c3_usb", {"USB_DP": "spur", "USB_DN": "spur"}), ("node", {"USB_DP": "held", "USB_DN": "spur"})):
         got = {r.net: r for r in _ask(name)}
-        assert set(got) == {held, spur}, (name, got)
-        assert (got[held].verdict, got[held].owner) == ("held", "R4"), (name, got[held])
-        assert (got[spur].verdict, got[spur].owner) == ("spur", "R4"), (name, got[spur])
+        assert {n: r.verdict for n, r in got.items()} == want, (name, got)
+        assert {r.owner for r in got.values()} == {"R4"}, (name, got)
         gate = _chain_gate(_routed(name).read_text(), load_board(_board(name)))
         assert gate["fails"] == [], (name, "a pair chain never stops the build")
-        assert len(gate["notes"]) == 1 and gate["notes"][0].startswith(f"{spur} chain "), gate["notes"]
-        assert "R2 routes no pair at all, so this copper is KRT's and R4's" in gate["notes"][0], gate["notes"]
-        assert gate["checked"] == {held: "held", spur: "spur"}, (name, gate["checked"])
+        spurs = sorted(n for n, v in want.items() if v == "spur")
+        assert sorted(n.split(" chain ")[0] for n in gate["notes"]) == spurs, gate["notes"]
+        assert all("R2 routes no pair at all, so this copper is KRT's and R4's" in n for n in gate["notes"]), gate["notes"]
+        assert gate["checked"] == want, (name, gate["checked"])
 
 
 def test_a_board_with_no_declared_chain_says_nothing():
@@ -226,21 +262,32 @@ def test_a_board_with_no_declared_chain_says_nothing():
 # --- the tolerance, and what it is worth -----------------------------------------------------------
 
 
-SWEEP = [0.0, 0.05, 0.0889, 0.127, 0.2, 0.3, 0.5, 1.0, 2.0]
-"""Every tolerance the verdicts were swept at (mm), from "the pad's exact copper" to sixteen times
-the coarsest process floor in the repo."""
+SWEEP = [0.0, 0.05, 0.0889, 0.127, 0.2, 0.3, 0.5, 1.0, 1.5]
+"""Every tolerance the verdicts were swept at (mm), from "the pad's exact copper" to nearly twelve
+times the coarsest process floor in the repo.
+
+Re-recorded 2026-09-21: this used to end at 2.0 mm, and on boards pcbc builds c3_usb's `USB_DP`
+flips at **1.64392 mm** — so 2.0 was past the first flip rather than short of it, and the sweep was
+asserting the opposite of what it claimed. Bisected over sixty halvings on fresh builds, the flip
+points are c3_usb `USB_DP` **1.64392**, node `USB_DN` **1.94995**, c3_usb `USB_DN` **3.29168**, and
+node's `USB_DP` and ds2's `VDDA` never (swept to 6 mm)."""
 
 
 def test_the_tolerance_decides_nothing_on_any_board_in_this_repo():
     """The number this check dilates a station's pad by is `stackup.clearance_min`, and the argument
     for it is `chain.stub_need`'s (S6 decision 1): copper closer together than a fab's minimum
     clearance is not two separable things. The argument is worth stating because the measurement is
-    that it does not matter — no verdict here moves between 0.0 mm and 2.0 mm.
+    that it does not matter — no verdict here moves between 0.0 mm and 1.5 mm.
 
-    The nearest flip is node's `USB_DN` at 2.5 mm and c3_usb's at 3.0 mm, where the dilated pad
-    swallows the spur and its via whole: 28x and 24x their own process floors (0.0889 and 0.127 mm). So the gap between the closest pass
-    (ds2's junction, 0.43 mm *inside* its pad) and the closest fail is about 3 mm wide, and a reader
-    deciding whether to trust a verdict is deciding on millimetres, not on a tolerance.
+    The nearest flip is c3_usb's `USB_DP` at **1.64392 mm**, where the dilated pad swallows the spur
+    whole: **12.9x** that board's own 0.127 mm process floor. So the gap between the closest pass
+    (ds2's junction, 0.43 mm *inside* its pad) and the closest fail is more than a millimetre wide,
+    and a reader deciding whether to trust a verdict is deciding on millimetres, not on a tolerance.
+
+    **Re-measured on fresh builds, and the margin fell from 2.5 mm to 1.64392** — because c3_usb's
+    `USB_DP` is a `spur` on a board pcbc builds where the stale artifact had it `held`, so it has a
+    flip at all. The conclusion holds with 13x of room; the number it held by was wrong, and it is
+    bisected now rather than sampled.
     """
     names = ["c3_usb", "node"] + (["ds2"] if HAS_DS2 else [])
     for name in names:
@@ -249,9 +296,11 @@ def test_the_tolerance_decides_nothing_on_any_board_in_this_repo():
             assert {r.net: r.verdict for r in _ask(name, floor=tol)} == base, (name, tol, base)
     if HAS_DS2:
         assert base == {"VDDA": "held"}, base
-    for name, net, flips in (("node", "USB_DN", 2.5), ("c3_usb", "USB_DN", 3.0)):
-        got = {r.net: r.verdict for r in _ask(name, floor=flips)}
-        assert got[net] == "held", (name, net, flips, "the dilated pad has swallowed the spur")
+    # Each flip bracketed, so "no verdict moves" is a statement with an edge rather than a hope.
+    for name, net, below, above in (("c3_usb", "USB_DP", 1.6439, 1.6440), ("node", "USB_DN", 1.9499, 1.9500), ("c3_usb", "USB_DN", 3.2916, 3.2917)):
+        assert {r.net: r.verdict for r in _ask(name, floor=below)}[net] == "spur", (name, net, below, "still a spur a tenth of a micron below")
+        assert {r.net: r.verdict for r in _ask(name, floor=above)}[net] == "held", (name, net, above, "the dilated pad has swallowed the spur")
+    assert {r.net: r.verdict for r in _ask("node", floor=6.0)}["USB_DP"] == "held", "node's held chain has no flip to find"
 
 
 # --- the two things the copper cannot answer -------------------------------------------------------

@@ -12,6 +12,7 @@ class BoardSpec:
     pcb: str | None = None
     planes: tuple[tuple[str, str], ...] = ()
     padding: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)
+    net_order: str | None = None
 
 
 @dataclass

@@ -142,3 +142,58 @@ def test_a_pad_krt_left_open_is_reported_whichever_field_names_it():
     design = load_board(Path(__file__).resolve().parent.parent / "examples" / "blinky" / "blinky.py")
     move = _unrouted_move(compile_design(design), design, "GND", [f"P{i} at (0, {i})" for i in range(9)])
     assert "the pour could not reach P0 at (0, 0), " in move and "P5 at (0, 5), ..." in move and "P6" not in move
+
+
+def test_an_unrouted_differential_pair_is_a_move_that_names_the_edit_that_works():
+    """A pair's refusal is the one that names a *step* rather than a shape, and the one whose move
+    had to be checked against the compiler before it could be written down.
+
+    `route_diff.py` routes one coupled path per net and nothing else, so a pair net with a third pad
+    -- a USB-C connector's flip-side `B6`/`B7`, an ESD array's second side -- has pads its own step
+    was never going to reach. c3_usb's `USB_DP` carries **five** (`J1.A6, J1.B6, U1.27, U3.1,
+    U3.6`), and the wildcard `signals` step is what reaches them: measured 2026-09-21, excluding
+    pairs from `signals` leaves 3 pads open on c3_usb and 6 on node and neither board builds. So a
+    pair that reaches this message is genuinely boxed in, or it is asking to stop being a pair.
+
+    The move says `autoroute=True` and says explicitly that `pair=False` is **not** the edit,
+    because `pair=False` compiles and does nothing: the `usb_hs` preset carries
+    `autoroute="diff_pair"` and `constraints.py`'s `if req.pair:` can only turn it on. Compiling
+    c3_usb with `pair=False` still yields `autoroute == "diff_pair"`; with `autoroute=True` it
+    yields `True`. A refusal whose move is a no-op is worse than no refusal.
+    """
+    from pcbc.compile import compile_design
+    from pcbc.language import load_board
+    from pcbc.route import _unrouted_move
+
+    design = load_board(Path(__file__).resolve().parent.parent / "examples" / "c3_usb" / "c3_usb.py")
+    job = compile_design(design)
+    move = _unrouted_move(job, design, "USB_DP")
+    assert "as a differential pair on F.Cu, B.Cu" in move
+    assert "NetReq('USB_DP', 'USB_DN', kind='usb_hs', autoroute=True)" in move
+    assert "**Not `pair=False`**" in move
+    # The generic branch is untouched: a plain net still gets the placement move.
+    assert "found no path on any layer" in _unrouted_move(job, design, "VBUS")
+
+
+def test_pair_false_is_the_no_op_the_pair_refusal_warns_about(tmp_path: Path):
+    """The claim the move makes, asserted rather than believed: the preset wins, and only
+    `autoroute=` overrides it."""
+    import shutil
+
+    from pcbc.compile import compile_design
+    from pcbc.language import load_board
+
+    src = Path(__file__).resolve().parent.parent / "examples" / "c3_usb"
+    shutil.copytree(src / "components", tmp_path / "components")
+    line = 'NetReq("USB_DP", "USB_DN", kind="usb_hs", z_diff_ohm=90, pair=True)'
+    text = (src / "c3_usb.py").read_text()
+    assert text.count(line) == 1
+
+    def _auto(replacement: str):
+        board = tmp_path / "c3.py"
+        board.write_text(text.replace(line, replacement))
+        job = compile_design(load_board(board))
+        return next(cn.autoroute for cn in job.nets if "USB_DP" in cn.patterns)
+
+    assert _auto(line.replace("pair=True", "pair=False")) == "diff_pair"  # the no-op
+    assert _auto(line.replace("pair=True", "autoroute=True")) is True  # the edit that works

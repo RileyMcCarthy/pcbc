@@ -116,6 +116,18 @@ def _padding4(padding) -> tuple[float, float, float, float]:
     )
 
 
+NET_ORDERS = ("mps", "inside_out", "original", "bus")
+"""The net orders KRT's `route.py` accepts (`--ordering`), and the only values `Board(net_order=)`
+takes. Pinned against `KRT_SHA`: a name that is not in KRT's own `choices` reaches the router as a
+step that exits non-zero halfway through a build, which is a worse way to learn of a typo than a
+refusal at declaration time."""
+
+DEFAULT_NET_ORDER = "mps"
+"""KRT's own default (`routing_defaults.DEFAULT_ORDERING_STRATEGY`), named here only so the refusal
+can say what dropping the argument gets you. pcbc passes no `--ordering` at all when a board does
+not declare one, so this constant steers nothing -- it is a sentence, not a setting."""
+
+
 def Board(
     size_mm: tuple[float, float] | None = None,
     *,
@@ -126,6 +138,7 @@ def Board(
     pcb: str | None = None,
     planes: list[tuple[str, str]] | None = None,
     padding: object = 0,
+    net_order: str | None = None,
 ) -> BoardSpec:
     if size_mm is not None:
         w, h = float(size_mm[0]), float(size_mm[1])
@@ -165,6 +178,31 @@ def Board(
                 f"Board(planes=[({net!r}, {lay!r})]): {stackup} has no copper layer {lay}; "
                 f"it has {', '.join(sorted(copper))}"
             )
+    # `net_order` is the one router knob a board may set, and it is a **declaration with no
+    # declarer in this repo** -- which is the measurement, not an oversight (`docs/quality-plan.md`
+    # slice 4, fresh builds of all five boards 2026-09-21). `"original"` against KRT's default
+    # `"mps"`: blinky and node **byte-identical**; ds2 -0.8 % of copper for two more vias with
+    # `REFP_F` unmoved at 3.23; c3_usb strictly worse -- worst detour 1.69 -> 1.73 with `EN` alone
+    # going 1.04 -> 1.73; and buck -9.7 % of copper with `VIN` 2.51 -> 1.84, which is the only win
+    # and which **buck still does not take**: that shorter route makes two layer changes it does not
+    # make under `mps`, each on a single 0.3 mm via, and `route_verify.via_parallelism` reads 0.707 A
+    # carried against 3 vias needed on a 2.0 A rail. Shorter copper bought with under-rated vias is
+    # ampacity traded for detour, and no rail makes that trade by default.
+    #
+    # So this argument exists to be *available* to a board whose author has measured their own, and
+    # the refusal below keeps it from being a typo that surfaces as a KRT step exiting non-zero
+    # halfway through a build. It names no recommended value on purpose: the one that measured
+    # fastest also measured unsafe.
+    order = str(net_order) if net_order is not None else None
+    if order is not None and order not in NET_ORDERS:
+        raise ValueError(
+            f"Board(net_order={order!r}): the router orders nets by one of "
+            f"{', '.join(repr(o) for o in NET_ORDERS)}; drop the argument to keep the router's own "
+            f"default, {DEFAULT_NET_ORDER!r}, which is what every board in pcbc's examples uses -- "
+            f"and measure any other choice with `pcbc build --strict-power` before keeping it "
+            f"(docs/quality-plan.md slice 4: 'original' buys buck 9.7 % of its copper and pays for "
+            f"it with two under-rated vias on a 2 A rail)"
+        )
     spec = BoardSpec(
         size_mm=(w, h),
         layers=int(layers),
@@ -172,6 +210,7 @@ def Board(
         pcb=pcb,
         planes=declared,
         padding=_padding4(padding),
+        net_order=order,
     )
     _doc().board = spec
     return spec

@@ -58,9 +58,16 @@ def test_the_step_after_the_last_router_step_writes_a_byte_copy_of_the_board(tmp
     With `patterns.FINAL == ()` the `final` stage runs — it builds the scene over the finished copper
     and runs `pattern_copper`'s self-check — and writes nothing, so the board it hands on is the board
     it was handed, byte for byte. That is the architectural hypothesis in the only form a test can
-    hold it: `patterns_final` is the **last** step file of the route, and it differs from the step
-    before it in not one byte. If a no-op step after the last router step ever moved a board, this is
-    where it would say so.
+    hold it: `patterns_final` differs from the step before it in not one byte. If a no-op step after
+    the last router step ever moved a board, this is where it would say so.
+
+    **`patterns_final` is no longer the last step file, and the two halves of that sentence are
+    tested separately now.** `docs/quality-plan.md` slice 1 puts `relax` after it, and the position
+    is that step's whole safety argument — `route.krt_plan` schedules nothing after it, so no router
+    and no pattern can react to copper it rewrote (`route_relax`'s module docstring). So this asserts
+    both: the byte copy, still, of the stage that adds nothing, and that the thing scheduled after it
+    is `relax` and nothing else. On blinky `relax` does move the board — 6 segments to 4 — which is
+    why it cannot be folded into the byte-copy assertion.
 
     The board-level half of the acceptance — a fresh build of all five boards byte-identical to the
     same build without the stage — is a before/after measurement a single run cannot make; it is
@@ -72,9 +79,16 @@ def test_the_step_after_the_last_router_step_writes_a_byte_copy_of_the_board(tmp
     assert result.get("error") is None, result
     work = tmp_path / "layout" / "blinky" / "routed"
     steps = sorted(work.glob("[0-9][0-9]_*.kicad_pcb"))
-    assert steps[-1].name.endswith("_patterns_final.kicad_pcb"), [p.name for p in steps]
-    assert steps[-1].read_bytes() == steps[-2].read_bytes(), (steps[-2].name, steps[-1].name)
+    assert steps[-1].name.endswith("_relax.kicad_pcb"), [p.name for p in steps]
+    assert steps[-2].name.endswith("_patterns_final.kicad_pcb"), [p.name for p in steps]
+    assert steps[-2].read_bytes() == steps[-3].read_bytes(), (steps[-3].name, steps[-2].name)
     route = result["steps"][-1]
-    assert [p["step"] for p in route["plan"]][-1] == "patterns_final", route["plan"]
+    assert [p["step"] for p in route["plan"]][-2:] == ["patterns_final", "relax"], route["plan"]
     final = [s for s in route["steps"] if s["step"] == "patterns_final"]
     assert len(final) == 1 and final[0]["summary"]["pieces"] == 0 and final[0]["summary"]["refused"] == {}, final
+    # And the relaxer, on the cheapest board there is: two chains, one pulled taut, 6 segments -> 4,
+    # 0.3252 mm shorter, and both halves of its own self-check at zero. Measured 2026-09-21.
+    relax = [s for s in route["steps"] if s["step"] == "relax"]
+    assert len(relax) == 1, route["steps"]
+    got = {k: relax[0]["summary"][k] for k in ("chains", "moved", "segments_in", "segments_out", "orphans_in", "orphans_out", "skipped_segments")}
+    assert got == {"chains": 2, "moved": 1, "segments_in": 6, "segments_out": 4, "orphans_in": 0, "orphans_out": 0, "skipped_segments": 0}, relax[0]["summary"]

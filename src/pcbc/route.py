@@ -176,7 +176,7 @@ def lock_copper(text: str, nets: set[str]) -> str:
     return "".join(out)
 
 
-def krt_plan(job: CompiledJob, design: Design, placed: Path, work: Path, home: Path, plan: "PatternPlan | None" = None, post: bool = False, final: bool = False) -> list[tuple[str, list[str]]]:
+def krt_plan(job: CompiledJob, design: Design, placed: Path, work: Path, home: Path, plan: "PatternPlan | None" = None, post: bool = False, final: bool = False, relax: bool = False) -> list[tuple[str, list[str]]]:
     """(step name, command) pairs. Pure: the same board.py gives the same plan.
 
     `plan` is the `PatternPlan` the pattern stage handed back (C.4). What it changes: `local_hops` is
@@ -226,6 +226,17 @@ def krt_plan(job: CompiledJob, design: Design, placed: Path, work: Path, home: P
         nonlocal prev
         out = work / f"{len(steps) + 1:02d}_{name}.kicad_pcb"
         common = ["--no-fix-drc-settings", "--grid-step", grid, *via, "--fab-overrides", str(overrides)]
+        if job.net_order and name in ("signals", "finalize"):
+            # `Board(net_order=)`, and **only on the two wildcard steps**, which is a measured scope
+            # rather than a tidy one. Given to every `route.py` step instead -- `local_hops`, the
+            # constrained `*_nets` steps and `plane_taps` as well -- the DS2 Addon stops being a
+            # board: `kicad_drc` returns two `items_not_allowed` errors and a
+            # `solder_mask_bridge`, where the same board with the flag on `signals` alone is
+            # **identical to base on every violation type** (114 warnings, 0 errors, both arms).
+            # The constrained steps route on an otherwise empty board, where there is no congestion
+            # for an ordering to negotiate; `signals` is the step that routes everything at once
+            # and the only one whose order can matter. Measured 2026-09-21, all five boards.
+            common += ["--ordering", job.net_order]
         if tool == "route_planes.py" or name in ("signals", "local_hops"):
             # Keeps every via out of same-net SMD pads (a via in an 0603 pad wicks solder; the
             # fab stage refuses it on a passive): the long nets' vias, and a hop's via if it ever
@@ -389,6 +400,20 @@ def krt_plan(job: CompiledJob, design: Design, placed: Path, work: Path, home: P
     # it, while here `gnd_pour` has already written it and every piece of copper on the board is down.
     if final:
         pcbc_step("patterns_final", "final")
+
+    # 8. The relaxer (`route_relax`, `docs/quality-plan.md` slice 1). **Last, after every other step
+    # including pcbc's own**, and its position is the whole of its safety argument: this function
+    # schedules nothing after it, so no router and no pattern can react to what it writes. That is
+    # the same argument `patterns_final` makes one line up, and the relaxer needs a stronger version
+    # of it, because `patterns_final` only ever *adds* copper (`route_emit.write_pieces`) while this
+    # step **replaces** it (`route_emit.strip_segments`) — so `docs/stitch-plan.md` R-S1's redundancy
+    # reading does not reach it and position plus contact preservation is what does.
+    #
+    # A third flag rather than a reading of `final`, because they answer different questions: `final`
+    # is "is there a pattern stage after KRT?" and this is "may pcbc redraw what is on the board?".
+    # `route_job` passes both off the same `not patterns_off()`, so the rollback stays a rollback.
+    if relax:
+        pcbc_step("relax", "relax")
     return steps
 
 
@@ -496,7 +521,7 @@ def route_job(design: Design, placed: Path, *, out: Path, name: str = "board") -
         start = work / "00_patterns_pre.kicad_pcb"
         copy_with_siblings(placed, start)
         start.write_text(board_text)
-    steps = krt_plan(job, design, start, work, home, plan, post=not patterns_off(), final=not patterns_off())
+    steps = krt_plan(job, design, start, work, home, plan, post=not patterns_off(), final=not patterns_off(), relax=not patterns_off())
     result: dict = {
         "pcb": str(out),
         "router": "krt",
@@ -530,6 +555,11 @@ def route_job(design: Design, placed: Path, *, out: Path, name: str = "board") -
     # it has run. It is what `_lost` checks for survival after every KRT step, what keeps its own
     # uuids through `pin_copper_ids`, and what the copper bar reads a reason off.
     owned: list = list(pre)
+    # The step file that wrote each of `owned`'s pieces, in the same order. One list rather than a
+    # field on `Piece` because it is a fact about *this route* and not about the copper: the same
+    # geometry written by the pre stage and rewritten by the relaxer is the same piece with the same
+    # reason, and only the step changes. `copper.json` groups by it (D.4).
+    owned_steps: list[str] = ["patterns_pre"] * len(pre)
     # pcbc's in-KRT stages, keyed by the stage that ran — "post", then "final". One variable would be
     # smaller and it would be wrong: every reader below wants a *named* stage, not the last one that
     # happened to run. `plane_taps` wants the tap stage's refusals and nothing else; the sidecar
@@ -562,10 +592,28 @@ def route_job(design: Design, placed: Path, *, out: Path, name: str = "board") -
             # KRT locks its own constrained-net copper too (`lock_copper`), so `(locked yes)` is not a
             # provenance. This list is, it already exists here, and it is the same list `_lost` holds
             # KRT to after every step.
+            if stage == "relax":
+                # `docs/quality-plan.md` slice 1. Not a pattern and not run by `pattern_copper`: a
+                # pattern proposes copper and this redraws it, so it takes `owned` and hands it back
+                # rewritten — a relaxed `tap` stub is still a `tap`, or `bar_key` below would read
+                # pcbc's own copper as leftover the moment it moved.
+                from .route_relax import relax_board
+
+                got = relax_board(design, job, job.constraints, current.read_text(), name, owned=owned, owned_steps=owned_steps)
+                produced.write_text(got.text)
+                owned, owned_steps = list(got.owned), list(got.owned_steps)
+                result["patterns"] = _census(owned)
+                result["notes"] += list(got.notes)
+                result["pattern_ms"] += got.wall_ms
+                result["steps"].append({"step": step_name, "returncode": 0, "log": "", "summary": {**got.stats, "ms": got.wall_ms}})
+                current = produced
+                last = produced
+                continue
             sub = pattern_copper(design, job, job.constraints, current.read_text(), name, stage=stage, owned=owned)
             plans[stage] = sub
             produced.write_text(sub.text)
             owned += list(sub.pieces)
+            owned_steps += [step_name] * len(sub.pieces)
             result["patterns"] = _census(owned)
             result["pattern_moves"] += list(sub.moves)
             result["notes"] += list(sub.notes)
@@ -675,19 +723,39 @@ def route_job(design: Design, placed: Path, *, out: Path, name: str = "board") -
     # stage. Later stages win a net, which is the order the copper was written in.
     link_plans = [plan.links] + [plans[s].links for s in ("post", "final") if s in plans]
     result["pattern_links"] = {r: dict(sorted({k: v for src in link_plans for k, v in src.get(r, {}).items()}.items())) for r in sorted({r for src in link_plans for r in src})}
-    doc = sidecar(pre, step="patterns_pre", refusals=result["refusals"], notes=result["notes"], leftover=result["leftover"])
-    # One sidecar, three stages: a piece carries the step that wrote it, so `copper.json` says which
+    def _wrote(label: str) -> list:
+        return [p for p, lab in zip(owned, owned_steps) if lab == label]
+
+    doc = sidecar(_wrote("patterns_pre"), step="patterns_pre", refusals=result["refusals"], notes=result["notes"], leftover=result["leftover"])
+    # One sidecar, four stages: a piece carries the step that wrote it, so `copper.json` says which
     # of pcbc's stages a via came from and the census is the whole board's (D.4). The label is the
     # step file's name, not the stage's, because that is what `blocking.step_boards` prints and what
-    # the reader will go looking for on disk.
+    # the reader will go looking for on disk. Read off `owned_steps` rather than off each stage's own
+    # plan since S1 of `docs/quality-plan.md`: the relax step rewrites pieces the pre and post stages
+    # wrote, and a piece has to be listed once, under the step that wrote the geometry in the file.
     wrote = False
-    for stage_name, label in (("post", "patterns_post"), ("final", "patterns_final")):
-        stage_plan = plans.get(stage_name)
-        if stage_plan is not None and stage_plan.pieces:
-            doc.items += sidecar(stage_plan.pieces, step=label).items
+    for label in ("patterns_post", "patterns_final", "relax"):
+        group = _wrote(label)
+        if group:
+            doc.items += sidecar(group, step=label).items
             wrote = True
     if wrote:
         doc.census = _census(owned, leftover=result["leftover"])
+    # The congestion map of the board the router was **handed**, not of the one it produced: a net
+    # that comes back unrouted now has the channel census beside it, and a placement that was never
+    # routable is distinguishable from a router that gave up (`docs/topo-plan.md` slice 1). The
+    # scene is rebuilt from `placed` rather than reusing `plan.scene`, because `plan.scene` has
+    # pcbc's own pre-stage copper added to it by then and this has to describe the placement alone.
+    # It costs milliseconds against a route that costs minutes, and it is a pure function of the
+    # placed board, so it cannot make `copper.json` differ between two runs.
+    from .route_channel import channels_doc, class_widths
+    from .route_scene import build_scene as _build_scene
+
+    doc.channels = channels_doc(
+        _build_scene(design, job, job.constraints, placed.read_text()),
+        widths=class_widths(job),
+        layers_of={c.net: c.layers for c in (job.constraints.constraints if job.constraints is not None else ())},
+    )
     write_sidecar(out.parent / "copper.json", doc)
     opens = unrouted_nets(text)
     result["segments"] = len(re.findall(r"\n\t\(segment\b", text))
@@ -780,7 +848,26 @@ def _unrouted_move(job: CompiledJob, design: Design, net: str, unreached: list[s
     pads = sorted(expected_nets(design).get(net, set()))
     refs = ", ".join(f"{r}.{p}" for r, p in pads[:6]) + (", ..." if len(pads) > 6 else "")
     rule = next((cn for cn in job.nets if any(fnmatch(net, p) for p in cn.patterns)), None)
-    if rule and (rule.vias is False or len(rule.layers) == 1):
+    if rule and rule.autoroute == "diff_pair":
+        # A pair is the one net whose refusal names a *step* rather than a shape. `route_diff.py`
+        # routes one coupled path per net and nothing else, so a pair net with a third pad -- a
+        # USB-C connector's flip-side `B6`/`B7`, an ESD array's second side -- has pads its own step
+        # was never going to reach, and the wildcard `signals` step is what reaches them (measured
+        # on c3_usb and node, 2026-09-21: excluding pairs from `signals` leaves 3 pads open on
+        # c3_usb and 6 on node). So a pair that arrives here is either genuinely boxed in or is
+        # asking to stop being a pair, and the move says both.
+        partner = next((n for n in _net_names(design, rule.patterns) if n != net), "")
+        both = ", ".join(repr(x) for x in (net, partner) if x)
+        how = f"as a differential pair on {', '.join(rule.layers)} (NetReq({both}, kind={rule.kind!r}, pair=True))"
+        fix = (
+            "give the pair a clear lane -- move what sits between its ends -- or route the two nets "
+            f"singly with NetReq({both}, kind={rule.kind!r}, autoroute=True). **Not `pair=False`**: "
+            f"the {rule.kind!r} preset carries `autoroute=\"diff_pair\"` itself and `req.pair` can "
+            "only turn it on (`constraints.py:1860`), so `pair=False` compiles and changes nothing. "
+            "`autoroute=True` is the override the preset loses to, and it keeps the class's width, "
+            "clearance and the skew rule -- only the coupling goes"
+        )
+    elif rule and (rule.vias is False or len(rule.layers) == 1):
         how = f"on {', '.join(rule.layers[:1] if rule.vias is False else rule.layers)} without vias (NetReq kind={rule.kind!r})"
         fix = f"line its parts up on that side of the board, or allow vias with NetReq({net!r}, kind={rule.kind!r}, vias=True)"
     else:

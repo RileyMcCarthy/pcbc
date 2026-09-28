@@ -76,9 +76,13 @@ def _doc() -> Design:
     return _current
 
 
+_sch_region: str | None = None
+
+
 def reset() -> None:
-    global _layout_source
+    global _layout_source, _sch_region
     _layout_source = "board"
+    _sch_region = None
     global _current, _board_dir, _board_path
     _current = Design()
     _board_dir = None
@@ -1739,18 +1743,21 @@ def SchRegion(
     title: str | None = None,
     **css,
 ) -> RegionSpec:
+    global _sch_region
     who = f"SchRegion({name!r})"
     if padding is not None:
         css = {**css, "padding": padding}
-    st = _style(who, style=style, position=position or "absolute", parent=parent, **css)
-    if not st.has_insets():
-        raise ValueError(
-            f"{who}: needs CSS left/top/right/bottom/width/height"
-        )
     spec = RegionSpec(name=str(name))
-    spec = apply_style_to_spec(spec, st)
+    if css or position or style or parent:
+        st = _style(who, style=style, position=position or "absolute", parent=parent, **css)
+        if not st.has_insets():
+            raise ValueError(
+                f"{who}: needs CSS left/top/right/bottom/width/height"
+            )
+        spec = apply_style_to_spec(spec, st)
     spec.title = title or str(name)
     _doc().sch_regions.append(spec)
+    _sch_region = spec.name
     return spec
 
 
@@ -1760,6 +1767,7 @@ def SchPlace(
     pin: str | None = None,
     to: str | None = None,
     along: str | None = None,
+    below: str | None = None,
     gap: float | None = None,
     align: str | None = None,
     side: str | None = None,
@@ -1786,6 +1794,8 @@ def SchPlace(
     who = f"SchPlace({ref!r})"
     if "gap" in css:
         raise ValueError(f"{who}: gap= is pin spacing (not CSS). Pass gap= as its own argument.")
+    if below and (to or along):
+        raise ValueError(f"{who}: below= stacks a part; it cannot combine with to= or along=")
     attach = bool(to or along)
     if side is not None and side not in ("left", "right", "top", "bottom"):
         raise ValueError(f"{who}: side must be left/right/top/bottom, got {side!r}")
@@ -1796,6 +1806,7 @@ def SchPlace(
         pin=pin,
         to=to,
         along=along,
+        below=below,
         gap=float(gap) if gap is not None else None,
         align=align,
         side=side,
@@ -1821,8 +1832,10 @@ def SchPlace(
             spec.position = "absolute"
         if parent:
             spec.parent = parent
-    if not spec.has_css() and not spec.has_attach():
-        raise ValueError(f"{who}: needs CSS left/top/... or pin= and to=")
+    if spec.parent is None:
+        spec.parent = _sch_region
+    if not spec.has_css() and not spec.has_attach() and not spec.below and spec.parent is None:
+        raise ValueError(f"{who}: needs a SchRegion, below=, CSS left/top/..., or to=")
     _doc().sch_places.append(spec)
     return spec
 

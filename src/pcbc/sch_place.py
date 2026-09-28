@@ -509,6 +509,16 @@ def _apply_attach(spec: SchPlaceSpec, part, other, other_pin_name: str, occupied
             gap = min(gap, 5.08)  # a symbol, not a label, goes on this stub
     else:
         poses = [facing]
+    # A second part that wants this same side of the symbol tries the other
+    # poses at the short gap before it slides out along the pin.
+    taken = any(
+        getattr(o, "attach_ref", None) == other.ref
+        and abs((getattr(o, "attach_dir", (0.0, 0.0)) or (0.0, 0.0))[0] - step[0]) < 0.5
+        and abs((getattr(o, "attach_dir", (0.0, 0.0)) or (0.0, 0.0))[1] - step[1]) < 0.5
+        for o in occupied
+    )
+    if taken and part.kind == "c" and not spec.side and len(poses) > 1:
+        poses = poses[1:] + poses[:1]
     gap += float((gap_extra or {}).get(part.ref, 0.0))
     # The first pose at the asked gap, then a stagger of a few grid steps,
     # then the other poses, then longer slides.
@@ -611,6 +621,48 @@ def _overlap_body(a, b, pad: float = _BODY_PAD) -> bool:
     return _boxes_overlap(body_aabb(a), body_aabb(b), pad)
 
 
+def _apply_origin(spec: SchPlaceSpec, part) -> None:
+    """First anchor of a group: its body sits on the sheet origin. Packing moves the group."""
+    if not spec.rotate_set:
+        part.rot = 0.0
+    part.mirror = spec.mirror
+    part.x = part.y = 0.0
+    left, top, _, _ = world_aabb(part)
+    part.x -= left
+    part.y -= top
+    part.x = round(part.x / _GRID) * _GRID
+    part.y = round(part.y / _GRID) * _GRID
+    part.placed = True
+
+
+def _apply_below(spec: SchPlaceSpec, part, other, occupied: list, kinds) -> None:
+    """Stack part under other, left edges aligned, one clearance apart."""
+    if not spec.rotate_set:
+        part.rot = 0.0
+    part.mirror = spec.mirror
+    _, _, _, bottom = world_aabb(other)
+    part.x = other.x
+    part.y = other.y
+    left, top, _, _ = world_aabb(part)
+    other_left = world_aabb(other)[0]
+    part.x += other_left - left
+    part.y += bottom - top
+    for i in range(0, 24):
+        gap = 2.54 + i * 1.27
+        part.y = other.y
+        _, top, _, _ = world_aabb(part)
+        part.y += (bottom + gap) - top
+        part.x = round(part.x / _GRID) * _GRID
+        part.y = round(part.y / _GRID) * _GRID
+        if not any(_clash(part, o, kinds) for o in occupied):
+            if i:
+                part.shoved_mm = i * 1.27
+            break
+    part.attach_ref = other.ref
+    part.attach_dir = (0.0, 1.0)
+    part.placed = True
+
+
 def apply_sch_places(design: Design, parts: list, gap_extra: dict | None = None) -> None:
     """Set x/y/rot on schematic parts from design.sch_places."""
     by_ref = {p.ref: p for p in parts}
@@ -622,7 +674,11 @@ def apply_sch_places(design: Design, parts: list, gap_extra: dict | None = None)
     if extra:
         raise ValueError("SchPlace() for unknown ref " + ", ".join(extra))
 
-    regions = resolve_regions(SHEET, design.sch_regions)
+    boxed = [
+        r for r in design.sch_regions
+        if any(getattr(r, k) is not None for k in ("top", "right", "bottom", "left", "width", "height"))
+    ]
+    regions = resolve_regions(SHEET, boxed) if boxed else {}
     kinds = {n.name: n.kind for n in design.nets.values()}
     degree: dict[str, int] = {}
     for p in parts:
@@ -634,14 +690,34 @@ def apply_sch_places(design: Design, parts: list, gap_extra: dict | None = None)
 
     for spec in design.sch_places:
         part = by_ref[spec.ref]
-        if spec.has_attach():
+        if spec.has_attach() or spec.below:
             continue
-        if not spec.has_css():
-            raise ValueError(
-                f"SchPlace({spec.ref!r}) needs CSS left/top/... or pin= and to="
-            )
-        _apply_css(spec, part, regions)
+        if spec.has_css():
+            _apply_css(spec, part, regions)
+        else:
+            _apply_origin(spec, part)
         placed.add(spec.ref)
+
+    pending_below = [s for s in design.sch_places if s.below]
+    guard = 0
+    while pending_below:
+        guard += 1
+        if guard > 64:
+            raise ValueError("SchPlace below= cycle: " + ", ".join(s.ref for s in pending_below))
+        nxt_below: list[SchPlaceSpec] = []
+        for spec in pending_below:
+            if spec.below not in placed:
+                nxt_below.append(spec)
+                continue
+            if spec.below not in by_ref:
+                raise ValueError(f"SchPlace({spec.ref!r}): {spec.below} is not on the sheet")
+            _apply_below(spec, by_ref[spec.ref], by_ref[spec.below], [by_ref[r] for r in placed], kinds)
+            placed.add(spec.ref)
+        if len(nxt_below) == len(pending_below) and nxt_below:
+            raise ValueError(
+                "SchPlace below= waiting on unplaced " + ", ".join(s.below or s.ref for s in nxt_below)
+            )
+        pending_below = nxt_below
 
     def _rigidity(spec: SchPlaceSpec) -> int:
         part = by_ref[spec.ref]

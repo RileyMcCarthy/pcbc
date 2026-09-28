@@ -1,0 +1,33 @@
+{
+  "v": 1,
+  "images": [
+    {
+      "id": "blinky",
+      "title": "Blinky",
+      "path": "tests/benchmarks/schematics/blinky.png",
+      "kind": "schematic",
+      "board": "blinky"
+    },
+    {
+      "id": "buck",
+      "title": "Buck",
+      "path": "tests/benchmarks/schematics/buck.png",
+      "kind": "schematic",
+      "board": "buck"
+    },
+    {
+      "id": "c3_usb",
+      "title": "C3 USB",
+      "path": "tests/benchmarks/schematics/c3_usb.png",
+      "kind": "schematic",
+      "board": "c3_usb"
+    },
+    {
+      "id": "node",
+      "title": "Node",
+      "path": "tests/benchmarks/schematics/node.png",
+      "kind": "schematic",
+      "board": "node"
+    }
+  ]
+}

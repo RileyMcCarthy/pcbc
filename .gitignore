@@ -38,3 +38,7 @@ tests/fixtures/**/layout/
 # Example parts keep their STEP models out of git (megabytes each); pcbc fetch restores them
 examples/**/*.step
 examples/**/*.wrl
+
+# Picture differences Vibes draws for a pull request. The committed sheets live
+# under tests/benchmarks/schematics/.
+vibes-images/

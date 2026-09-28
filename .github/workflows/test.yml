@@ -104,12 +104,11 @@ jobs:
             examples/c3_usb/layout/c3_usb/review/board.glb
             examples/c3_usb/layout/c3_usb/review/*.svg
 
-  # The saved sheets are the pictures in vibes.images.json. This posts current,
-  # new, and difference on the pull request. A sheet the base ref does not have
-  # yet leaves current and difference empty. Difference pictures are not part of
-  # the commit; they are published on the vibes-images branch so the comment can
-  # load them. Forks do not get a write token, so the job only runs for pulls
-  # opened from this repo.
+  # Pictures named by vibes.images.json. Vibes writes the report, publishes
+  # difference files, and keeps one comment on the pull request. Forks do not
+  # get a write token, so the job only runs for pulls opened from this repo.
+  # The Vibes ref is feat/image-benchmarks until that change is on main:
+  # https://github.com/RileyMcCarthy/vibes/pull/5
   pictures:
     if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
@@ -140,67 +139,28 @@ jobs:
           node vibes/bin/vibes.mjs report \
             --base "origin/${{ github.base_ref }}" \
             --head "${{ github.event.pull_request.head.sha }}" \
-            --github "${{ github.server_url }}/${{ github.repository }}" \
+            --publish-ref vibes-images \
+            --into "${{ github.event.pull_request.head.sha }}" \
             --diff-dir vibes-images \
-            --diff-base-url "${{ github.server_url }}/${{ github.repository }}/raw/vibes-images/${{ github.event.pull_request.head.sha }}" \
             > vibes-report.md
           echo "code=$?" >> "$GITHUB_OUTPUT"
           cat vibes-report.md
       - name: Publish difference pictures
         if: always()
         run: |
-          set -euo pipefail
-          sha="${{ github.event.pull_request.head.sha }}"
-          shopt -s nullglob
-          files=(vibes-images/*.diff.png)
-          if [ "${#files[@]}" -eq 0 ]; then
-            echo "no difference pictures to publish"
-            exit 0
-          fi
-          tmp="$(mktemp -d)"
-          git fetch origin vibes-images || true
-          if git show-ref --verify --quiet refs/remotes/origin/vibes-images; then
-            git worktree add --detach "$tmp" origin/vibes-images
-          else
-            git worktree add --detach "$tmp" HEAD
-            git -C "$tmp" checkout --orphan vibes-publish
-            git -C "$tmp" rm -rf --quiet . || true
-            git -C "$tmp" clean -fdx
-          fi
-          mkdir -p "$tmp/$sha"
-          cp "${files[@]}" "$tmp/$sha/"
-          git -C "$tmp" add -- "$sha"
-          if git -C "$tmp" diff --cached --quiet; then
-            echo "difference pictures already published"
-            exit 0
-          fi
-          git -C "$tmp" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
-            -c user.name="github-actions[bot]" \
-            commit -m "schematic picture differences for ${sha}"
-          # HEAD: ref, so this never needs the side branch checked out here.
-          git -C "$tmp" push origin HEAD:vibes-images
+          node vibes/bin/vibes.mjs publish \
+            --dir vibes-images \
+            --ref vibes-images \
+            --into "${{ github.event.pull_request.head.sha }}"
       - name: Post the report to the PR
         if: always()
         env:
           GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-          PR: ${{ github.event.pull_request.number }}
         run: |
-          marker='<!-- vibes-ledger -->'
-          body="$(head -c 60000 vibes-report.md)"
-          if [ "$(wc -c < vibes-report.md)" -gt 60000 ]; then
-            body="$body"$'\n\n_Truncated — the full report is in the job summary._'
-          fi
-          body="$marker"$'\n'"$body"
-          existing=$(gh api "repos/$REPO/issues/$PR/comments" --paginate \
-            --jq ".[] | select(.body | startswith(\"$marker\")) | .id" | head -n1)
-          if [ -n "$existing" ]; then
-            gh api -X PATCH "repos/$REPO/issues/comments/$existing" -f body="$body" >/dev/null \
-              && echo "updated comment $existing" || echo "::warning::could not update the PR comment"
-          else
-            gh api "repos/$REPO/issues/$PR/comments" -f body="$body" --jq .html_url \
-              || echo "::warning::could not post the PR comment"
-          fi
+          node vibes/bin/vibes.mjs post \
+            --file vibes-report.md \
+            --repo "${{ github.repository }}" \
+            --pr "${{ github.event.pull_request.number }}"
       - uses: actions/upload-artifact@v4
         if: always()
         with:

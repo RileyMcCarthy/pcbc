@@ -66,6 +66,13 @@ def rasterize(svg: str, dest: Path, width: int = 1400) -> None:
     subprocess.run([tool, "-w", str(width), "-o", str(dest)], input=svg, text=True, check=True, capture_output=True)
 
 
+# The same reading the Vibes picture report uses: a channel more than this
+# far apart has moved, agreement is grey, movement is red.
+_MOVED_ABOVE = 16
+_AGREE = (236, 236, 236)
+_MOVED = (210, 32, 32)
+
+
 def write_diff(saved: Path, new: Path, dest: Path) -> None:
     """Grey where the two pictures agree, red where a pixel changed."""
     from PIL import Image, ImageChops
@@ -78,9 +85,9 @@ def write_diff(saved: Path, new: Path, dest: Path) -> None:
     base_new = Image.new("RGB", (width, height), (255, 255, 255))
     base_old.paste(old, (0, 0))
     base_new.paste(nxt, (0, 0))
-    mask = ImageChops.difference(base_old, base_new).convert("L").point(lambda p: 255 if p > 16 else 0)
-    out = Image.new("RGB", (width, height), (236, 236, 236))
-    out.paste(Image.new("RGB", (width, height), (210, 32, 32)), mask=mask)
+    mask = ImageChops.difference(base_old, base_new).convert("L").point(lambda p: 255 if p > _MOVED_ABOVE else 0)
+    out = Image.new("RGB", (width, height), _AGREE)
+    out.paste(Image.new("RGB", (width, height), _MOVED), mask=mask)
     dest.parent.mkdir(parents=True, exist_ok=True)
     out.save(dest)
 
@@ -90,7 +97,7 @@ def _page(rows: list[tuple[str, bool]]) -> None:
         "<!DOCTYPE html><meta charset=utf-8><title>Schematic pictures</title>",
         "<style>body{font:16px sans-serif;background:#111;color:#eee;margin:24px} img{max-width:100%;background:#fff} figure{margin:0} .row{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;margin:24px 0}</style>",
         "<h1>Schematic pictures</h1>",
-        "<p>Saved, the sheet this tool draws now, and the pixels that moved.</p>",
+        "<p>Current, the sheet this tool draws now, and the pixels that moved. An empty column is a picture this run does not have.</p>",
     ]
     for name, changed in rows:
         folder = OUT / name
@@ -99,10 +106,12 @@ def _page(rows: list[tuple[str, bool]]) -> None:
             parts.append("<p>Unchanged.</p>")
             continue
         parts.append('<div class="row">')
-        for label, filename in (("Saved", "current.png"), ("Now", "new.png"), ("Difference", "diff.png")):
+        for label, filename in (("Current", "current.png"), ("New", "new.png"), ("Difference", "diff.png")):
             path = folder / filename
             if path.exists():
                 parts.append(f"<figure><figcaption>{label}</figcaption><img src='{name}/{filename}'></figure>")
+            else:
+                parts.append(f"<figure><figcaption>{label}</figcaption></figure>")
         parts.append("</div>")
     (OUT / "index.html").write_text("\n".join(parts))
 

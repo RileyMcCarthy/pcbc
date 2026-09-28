@@ -19,6 +19,8 @@ def test_manifest_names_each_saved_schematic():
     images = doc["images"]
     assert [row["id"] for row in images] == list(BOARDS)
     for row in images:
+        # kind and board are this repo's metadata. Vibes prints any string
+        # field and does not treat these names as special.
         assert row["kind"] == "schematic"
         assert row["board"] == row["id"]
         assert row["title"]

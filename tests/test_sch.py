@@ -166,8 +166,10 @@ def test_ic_stays_upright_when_attached():
 
 def test_rotated_symbol_fields_stay_horizontal():
     sch = emit_from_design(load_board(C3_USB), title="c3_usb")
-    # R_EN is a 90/270 symbol; KiCad turns its fields, so the file compensates.
-    i = sch.index('(property "Reference" "R_EN"')
+    # R_LED is a 90/270 symbol. KiCad turns field text with the body, so the
+    # file writes 90 and the name stays horizontal. R_EN stands upright, so
+    # its reference is angle 0 and does not exercise this.
+    i = sch.index('(property "Reference" "R_LED"')
     assert " 90)" in sch[i : i + 80]
 
 

@@ -250,6 +250,7 @@ class SchPlaceSpec:
     pin: str | None = None
     to: str | None = None
     along: str | None = None
+    below: str | None = None  # stack under this ref; the tool picks the clearance
     gap: float | None = None  # None: the tool leaves room for the net's label
     align: str | None = None
     side: str | None = None

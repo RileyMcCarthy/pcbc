@@ -27,7 +27,7 @@ jobs:
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends software-properties-common
           sudo add-apt-repository -y ppa:kicad/kicad-10.0-releases
           sudo apt-get update
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends kicad
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends kicad librsvg2-bin
           kicad-cli version
           kicad-cli version | grep -q '^10\.' || { echo "need KiCad 10.x"; exit 1; }
       - run: pip install -e ".[dev]"
@@ -75,6 +75,11 @@ jobs:
           test -f examples/node/layout/node/routed/layout.kicad_pcb
           test -f examples/node/layout/node/routed/unrouted/VBUS-1.json
       - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: schematic-pictures
+          path: tests/benchmarks/schematics/out
+      - uses: actions/upload-artifact@v4
         with:
           name: blinky-fab
           path: |
@@ -98,3 +103,67 @@ jobs:
             examples/c3_usb/layout/c3_usb/review/index.html
             examples/c3_usb/layout/c3_usb/review/board.glb
             examples/c3_usb/layout/c3_usb/review/*.svg
+
+  # Pictures named by vibes.images.json. Vibes writes the report, publishes
+  # difference files, and keeps one comment on the pull request. Forks do not
+  # get a write token, so the job only runs for pulls opened from this repo.
+  pictures:
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Fetch the base ref
+        run: git fetch origin "${{ github.base_ref }}"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - uses: actions/checkout@v4
+        with:
+          repository: RileyMcCarthy/vibes
+          ref: main
+          path: vibes
+      - name: Build Vibes
+        working-directory: vibes
+        run: npm ci --no-audit --no-fund && npm test && npm run build
+      - name: Picture report
+        id: report
+        run: |
+          set +e
+          node vibes/bin/vibes.mjs report \
+            --base "origin/${{ github.base_ref }}" \
+            --head "${{ github.event.pull_request.head.sha }}" \
+            --publish-ref vibes-images \
+            --into "${{ github.event.pull_request.head.sha }}" \
+            --diff-dir vibes-images \
+            > vibes-report.md
+          echo "code=$?" >> "$GITHUB_OUTPUT"
+          cat vibes-report.md
+      - name: Publish difference pictures
+        if: always()
+        run: |
+          node vibes/bin/vibes.mjs publish \
+            --dir vibes-images \
+            --ref vibes-images \
+            --into "${{ github.event.pull_request.head.sha }}"
+      - name: Post the report to the PR
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          node vibes/bin/vibes.mjs post \
+            --file vibes-report.md \
+            --repo "${{ github.repository }}" \
+            --pr "${{ github.event.pull_request.number }}"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: vibes-images
+          path: vibes-images
+          if-no-files-found: ignore
+      - name: Propagate the verdict
+        run: exit ${{ steps.report.outputs.code }}

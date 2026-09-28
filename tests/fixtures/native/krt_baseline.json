@@ -1,0 +1,362 @@
+{
+ "boards": {
+  "blinky": {
+   "drc_by_type_gate": {
+    "warning:length_out_of_range": 1,
+    "warning:lib_footprint_issues": 2,
+    "warning:text_height": 2
+   },
+   "p6": {
+    "deg": 90.0,
+    "degmm": 3.86,
+    "drc": {
+     "warning:length_out_of_range": 1,
+     "warning:lib_footprint_issues": 2,
+     "warning:text_height": 2
+    },
+    "drc_errors": 0,
+    "micro": 0,
+    "mm": 23.308,
+    "pairs": [],
+    "segments": 4,
+    "unconnected": 0,
+    "vias": 1
+   },
+   "place_lines": [
+    "Place(\"D1\", at=(30.52, 12.5), rot=0.0, layer=\"F.Cu\", locked=True)",
+    "Place(\"FID1\", at=(36.0, 4.0), rot=0.0, layer=\"F.Cu\", locked=False)",
+    "Place(\"FID2\", at=(36.0, 21.0), rot=0.0, layer=\"F.Cu\", locked=False)",
+    "Place(\"FID3\", at=(4.0, 21.0), rot=0.0, layer=\"F.Cu\", locked=False)",
+    "Place(\"R1\", at=(8.93, 12.5), rot=0.0, layer=\"F.Cu\", locked=True)"
+   ],
+   "place_objects": [
+    "Pour(None, layer=None, layers=(\"F.Cu\", \"B.Cu\"), name=\"FID3_mask\", priority=None, locked=False, hatch=(\"edge\", 0.5), connect=\"thermal\", clearance=0.0, min_thickness=0.25, filled_areas_thickness=None, teardrop_type=None, keepout={\"tracks\": \"not_allowed\", \"vias\": \"not_allowed\", \"pads\": \"allowed\", \"copperpour\": \"not_allowed\", \"footprints\": \"allowed\"}, placement={\"enabled\": False, \"sheetname\": \"\"}, filled=False, fill_mode=None, thermal_gap=0.5, thermal_bridge_width=0.5, smoothing=None, radius=None, island_removal_mode=0, island_area_min=None, hatch_thickness=None, hatch_gap=None, hatch_orientation=None, hatch_smoothing_level=None, hatch_smoothing_value=None, hatch_border_algorithm=None, hatch_min_hole_area=None, hatch_position=None, points=[(2.75, 19.75), (5.25, 19.75), (5.25, 22.25), (2.75, 22.25)], holes=[], uuid=\"e84d5a8c-767b-512b-9575-190fa2346cc1\", id=\"pour-e84d5a8c\")",
+    "Pour(None, layer=None, layers=(\"F.Cu\", \"B.Cu\"), name=\"FID1_mask\", priority=None, locked=False, hatch=(\"edge\", 0.5), connect=\"thermal\", clearance=0.0, min_thickness=0.25, filled_areas_thickness=None, teardrop_type=None, keepout={\"tracks\": \"not_allowed\", \"vias\": \"not_allowed\", \"pads\": \"allowed\", \"copperpour\": \"not_allowed\", \"footprints\": \"allowed\"}, placement={\"enabled\": False, \"sheetname\": \"\"}, filled=False, fill_mode=None, thermal_gap=0.5, thermal_bridge_width=0.5, smoothing=None, radius=None, island_removal_mode=0, island_area_min=None, hatch_thickness=None, hatch_gap=None, hatch_orientation=None, hatch_smoothing_level=None, hatch_smoothing_value=None, hatch_border_algorithm=None, hatch_min_hole_area=None, hatch_position=None, points=[(34.75, 2.75), (37.25, 2.75), (37.25, 5.25), (34.75, 5.25)], holes=[], uuid=\"a18fc07a-fcd3-5a1e-a8d1-da27fa6e5d95\", id=\"pour-a18fc07a\")",
+    "Pour(None, layer=None, layers=(\"F.Cu\", \"B.Cu\"), name=\"FID2_mask\", priority=None, locked=False, hatch=(\"edge\", 0.5), connect=\"thermal\", clearance=0.0, min_thickness=0.25, filled_areas_thickness=None, teardrop_type=None, keepout={\"tracks\": \"not_allowed\", \"vias\": \"not_allowed\", \"pads\": \"allowed\", \"copperpour\": \"not_allowed\", \"footprints\": \"allowed\"}, placement={\"enabled\": False, \"sheetname\": \"\"}, filled=False, fill_mode=None, thermal_gap=0.5, thermal_bridge_width=0.5, smoothing=None, radius=None, island_removal_mode=0, island_area_min=None, hatch_thickness=None, hatch_gap=None, hatch_orientation=None, hatch_smoothing_level=None, hatch_smoothing_value=None, hatch_border_algorithm=None, hatch_min_hole_area=None, hatch_position=None, points=[(34.75, 19.75), (37.25, 19.75), (37.25, 22.25), (34.75, 22.25)], holes=[], uuid=\"1398bfa0-006b-5137-86a0-a42fd80462bf\", id=\"pour-1398bfa0\")",
+    "Rect((0.0, 0.0), (40.0, 25.0), radius=None, width=0.05, stroke_type=\"default\", stroke_color=None, fill=False, locked=False, layer=\"Edge.Cuts\", layers=None, solder_mask_margin=None, net=None, uuid=\"d42b1066-6b29-5b09-bb40-1bf2fb5a8329\", id=\"rect-d42b1066\")"
+   ],
+   "pours": [
+    "Pour(\"GND\", layer=\"B.Cu\", layers=None, name=None, priority=None, locked=False, hatch=(\"edge\", 0.5), connect=\"solid\", clearance=0.16, min_thickness=0.1, filled_areas_thickness=None, teardrop_type=None, keepout=None, placement=None, filled=True, fill_mode=None, thermal_gap=0.2, thermal_bridge_width=0.2, smoothing=None, radius=None, island_removal_mode=0, island_area_min=None, hatch_thickness=None, hatch_gap=None, hatch_orientation=None, hatch_smoothing_level=None, hatch_smoothing_value=None, hatch_border_algorithm=None, hatch_min_hole_area=None, hatch_position=None, points=[(0.3, 0.3), (39.7, 0.3), (39.7, 24.7), (0.3, 24.7)], holes=[], uuid=\"d5728b17-86ad-5049-a690-d7916d0aac71\", id=\"pour-d5728b17\")"
+   ],
+   "wall_s": 9.0
+  },
+  "buck": {
+   "drc_by_type_gate": {
+    "warning:length_out_of_range": 1,
+    "warning:lib_footprint_issues": 12,
+    "warning:silk_edge_clearance": 10,
+    "warning:silk_over_copper": 3,
+    "warning:text_height": 9,
+    "warning:track_angle": 20,
+    "warning:track_segment_length": 7,
+    "warning:track_width": 8
+   },
+   "p6": {
+    "deg": 2700.0,
+    "degmm": 18.32,
+    "drc": {
+     "warning:length_out_of_range": 1,
+     "warning:lib_footprint_issues": 12,
+     "warning:silk_edge_clearance": 10,
+     "warning:silk_over_copper": 3,
+     "warning:text_height": 9,
+     "warning:track_angle": 20,
+     "warning:track_segment_length": 7,
+     "warning:track_width": 8
+    },
+    "drc_errors": 0,
+    "micro": 7,
+    "mm": 147.374,
+    "pairs": [],
+    "segments": 73,
+    "unconnected": 0,
+    "vias": 7
+   },
+   "place_lines": [
+    "Place(\"C_BOOT\", at=(15.99, 6.464), rot=0.0, layer=\"F.Cu\", locked=True)",
+    "Place(\"C_IN1\", at=(16.46, 11.676), rot=180.0, layer=\"F.Cu\", locked=True)",
+    "Place(\"C_IN2\", at=(19.82, 9.46), rot=0.0, layer=\"F.Cu\", locked=True)",
+    "Place(\"C_OUT1\", at=(29.082, 13.996), rot=0.0, layer=\"F.Cu\", locked=True)",
+    "Place(\"C_OUT2\", at=(29.082, 16.246), rot=0.0, layer=\"F.Cu\", locked=True)",
+    "Place(\"FID1\", at=(36.0, 4.0), rot=0.0, layer=\"F.Cu\", locked=False)",
+    "Place(\"FID2\", at=(36.0, 21.0), rot=0.0, layer=\"F.Cu\", locked=False)",
+    "Place(\"FID3\", at=(4.0, 21.0), rot=0.0, layer=\"F.Cu\", locked=False)",
+    "Place(\"J_IN\", at=(3.7, 11.975), rot=180.0, layer=\"F.Cu\", locked=True)",
+    "Place(\"J_OUT\", at=(36.3, 13.025), rot=0.0, layer=\"F.Cu\", locked=True)",
+    "Place(\"L1\", at=(22.84, 13.996), rot=180.0, layer=\"F.Cu\", locked=True)",
+    "Place(\"R_EN\", at=(18.22, 6.454), rot=180.0, layer=\"F.Cu\", locked=True)",
+    "Place(\"R_FB_BOT\", at=(20.42, 6.454), rot=0.0, layer=\"F.Cu\", locked=True)",
+    "Place(\"R_FB_TOP\", at=(19.05, 7.66), rot=180.0, layer=\"F.Cu\", locked=True)",
+    "Place(\"U1\", at=(16.46, 8.81), rot=0.0, layer=\"F.Cu\", locked=True)"
+   ],
+   "place_objects": [
+    "Pour(None, layer=None, layers=(\"F.Cu\", \"B.Cu\"), name=\"FID3_mask\", priority=None, locked=False, hatch=(\"edge\", 0.5), connect=\"thermal\", clearance=0.0, min_thickness=0.25, filled_areas_thickness=None, teardrop_type=None, keepout={\"tracks\": \"not_allowed\", \"vias\": \"not_allowed\", \"pads\": \"allowed\", \"copperpour\": \"not_allowed\", \"footprints\": \"allowed\"}, placement={\"enabled\": False, \"sheetname\": \"\"}, filled=False, fill_mode=None, thermal_gap=0.5, thermal_bridge_width=0.5, smoothing=None, radius=None, island_removal_mode=0, island_area_min=None, hatch_thickness=None, hatch_gap=None, hatch_orientation=None, hatch_smoothing_level=None, hatch_smoothing_value=None, hatch_border_algorithm=None, hatch_min_hole_area=None, hatch_position=None, points=[(2.75, 19.75), (5.25, 19.75), (5.25, 22.25), (2.75, 22.25)], holes=[], uuid=\"3e0bf5a3-617a-5afe-9b7c-7a480c72eab5\", id=\"pour-3e0bf5a3\")",
+    "Pour(None, layer=None, layers=(\"F.Cu\", \"B.Cu\"), name=\"FID1_mask\", priority=None, locked=False, hatch=(\"edge\", 0.5), connect=\"thermal\", clearance=0.0, min_thickness=0.25, filled_areas_thickness=None, teardrop_type=None, keepout={\"tracks\": \"not_allowed\", \"vias\": \"not_allowed\", \"pads\": \"allowed\", \"copperpour\": \"not_allowed\", \"footprints\": \"allowed\"}, placement={\"enabled\": False, \"sheetname\": \"\"}, filled=False, fill_mode=None, thermal_gap=0.5, thermal_bridge_width=0.5, smoothing=None, radius=None, island_removal_mode=0, island_area_min=None, hatch_thickness=None, hatch_gap=None, hatch_orientation=None, hatch_smoothing_level=None, hatch_smoothing_value=None, hatch_border_algorithm=None, hatch_min_hole_area=None, hatch_position=None, points=[(34.75, 2.75), (37.25, 2.75), (37.25, 5.25), (34.75, 5.25)], holes=[], uuid=\"1d37ec58-f448-5d6a-a778-a92e853d050e\", id=\"pour-1d37ec58\")",
+    "Pour(None, layer=None, layers=(\"F.Cu\", \"B.Cu\"), name=\"FID2_mask\", priority=None, locked=False, hatch=(\"edge\", 0.5), connect=\"thermal\", clearance=0.0, min_thickness=0.25, filled_areas_thickness=None, teardrop_type=None, keepout={\"tracks\": \"not_allowed\", \"vias\": \"not_allowed\", \"pads\": \"allowed\", \"copperpour\": \"not_allowed\", \"footprints\": \"allowed\"}, placement={\"enabled\": False, \"sheetname\": \"\"}, filled=False, fill_mode=None, thermal_gap=0.5, thermal_bridge_width=0.5, smoothing=None, radius=None, island_removal_mode=0, island_area_min=None, hatch_thickness=None, hatch_gap=None, hatch_orientation=None, hatch_smoothing_level=None, hatch_smoothing_value=None, hatch_border_algorithm=None, hatch_min_hole_area=None, hatch_position=None, points=[(34.75, 19.75), (37.25, 19.75), (37.25, 22.25), (34.75, 22.25)], holes=[], uuid=\"47fd2312-93d3-5e1a-983d-d7b977c827a1\", id=\"pour-47fd2312\")",
+    "Rect((0.0, 0.0), (40.0, 25.0), radius=None, width=0.05, stroke_type=\"default\", stroke_color=None, fill=False, locked=False, layer=\"Edge.Cuts\", layers=None, solder_mask_margin=None, net=None, uuid=\"fe167765-302c-5956-8e63-dc374e8e1045\", id=\"rect-fe167765\")"
+   ],
+   "pours": [
+    "Pour(\"GND\", layer=\"B.Cu\", layers=None, name=None, priority=None, locked=False, hatch=(\"edge\", 0.5), connect=\"solid\", clearance=0.16, min_thickness=0.1, filled_areas_thickness=None, teardrop_type=None, keepout=None, placement=None, filled=True, fill_mode=None, thermal_gap=0.2, thermal_bridge_width=0.2, smoothing=None, radius=None, island_removal_mode=0, island_area_min=None, hatch_thickness=None, hatch_gap=None, hatch_orientation=None, hatch_smoothing_level=None, hatch_smoothing_value=None, hatch_border_algorithm=None, hatch_min_hole_area=None, hatch_position=None, points=[(0.3, 0.3), (39.7, 0.3), (39.7, 24.7), (0.3, 24.7)], holes=[], uuid=\"ff18e212-cf16-57ea-99be-2411a30ad47f\", id=\"pour-ff18e212\")"
+   ],
+   "wall_s": 19.0
+  },
+  "c3_usb": {
+   "drc_by_type_gate": {
+    "warning:diff_pair_uncoupled_length_too_long": 1,
+    "warning:length_out_of_range": 1,
+    "warning:lib_footprint_issues": 19,
+    "warning:silk_edge_clearance": 3,
+    "warning:silk_over_copper": 11,
+    "warning:silk_overlap": 5,
+    "warning:skew_out_of_range": 1,
+    "warning:text_height": 17,
+    "warning:too_many_vias": 1,
+    "warning:track_angle": 116,
+    "warning:track_segment_length": 83,
+    "warning:track_width": 25
+   },
+   "p6": {
+    "deg": 12713.6,
+    "degmm": 35.43,
+    "drc": {
+     "warning:diff_pair_uncoupled_length_too_long": 1,
+     "warning:length_out_of_range": 1,
+     "warning:lib_footprint_issues": 19,
+     "warning:silk_edge_clearance": 3,
+     "warning:silk_over_copper": 11,
+     "warning:silk_overlap": 5,
+     "warning:skew_out_of_range": 1,
+     "warning:text_height": 17,
+     "warning:too_many_vias": 1,
+     "warning:track_angle": 116,
+     "warning:track_segment_length": 83,
+     "warning:track_width": 25
+    },
+    "drc_errors": 0,
+    "micro": 85,
+    "mm": 358.883,
+    "pairs": [
+     {
+      "coupled_mm": 29.722,
+      "len_mm": 37.653,
+      "pair": "USB_DP/USB_DN",
+      "threshold_mm": 0.35
+     }
+    ],
+    "segments": 302,
+    "unconnected": 0,
+    "vias": 55
+   },
+   "place_lines": [
+    "Place(\"C_3V3\", at=(35.8625, 9.07), rot=0.0, layer=\"F.Cu\", locked=True)",
+    "Place(\"C_3V3_HF\", at=(36.66, 11.23), rot=-90.0, layer=\"F.Cu\", locked=True)",
+    "Place(\"C_EN\", at=(15.58, 15.36), rot=0.0, layer=\"F.Cu\", locked=True)",
+    "Place(\"C_MCU\", at=(11.35, 16.38), rot=-90.0, layer=\"F.Cu\", locked=True)",
+    "Place(\"C_MCU_HF\", at=(9.37, 15.36), rot=180.0, layer=\"F.Cu\", locked=True)",
+    "Place(\"C_VBUS\", at=(29.843, 10.25), rot=180.0, layer=\"F.Cu\", locked=True)",
+    "Place(\"C_VBUS_HF\", at=(30.863, 12.17), rot=90.0, layer=\"F.Cu\", locked=True)",
+    "Place(\"D1\", at=(21.84, 11.45), rot=180.0, layer=\"F.Cu\", locked=True)",
+    "Place(\"FID1\", at=(36.0, 4.0), rot=0.0, layer=\"F.Cu\", locked=False)",
+    "Place(\"FID2\", at=(36.0, 26.0), rot=0.0, layer=\"F.Cu\", locked=False)",
+    "Place(\"FID3\", at=(4.0, 26.0), rot=0.0, layer=\"F.Cu\", locked=False)",
+    "Place(\"J1\", at=(20.0, 24.91), rot=0.0, layer=\"F.Cu\", locked=True)",
+    "Place(\"R_BOOT\", at=(18.77, 4.36), rot=90.0, layer=\"F.Cu\", locked=True)",
+    "Place(\"R_CC1\", at=(15.99, 19.8685), rot=180.0, layer=\"F.Cu\", locked=True)",
+    "Place(\"R_CC2\", at=(22.75, 19.4085), rot=90.0, layer=\"F.Cu\", locked=True)",
+    "Place(\"R_EN\", at=(13.34, 15.37), rot=0.0, layer=\"F.Cu\", locked=True)",
+    "Place(\"R_LED\", at=(19.23, 11.2), rot=0.0, layer=\"F.Cu\", locked=True)",
+    "Place(\"SW_BOOT\", at=(19.95, 8.05), rot=-90.0, layer=\"F.Cu\", locked=True)",
+    "Place(\"SW_RST\", at=(13.1, 20.55), rot=-90.0, layer=\"F.Cu\", locked=True)",
+    "Place(\"U1\", at=(12.25, 7.85), rot=90.0, layer=\"F.Cu\", locked=True)",
+    "Place(\"U2\", at=(33.95, 11.7), rot=0.0, layer=\"F.Cu\", locked=True)",
+    "Place(\"U3\", at=(19.6125, 18.6385), rot=180.0, layer=\"F.Cu\", locked=True)"
+   ],
+   "place_objects": [
+    "Pour(None, layer=None, layers=(\"F.Cu\", \"B.Cu\"), name=\"ANTENNA\", priority=None, locked=False, hatch=(\"edge\", 0.5), connect=\"thermal\", clearance=0.0, min_thickness=0.25, filled_areas_thickness=None, teardrop_type=None, keepout={\"tracks\": \"not_allowed\", \"vias\": \"not_allowed\", \"pads\": \"allowed\", \"copperpour\": \"not_allowed\", \"footprints\": \"allowed\"}, placement={\"enabled\": False, \"sheetname\": \"\"}, filled=False, fill_mode=None, thermal_gap=0.5, thermal_bridge_width=0.5, smoothing=None, radius=None, island_removal_mode=0, island_area_min=None, hatch_thickness=None, hatch_gap=None, hatch_orientation=None, hatch_smoothing_level=None, hatch_smoothing_value=None, hatch_border_algorithm=None, hatch_min_hole_area=None, hatch_position=None, points=[(0.0, 0.0), (4.0, 0.0), (4.0, 15.0), (0.0, 15.0)], holes=[], uuid=\"285b9467-74f1-5232-9ff4-40cd25ccd4f4\", id=\"pour-285b9467\")",
+    "Pour(None, layer=None, layers=(\"F.Cu\", \"B.Cu\"), name=\"FID3_mask\", priority=None, locked=False, hatch=(\"edge\", 0.5), connect=\"thermal\", clearance=0.0, min_thickness=0.25, filled_areas_thickness=None, teardrop_type=None, keepout={\"tracks\": \"not_allowed\", \"vias\": \"not_allowed\", \"pads\": \"allowed\", \"copperpour\": \"not_allowed\", \"footprints\": \"allowed\"}, placement={\"enabled\": False, \"sheetname\": \"\"}, filled=False, fill_mode=None, thermal_gap=0.5, thermal_bridge_width=0.5, smoothing=None, radius=None, island_removal_mode=0, island_area_min=None, hatch_thickness=None, hatch_gap=None, hatch_orientation=None, hatch_smoothing_level=None, hatch_smoothing_value=None, hatch_border_algorithm=None, hatch_min_hole_area=None, hatch_position=None, points=[(2.75, 24.75), (5.25, 24.75), (5.25, 27.25), (2.75, 27.25)], holes=[], uuid=\"a6ed39a9-995c-57c3-b65e-86f81bf19dec\", id=\"pour-a6ed39a9\")",
+    "Pour(None, layer=None, layers=(\"F.Cu\", \"B.Cu\"), name=\"FID1_mask\", priority=None, locked=False, hatch=(\"edge\", 0.5), connect=\"thermal\", clearance=0.0, min_thickness=0.25, filled_areas_thickness=None, teardrop_type=None, keepout={\"tracks\": \"not_allowed\", \"vias\": \"not_allowed\", \"pads\": \"allowed\", \"copperpour\": \"not_allowed\", \"footprints\": \"allowed\"}, placement={\"enabled\": False, \"sheetname\": \"\"}, filled=False, fill_mode=None, thermal_gap=0.5, thermal_bridge_width=0.5, smoothing=None, radius=None, island_removal_mode=0, island_area_min=None, hatch_thickness=None, hatch_gap=None, hatch_orientation=None, hatch_smoothing_level=None, hatch_smoothing_value=None, hatch_border_algorithm=None, hatch_min_hole_area=None, hatch_position=None, points=[(34.75, 2.75), (37.25, 2.75), (37.25, 5.25), (34.75, 5.25)], holes=[], uuid=\"479fe63a-e6f2-5b23-b3a4-5c6bedc913a9\", id=\"pour-479fe63a\")",
+    "Pour(None, layer=None, layers=(\"F.Cu\", \"B.Cu\"), name=\"FID2_mask\", priority=None, locked=False, hatch=(\"edge\", 0.5), connect=\"thermal\", clearance=0.0, min_thickness=0.25, filled_areas_thickness=None, teardrop_type=None, keepout={\"tracks\": \"not_allowed\", \"vias\": \"not_allowed\", \"pads\": \"allowed\", \"copperpour\": \"not_allowed\", \"footprints\": \"allowed\"}, placement={\"enabled\": False, \"sheetname\": \"\"}, filled=False, fill_mode=None, thermal_gap=0.5, thermal_bridge_width=0.5, smoothing=None, radius=None, island_removal_mode=0, island_area_min=None, hatch_thickness=None, hatch_gap=None, hatch_orientation=None, hatch_smoothing_level=None, hatch_smoothing_value=None, hatch_border_algorithm=None, hatch_min_hole_area=None, hatch_position=None, points=[(34.75, 24.75), (37.25, 24.75), (37.25, 27.25), (34.75, 27.25)], holes=[], uuid=\"aa28e062-582a-5fba-b9fb-60ea8484c447\", id=\"pour-aa28e062\")",
+    "Rect((0.0, 0.0), (40.0, 30.0), radius=None, width=0.05, stroke_type=\"default\", stroke_color=None, fill=False, locked=False, layer=\"Edge.Cuts\", layers=None, solder_mask_margin=None, net=None, uuid=\"48148941-d786-590b-94a3-f02fa8f80f90\", id=\"rect-48148941\")"
+   ],
+   "pours": [
+    "Pour(\"GND\", layer=\"B.Cu\", layers=None, name=None, priority=None, locked=False, hatch=(\"edge\", 0.5), connect=\"solid\", clearance=0.16, min_thickness=0.1, filled_areas_thickness=None, teardrop_type=None, keepout=None, placement=None, filled=True, fill_mode=None, thermal_gap=0.2, thermal_bridge_width=0.2, smoothing=None, radius=None, island_removal_mode=0, island_area_min=None, hatch_thickness=None, hatch_gap=None, hatch_orientation=None, hatch_smoothing_level=None, hatch_smoothing_value=None, hatch_border_algorithm=None, hatch_min_hole_area=None, hatch_position=None, points=[(0.3, 0.3), (39.7, 0.3), (39.7, 29.7), (0.3, 29.7)], holes=[], uuid=\"f9da08b1-a9fb-5370-a901-7228e275ffd5\", id=\"pour-f9da08b1\")"
+   ],
+   "wall_s": 29.5
+  },
+  "ds2": {
+   "drc_by_type_gate": {
+    "warning:length_out_of_range": 1,
+    "warning:lib_footprint_issues": 28,
+    "warning:silk_edge_clearance": 15,
+    "warning:silk_over_copper": 3,
+    "warning:silk_overlap": 1,
+    "warning:text_height": 22,
+    "warning:track_angle": 8,
+    "warning:track_segment_length": 32,
+    "warning:track_width": 3
+   },
+   "p6": {
+    "deg": 7705.4,
+    "degmm": 15.36,
+    "drc": {
+     "warning:length_out_of_range": 1,
+     "warning:lib_footprint_issues": 28,
+     "warning:silk_edge_clearance": 15,
+     "warning:silk_over_copper": 3,
+     "warning:silk_overlap": 1,
+     "warning:text_height": 22,
+     "warning:track_angle": 8,
+     "warning:track_segment_length": 32,
+     "warning:track_width": 3
+    },
+    "drc_errors": 0,
+    "micro": 32,
+    "mm": 501.772,
+    "pairs": [],
+    "segments": 227,
+    "unconnected": 0,
+    "vias": 27
+   },
+   "place_lines": [
+    "Place(\"C1\", at=(36.8, 9.85), rot=180.0, layer=\"F.Cu\", locked=True)",
+    "Place(\"C10\", at=(36.43, 12.7), rot=180.0, layer=\"F.Cu\", locked=True)",
+    "Place(\"C11\", at=(39.3475, 15.55), rot=-90.0, layer=\"F.Cu\", locked=True)",
+    "Place(\"C12\", at=(41.9275, 16.05), rot=-90.0, layer=\"F.Cu\", locked=True)",
+    "Place(\"C2\", at=(39.88, 7.2025), rot=90.0, layer=\"F.Cu\", locked=True)",
+    "Place(\"C3\", at=(31.76, 2.25), rot=-90.0, layer=\"F.Cu\", locked=True)",
+    "Place(\"C4\", at=(19.555, 6.4411), rot=180.0, layer=\"F.Cu\", locked=True)",
+    "Place(\"C5\", at=(22.955, 6.4411), rot=0.0, layer=\"F.Cu\", locked=True)",
+    "Place(\"C6\", at=(25.43, 5.6911), rot=90.0, layer=\"F.Cu\", locked=True)",
+    "Place(\"C7\", at=(8.3025, 15.35), rot=0.0, layer=\"F.Cu\", locked=True)",
+    "Place(\"C8\", at=(4.685, 17.23), rot=180.0, layer=\"F.Cu\", locked=True)",
+    "Place(\"C9\", at=(1.52, 19.41), rot=-90.0, layer=\"F.Cu\", locked=True)",
+    "Place(\"FID1\", at=(43.0, 4.0), rot=0.0, layer=\"F.Cu\", locked=False)",
+    "Place(\"FID2\", at=(43.0, 21.4), rot=0.0, layer=\"F.Cu\", locked=False)",
+    "Place(\"FID3\", at=(4.0, 21.4), rot=0.0, layer=\"F.Cu\", locked=False)",
+    "Place(\"J1\", at=(13.27, 19.05), rot=-90.0, layer=\"F.Cu\", locked=True)",
+    "Place(\"J2\", at=(5.08, 12.7), rot=180.0, layer=\"F.Cu\", locked=True)",
+    "Place(\"J3\", at=(37.75, 21.59), rot=-90.0, layer=\"F.Cu\", locked=True)",
+    "Place(\"J4\", at=(37.75, 2.57), rot=90.0, layer=\"F.Cu\", locked=True)",
+    "Place(\"J5\", at=(44.43, 12.7), rot=0.0, layer=\"F.Cu\", locked=True)",
+    "Place(\"R1\", at=(37.75, 6.99), rot=-90.0, layer=\"F.Cu\", locked=True)",
+    "Place(\"R10\", at=(20.6075, 18.1789), rot=0.0, layer=\"F.Cu\", locked=True)",
+    "Place(\"R2\", at=(34.62, 1.3), rot=180.0, layer=\"F.Cu\", locked=True)",
+    "Place(\"R3\", at=(16.42, 19.05), rot=0.0, layer=\"F.Cu\", locked=True)",
+    "Place(\"R4\", at=(16.42, 21.59), rot=0.0, layer=\"F.Cu\", locked=True)",
+    "Place(\"R5\", at=(10.85, 23.2175), rot=90.0, layer=\"F.Cu\", locked=True)",
+    "Place(\"R6\", at=(4.7225, 15.1), rot=0.0, layer=\"F.Cu\", locked=True)",
+    "Place(\"R7\", at=(1.27, 15.83), rot=-90.0, layer=\"F.Cu\", locked=True)",
+    "Place(\"R8\", at=(40.01, 12.7), rot=180.0, layer=\"F.Cu\", locked=True)",
+    "Place(\"R9\", at=(44.7875, 15.1), rot=180.0, layer=\"F.Cu\", locked=True)",
+    "Place(\"U1\", at=(22.5, 12.2), rot=0.0, layer=\"F.Cu\", locked=True)"
+   ],
+   "place_objects": [
+    "Pour(None, layer=None, layers=(\"F.Cu\", \"B.Cu\"), name=\"FID3_mask\", priority=None, locked=False, hatch=(\"edge\", 0.5), connect=\"thermal\", clearance=0.0, min_thickness=0.25, filled_areas_thickness=None, teardrop_type=None, keepout={\"tracks\": \"not_allowed\", \"vias\": \"not_allowed\", \"pads\": \"allowed\", \"copperpour\": \"not_allowed\", \"footprints\": \"allowed\"}, placement={\"enabled\": False, \"sheetname\": \"\"}, filled=False, fill_mode=None, thermal_gap=0.5, thermal_bridge_width=0.5, smoothing=None, radius=None, island_removal_mode=0, island_area_min=None, hatch_thickness=None, hatch_gap=None, hatch_orientation=None, hatch_smoothing_level=None, hatch_smoothing_value=None, hatch_border_algorithm=None, hatch_min_hole_area=None, hatch_position=None, points=[(2.75, 20.15), (5.25, 20.15), (5.25, 22.65), (2.75, 22.65)], holes=[], uuid=\"9e00a00b-6f85-5aa5-ab3a-8d73a16ac7e1\", id=\"pour-9e00a00b\")",
+    "Pour(None, layer=None, layers=(\"F.Cu\", \"B.Cu\"), name=\"FID1_mask\", priority=None, locked=False, hatch=(\"edge\", 0.5), connect=\"thermal\", clearance=0.0, min_thickness=0.25, filled_areas_thickness=None, teardrop_type=None, keepout={\"tracks\": \"not_allowed\", \"vias\": \"not_allowed\", \"pads\": \"allowed\", \"copperpour\": \"not_allowed\", \"footprints\": \"allowed\"}, placement={\"enabled\": False, \"sheetname\": \"\"}, filled=False, fill_mode=None, thermal_gap=0.5, thermal_bridge_width=0.5, smoothing=None, radius=None, island_removal_mode=0, island_area_min=None, hatch_thickness=None, hatch_gap=None, hatch_orientation=None, hatch_smoothing_level=None, hatch_smoothing_value=None, hatch_border_algorithm=None, hatch_min_hole_area=None, hatch_position=None, points=[(41.75, 2.75), (44.25, 2.75), (44.25, 5.25), (41.75, 5.25)], holes=[], uuid=\"6f701ef5-6239-5f8e-8da5-99b01ace637d\", id=\"pour-6f701ef5\")",
+    "Pour(None, layer=None, layers=(\"F.Cu\", \"B.Cu\"), name=\"FID2_mask\", priority=None, locked=False, hatch=(\"edge\", 0.5), connect=\"thermal\", clearance=0.0, min_thickness=0.25, filled_areas_thickness=None, teardrop_type=None, keepout={\"tracks\": \"not_allowed\", \"vias\": \"not_allowed\", \"pads\": \"allowed\", \"copperpour\": \"not_allowed\", \"footprints\": \"allowed\"}, placement={\"enabled\": False, \"sheetname\": \"\"}, filled=False, fill_mode=None, thermal_gap=0.5, thermal_bridge_width=0.5, smoothing=None, radius=None, island_removal_mode=0, island_area_min=None, hatch_thickness=None, hatch_gap=None, hatch_orientation=None, hatch_smoothing_level=None, hatch_smoothing_value=None, hatch_border_algorithm=None, hatch_min_hole_area=None, hatch_position=None, points=[(41.75, 20.15), (44.25, 20.15), (44.25, 22.65), (41.75, 22.65)], holes=[], uuid=\"29b639f4-b9de-5dd7-a5e3-2d6e517b8369\", id=\"pour-29b639f4\")",
+    "Rect((0.0, 0.0), (47.0, 25.4), radius=None, width=0.05, stroke_type=\"default\", stroke_color=None, fill=False, locked=False, layer=\"Edge.Cuts\", layers=None, solder_mask_margin=None, net=None, uuid=\"69d546d4-8af6-56d5-8f3c-48963cd94172\", id=\"rect-69d546d4\")"
+   ],
+   "pours": [
+    "Pour(\"GND\", layer=\"B.Cu\", layers=None, name=None, priority=None, locked=False, hatch=(\"edge\", 0.5), connect=\"solid\", clearance=0.16, min_thickness=0.1, filled_areas_thickness=None, teardrop_type=None, keepout=None, placement=None, filled=True, fill_mode=None, thermal_gap=0.2, thermal_bridge_width=0.2, smoothing=None, radius=None, island_removal_mode=0, island_area_min=None, hatch_thickness=None, hatch_gap=None, hatch_orientation=None, hatch_smoothing_level=None, hatch_smoothing_value=None, hatch_border_algorithm=None, hatch_min_hole_area=None, hatch_position=None, points=[(0.3, 0.3), (46.7, 0.3), (46.7, 25.1), (0.3, 25.1)], holes=[], uuid=\"9cbbca27-17b1-5f9b-9bdb-fb4999aa90a5\", id=\"pour-9cbbca27\")"
+   ],
+   "wall_s": 21.9
+  },
+  "node": {
+   "drc_by_type_gate": {
+    "warning:diff_pair_uncoupled_length_too_long": 1,
+    "warning:length_out_of_range": 1,
+    "warning:lib_footprint_issues": 31,
+    "warning:silk_edge_clearance": 8,
+    "warning:silk_over_copper": 17,
+    "warning:silk_overlap": 6,
+    "warning:skew_out_of_range": 1,
+    "warning:text_height": 28,
+    "warning:track_angle": 94,
+    "warning:track_segment_length": 27,
+    "warning:track_width": 57
+   },
+   "p6": {
+    "deg": 12391.1,
+    "degmm": 30.26,
+    "drc": {
+     "warning:diff_pair_uncoupled_length_too_long": 1,
+     "warning:length_out_of_range": 1,
+     "warning:lib_footprint_issues": 31,
+     "warning:silk_edge_clearance": 8,
+     "warning:silk_over_copper": 17,
+     "warning:silk_overlap": 6,
+     "warning:skew_out_of_range": 1,
+     "warning:text_height": 28,
+     "warning:track_angle": 94,
+     "warning:track_segment_length": 27,
+     "warning:track_width": 57
+    },
+    "drc_errors": 0,
+    "micro": 27,
+    "mm": 409.453,
+    "pairs": [
+     {
+      "coupled_mm": 58.685,
+      "len_mm": 65.404,
+      "pair": "USB_DP/USB_DN",
+      "threshold_mm": 0.45
+     }
+    ],
+    "segments": 274,
+    "unconnected": 0,
+    "vias": 86
+   },
+   "place_lines": [
+    "Place(\"C_3V3\", at=(29.9625, 28.67), rot=0.0, layer=\"F.Cu\", locked=True)",
+    "Place(\"C_3V3_HF\", at=(31.21, 30.35), rot=0.0, layer=\"F.Cu\", locked=True)",
+    "Place(\"C_BME\", at=(52.4465, 5.09), rot=90.0, layer=\"F.Cu\", locked=True)",
+    "Place(\"C_EN\", at=(16.58, 15.96), rot=0.0, layer=\"F.Cu\", locked=True)",
+    "Place(\"C_MCU\", at=(11.35, 16.38), rot=-90.0, layer=\"F.Cu\", locked=True)",
+    "Place(\"C_MCU_HF\", at=(9.37, 15.36), rot=180.0, layer=\"F.Cu\", locked=True)",
+    "Place(\"C_OPA\", at=(22.22, 15.11), rot=180.0, layer=\"F.Cu\", locked=True)",
+    "Place(\"C_VBUS\", at=(24.32, 29.85), rot=180.0, layer=\"F.Cu\", locked=True)",
+    "Place(\"C_VBUS_HF\", at=(25.34, 31.77), rot=90.0, layer=\"F.Cu\", locked=True)",
+    "Place(\"D1\", at=(19.37, 14.82), rot=90.0, layer=\"F.Cu\", locked=True)",
+    "Place(\"FID1\", at=(56.0, 41.0), rot=0.0, layer=\"F.Cu\", locked=False)",
+    "Place(\"FID2\", at=(4.0, 41.0), rot=0.0, layer=\"F.Cu\", locked=False)",
+    "Place(\"FID3\", at=(30.0, 4.0), rot=0.0, layer=\"F.Cu\", locked=False)",
+    "Place(\"J1\", at=(30.0, 39.91), rot=0.0, layer=\"F.Cu\", locked=True)",
+    "Place(\"J_LOAD\", at=(56.3, 23.025), rot=0.0, layer=\"F.Cu\", locked=True)",
+    "Place(\"Q1\", at=(50.9, 23.025), rot=180.0, layer=\"F.Cu\", locked=True)",
+    "Place(\"R_BOOT\", at=(18.77, 4.36), rot=90.0, layer=\"F.Cu\", locked=True)",
+    "Place(\"R_CC1\", at=(28.24, 35.1912), rot=180.0, layer=\"F.Cu\", locked=True)",
+    "Place(\"R_CC2\", at=(35.25, 34.7312), rot=90.0, layer=\"F.Cu\", locked=True)",
+    "Place(\"R_EN\", at=(13.84, 15.97), rot=0.0, layer=\"F.Cu\", locked=True)",
+    "Place(\"R_G\", at=(48.27, 22.075), rot=0.0, layer=\"F.Cu\", locked=True)",
+    "Place(\"R_LED\", at=(19.37, 12.21), rot=-90.0, layer=\"F.Cu\", locked=True)",
+    "Place(\"R_NTC\", at=(23.21, 10.08), rot=180.0, layer=\"F.Cu\", locked=True)",
+    "Place(\"R_PD\", at=(48.73, 23.835), rot=-90.0, layer=\"F.Cu\", locked=True)",
+    "Place(\"R_SCL\", at=(57.5235, 6.73), rot=180.0, layer=\"F.Cu\", locked=True)",
+    "Place(\"R_SDA\", at=(57.0635, 5.06), rot=-90.0, layer=\"F.Cu\", locked=True)",
+    "Place(\"R_TDIV\", at=(23.87, 11.81), rot=-90.0, layer=\"F.Cu\", locked=True)",
+    "Place(\"SW_BOOT\", at=(19.95, 8.05), rot=-90.0, layer=\"F.Cu\", locked=True)",
+    "Place(\"SW_RST\", at=(14.1, 19.05), rot=-90.0, layer=\"F.Cu\", locked=True)",
+    "Place(\"U1\", at=(12.25, 7.85), rot=90.0, layer=\"F.Cu\", locked=True)",
+    "Place(\"U2\", at=(28.05, 31.3), rot=0.0, layer=\"F.Cu\", locked=True)",
+    "Place(\"U3\", at=(32.3875, 33.9612), rot=180.0, layer=\"F.Cu\", locked=True)",
+    "Place(\"U4\", at=(54.75, 5.25), rot=0.0, layer=\"F.Cu\", locked=True)",
+    "Place(\"U5\", at=(21.75, 12.6), rot=90.0, layer=\"F.Cu\", locked=True)"
+   ],
+   "place_objects": [
+    "Pour(None, layer=None, layers=(\"F.Cu\", \"B.Cu\", \"In1.Cu\", \"In2.Cu\"), name=\"ANTENNA\", priority=None, locked=False, hatch=(\"edge\", 0.5), connect=\"thermal\", clearance=0.0, min_thickness=0.25, filled_areas_thickness=None, teardrop_type=None, keepout={\"tracks\": \"not_allowed\", \"vias\": \"not_allowed\", \"pads\": \"allowed\", \"copperpour\": \"not_allowed\", \"footprints\": \"allowed\"}, placement={\"enabled\": False, \"sheetname\": \"\"}, filled=False, fill_mode=None, thermal_gap=0.5, thermal_bridge_width=0.5, smoothing=None, radius=None, island_removal_mode=0, island_area_min=None, hatch_thickness=None, hatch_gap=None, hatch_orientation=None, hatch_smoothing_level=None, hatch_smoothing_value=None, hatch_border_algorithm=None, hatch_min_hole_area=None, hatch_position=None, points=[(0.0, 0.0), (4.0, 0.0), (4.0, 15.0), (0.0, 15.0)], holes=[], uuid=\"b4aea9dc-5fc1-598c-968e-80208055f1e5\", id=\"pour-b4aea9dc\")",
+    "Pour(None, layer=None, layers=(\"F.Cu\", \"B.Cu\", \"In1.Cu\", \"In2.Cu\"), name=\"FID2_mask\", priority=None, locked=False, hatch=(\"edge\", 0.5), connect=\"thermal\", clearance=0.0, min_thickness=0.25, filled_areas_thickness=None, teardrop_type=None, keepout={\"tracks\": \"not_allowed\", \"vias\": \"not_allowed\", \"pads\": \"allowed\", \"copperpour\": \"not_allowed\", \"footprints\": \"allowed\"}, placement={\"enabled\": False, \"sheetname\": \"\"}, filled=False, fill_mode=None, thermal_gap=0.5, thermal_bridge_width=0.5, smoothing=None, radius=None, island_removal_mode=0, island_area_min=None, hatch_thickness=None, hatch_gap=None, hatch_orientation=None, hatch_smoothing_level=None, hatch_smoothing_value=None, hatch_border_algorithm=None, hatch_min_hole_area=None, hatch_position=None, points=[(2.75, 39.75), (5.25, 39.75), (5.25, 42.25), (2.75, 42.25)], holes=[], uuid=\"9ba95932-a07a-53ed-8c57-57ab10f34710\", id=\"pour-9ba95932\")",
+    "Pour(None, layer=None, layers=(\"F.Cu\", \"B.Cu\", \"In1.Cu\", \"In2.Cu\"), name=\"FID3_mask\", priority=None, locked=False, hatch=(\"edge\", 0.5), connect=\"thermal\", clearance=0.0, min_thickness=0.25, filled_areas_thickness=None, teardrop_type=None, keepout={\"tracks\": \"not_allowed\", \"vias\": \"not_allowed\", \"pads\": \"allowed\", \"copperpour\": \"not_allowed\", \"footprints\": \"allowed\"}, placement={\"enabled\": False, \"sheetname\": \"\"}, filled=False, fill_mode=None, thermal_gap=0.5, thermal_bridge_width=0.5, smoothing=None, radius=None, island_removal_mode=0, island_area_min=None, hatch_thickness=None, hatch_gap=None, hatch_orientation=None, hatch_smoothing_level=None, hatch_smoothing_value=None, hatch_border_algorithm=None, hatch_min_hole_area=None, hatch_position=None, points=[(28.75, 2.75), (31.25, 2.75), (31.25, 5.25), (28.75, 5.25)], holes=[], uuid=\"09a176c4-997c-57d8-bc05-6ad70aa01b86\", id=\"pour-09a176c4\")",
+    "Pour(None, layer=None, layers=(\"F.Cu\", \"B.Cu\", \"In1.Cu\", \"In2.Cu\"), name=\"FID1_mask\", priority=None, locked=False, hatch=(\"edge\", 0.5), connect=\"thermal\", clearance=0.0, min_thickness=0.25, filled_areas_thickness=None, teardrop_type=None, keepout={\"tracks\": \"not_allowed\", \"vias\": \"not_allowed\", \"pads\": \"allowed\", \"copperpour\": \"not_allowed\", \"footprints\": \"allowed\"}, placement={\"enabled\": False, \"sheetname\": \"\"}, filled=False, fill_mode=None, thermal_gap=0.5, thermal_bridge_width=0.5, smoothing=None, radius=None, island_removal_mode=0, island_area_min=None, hatch_thickness=None, hatch_gap=None, hatch_orientation=None, hatch_smoothing_level=None, hatch_smoothing_value=None, hatch_border_algorithm=None, hatch_min_hole_area=None, hatch_position=None, points=[(54.75, 39.75), (57.25, 39.75), (57.25, 42.25), (54.75, 42.25)], holes=[], uuid=\"37ef52af-e339-53d2-8b75-f688c1e24c43\", id=\"pour-37ef52af\")",
+    "Rect((0.0, 0.0), (60.0, 45.0), radius=None, width=0.05, stroke_type=\"default\", stroke_color=None, fill=False, locked=False, layer=\"Edge.Cuts\", layers=None, solder_mask_margin=None, net=None, uuid=\"7c9109a6-a19f-5555-8a94-afbe2f929c9b\", id=\"rect-7c9109a6\")"
+   ],
+   "pours": [
+    "Pour(\"3V3\", layer=\"In2.Cu\", layers=None, name=None, priority=None, locked=False, hatch=(\"edge\", 0.5), connect=\"solid\", clearance=0.18, min_thickness=0.1, filled_areas_thickness=None, teardrop_type=None, keepout=None, placement=None, filled=True, fill_mode=None, thermal_gap=0.2, thermal_bridge_width=0.2, smoothing=None, radius=None, island_removal_mode=0, island_area_min=None, hatch_thickness=None, hatch_gap=None, hatch_orientation=None, hatch_smoothing_level=None, hatch_smoothing_value=None, hatch_border_algorithm=None, hatch_min_hole_area=None, hatch_position=None, points=[(0.3, 0.3), (59.7, 0.3), (59.7, 44.7), (0.3, 44.7)], holes=[], uuid=\"dbcab33c-e30e-5a4a-9295-24cd2e24ff11\", id=\"pour-dbcab33c\")",
+    "Pour(\"GND\", layer=\"In1.Cu\", layers=None, name=None, priority=None, locked=False, hatch=(\"edge\", 0.5), connect=\"solid\", clearance=0.18, min_thickness=0.1, filled_areas_thickness=None, teardrop_type=None, keepout=None, placement=None, filled=True, fill_mode=None, thermal_gap=0.2, thermal_bridge_width=0.2, smoothing=None, radius=None, island_removal_mode=0, island_area_min=None, hatch_thickness=None, hatch_gap=None, hatch_orientation=None, hatch_smoothing_level=None, hatch_smoothing_value=None, hatch_border_algorithm=None, hatch_min_hole_area=None, hatch_position=None, points=[(0.3, 0.3), (59.7, 0.3), (59.7, 44.7), (0.3, 44.7)], holes=[], uuid=\"419553be-0155-547d-98eb-ab949b6f39a0\", id=\"pour-419553be\")"
+   ],
+   "wall_s": 36.6
+  }
+ },
+ "command": "native/baseline/run_baseline.py (build_job(force=True) on copies, PYTHONPATH=frozen KRT-era src) then native/measure.py on routed/layout.kicad_pcb; pairs coupled at 0.35 mm (c3_usb) / 0.45 mm (node)",
+ "date": "2026-09-25",
+ "tree": "the pre-native working tree (CKPT_prenative_*), KRT at ~/Downloads/KiCadRoutingTools"
+}

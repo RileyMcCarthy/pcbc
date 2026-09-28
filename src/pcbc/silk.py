@@ -4,10 +4,7 @@ from __future__ import annotations
 
 import math
 import re
-import shutil
-from pathlib import Path
 
-from .compile import CompiledJob
 from .sexp import board_footprint_spans, footprint_at, footprint_reference, matching_paren
 
 
@@ -172,56 +169,76 @@ def _set_reference(
     return block[:open_at] + prop + block[end + 1 :]
 
 
+def silk_part(ref: str, at: tuple[float, float, float], crtyd, silk, pads) -> dict:
+    """One part as the silkscreen pass reads it: its reference, its `(at x y rot)`, its `F.CrtYd` and
+    `F.SilkS` extents in its own frame, and a thunk for its pads' world boxes (asked of big parts only)."""
+    local = crtyd or silk or (-0.8, -0.8, 0.8, 0.8)
+    if silk:
+        local = (min(local[0], silk[0]), min(local[1], silk[1]), max(local[2], silk[2]), max(local[3], silk[3]))
+    keep = _world_aabb(local, at)
+    span = max(keep[2] - keep[0], keep[3] - keep[1])
+    return {"ref": ref, "at": at, "keep": keep, "span": span, "pads": pads}
+
+
+def silk_parts_of_text(text: str) -> list[dict]:
+    """Every footprint of a board text as a `silk_part`, in file order (for a board file handed in)."""
+    out = []
+    for start, end in board_footprint_spans(text):
+        block = text[start:end]
+        at = footprint_at(block) or (0.0, 0.0, 0.0)
+        out.append(
+            silk_part(
+                footprint_reference(block) or "?",
+                at,
+                _bbox_on_layer(block, "F.CrtYd", ("fp_line", "fp_rect", "fp_poly", "fp_circle")),
+                _bbox_on_layer(block, "F.SilkS", ("fp_line", "fp_rect", "fp_poly", "fp_circle", "fp_arc")),
+                (lambda b=block, a=at: _pad_boxes(b, a)),
+            )
+        )
+    return out
+
+
 def legalize_silk(text: str, board_mm: tuple[float, float], hide_if_no_room: frozenset[str] = frozenset()) -> tuple[str, dict]:
-    """Rewrite footprint Reference properties. Does not move footprints.
+    """Rewrite footprint Reference properties of a board text (`silk_plan` over `silk_parts_of_text`,
+    then `apply_silk`). Does not move footprints."""
+    decisions, report = silk_plan(silk_parts_of_text(text), board_mm, hide_if_no_room)
+    return apply_silk(text, decisions), report
+
+
+def apply_silk(text: str, decisions: dict) -> str:
+    """Every footprint's Reference property set as `silk_plan` decided (`{ref: _set_reference kwargs}`)."""
+    pieces: list[str] = []
+    last = 0
+    for start, end in board_footprint_spans(text):
+        block = text[start:end]
+        d = decisions.get(footprint_reference(block) or "?")
+        pieces.append(text[last:start])
+        pieces.append(_set_reference(block, **d) if d is not None else block)
+        last = end
+    pieces.append(text[last:])
+    return "".join(pieces)
+
+
+def silk_plan(parts: list[dict], board_mm: tuple[float, float], hide_if_no_room: frozenset[str] = frozenset()) -> tuple[dict, dict]:
+    """(`{ref: where its Reference goes}`, the report) for `parts` (`silk_part`s, in board order). Reads
+    no board text: the place stage hands it the parts from their `.kicad_mod`s and poses.
 
     A ref in `hide_if_no_room` (a decoupling cap: its distance to its pin matters more than its
     label) is hidden when nothing fits, and noted, instead of printed over a neighbour."""
     bw, bh = board_mm
     edge = (0.4, 0.4, bw - 0.4, bh - 0.4)
-    parts: list[dict] = []
-    for start, end in board_footprint_spans(text):
-        block = text[start:end]
-        ref = footprint_reference(block) or "?"
-        at = footprint_at(block) or (0.0, 0.0, 0.0)
-        crtyd = _bbox_on_layer(block, "F.CrtYd", ("fp_line", "fp_rect", "fp_poly", "fp_circle"))
-        silk = _bbox_on_layer(block, "F.SilkS", ("fp_line", "fp_rect", "fp_poly", "fp_circle", "fp_arc"))
-        local = crtyd or silk or (-0.8, -0.8, 0.8, 0.8)
-        if silk:
-            local = (
-                min(local[0], silk[0]),
-                min(local[1], silk[1]),
-                max(local[2], silk[2]),
-                max(local[3], silk[3]),
-            )
-        keep = _world_aabb(local, at)
-        span = max(keep[2] - keep[0], keep[3] - keep[1])
-        parts.append(
-            {
-                "start": start,
-                "end": end,
-                "ref": ref,
-                "at": at,
-                "keep": keep,
-                "span": span,
-                "block": block,
-            }
-        )
-
-    parts.sort(key=lambda p: p["span"])
+    parts = sorted(parts, key=lambda p: p["span"])
     occupied: list[tuple[float, float, float, float]] = []
     bodies = [p["keep"] for p in parts]
     report = {"moved": [], "hidden": [], "sized": [], "issues": [], "notes": []}
     names = {id(p["keep"]): p["ref"] for p in parts}
 
-    new_blocks: dict[int, str] = {}
+    out: dict[str, dict] = {}
     for p in parts:
         ref = p["ref"]
         fx, fy, frot = p["at"]
         if ref.startswith("FID"):
-            new_blocks[p["start"]] = _set_reference(
-                p["block"], lx=0, ly=0, prot=0, size=0.5, thick=0.08, hide=True
-            )
+            out[ref] = dict(lx=0, ly=0, prot=0, size=0.5, thick=0.08, hide=True)
             report["hidden"].append(ref)
             continue
         size = ref_font_mm(p["span"])
@@ -229,7 +246,7 @@ def legalize_silk(text: str, board_mm: tuple[float, float], hide_if_no_room: fro
         tw, th = 0.72 * size * max(len(ref), 1), size
         placed = False
         big = p["span"] >= 8.0
-        own_pads = _pad_boxes(p["block"], p["at"]) if big else []
+        own_pads = p["pads"]() if big else []
         for attempt in (size, 0.5, 0.4):
             size = attempt
             thick = round(min(0.12, size * 0.2), 3)
@@ -250,9 +267,7 @@ def legalize_silk(text: str, board_mm: tuple[float, float], hide_if_no_room: fro
                 dx, dy = wx - fx, wy - fy
                 lx, ly = _rot_pt(dx, dy, -frot)
                 prot = (trot - frot) % 360
-                new_blocks[p["start"]] = _set_reference(
-                    p["block"], lx=lx, ly=ly, prot=prot, size=size, thick=thick, hide=False
-                )
+                out[ref] = dict(lx=lx, ly=ly, prot=prot, size=size, thick=thick, hide=False)
                 occupied.append(box)
                 report["moved"].append({"ref": ref, "at": [round(wx, 2), round(wy, 2)], "size": size})
                 report["sized"].append({"ref": ref, "size": size})
@@ -261,15 +276,12 @@ def legalize_silk(text: str, board_mm: tuple[float, float], hide_if_no_room: fro
             if placed:
                 break
         if not placed and ref in hide_if_no_room:
-            new_blocks[p["start"]] = _set_reference(p["block"], lx=0, ly=0, prot=0, size=0.4, thick=0.08, hide=True)
+            out[ref] = dict(lx=0, ly=0, prot=0, size=0.4, thick=0.08, hide=True)
             report["hidden"].append(ref)
             report["notes"].append(f"{ref}'s silkscreen reference is hidden: no room around it, and a decoupling cap stays at its pin")
             continue
         if not placed:
-            new_blocks[p["start"]] = _set_reference(
-                p["block"], lx=0, ly=-(p["span"] / 2 + 0.6), prot=(-frot) % 360,
-                size=0.4, thick=0.08, hide=False,
-            )
+            out[ref] = dict(lx=0, ly=-(p["span"] / 2 + 0.6), prot=(-frot) % 360, size=0.4, thick=0.08, hide=False)
             report["moved"].append({"ref": ref, "at": "fallback", "size": 0.4})
             tw, th = 0.72 * 0.4 * max(len(ref), 1), 0.4
             over = _text_aabb(fx, fy - (p["span"] / 2 + 0.6), tw, th)
@@ -279,38 +291,4 @@ def legalize_silk(text: str, board_mm: tuple[float, float], hide_if_no_room: fro
                 f"{ref}: no clear spot for its silkscreen reference around the part (0.8 to 0.4 mm text, both ways); "
                 f"it prints above it over {what}: give {ref} room or move {hit[0] if hit else 'its neighbour'}"
             )
-
-    # Rebuild from the original text using original spans (not mutated).
-    pieces: list[str] = []
-    last = 0
-    for start, end in board_footprint_spans(text):
-        pieces.append(text[last:start])
-        pieces.append(new_blocks.get(start, text[start:end]))
-        last = end
-    pieces.append(text[last:])
-    return "".join(pieces), report
-
-
-def silk_job(
-    job: CompiledJob,
-    pcb: Path,
-    *,
-    out: Path | None = None,
-    backup: bool = True,
-    hide_if_no_room: frozenset[str] = frozenset(),
-) -> dict:
-    pcb = Path(pcb)
-    text = pcb.read_text()
-    new, report = legalize_silk(text, job.board_size_mm, hide_if_no_room)
-    dest = Path(out) if out else pcb
-    if dest == pcb and backup:
-        bak = pcb.with_suffix(pcb.suffix + ".bak-silk")
-        shutil.copy2(pcb, bak)
-        report["backup"] = str(bak)
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    if dest != pcb:
-        from .project import copy_with_siblings
-
-        copy_with_siblings(pcb, dest)
-    dest.write_text(new)
-    return {"pcb": str(dest), "silk": report}
+    return out, report

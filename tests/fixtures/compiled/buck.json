@@ -80,44 +80,6 @@
   }
  ],
  "keepouts": [],
- "krt": {
-  "length_match": [],
-  "planes": [],
-  "power_nets": [
-   "VIN",
-   "5V",
-   "GND"
-  ],
-  "sensitive": [
-   {
-    "clearance": 0.2,
-    "kind": "switch_node",
-    "layers": [
-     "F.Cu"
-    ],
-    "nets": [
-     "SW"
-    ],
-    "width": 0.3
-   },
-   {
-    "clearance": 0.2,
-    "kind": "analog",
-    "layers": [
-     "F.Cu"
-    ],
-    "nets": [
-     "FB"
-    ],
-    "width": 0.2
-   }
-  ],
-  "skip_patterns": [
-   "SW",
-   "FB"
-  ],
-  "usb_pairs": []
- },
  "layers": 2,
  "nets": [
   {

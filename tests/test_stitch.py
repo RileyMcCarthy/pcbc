@@ -25,12 +25,15 @@ from pcbc.copper_bar import REDUNDANT, copper_bar
 from pcbc.language import load_board
 from pcbc.patterns import FINAL, PatternCtx, _STAGES, pattern_copper
 from pcbc.patterns import stitch as st
-from pcbc.route import bar_key
-from pcbc.route_emit import REASONS, piece_key, seg_piece, via_piece, write_pieces
+from boardtext import bar_key
+from pcbc.route_emit import REASONS, piece_key, seg_piece, via_piece
+from boardtext import write_pieces
 from pcbc.route_geom import EPS_MM, is_octilinear, q
-from pcbc.route_scene import ZoneRule, build_scene, zone_rules
+from pcbc.route_scene import ZoneRule
+from boardtext import zone_rules
 from pcbc.route_verify import BRANCH_REASONS, parallel_joined, verify_copper
 from pcbc.stackup import via_amps, vias_per_change
+from boardtext import scene_from_text
 
 ROOT = Path(__file__).resolve().parent.parent
 EXAMPLES = ROOT / "examples"
@@ -55,7 +58,7 @@ def _scene(name: str, extra=()):
     text = placed_board(name, b).read_text()
     if extra:
         text = write_pieces(text, extra)
-    return design, job, build_scene(design, job, job.constraints, text), text
+    return design, job, scene_from_text(design, job, job.constraints, text), text
 
 
 def _ctx(name: str, extra=()):
@@ -259,7 +262,7 @@ def test_the_rungs_own_copper_passes_pcbcs_self_check():
     """`verify_copper` is what `pattern_copper` raises on, and it asks the via-size rule, the angle
     rule, the leg-length rule and every clearance of the copper just written."""
     ctx, text = _ctx("node", (_anchor(),))
-    plan = pattern_copper(load_board(_board("node")), ctx.job, ctx.cs, text, "node", stage="final")
+    plan = pattern_copper(load_board(_board("node")), ctx.job, ctx.cs, "node", stage="final", scene=scene_from_text(load_board(_board("node")), ctx.job, ctx.cs, text))
     # Three pieces for the rung and twelve barrels for node's declared array: the whole `final` stage
     # on this board, judged in one pass by the check `pattern_copper` raises on.
     assert plan.moves == () and len(plan.pieces) == 15, plan.moves
@@ -397,7 +400,7 @@ def test_the_window_is_empty_on_two_layers_and_the_refusal_names_the_stackup():
     design = load_board(b)
     job = compile_design(design)
     anchor = via_piece("VBUS", "leftover", OPEN, 0.5, 0.3, owner="VBUS via at (44,36)")
-    scene = build_scene(design, job, job.constraints, write_pieces(placed_board("c3_usb", b).read_text(), [anchor]))
+    scene = scene_from_text(design, job, job.constraints, write_pieces(placed_board("c3_usb", b).read_text(), [anchor]))
     scene.zone_rules = (ZoneRule(net="GND", layer="B.Cu", pad_clearance=0.16, min_thickness=0.1),)
     pitch, why = st.antipad_pitch(scene, "VBUS", scene.stack.via_diameter)
     assert (pitch, why) == (1.0, "the GND plane on B.Cu, whose min_thickness is 0.1 mm"), (pitch, why)
@@ -425,12 +428,11 @@ def test_the_real_two_layer_boards_never_reach_that_refusal():
     second carrier joined the module."""
     for name in ("blinky", "buck", "c3_usb"):
         ctx, text = _ctx(name)
-        plan = pattern_copper(load_board(_board(name)), ctx.job, ctx.cs, text, name, stage="final")
+        plan = pattern_copper(load_board(_board(name)), ctx.job, ctx.cs, name, stage="final", scene=scene_from_text(load_board(_board(name)), ctx.job, ctx.cs, text))
         assert plan.moves == () and plan.refused == {}, name
         assert all(p.reason == "thermal" for p in plan.pieces), (name, plan.census)
         if name != "c3_usb":
-            assert (plan.pieces, plan.notes) == ((), ()), name
-            assert plan.text == text, f"{name}: the final stage rewrote a board it wrote nothing on"
+            assert (plan.pieces, plan.notes) == ((), ()), f"{name}: the final stage wrote copper on a board it had nothing to write on"
 
 
 # --- parallel_joined -------------------------------------------------------------------------------

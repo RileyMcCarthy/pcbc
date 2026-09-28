@@ -8,7 +8,6 @@ BLINKY = Path(__file__).resolve().parent.parent / "examples" / "blinky" / "blink
 
 
 @pytest.mark.kicad
-@pytest.mark.krt
 def test_blinky_upto_route(tmp_path: Path, monkeypatch):
     # Copy board into tmp so layout/ does not dirty the example until --force CI.
     board = tmp_path / "blinky.py"
@@ -19,14 +18,14 @@ def test_blinky_upto_route(tmp_path: Path, monkeypatch):
     pcb = (layout / "routed" / "layout.kicad_pcb").read_text()
     assert '(net "LED")' in pcb
     assert "(segment" in pcb
-    assert result["steps"][-1]["router"] == "krt" and result["steps"][-1]["copper"] == "verified"
+    assert result["steps"][-1]["router"] == "native" and result["steps"][-1]["copper"] == "verified"
     sch = (layout / "schematic.kicad_sch").read_text()
     assert "(kicad_sch" in sch
-    assert '(property "LCSC" "C72043"' in (layout / "placed" / "layout.kicad_pcb").read_text()
+    assert '(property "LCSC" "C72043"' in pcb
+    assert not (layout / "placed").exists() and not (layout / "seed").exists(), "no board file before the emitted one"
 
 
 @pytest.mark.kicad
-@pytest.mark.krt
 def test_blinky_fab(tmp_path: Path):
     board = tmp_path / "blinky.py"
     board.write_text(BLINKY.read_text())
@@ -51,44 +50,17 @@ def test_blinky_fab(tmp_path: Path):
 
 
 @pytest.mark.kicad
-@pytest.mark.krt
-def test_the_step_after_the_last_router_step_writes_a_byte_copy_of_the_board(tmp_path: Path):
-    """`docs/stitch-plan.md` S2's acceptance, on the cheapest real build in the repo.
-
-    With `patterns.FINAL == ()` the `final` stage runs — it builds the scene over the finished copper
-    and runs `pattern_copper`'s self-check — and writes nothing, so the board it hands on is the board
-    it was handed, byte for byte. That is the architectural hypothesis in the only form a test can
-    hold it: `patterns_final` differs from the step before it in not one byte. If a no-op step after
-    the last router step ever moved a board, this is where it would say so.
-
-    **`patterns_final` is no longer the last step file, and the two halves of that sentence are
-    tested separately now.** `docs/quality-plan.md` slice 1 puts `relax` after it, and the position
-    is that step's whole safety argument — `route.krt_plan` schedules nothing after it, so no router
-    and no pattern can react to copper it rewrote (`route_relax`'s module docstring). So this asserts
-    both: the byte copy, still, of the stage that adds nothing, and that the thing scheduled after it
-    is `relax` and nothing else. On blinky `relax` does move the board — 6 segments to 4 — which is
-    why it cannot be folded into the byte-copy assertion.
-
-    The board-level half of the acceptance — a fresh build of all five boards byte-identical to the
-    same build without the stage — is a before/after measurement a single run cannot make; it is
-    recorded in `patterns.FINAL`'s docstring with the five step files it added.
-    """
+def test_the_relaxer_runs_last_and_its_self_checks_hold_on_blinky(tmp_path: Path):
+    """`route_relax.relax_pieces` is the route stage's last step (docs/native-plan.md §3.4), after the
+    `final` patterns, and on blinky — whose one link is the LED hop — it pulls the hop taut: the numbers
+    the old step recorded, measured again natively 2026-09-25 (6 segments in, 4 out, 0.3252 mm
+    shorter, no copper orphaned). blinky's `final` stage writes nothing (no declaration asks it to)."""
     board = tmp_path / "blinky.py"
     board.write_text(BLINKY.read_text())
     result = build_job(board, upto="route", force=True)
     assert result.get("error") is None, result
-    work = tmp_path / "layout" / "blinky" / "routed"
-    steps = sorted(work.glob("[0-9][0-9]_*.kicad_pcb"))
-    assert steps[-1].name.endswith("_relax.kicad_pcb"), [p.name for p in steps]
-    assert steps[-2].name.endswith("_patterns_final.kicad_pcb"), [p.name for p in steps]
-    assert steps[-2].read_bytes() == steps[-3].read_bytes(), (steps[-3].name, steps[-2].name)
     route = result["steps"][-1]
-    assert [p["step"] for p in route["plan"]][-2:] == ["patterns_final", "relax"], route["plan"]
-    final = [s for s in route["steps"] if s["step"] == "patterns_final"]
-    assert len(final) == 1 and final[0]["summary"]["pieces"] == 0 and final[0]["summary"]["refused"] == {}, final
-    # And the relaxer, on the cheapest board there is: two chains, one pulled taut, 6 segments -> 4,
-    # 0.3252 mm shorter, and both halves of its own self-check at zero. Measured 2026-09-21.
-    relax = [s for s in route["steps"] if s["step"] == "relax"]
-    assert len(relax) == 1, route["steps"]
-    got = {k: relax[0]["summary"][k] for k in ("chains", "moved", "segments_in", "segments_out", "orphans_in", "orphans_out", "skipped_segments")}
-    assert got == {"chains": 2, "moved": 1, "segments_in": 6, "segments_out": 4, "orphans_in": 0, "orphans_out": 0, "skipped_segments": 0}, relax[0]["summary"]
+    relax = route["route_stats"]["relax"]
+    got = {k: relax[k] for k in ("chains", "moved", "segments_in", "segments_out", "orphans_in", "orphans_out", "mm_saved")}
+    assert got == {"chains": 2, "moved": 1, "segments_in": 6, "segments_out": 4, "orphans_in": 0.0, "orphans_out": 0.0, "mm_saved": 0.3252}, got
+    assert route["refused"] == {} and not [n for n in route["notes"] if n.startswith("style: stitch")], route["notes"]

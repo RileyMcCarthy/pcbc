@@ -17,7 +17,7 @@ from dataclasses import dataclass, field, replace
 from .copper import _rotate
 from .css import Rect, rotate_local_bounds
 from .geom import _iter_tagged, footprint_box_local
-from .layout import content_rect, footprints_by_ref, resolve_keepout, resolve_place, resolve_regions
+from .layout import content_rect, resolve_keepout, resolve_place, resolve_regions
 from .model import BoardSpec, Design, PlaceSpec
 from .stackup import Stackup, fanout_lane, get_stackup, pass_mm
 
@@ -62,6 +62,7 @@ class Foot:
     escape: dict[str, str] = field(default_factory=dict)  # closed pad -> the side it escapes to
     lanes: dict[str, float] = field(default_factory=dict)  # side -> its fanout lane, mm
     lane_mm: float = 0.0  # the widest of them, for the report
+    layer: str = "F.Cu"  # the footprint's own `(layer ...)`: the side its pads escape on
 
     def world_box(self, at=None, rot=None) -> tuple[float, float, float, float]:
         at = at or self.at
@@ -352,20 +353,26 @@ def fiducial_spots(size_mm: tuple[float, float], taken: list[Foot], want: int = 
     return spots
 
 
-def resolve_places(design: Design, job, pcb_text: str) -> tuple[list[PlaceSpec], list[str], list[tuple[str, float, float]]]:
+def resolve_places(design: Design, job, seeds) -> tuple[list[PlaceSpec], list[str], list[tuple[str, float, float]]]:
     """Every Place() as an absolute (at, rot). Anchors by CSS, then fiducials in the free corners,
-    then relations. Returns (places, moves, fiducial spots)."""
+    then relations. Returns (places, moves, fiducial spots).
+
+    `seeds` is every part at its seed pose (`place_native.seed_feet`: the part's `.kicad_mod`, posed
+    where the seed grid puts it) — the Python model; no board text is read (`docs/direction.md` §1)."""
+    from .foot_native import foot_of
+
     board = _board_of(job)
     regions = resolve_regions(board, job.regions)
     content = content_rect(board)
-    blocks = footprints_by_ref(pcb_text)
-    feet: dict[str, Foot] = {ref: parse_foot(ref, blk) for ref, blk in blocks.items()}
-    nets_of = _pins_of(design)
+    libs = {pf.ref: pf.lib for pf in seeds}
+    seed_at = {pf.ref: (pf.at[0], pf.at[1], pf.rot) for pf in seeds}
+    feet: dict[str, Foot] = {}
     stack, clearance = lane_rules(job)
-    for ref, foot in feet.items():
-        for pad in foot.pads:
-            pad.net = nets_of.get(ref, {}).get(pad.num, pad.net)
+    for pf in seeds:
+        foot = foot_of(pf)
+        foot.at, foot.rot = None, 0.0
         foot.lane(stack, clearance)
+        feet[pf.ref] = foot
     keepouts = [resolve_keepout(ko, board, regions) for ko in job.keepouts]
     values = {inst.ref: (inst.value or inst.part.value or "") for inst in design.instances}
     # File order, and nothing else: the first Place() written gets the closest spot. Grouping by
@@ -384,16 +391,13 @@ def resolve_places(design: Design, job, pcb_text: str) -> tuple[list[PlaceSpec],
         resolved[spec.ref] = done
         return done
 
-    from .sexp import footprint_at
-
     specced = {p.ref for p in job.places}
     for ref, foot in sorted(feet.items()):
         if ref in specced:
             continue
-        at = footprint_at(blocks[ref])
-        if at is not None:
-            foot.at, foot.rot = (at[0], at[1]), at[2]
-            placed.append(foot)  # a fiducial, or anything the seed put down: keep off it
+        at = seed_at[ref]
+        foot.at, foot.rot = (at[0], at[1]), at[2]
+        placed.append(foot)  # a fiducial, or anything the seed put down: keep off it
     pending: list[PlaceSpec] = []
     for spec in job.places:
         if spec.ref not in feet:
@@ -402,7 +406,7 @@ def resolve_places(design: Design, job, pcb_text: str) -> tuple[list[PlaceSpec],
             pending.append(spec)
             continue
         s = _edge_css(spec, feet[spec.ref]) if spec.edge else spec
-        rp = resolve_place(s, board, blocks[spec.ref], regions)
+        rp = resolve_place(s, board, libs[spec.ref], regions)
         if rp.at is None:
             continue
         settle(rp, rp.at, rp.rot)
@@ -574,26 +578,27 @@ def _clashes(box, keep, others: list[Foot], keepouts, limit: Rect, gap: float) -
 # ---------------------------------------------------------------- report
 
 
-def layout_report(design: Design, job, pcb_text: str) -> list[str]:
-    """Moves, in words, from the placed board: overlaps, off-board, far decaps, connectors off the edge."""
+def posed_feet_of(job, posed) -> dict[str, Foot]:
+    """{ref: Foot} of the placed parts (`foot_native.PosedFoot`s: each `.kicad_mod` posed by its
+    `Pose`), laned — the one reading `layout_report`, `route_checks.build_ctx` and the router's scene
+    (`route_scene.build_scene`) all make of a part, so no two of them can disagree about its box."""
+    from .foot_native import foot_of
+
+    stack, clearance = lane_rules(job)
+    out: dict[str, Foot] = {}
+    for pf in posed:
+        f = foot_of(pf)
+        f.lane(stack, clearance)
+        out[pf.ref] = f
+    return out
+
+
+def layout_report(design: Design, job, posed) -> list[str]:
+    """Moves, in words, from the placed parts (`posed`: `foot_native.PosedFoot`s): overlaps, off-board,
+    far decaps, connectors off the edge."""
     board = _board_of(job)
     content = content_rect(board)
-    blocks = footprints_by_ref(pcb_text)
-    feet: dict[str, Foot] = {}
-    from .sexp import footprint_at
-
-    nets_of = _pins_of(design)
-    stack, clearance = lane_rules(job)
-    for ref, blk in blocks.items():
-        f = parse_foot(ref, blk)
-        at = footprint_at(blk)
-        if at is None:
-            continue
-        f.at, f.rot = (at[0], at[1]), at[2]
-        for pad in f.pads:
-            pad.net = nets_of.get(ref, {}).get(pad.num, pad.net)
-        f.lane(stack, clearance)
-        feet[ref] = f
+    feet = posed_feet_of(job, posed)
     issues: list[str] = []
     refs = sorted(feet)
     for i, a in enumerate(refs):

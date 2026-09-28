@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from typing import Sequence
 
 from .geom import _iter_tagged
 from .route_geom import (
@@ -152,10 +153,92 @@ def _expand_layers(tokens: str, layers: tuple[str, ...], side: str) -> tuple[fro
     return (frozenset(cu), frozenset(mask))
 
 
-def _copper_shapes(pad: str, shape: str, cx: float, cy: float, w: float, h: float, rot: float) -> tuple[Shape, ...]:
+@dataclass(frozen=True)
+class PadSpec:
+    """One `(pad ...)` as a file writes it, every field `PadGeom` and `pcb_place.Foot` are made from.
+
+    `x`, `y` are the pad's position in its footprint's frame (a board file and a `.kicad_mod` write
+    the same numbers). `angle` is the pad's angle **as the file writes it**: in a `.kicad_mod` the
+    library angle, in a board file the library angle plus the footprint's (KiCad's board-file
+    convention). `foot_native.posed` turns the first into the second, so one set of functions reads
+    both. Parsed once per pad by `pad_spec`; nothing downstream re-reads the pad's text.
+    """
+
+    num: str
+    kind: str  # "smd" | "thru_hole" | "np_thru_hole" | "connect"
+    shape: str  # KiCad's own token
+    x: float
+    y: float
+    angle: float
+    w: float
+    h: float
+    rratio: float = 0.0
+    delta: tuple[float, float] = (0.0, 0.0)  # `(rect_delta dy dx)`, a trapezoid's shear
+    prims: tuple[tuple[str, tuple[Pt, ...], float], ...] = ()  # a custom pad's (tag, points, stroke)
+    custom: tuple[float, float] | None = None  # `pcb_place._custom_size`: the primitives' extent
+    drill: tuple[bool, float, float | None] | None = None  # (oval, w, h)
+    layers: str = ""  # the raw tokens of `(layers ...)`
+    mask_margin: float = 0.0
+    props: frozenset[str] = frozenset()
+    net: str = ""
+
+
+def pad_spec(pad: str) -> PadSpec | None:
+    """One `(pad ...)` s-expression read into a `PadSpec`, or None when it has no number, position or
+    size (the same three `pad_geoms` has always required)."""
+    head = _HEAD.match(pad)
+    pat = _AT.search(pad)
+    size = _SIZE.search(pad)
+    if not head or not pat or not size:
+        return None
+    rr = _RRATIO.search(pad)
+    dm = re.search(r"\(rect_delta\s+([-0-9.e+]+)\s+([-0-9.e+]+)\)", pad)
+    prims: list[tuple[str, tuple[Pt, ...], float]] = []
+    i = pad.find("(primitives")
+    if i >= 0:
+        for tag in ("gr_poly", "gr_rect", "gr_line", "gr_circle"):
+            for prim in _iter_tagged(pad[i:], tag):
+                pts = tuple((float(a), float(b)) for a, b in _PRIM_PTS.findall(prim))
+                if not pts:
+                    continue
+                wm = _PRIM_WIDTH.search(prim)
+                prims.append((tag, pts, float(wm.group(1)) if wm else 0.0))
+    cw, ch = custom_size(pad)
+    drill = _DRILL.search(pad)
+    lm = _LAYERS.search(pad)
+    mm = _MASK_MARGIN.search(pad)
+    netm = _NET.search(pad)
+    return PadSpec(
+        num=head.group(1),
+        kind=head.group(2),
+        shape=head.group(3),
+        x=float(pat.group(1)),
+        y=float(pat.group(2)),
+        angle=_f(pat.group(3)),
+        w=float(size.group(1)),
+        h=float(size.group(2)),
+        rratio=_f(rr.group(1)) if rr else 0.0,
+        delta=(float(dm.group(1)), float(dm.group(2))) if dm else (0.0, 0.0),
+        prims=tuple(prims),
+        custom=(cw, ch) if cw is not None else None,
+        drill=(bool(drill.group(1)), float(drill.group(2)), float(drill.group(3)) if drill.group(3) else None) if drill else None,
+        layers=lm.group(1) if lm else "",
+        mask_margin=float(mm.group(1)) if mm else 0.0,
+        props=frozenset(_PROP.findall(pad)),
+        net=netm.group(1) if netm else "",
+    )
+
+
+def pad_specs(block: str) -> tuple[PadSpec, ...]:
+    """Every pad of one footprint block (a board file's or a `.kicad_mod`'s), in file order."""
+    return tuple(s for s in (pad_spec(p) for p in _iter_tagged(block, "pad")) if s is not None)
+
+
+def _copper_shapes(sp: PadSpec, cx: float, cy: float, rot: float) -> tuple[Shape, ...]:
     """A.1's table, one branch per row. Every branch is exact except the two named supersets."""
+    shape, w, h = sp.shape, sp.w, sp.h
     if shape == "custom":
-        prims = _primitive_shapes(pad, cx, cy, rot)
+        prims = _primitive_shapes(sp, cx, cy, rot)
         if prims:
             # The anchor is copper too (KiCad draws it), and it is a rounding error next to the
             # primitives on every board here — but including it can only grow the obstacle, which
@@ -169,19 +252,18 @@ def _copper_shapes(pad: str, shape: str, cx: float, cy: float, w: float, h: floa
     if shape == "roundrect":
         # A chamfered roundrect is read as the roundrect: a chamfer only ever removes copper from a
         # corner, so ignoring it makes the obstacle a superset and never a subset (A.1).
-        return (roundrect_shape(cx, cy, w, h, _f(_RRATIO.search(pad) and _RRATIO.search(pad).group(1)), rot),)
+        return (roundrect_shape(cx, cy, w, h, sp.rratio, rot),)
     if shape == "trapezoid":
         # The four true corners: `(rect_delta dy dx)` shears the box, and the hull of the sheared
         # corners is exact because a trapezoid is convex.
-        m = re.search(r"\(rect_delta\s+([-0-9.e+]+)\s+([-0-9.e+]+)\)", pad)
-        dy, dx = (float(m.group(1)), float(m.group(2))) if m else (0.0, 0.0)
+        dy, dx = sp.delta
         hx, hy = w / 2.0, h / 2.0
         local = ((-hx - dy / 2.0, -hy + dx / 2.0), (hx + dy / 2.0, -hy - dx / 2.0), (hx - dy / 2.0, hy + dx / 2.0), (-hx + dy / 2.0, hy - dx / 2.0))
         return (poly_shape(tuple((cx + px, cy + py) for px, py in (_rot_pt(lx, ly, rot) for lx, ly in local))),)
     return (rect_shape(cx, cy, w, h, rot),)
 
 
-def _primitive_shapes(pad: str, cx: float, cy: float, rot: float) -> tuple[Shape, ...]:
+def _primitive_shapes(sp: PadSpec, cx: float, cy: float, rot: float) -> tuple[Shape, ...]:
     """One `Shape` per `(gr_poly)` / `(gr_rect)` / `(gr_line)` primitive of a custom pad.
 
     The USB-C shield pad declares `(size 0.005 0.005)` and draws an eight-point concave `gr_poly`
@@ -189,33 +271,24 @@ def _primitive_shapes(pad: str, cx: float, cy: float, rot: float) -> tuple[Shape
     four pads of c3_usb and node, which every check was blind to before S1b. The hull of a concave
     outline is a superset, which is the side of A.1's rule this has to be on.
     """
-    i = pad.find("(primitives")
-    if i < 0:
-        return ()
     out: list[Shape] = []
-    for tag in ("gr_poly", "gr_rect", "gr_line", "gr_circle"):
-        for prim in _iter_tagged(pad[i:], tag):
-            pts = [(float(a), float(b)) for a, b in _PRIM_PTS.findall(prim)]
-            if not pts:
-                continue
-            wm = _PRIM_WIDTH.search(prim)
-            stroke = float(wm.group(1)) if wm else 0.0
-            world = tuple((cx + px, cy + py) for px, py in (_rot_pt(x, y, rot) for x, y in pts))
-            if tag == "gr_rect" and len(world) == 2:
-                (x0, y0), (x1, y1) = world  # the two opposite corners, already turned
-                a, b = _rot_pt(pts[0][0], pts[1][1], rot), _rot_pt(pts[1][0], pts[0][1], rot)
-                world = ((x0, y0), (cx + a[0], cy + a[1]), (x1, y1), (cx + b[0], cy + b[1]))
-            out.append(poly_shape(world, stroke))
+    for tag, pts, stroke in sp.prims:
+        world = tuple((cx + px, cy + py) for px, py in (_rot_pt(x, y, rot) for x, y in pts))
+        if tag == "gr_rect" and len(world) == 2:
+            (x0, y0), (x1, y1) = world  # the two opposite corners, already turned
+            a, b = _rot_pt(pts[0][0], pts[1][1], rot), _rot_pt(pts[1][0], pts[0][1], rot)
+            world = ((x0, y0), (cx + a[0], cy + a[1]), (x1, y1), (cx + b[0], cy + b[1]))
+        out.append(poly_shape(world, stroke))
     return tuple(out)
 
 
-def _hole(pad: str, cx: float, cy: float, rot: float) -> Shape | None:
-    m = _DRILL.search(pad)
-    if not m:
+def _hole(sp: PadSpec, cx: float, cy: float, rot: float) -> Shape | None:
+    if sp.drill is None:
         return None
-    if m.group(1):  # (drill oval w h): a capsule in the pad's frame, not a scalar
-        return hole_shape(cx, cy, float(m.group(2)), float(m.group(3)), rot)
-    return hole_shape(cx, cy, float(m.group(2)))
+    oval, a, b = sp.drill
+    if oval:  # (drill oval w h): a capsule in the pad's frame, not a scalar
+        return hole_shape(cx, cy, a, b, rot)
+    return hole_shape(cx, cy, a)
 
 
 def pad_geoms(
@@ -242,45 +315,49 @@ def pad_geoms(
     `layers` is the board's copper layer list, which is what `*.Cu` expands to; it is a keyword
     because A.1's table does not say what a 4-layer `*.Cu` pad spans and the scene does.
     """
+    return geoms_of(pad_specs(block), at, side, ref=ref, nets=nets, layers=layers)
+
+
+def geoms_of(
+    specs: Sequence[PadSpec],
+    at: tuple[float, float, float],
+    side: str = "F",
+    *,
+    ref: str = "",
+    nets: dict[str, str] | None = None,
+    layers: tuple[str, ...] = DEFAULT_LAYERS,
+) -> tuple[PadGeom, ...]:
+    """`pad_geoms` over parsed pads: each `PadSpec.angle` is the pad's absolute angle (a board file's,
+    or `foot_native.posed`'s), `at` the footprint's `(x, y, rot)`."""
     fx, fy, frot = at
     out: list[PadGeom] = []
-    for pad in _iter_tagged(block, "pad"):
-        head = _HEAD.match(pad)
-        pat = _AT.search(pad)
-        size = _SIZE.search(pad)
-        if not head or not pat or not size:
-            continue
-        num, kind, shape = head.group(1), head.group(2), head.group(3)
-        lx, ly = float(pat.group(1)), float(pat.group(2))
+    for sp in specs:
+        lx, ly = sp.x, sp.y
         if side == "B":
             lx = -lx
         dx, dy = _rot_pt(lx, ly, frot)
         cx, cy = qp((fx + dx, fy + dy))
-        rot = _f(pat.group(3))
-        w, h = float(size.group(1)), float(size.group(2))
-        netm = _NET.search(pad)
-        # The board file is the authority on what its own copper is bound to, because that is what
-        # KiCad judges; `nets` only fills in a pad the file left unbound, which is what a freshly
-        # placed board looks like before `apply` writes the bindings.
-        net = (netm.group(1) if netm else "") or (nets or {}).get(num, "")
-        cu, mask = _expand_layers(_LAYERS.search(pad).group(1) if _LAYERS.search(pad) else "", layers, side)
-        copper = () if kind == "np_thru_hole" else _copper_shapes(pad, shape, cx, cy, w, h, rot)
-        mm = _MASK_MARGIN.search(pad)
+        rot = sp.angle
+        # The file is the authority on what its own copper is bound to, because that is what KiCad
+        # judges; `nets` only fills in a pad the file left unbound (a `.kicad_mod` binds none).
+        net = sp.net or (nets or {}).get(sp.num, "")
+        cu, mask = _expand_layers(sp.layers, layers, side)
+        copper = () if sp.kind == "np_thru_hole" else _copper_shapes(sp, cx, cy, rot)
         out.append(
             PadGeom(
                 ref=ref,
-                num=num,
+                num=sp.num,
                 net=net,
-                kind=kind,
-                shape=shape,
+                kind=sp.kind,
+                shape=sp.shape,
                 at=(cx, cy),
                 rot=rot,
                 copper=copper,
-                hole=_hole(pad, cx, cy, rot),
+                hole=_hole(sp, cx, cy, rot),
                 cu_layers=cu,
                 mask_layers=mask,
-                mask_margin=float(mm.group(1)) if mm else 0.0,
-                prop=frozenset(_PROP.findall(pad)),
+                mask_margin=sp.mask_margin,
+                prop=sp.props,
             )
         )
     return tuple(out)

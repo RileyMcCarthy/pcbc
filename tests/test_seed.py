@@ -1,7 +1,7 @@
 from pathlib import Path
 
 from pcbc.language import load_board
-from pcbc.seed import emit_pcb, pad_nets, seed_job
+from pcbc.seed import emit_pcb, pad_nets
 
 EXAMPLES = Path(__file__).resolve().parent.parent / "examples"
 BLINKY = EXAMPLES / "blinky" / "blinky.py"
@@ -19,10 +19,13 @@ def test_blinky_seed_properties(tmp_path: Path):
     assert '(property "Reference" "R1"' in pcb
     assert '(net "LED")' in pcb
     assert '(generator "pcbc")' in pcb
-    out = tmp_path / "layout.kicad_pcb"
-    seed_job(design, out, name="blinky")
-    assert out.exists()
-    assert out.with_suffix(".kicad_pro").exists()
+    # The native placer builds the same footprints in memory and writes no file: its base carries the
+    # footprints and no layout primitive (the outline is a `Rect` object, never board text).
+    from pcbc.place_native import place
+
+    pl = place(design, name="blinky")
+    assert '(property "Reference" "R1"' in pl.text and "(gr_rect" not in pl.text and "(zone" not in pl.text
+    assert not list(tmp_path.iterdir()), "placement wrote nothing"
 
 
 def test_seed_uuid_stable():

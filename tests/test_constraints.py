@@ -86,18 +86,21 @@ def _expect(lines: tuple[str, ...], wanted: list[tuple[str, str]]) -> None:
 # ---------------------------------------------------------------------------------------------
 
 
-def test_the_five_boards_keep_todays_classes_nets_and_krt(tmp_path: Path):
+def test_the_five_boards_keep_todays_classes_and_nets(tmp_path: Path):
     """Snapshot fixtures were recorded from CompiledJob.to_dict() before S1; the projection of the
-    ConstraintSet reproduces every recorded key. New keys (lane_clearance_mm) are allowed."""
+    ConstraintSet reproduces every recorded key. New keys (lane_clearance_mm) are allowed. The old
+    router's `krt` block and `net_order` left the job with the router (the fixtures were rewritten
+    without the two keys, nothing else)."""
     for name, path in _boards(tmp_path).items():
         was = json.loads((FIXTURES / f"{name}.json").read_text())
         now = json.loads(json.dumps(compile_design(load_board(path)).to_dict()))
-        for key in ("krt", "keepouts", "places", "regions", "planes", "skip_autoroute_patterns"):
+        assert "krt" not in now and "net_order" not in now
+        for key in ("keepouts", "places", "regions", "planes", "skip_autoroute_patterns"):
             assert now[key] == was[key], (name, key)
         # The one deliberate difference in `nets`: a power net on a two-layer board used to be
         # told it runs on In1.Cu and In2.Cu (the preset's four-layer tuple, printed verbatim in
         # the report). The preset is now trimmed to the stackup's own layers; nothing reads the
-        # field for an unconstrained net (route.krt_plan takes the board's copper layers), so
+        # field for an unconstrained net, so
         # only the report changes. Every other key is byte-identical.
         two_layer = now["layers"] == 2
         for a, b in zip(now["nets"], was["nets"], strict=True):
@@ -366,8 +369,9 @@ Guard("AIN0", stitch_mm=2.0)
     ])
     job = compile_design(design)
     assert [c.name for c in job.classes] == ["Default", "Power", "USB", "Pair_SENSE_P"], "D: a bare Pair gets class Pair_<p>"
-    assert job.krt["usb_pairs"] == [{"nets": ["D_P", "D_N"], "class": "USB"}, {"nets": ["SENSE_P", "SENSE_N"], "class": "Pair_SENSE_P"}]
-    assert job.krt["length_match"] == [{"nets": ["SCK", "MOSI", "MISO"], "tolerance_mm": 1.0}, {"nets": ["SENSE_P", "SENSE_N"], "tolerance_mm": 0.5}]
+    from pcbc.route_native import pair_nets
+
+    assert pair_nets(job) == [("D_N", "D_P"), ("SENSE_N", "SENSE_P")], "the two pairs the router routes as one object each"
     assert [g.kind for g in cs.groups] == ["bus", "chain"]
     ain0 = cs.by_net("AIN0")
     assert ain0 is not None and ain0.guard_stitch_mm == 2.0 and ain0.line == 0 and ain0.kind == "generic", "A.1: line 0 when synthesised from Pair/Bus alone"
@@ -550,7 +554,7 @@ def _robust(tmp_path: Path, name: str, line: str, *, layers: int = 2, stackup: s
         ("volts_str", 'NetReq("VCC", kind="power", volts="5V")',
          'line 6: NetReq("VCC"): volts=\'5V\' is not a number; write volts=5 (millimetres, volts, amps or ohms, no unit)'),
         ("amps_str", 'NetReq("VCC", kind="power", amps="2A")',
-         'line 6: NetReq("VCC"): amps=\'2A\' is not a number; write amps=5 (millimetres, volts, amps or ohms, no unit)'),
+         'line 6: NetReq("VCC"): amps=\'2A\' is not a number; write amps=2 (millimetres, volts, amps or ohms, no unit)'),
         ("amps_zero", 'NetReq("VCC", kind="power", amps=0)',
          'line 6: NetReq("VCC"): amps=0 is not physical; amps must be greater than 0'),
         ("amps_huge", 'NetReq("VCC", kind="power", amps=50)',

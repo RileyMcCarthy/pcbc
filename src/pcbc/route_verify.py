@@ -18,11 +18,10 @@ from dataclasses import dataclass
 from typing import Sequence
 
 from .ampacity import VIA_PARALLEL_MM
-from .constraints import ConstraintSet
+from .constraints import ConstraintSet, clearance_table
 from .route_emit import Piece
 from .route_geom import MICRO_MM, Box, Pt, Shape, aabb, clears, clip_len_in_box, hull_dist2, is_octilinear, legs_ok, q, seg_lengths, track_shape, turn_ok, via_shape
 from .route_scene import Item, Scene, clashes
-from .route_scene import _vias as board_vias
 from .sexp import matching_paren
 from .stackup import via_amps, vias_per_change
 
@@ -73,7 +72,7 @@ while `ViaSpec.per_change` applies where the *trunk* changes layer, which R2 nev
 spine refuses instead).
 
 `"stitch"` is here as the **fallback** and not as the rule (`docs/stitch-plan.md` §2s). A parallel
-rung copies its **anchor's** size — the via KRT already placed, which on node is 0.35/0.2 while the
+rung copies its **anchor's** size — the via already on the board, which on node is 0.35/0.2 while the
 `Power` class via is 0.8/0.4, and at the class ring two vias need 1.080 mm between centres against an
 `ampacity.VIA_PARALLEL_MM` of 1.0, so a class-size partner cannot be placed at all — and `_via_rules`
 reads that anchor off the board (`_anchor_via`). What this entry decides is the case where there is
@@ -102,6 +101,35 @@ full stop" and recorded it as the decision its author was least sure of. The ans
 rather than the rule of thumb — the smallest via whose current rating covers one pad's share, capped
 at the net's class via — and it lives in `patterns/tap.py::tap_via` so the pattern and this check
 cannot drift apart (A.3's one-source discipline, applied to the via table)."""
+
+
+
+def board_vias(text: str) -> list[dict]:
+    """Every via of a board text (`copper_bar.vias` plus the drill and layers): a checker's read of the
+    emitted board."""
+    import re
+
+    from .copper import net_table
+
+    names = net_table(text)
+    pat = re.compile(
+        r'\(via\s*\(at ([-0-9.]+) ([-0-9.]+)\)\s*\(size ([-0-9.]+)\)\s*\(drill ([-0-9.]+)\)\s*\(layers "([^"]+)" "([^"]+)"\)'
+        r'(?:\s*\(locked yes\))?\s*\(net (?:(\d+)|(?:\d+\s+)?"([^"]*)")\)'
+    )
+    out = []
+    for m in pat.finditer(text):
+        net = names.get(int(m.group(7))) if m.group(7) else m.group(8)
+        out.append(
+            {
+                "net": net or "",
+                "at": (float(m.group(1)), float(m.group(2))),
+                "size": float(m.group(3)),
+                "drill": float(m.group(4)),
+                "layers": (m.group(5), m.group(6)),
+                "locked": "(locked yes)" in m.group(0),
+            }
+        )
+    return out
 
 
 def paths_of(pieces: Sequence[Piece]) -> tuple[tuple[Pt, ...], ...]:
@@ -318,7 +346,7 @@ def _anchor_via(scene: Scene, p: Piece, pieces_on_net: Sequence[Piece] = ()) -> 
     wrong ones. It is the nearest via of this net within `ampacity.VIA_PARALLEL_MM` that this run did
     not itself write — every via inside that radius is in the same single-linkage cluster by
     construction, and excluding the pattern's own rungs means a second rung is measured against the
-    barrel KRT placed and not against the first rung. `None` when there is none, which hands the
+    barrel already on the board and not against the first rung. `None` when there is none, which hands the
     answer to `BRANCH_REASONS`.
     """
     mine = {(v.a[0], v.a[1]) for v in pieces_on_net if v.kind == "via" and v.reason == p.reason and v.net == p.net}
@@ -358,10 +386,10 @@ def _pts(path: Sequence[Pt]) -> str:
 # `island_removal_mode 0`, which turns a pad whose only connection was that fragment into an
 # unconnected item the gate fails on.
 #
-# The two halves run at different times, and that is deliberate. On four layers KRT pours before the
-# post stage, so the plane is on the board and `plane_islands` measures the arbiter's own answer
-# after the gate refills. On two layers the pour is written near the end, after the signals, so
-# there is nothing to measure when the tap is placed and `pour_raster` predicts instead.
+# The two halves run at different times, and that is deliberate. While the route stage runs no pour
+# is filled on any stackup (a `Pour` is its fields; KiCad fills the emitted board), so a pattern that
+# needs to know where a plane will flood asks `pour_raster`, a prediction. After emit, `plane_islands`
+# and `plane_area` measure the arbiter's own fill.
 
 
 @dataclass(frozen=True)
@@ -395,6 +423,10 @@ def zones(text: str) -> tuple[Zone, ...]:
         end = matching_paren(text, m.start() + 2)
         block = text[m.start() : end + 1]
         head = block.split("(filled_polygon", 1)[0]
+        if "(attr" in head and "(teardrop" in head:
+            # KiCad's own teardrop zone (`gen.is_teardrop_zone`): a fillet on a via or a pad, not a
+            # plane, and not a second island of one (third review P1).
+            continue
         nm = _ZONE_NET.search(head)
         lm = _ZONE_LAYER.search(head)
         polys: list[tuple[Pt, ...]] = []
@@ -538,10 +570,11 @@ rather than accepting one that would not. It is also still four times finer than
 class PourRaster:
     """Where a pour that does not exist yet will be able to flood.
 
-    Two-layer boards only, and the reason is the order: `krt_plan` writes the back pour as
-    `gnd_pour`, after the signals, so a tap placed by the post stage is placed into a board whose
-    pour has not been poured. The alternative to predicting is discovering, and the thing discovered
-    is an unconnected item in the gate (`docs/router-plan.md` section 9 records one already).
+    Asked for the outer layers, where a pour shares its layer with pads and signals: while the route
+    stage runs no pour is filled (KiCad fills the emitted board), so a tap or a stitch barrel is placed
+    against this prediction. The alternative to predicting is discovering, and the thing discovered is
+    an unconnected item in the gate. An inner plane has no signal copper on its layer
+    (`route_native.route_layers`) and is judged after the fill by `plane_islands` and `plane_area`.
     """
 
     cell: float
@@ -571,7 +604,7 @@ def pour_raster(scene: Scene, net: str, layer: str, *, cell: float = POUR_CELL_M
     One pass: every foreign item on that layer is dilated by what the pour owes it — the clearance
     table's own number for copper, `hole_to_copper` for a drill — every cell it touches is blocked,
     and the free cells are labelled 4-connected. The pour is the **largest** free region, which is
-    what KRT's own pour does with `island_removal_mode 0` behind it.
+    what KiCad's fill keeps of a pour with `island_removal_mode 0` behind it.
 
     Cached on the scene per (net, layer), because the tap pattern asks it once per pad and the only
     copper added between two pads is a tap: a tap is on the pour's own net, so it is not one of the
@@ -695,11 +728,10 @@ def same_net_slots(text: str, floor: float, layers: tuple[str, ...] = ("F.Cu", "
 
     The one clearance question neither pcbc nor KiCad asks, and a wide locked spine is the copper most
     likely to be hugged: `route_scene._pair_clashes` skips rules 1 and 4 for a same-net pair by
-    design, KiCad exempts same-net pairs from clearance entirely, and KRT treats its own net as free.
-    The S7 review measured node's leftover sitting **0.0501 mm** from the locked `VBUS` spine on a
-    board whose process floor is 0.0889 mm, and fifteen more such gaps across the five boards
-    (finding 16). It is a census, not a rule: the class is pre-existing — the patterns-off node has as
-    many — and an etch this fine is a yield question for the fab rather than a DRC error.
+    design, and KiCad exempts same-net pairs from clearance entirely. Two pieces of one net closer
+    than the process floor with no copper between them etch as a sliver (finding 16). It is a census,
+    not a rule: an etch this fine is a yield question for the fab rather than a DRC error
+    (`test_examples_fab.SAME_NET` pins the count).
 
     A mitre corner and a continuous run are two pieces of copper 0.05 mm apart with copper between
     them, and they are every false positive here, so they are removed: the closest-approach line is
@@ -778,15 +810,12 @@ def same_net_slots(text: str, floor: float, layers: tuple[str, ...] = ("F.Cu", "
     return sorted(out, key=lambda r: (r["gap"], r["net"], r["layer"], r["a"], r["b"]))
 
 
-# --- R-X4: a declared chain's order, measured in the copper KRT finished --------------------------
+# --- R-X4: a declared chain's order, measured in the emitted copper -------------------------------
 #
-# `docs/router-plan.md` line 202 tags R-X4 "**P** (chain), **V**" — a pattern *and* a verification —
-# and until this section only the P existed. The chain pattern refused a link it could not write and
-# nothing anywhere read the finished board to ask whether the order the author declared had survived
-# in it. That absence is what made the pattern's refusal **hard**: the refusal was standing in for a
-# gate that was never built, on the premise that KRT would branch and nobody would notice. The
-# premise is now measured instead of assumed (`docs/r2-measurements.md`, S6), the refusal is soft,
-# and this is the gate.
+# `docs/router-plan.md` line 202 tags R-X4 "**P** (chain), **V**" — a pattern *and* a verification.
+# The router links a declared chain station to station (`route_native.net_links`); this reads the
+# emitted board to ask whether the order the author declared survived in it, and `build._chain_gate`
+# fails the build when it did not.
 #
 # What it is not. It is not a connectivity check — `netcheck.check_copper` is KiCad's own netlist
 # gate and it is order-blind by construction, which is exactly the hole. It is not
@@ -938,8 +967,8 @@ def _outside(a: Pt, b: Pt, w: float, shapes: Sequence[Shape], d: float) -> tuple
 def _net_copper(text: str, net: str) -> tuple[tuple[str, frozenset[str], Shape, tuple], ...]:
     """Every track and via on one net, as `(kind, layers, shape, extra)`, in file order.
 
-    A via's layers are the whole copper stack when it spans `F.Cu` to `B.Cu`, which every via R2 or
-    KRT writes on these boards does (`_via_rules` item 8 asserts it of pcbc's own). A via that does
+    A via's layers are the whole copper stack when it spans `F.Cu` to `B.Cu`, which every via pcbc
+    writes does (`_via_rules` item 8 asserts it). A via that does
     not is read as the two layers it names, which under-connects rather than over-connects — the
     direction that reports a spur rather than inventing a path through one.
     """
@@ -971,7 +1000,7 @@ def _reaches(nodes: Sequence[tuple[str, frozenset[str], Shape, tuple]], src: Seq
     """Is any of `src` joined to any of `dst` through touching copper?
 
     Two pieces touch when `clears(a, b, 0.0)` is False — a gap under `EPS_MM`, which is pcbc's own
-    "these are one conductor". Copper pcbc and KRT write meets exactly, so the epsilon decides
+    "these are one conductor". Copper pcbc writes meets exactly, so the epsilon decides
     nothing here; it is the same one every other clearance answer on the board is given with.
     """
     boxes = [aabb(s) for _k, _l, s, _e in nodes]
@@ -1057,8 +1086,7 @@ def chain_order(text: str, design, cs: ConstraintSet, *, floor: float | None = N
     **The tolerance, and why it is not load-bearing.** A pad's copper is dilated by
     `stackup.clearance_min` before it is removed, so a junction sitting just *outside* a stop still
     counts as feeding through it. The number is the process floor — the same one `chain.stub_need`
-    takes for R-X4's pattern half (S6 decision 1) and the one `route.py` hands KRT as
-    `--same-net-pad-clearance` — on the argument that copper closer together than a fab's minimum
+    takes for R-X4's pattern half (S6 decision 1) — on the argument that copper closer together than a fab's minimum
     clearance is not two separable things. It decides nothing on any board in this repo: swept from
     0.0 mm to 2.0 mm, every one of the five declared chains keeps its verdict, and the nearest flip
     is node's `USB_DN` at 2.5 mm and c3_usb's at 3.0 mm — 28x and 24x their own process floors
@@ -1134,7 +1162,7 @@ def _judge(text: str, ch, stations: tuple[str, ...], pads: dict, owner: str, whe
             return ChainVerdict(
                 ch.net, where, stations, "open", owner,
                 f"no copper joins {stations[i]} to {stations[i + 1]}, so link {i + 1} of {n} of this chain is not on the board",
-                f'Route it or drop it: {_chain_call(ch)} declares a feed pcbc did not finish and KRT did not close.',
+                f'Route it or drop it: {_chain_call(ch)} declares a feed the router did not finish.',
             )
     for i in range(1, len(stations) - 1):
         pid = stations[i]
@@ -1218,13 +1246,10 @@ def poured_planes(text: str) -> tuple[tuple[str, str], ...]:
     board KiCad has already filled: a `Board(planes=...)` that poured nothing is not a reference
     plane, and an unfilled zone is not one either (`plane_checks`' finding 17, same stance).
 
-    Measured 2026-09-20, they agree on four boards and **disagree on blinky**, which is the reason to
-    ask the file. buck/c3_usb/ds2 both say `(("GND","B.Cu"),)` and node both say
-    `(("3V3","In2.Cu"), ("GND","In1.Cu"))`. blinky's compiled job says `(("GND","B.Cu"),)` — `krt_plan`
-    schedules `gnd_pour` for every two-layer board with `GND` among its power nets — and blinky's
-    routed board holds one segment and **no `(zone ...)` block at all**, so this returns `()`. That is
-    the trap `docs/stitch-plan.md` §7.1 names: stitch vias into a pour that was never written, on a
-    board where KiCad's pad-to-pad unconnected check would never mention it.
+    On the five emitted boards the two agree (the route stage pours exactly `plane_targets`). The file
+    is still the source for a check, because a pour KiCad could not fill is no reference plane — the
+    trap `docs/stitch-plan.md` §7.1 names: stitch vias into a pour that is not there, on a board where
+    KiCad's pad-to-pad unconnected check would never mention it.
     """
     return tuple(sorted({(z.net, z.layer) for z in zones(text) if z.polys and z.net}))
 
@@ -1292,18 +1317,11 @@ def return_vias(text: str, cs: ConstraintSet) -> tuple[ReturnVia, ...]:
 
     `docs/router-plan.md` line 196 tags R-X1/R-Z4 with a **V** and nothing in this repo has ever read
     a finished board to ask what a signal via does to its return current. `verify_copper`'s D.1 item 6
-    asserts pcbc *writes* no via on such a net, which is a statement about pcbc's copper; this is the
-    statement about KRT's, and KRT wrote all eleven of them.
+    asserts the patterns write no via on such a net; this classifies every via on it, the router's
+    included (`test_examples_fab.RETURNS` pins them: c3_usb's two `USB_DP` vias, both `lost`).
 
-    **The finding, and it is why `docs/stitch-plan.md` §8 refuses to ship a return-via placer at all.**
-    Measured on the checked-in routed boards, 2026-09-20:
-
-        node    7 vias (USB_DN 5, USB_DP 2)  all `net_change`
-        c3_usb  4 vias (USB_DN 2, USB_DP 2)  all `lost`
-        blinky, buck, ds2                    no net carries a reference, so nothing to classify
-
-    Not one of the eleven is `served`, `far` or `none` — that is, **not one of them is a distance
-    question**. node is four layers with `GND` on In1.Cu and `3V3` on In2.Cu, so a through via takes
+    **Why `docs/stitch-plan.md` §8 refuses to ship a return-via placer at all:** the verdicts on these
+    stackups are never a distance question. node is four layers with `GND` on In1.Cu and `3V3` on In2.Cu, so a through via takes
     the copper from a plane referenced to GND to a plane referenced to 3V3: the return current has to
     change *net*, and no via joins two nets. c3_usb is two layers with one pour on B.Cu, so a via that
     puts the track on B.Cu has no second plane to reach and the reference is simply gone. A placer
@@ -1311,11 +1329,8 @@ def return_vias(text: str, cs: ConstraintSet) -> tuple[ReturnVia, ...]:
     crossing and call it half done; both are copper that connects nothing while the tool's own report
     blesses it.
 
-    **Re-measured on fresh builds the same day, and the verdicts are the half that holds.** node comes
-    out of `pcbc build` with **no via at all** on either pair member — its checked-in routed directory
-    has no `patterns_post` step, so it predates S5 and §2(o) already called it stale — and c3_usb comes
-    out with **five**, still every one `lost`. So the count belongs to whatever KRT did that run and
-    the verdict belongs to the stackup, which is why the verdict is what §8's refusal rests on.
+    The count belongs to the route and the verdict to the stackup, which is why the verdict is what
+    §8's refusal rests on.
 
     Report-only, always. There is no move here that is not a board change (`Board(planes=...)` on node,
     `NetReq(layers=["F.Cu"])` on c3_usb), and `docs/stitch-plan.md` S5 owns printing them.
@@ -1612,7 +1627,7 @@ def parallel_joined(text: str, pieces: Sequence[Piece]) -> tuple[Rung, ...]:
     would call a twin joined by one link on one side "joined", when what makes two barrels parallel
     is that both ends of both of them are the same two nodes. The walk is `_reaches` over
     `_net_copper`, filtered to the layer — `chain_order`'s own reachability, which is `clears(a, b,
-    0.0)`: copper pcbc and KRT write meets exactly, so the epsilon decides nothing.
+    0.0)`: copper pcbc writes meets exactly, so the epsilon decides nothing.
 
     The layers asked about are the **barrel's own span**, never the layers a link was written for:
     asking the weaker question would let a rung that wrote one link pass for having written one link.
@@ -1656,7 +1671,7 @@ def _nearest_via(nodes: Sequence[tuple[str, frozenset[str], Shape, tuple]], at: 
     """The nearest via of this net to `at` that pcbc did not write itself, within `reach`.
 
     `exclude` is every twin of this run, so a pair of rungs around one anchor is each measured
-    against the barrel KRT placed rather than against each other — which is the same exclusion
+    against the barrel already on the board rather than against each other — which is the same exclusion
     `_anchor_via` makes and for the same reason: two rungs joined only to one another are a cluster
     the walk counts and the rail does not have.
     """
@@ -1752,8 +1767,8 @@ def guard_cover(text: str, pieces: Sequence[Piece]) -> tuple[GuardRun, ...]:
     vias. Per layer, because a guard is a flat thing and a component walk that may leave through
     another layer would call a stretch welded on the strength of a via at the other end of the board.
 
-    A `Guard()` that wrote nothing at all has no row here and is not a failure: a net KRT routed is
-    B.6's deferral, printed as a note by the pattern, and a run whose every stretch was blocked is
+    A `Guard()` that wrote nothing at all has no row here and is not a failure: a net whose copper is
+    not pcbc's (a core line, or none yet) is B.6's deferral, printed as a note by the pattern, and a run whose every stretch was blocked is
     R-S3's target half. What this catches is copper pcbc **did** write and cannot account for.
     """
     mine = [p for p in pieces if p.reason == "guard"]
@@ -1968,19 +1983,25 @@ class ThermalArray:
     theta_c_per_w: float  # what `got` barrels achieve
     rise_c: float  # at the declared watts
     budget_c: float  # what `Thermal(rise_c=)` asked for
+    blocks: int = 1  # the `(pad ...)`s the land is drawn as (the ESP32-C3-MINI's `49`: nine)
+    bare: tuple = ()  # the centre of each of them with no barrel whose ring is inside it
 
     @property
     def verdict(self) -> str:
-        """`served` | `short` | `none` | `adrift`, worst last-resort first when they collide.
+        """`served` | `short` | `bare` | `none` | `adrift`, worst last-resort first when they collide.
 
-        `adrift` beats the count verdicts because it is the only one that is a **bug**: the other
-        three are statements about how much room the land had, and `adrift` says a via pcbc placed is
-        not where pcbc believes it is.
+        `adrift` beats the count verdicts because it is the only one that is a **bug**: the others are
+        statements about how much room the land had, and `adrift` says a via pcbc placed is not where
+        pcbc believes it is. `bare` beats `short`: a pad of the land with no barrel moves no heat
+        through the board however many its neighbours carry, and the count alone called a land with
+        three bare pads of nine "served" (the third refutation round).
         """
         if self.got and (self.in_pad < self.got or self.in_plane < self.got):
             return "adrift"
         if self.got == 0:
             return "none"
+        if self.bare:
+            return "bare"
         return "served" if self.got >= self.want else "short"
 
     def to_dict(self) -> dict:
@@ -1996,12 +2017,15 @@ class ThermalArray:
             "theta_c_per_w": self.theta_c_per_w,
             "rise_c": self.rise_c,
             "budget_c": self.budget_c,
+            "blocks": self.blocks,
+            "bare": [list(b) for b in self.bare],
             "verdict": self.verdict,
         }
 
     def line(self) -> str:
+        pads = f", {self.blocks - len(self.bare)} of its {self.blocks} pads with one" if self.blocks > 1 else ""
         return (
-            f"thermal {self.pad}: {self.got} of {self.want} barrel(s) on {self.net}, {self.in_pad} inside the land and "
+            f"thermal {self.pad}: {self.got} of {self.want} barrel(s) on {self.net}, {self.in_pad} inside the land{pads} and "
             f"{self.in_plane} inside the {self.net} zone on {self.plane}, closest pair {self.pitch_mm:g} mm — "
             f"{self.theta_c_per_w:g} K/W, {self.rise_c:g} C of a {self.budget_c:g} C budget ({self.verdict})"
         )
@@ -2047,6 +2071,19 @@ def thermal_budget(text: str, pieces: Sequence[Piece], cs: ConstraintSet) -> tup
         mine = [p for p in pieces if p.kind == "via" and p.reason == "thermal" and p.net == spec.net and p.owner == spec.pad]
         zone = [z for z in zs if z.net == spec.net and z.layer == spec.plane]
         in_pad = in_plane = 0
+        # A barrel of this net inside the land that no `pcbc:thermal` group names — a
+        # `layout.core.py` array locked verbatim — is the array too (third review D2): the pattern
+        # counts it toward `need` (`patterns.stitch._vias_in_land`) and so does this measurement.
+        keyed = {(round(p.a[0], 4), round(p.a[1], 4)) for p in mine}
+        for v in board_vias(text):
+            at = (float(v["at"][0]), float(v["at"][1]))
+            if v.get("net") != spec.net or (round(at[0], 4), round(at[1], 4)) in keyed:
+                continue
+            ring_r = float(v.get("size") or 0.0) / 2.0
+            if any(all(_inside(shape, pt) for pt in [at] + [(at[0] + ring_r * math.cos(2 * math.pi * k / RING_SAMPLES), at[1] + ring_r * math.sin(2 * math.pi * k / RING_SAMPLES)) for k in range(RING_SAMPLES)]) for g in land for shape in g.copper):
+                from .route_emit import via_piece
+
+                mine = [*mine, via_piece(spec.net, "thermal", at, float(v.get("size") or 0.0), float(v.get("drill") or 0.0), layers=tuple(v.get("layers") or ("F.Cu", "B.Cu")), owner=spec.pad)]
         at_exact = [exact.get((round(p.a[0], 4), round(p.a[1], 4)), p.a) for p in mine]
         for p in mine:
             ring = _ring_of(p)
@@ -2056,6 +2093,9 @@ def thermal_budget(text: str, pieces: Sequence[Piece], cs: ConstraintSet) -> tup
                 in_plane += 1
         got = len(mine)
         theta = spec.theta_via.value
+        bare = tuple(
+            g.at for g in land if g.copper and not any(any(all(_inside(shape, pt) for pt in _ring_of(p)) for shape in g.copper) for p in mine)
+        )
         out.append(
             ThermalArray(
                 pad=spec.pad,
@@ -2069,9 +2109,36 @@ def thermal_budget(text: str, pieces: Sequence[Piece], cs: ConstraintSet) -> tup
                 theta_c_per_w=round(theta / got, 2) if got else 0.0,
                 rise_c=spec.rise_of(got),
                 budget_c=round(spec.rise_c, 2),
+                blocks=sum(1 for g in land if g.copper),
+                bare=bare,
             )
         )
     return tuple(out)
+
+
+def thermal_pieces(doc) -> list:
+    """The thermal barrels pcbc wrote, off a board's role groups (`layout_job.roles_doc`)."""
+    from .route_emit import via_piece
+
+    out = []
+    for i in (doc.items if doc is not None else []):
+        key = i.get("key") or [""]
+        if i.get("reason") != "thermal" or key[0] != "via":
+            continue
+        out.append(via_piece(i["net"], i["reason"], tuple(key[1]), float(i.get("w") or 0.0), float(i.get("drill") or 0.0), owner=i.get("owner", "")))
+    return out
+
+
+def thermal_rows(text: str, cs: ConstraintSet | None, doc=None) -> tuple[ThermalArray, ...]:
+    """`thermal_budget` of a finished board text, the barrels read off its own role groups: what the
+    route gate judges and what the fab note states (one reading, so the two cannot disagree)."""
+    if cs is None or not cs.thermals:
+        return ()
+    if doc is None:
+        from .layout_job import roles_doc
+
+        doc = roles_doc(text, ())
+    return thermal_budget(text, thermal_pieces(doc), cs)
 
 
 def _ring_of(p: Piece) -> list[Pt]:
@@ -2230,7 +2297,21 @@ def _pad_fed(text: str, net: str, pad_id: str, by_net: dict, zs: Sequence[Zone])
         for sh in pads[pid].copper:
             idx[pid].append(len(nodes))
             nodes.append(("pad", pads[pid].cu_layers, sh, (pid,)))
-    return _reaches(nodes, idx[pad_id], [i for pid in others for i in idx[pid]])
+    if _reaches(nodes, idx[pad_id], [i for pid in others for i in idx[pid]]):
+        return True
+    # Through the plane: a pad whose copper reaches a via standing in a filled zone of its own net is
+    # joined, through that zone, to every other pad that reaches it (a via spans every layer, so any
+    # zone of the net does). The native router welds most plane pads by a tap — a stub and a via — and
+    # no track runs pad to pad, so the flood above alone read those ties as open.
+    zoned = [z for z in zs if z.net == net and z.polys]
+    in_plane = [i for i, n in enumerate(nodes) if n[0] == "via" and any(in_zone(z, n[3][0]) for z in zoned)]
+    if not in_plane or not _reaches(nodes, idx[pad_id], in_plane):
+        return False
+    for pid in others:
+        direct = any(z.layer in pads[pid].cu_layers and in_zone(z, pads[pid].at) for z in zoned)
+        if direct or _reaches(nodes, idx[pid], in_plane):
+            return True
+    return False
 
 
 def _closest_copper(text: str, a: str, b: str, by_net: dict) -> tuple[float, str, str] | None:
@@ -2478,3 +2559,101 @@ def _tie_pads(design, ref: str, a: str, b: str) -> tuple[str, ...]:
 def bridge_lines(rows: Sequence[BridgeTie]) -> list[str]:
     """One line per ground pair, in net order — what `build._bridge_gate` prints."""
     return [r.line() for r in rows]
+
+
+# --- pair coupling, measured on the emitted board ------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class PairCoupling:
+    """One differential pair as the board carries it: each half's track length, how much of it runs
+    beside the partner, and the budgets `PairSpec` compiled."""
+
+    a: str
+    b: str
+    len_a: float
+    len_b: float
+    coupled_a: float
+    coupled_b: float
+    threshold: float
+    uncoupled_max: float
+    skew_max: float
+
+    @property
+    def uncoupled(self) -> float:
+        return round(max(self.len_a - self.coupled_a, self.len_b - self.coupled_b), 4)
+
+    @property
+    def skew(self) -> float:
+        return round(abs(self.len_a - self.len_b), 4)
+
+    @property
+    def ok(self) -> bool:
+        return self.uncoupled <= self.uncoupled_max + 1e-9
+
+    def line(self) -> str:
+        return (
+            f"pair {self.a}/{self.b}: {self.coupled_a:g} of {self.len_a:g} mm and {self.coupled_b:g} of {self.len_b:g} mm coupled "
+            f"(partner within {self.threshold:g} mm on the same layer); uncoupled {self.uncoupled:g} mm against {self.uncoupled_max:g}, "
+            f"skew {self.skew:g} mm against {self.skew_max:g}"
+        )
+
+
+def _coupled_mm(segs_a, segs_b, thr: float, step: float = 0.02) -> tuple[float, float]:
+    tot = cpl = 0.0
+    for s in segs_a:
+        p, q = s["start"], s["end"]
+        L = math.dist(p, q)
+        if L <= 0:
+            continue
+        n = max(1, int(L / step))
+        for k in range(n):
+            t = (k + 0.5) / n
+            pt = (p[0] + (q[0] - p[0]) * t, p[1] + (q[1] - p[1]) * t)
+            tot += L / n
+            for o in segs_b:
+                if o["layer"] != s["layer"]:
+                    continue
+                if math.sqrt(_seg_pt_d2(pt, o["start"], o["end"])) <= thr:
+                    cpl += L / n
+                    break
+    return round(tot, 4), round(cpl, 4)
+
+
+def _seg_pt_d2(p, a, b) -> float:
+    ax, ay = a
+    bx, by = b
+    dx, dy = bx - ax, by - ay
+    L2 = dx * dx + dy * dy
+    t = 0.0 if L2 == 0 else max(0.0, min(1.0, ((p[0] - ax) * dx + (p[1] - ay) * dy) / L2))
+    ex, ey = ax + t * dx - p[0], ay + t * dy - p[1]
+    return ex * ex + ey * ey
+
+
+def pair_coupling(text: str, cs: ConstraintSet) -> tuple[PairCoupling, ...]:
+    """Every compiled pair, measured on the board text: walk each half's centreline at 20 um and count
+    the length whose partner has copper on the same layer within `threshold` — the pair's own
+    centre-to-centre pitch (`width + max(gap, clearance)`) plus 0.05 mm. The number no KiCad rule
+    reads: KiCad's pair metrics *improve* as a pair stops being a pair (`route_relax` history, and
+    `docs/direction.md` §5), so the build holds the uncoupled length to `PairSpec.uncoupled_mm` itself."""
+    from .copper_bar import segments as _segs
+
+    segs = _segs(text)
+    table = clearance_table(cs)
+    out = []
+    seen = set()
+    for c in cs.constraints:
+        if c.pair is None or not c.pair.partner:
+            continue
+        a, b = sorted((c.net, c.pair.partner))
+        if (a, b) in seen:
+            continue
+        seen.add((a, b))
+        width = c.pair.width_mm.value
+        thr = round(width + max(c.pair.gap_mm.value, table.between(a, b)[0]) + 0.05, 4)
+        sa = [s for s in segs if s["net"] == a]
+        sb = [s for s in segs if s["net"] == b]
+        la, ca = _coupled_mm(sa, sb, thr)
+        lb, cb = _coupled_mm(sb, sa, thr)
+        out.append(PairCoupling(a, b, la, lb, ca, cb, thr, c.pair.uncoupled_mm.value, c.pair.skew_mm.value))
+    return tuple(out)

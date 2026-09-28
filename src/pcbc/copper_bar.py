@@ -143,7 +143,7 @@ def vias_in_courtyard(text: str, reasons: dict, owners: dict) -> list[dict]:
         key = bar_key("via", v["at"])
         reason = reasons.get(key)
         if reason is None:
-            continue  # KRT's leftover via: R3 owns where those land, and it is not measured here
+            continue  # a via no `pcbc:` group names (none natively): counted as `vias_leftover`, not here
         owner = (owners.get(key) or "").split(".")[0]
         x, y = v["at"]
         for ref, (x0, y0, x1, y1) in boxes:
@@ -195,8 +195,7 @@ def copper_bar(text: str, reasons: dict | None = None, owners: dict | None = Non
     `reasons` maps `bar_key` to the pattern that wrote that piece (D.4). With it the totals gain
     `by_reason`, `vias_pattern` and `vias_leftover`, the per-net rows gain their `leftover_*` half,
     and the report gains the line that says how much of the board is pcbc's own. Without it every
-    piece reads as leftover, which is what a `PCBC_PATTERNS=off` board is: the numbers
-    `test_patterns.py::test_patterns_off_claims_nothing_and_is_a_rollback` compares are unchanged.
+    piece reads as leftover.
 
     `bridges` maps `"A|B"` to the part that ties two `Ground()` nets, or to the verdict when nothing
     does (`route_verify.bridge_ties`). It is the one entry in this census that counts **no copper at
@@ -220,8 +219,8 @@ def copper_bar(text: str, reasons: dict | None = None, owners: dict | None = Non
             "off45": 0,
             "micro": 0,
             "segments": 0,
-            # The leftover's own half of every number above (finding 10). Without it there is no
-            # figure anywhere for what KRT paid for a pattern: `routed_mm` and `detour` are over
+            # The leftover's own half of every number above (finding 10): copper no `pcbc:` group
+            # names, which natively is none. `routed_mm` and `detour` are over
             # **all** the copper on the net, pattern and leftover together, so c3_usb's `3V3`
             # reads as a 19.81 mm win (leftover 50.90 -> 31.09) while the net's own total copper
             # rose 10 % and its leftover doubled in segments. A pattern that starts costing more

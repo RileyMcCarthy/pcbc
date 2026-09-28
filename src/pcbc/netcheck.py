@@ -146,6 +146,27 @@ def copper_nets(text: str) -> dict[str, set[Pad]]:
     return nets
 
 
+_PRIM_NET = re.compile(r'\(net\s+"((?:[^"\\]|\\.)*)"\)')
+
+
+def primitive_nets(text: str) -> set[str]:
+    """Every net name a top-level `(segment)`, `(arc)`, `(via)` or `(zone)` of the board carries."""
+    out: set[str] = set()
+    pos = 0
+    while True:
+        j = text.find("\n\t(", pos)
+        if j < 0:
+            break
+        start = j + 2
+        end = matching_paren(text, start) + 1
+        head = text[start + 1 : start + 12].split(None, 1)[0].rstrip(")")
+        if head in ("segment", "arc", "via", "zone"):
+            for m in _PRIM_NET.finditer(text[start:end]):
+                out.add(m.group(1).replace('\\"', '"').replace("\\\\", "\\"))
+        pos = end
+    return out
+
+
 def names_rule(description: str, rule: str) -> bool:
     """Whether a KiCad DRC violation came from the custom rule `rule`. Most checks say
     `(rule 'name' ...)`; the diff-pair checks say `(name minimum gap ...)` / `(name maximum
@@ -195,6 +216,16 @@ def _width_hits(violations: list) -> list[dict]:
     return out
 
 
+def _unconnected_by_net(unconnected) -> dict[str, int]:
+    """{net: KiCad's unconnected items on it}, a net read off each item's `[NET]` (the first item's)."""
+    out: dict[str, int] = {}
+    for u in unconnected:
+        nets = [m for i in (u.get("items") or []) for m in re.findall(r"\[([^\]]*)\]", str(i.get("description", ""))) if m]
+        if nets:
+            out[nets[0]] = out.get(nets[0], 0) + 1
+    return dict(sorted(out.items()))
+
+
 def check_copper(design: Design, pcb: Path, cli: Path | None = None, floor_mm: float | None = None, *, refill: bool = True) -> dict:
     """The copper gate: KiCad DRC clean, nothing unconnected, pads bound exactly as board.py says."""
     from .compile import compile_design
@@ -205,6 +236,13 @@ def check_copper(design: Design, pcb: Path, cli: Path | None = None, floor_mm: f
     fails: list[str] = []
     nets = compare(expected_nets(design), copper_nets(text), what="copper")
     fails += nets
+    # The pad bindings above are what KiCad's unconnected check reads; a track, via or zone on a net
+    # no pad has is invisible to it. Every net token on a copper primitive must be board.py's.
+    known = set(design.nets) | set(expected_nets(design)) | {""}  # `(net "")` is KiCad's no-net track or via
+    strays = sorted({n for n in primitive_nets(text) if n not in known})
+    if strays:
+        fails.append(f"copper on a net board.py does not have: {', '.join(repr(n) for n in strays)} (a segment, arc, via or zone carries it)")
+        nets = list(nets) + [f"copper on a net board.py does not have: {', '.join(repr(n) for n in strays)}"]
     doc = kicad_drc(pcb, cli, refill=refill)
     job = compile_design(design)
     if floor_mm is None:
@@ -243,6 +281,12 @@ def check_copper(design: Design, pcb: Path, cli: Path | None = None, floor_mm: f
         "nets": nets,
         "drc_errors": errors,
         "unconnected": len(unconnected),
+        # The nets KiCad calls open, read off each unconnected item's `[NET]` (the build holds them to
+        # the router's own unrouted list: a net open here that the router called done is a bug).
+        "unconnected_nets": sorted({m for u in unconnected for i in (u.get("items") or []) for m in re.findall(r"\[([^\]]*)\]", str(i.get("description", ""))) if m}),
+        # KiCad's count of missing links per net: one unconnected item is one ratsnest line between two
+        # items of one net. The build holds it to the router's own count (`route_native.open_links`).
+        "unconnected_by_net": _unconnected_by_net(unconnected),
         "drc_warnings": sum(
             1
             for v in violations
@@ -252,13 +296,44 @@ def check_copper(design: Design, pcb: Path, cli: Path | None = None, floor_mm: f
         ),
         "geometry": geometry,  # KiCad's own count of staircases and 90 degree corners
         # Where each `track_width` warning is, so a caller can ask **whose** copper it is. The
-        # aggregate alone let four of pcbc's own tap stubs sit inside a KRT total while the comment
-        # above it said "no tap stub is in these counts" (`docs/r2-measurements.md` S5r, finding 14).
+        # aggregate alone hid four of pcbc's own tap stubs inside a total (`docs/r2-measurements.md`
+        # S5r, finding 14).
         "width_hits": _width_hits(violations),
         "canary": canary_fired,
         "soft": soft,  # {rule name: hits} for pcbc's soft rules (track_width, skew, via budget, uncoupled)
         "rules": rule_hits,  # {rule name: hits} for every pcbc rule
+        # Every violation KiCad reported, `{"severity:type": count}`, and the unconnected items: what
+        # the layout pipeline holds the emitted board to against the router's (`layout_job`).
+        "by_type": _by_type(doc),
+        # The uuids of the items each failing violation names, so a failure can be traced to the
+        # `layout.core.py` line that wrote the object (`build.py`): the emitted board carries every
+        # copper object's own uuid, and KiCad reports it.
+        "fail_items": [_item(v) for v in copper_drc_errors(doc, floor_mm=floor_mm)]
+        + [{"type": "unconnected", "severity": "error", "text": f"unconnected: {u.get('description', '')}", "uuids": [str(i.get("uuid")) for i in u.get("items") or [] if i.get("uuid")], "pos": []} for u in unconnected],
+        # **Every** violation KiCad reported, warning or error, with the uuids of the items it names:
+        # a warning on an object a `layout.core.py` line wrote (a dangling via, a track under its
+        # class width) is that line's, and the build names it.
+        "items": [_item(v) for v in violations],
     }
+
+
+def _item(v: dict) -> dict:
+    return {
+        "type": v.get("type"),
+        "severity": (v.get("severity") or "").lower(),
+        "text": f"{v.get('type')}: {v.get('description')}" + "".join(f" [{i.get('description', '')}]" for i in v.get("items") or []),
+        "uuids": [str(i.get("uuid")) for i in v.get("items") or [] if i.get("uuid")],
+        "pos": [(float((i.get("pos") or {}).get("x", 0.0)), float((i.get("pos") or {}).get("y", 0.0))) for i in v.get("items") or [] if i.get("pos")],
+    }
+
+
+def _by_type(doc: dict) -> dict[str, int]:
+    from collections import Counter
+
+    got = Counter(f"{(v.get('severity') or '').lower()}:{v.get('type')}" for v in doc.get("violations") or [])
+    if doc.get("unconnected_items"):
+        got["unconnected"] = len(doc["unconnected_items"])
+    return dict(sorted(got.items()))
 
 
 def check_schematic(design: Design, sch: Path, cli: Path | None = None) -> list[str]:

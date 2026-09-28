@@ -5,7 +5,6 @@ from __future__ import annotations
 import shutil
 from pathlib import Path
 
-from pcbc.blocking import blocking_lines
 from pcbc.build import pcb_job
 from pcbc.copper import pads_by_net
 from pcbc.copper_bar import airwire_mm, copper_bar, off_45, segments
@@ -82,33 +81,3 @@ def test_airwire_is_the_spanning_tree_of_the_pads():
     assert airwire_mm([(0, 0), (3, 0), (10, 0)]) == 10.0
     assert airwire_mm([(0, 0), (3, 4), (0, 8)]) == 10.0  # two 5 mm legs, not the 8 mm hypotenuse plus one
     assert airwire_mm([(1, 1)]) == 0.0
-
-
-def test_a_blocked_pad_is_reported_with_what_is_in_the_way_and_whose_it_is(tmp_path: Path):
-    """The DS2 Addon's ground pin: 'GND found no path' named nothing. The analysis names the pad,
-    the foreign copper in its corridor, the step that put it there and the part it belongs to."""
-    shutil.copytree(EXAMPLES / "blinky", tmp_path / "blinky")
-    result = pcb_job(tmp_path / "blinky" / "blinky.py")
-    assert result.get("error") is None, result
-    design = load_board(tmp_path / "blinky" / "blinky.py")
-    text = Path(result["placed"]).read_text()
-    pads = pads_by_net(text)
-    net, sites = next((n, s) for n, s in sorted(pads.items()) if len(s) == 2)
-    other = next(n for n in sorted(pads) if n != net and pads[n])
-    (_r1, x1, y1), (_r2, x2, y2) = sites
-    mx, my = (x1 + x2) / 2, (y1 + y2) / 2
-    # A foreign track across the corridor, and a step file that says who drew it.
-    wall = (
-        f"\n\t(segment\n\t\t(start {mx - 1:.6f} {my + 2:.6f})\n\t\t(end {mx + 1:.6f} {my - 2:.6f})\n\t\t(width 0.2)\n\t\t(layer \"F.Cu\")\n\t\t(net \"{other}\")\n\t\t(uuid \"w\")\n\t)\n"
-    )
-    walled = text.rstrip()[:-1] + wall + ")\n"
-    work = tmp_path / "routed"
-    work.mkdir()
-    (work / "03_signals.kicad_pcb").write_text(walled)
-    lines = blocking_lines(design, walled, work, net)
-    assert len(lines) == 1, lines
-    line = lines[0]
-    assert line.startswith(f"{net}: ") and "cannot reach" in line
-    assert f"{other} track on F.Cu" in line and "[signals, " in line and "'s net]" in line
-    assert "Move " in line and "NetReq(..., layers=)" in line
-    assert blocking_lines(design, walled, None, "no-such-net") == []

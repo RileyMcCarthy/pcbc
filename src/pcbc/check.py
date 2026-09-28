@@ -21,9 +21,18 @@ class CheckError(Exception):
 
 
 def check_job(job: CompiledJob, pcb_path: Path, tol_mm: float = 0.05) -> list[str]:
-    """Return a list of failure strings. Empty means pass."""
+    """Return a list of failure strings for a board file. Empty means pass."""
     pcb_path = Path(pcb_path)
-    text = pcb_path.read_text()
+    fails = check_text(job, pcb_path.read_text(), tol_mm)
+    dru = pcb_path.with_suffix(".kicad_dru")
+    if job.dru and not dru.exists():
+        fails.append(f"missing {dru.name}")
+    return fails
+
+
+def check_text(job: CompiledJob, text: str, tol_mm: float = 0.05) -> list[str]:
+    """`check_job` on a board text: the native route stage asks it of the place-only board it renders
+    in memory, before anything is routed (a bad placement never costs a route)."""
     failures: list[str] = []
 
     by_ref = {}
@@ -68,7 +77,7 @@ def check_job(job: CompiledJob, pcb_path: Path, tol_mm: float = 0.05) -> list[st
                 f"{place.ref} moved: have ({at[0]:.3f},{at[1]:.3f}) "
                 f"want ({want.at[0]:.3f},{want.at[1]:.3f})"
             )
-        if abs((at[2] or 0) - want.rot) > 0.5:
+        if abs((((at[2] or 0) - want.rot) + 180.0) % 360.0 - 180.0) > 0.5:  # 270 and -90 are one angle
             failures.append(
                 f"{place.ref} rotated: have {at[2]:g} want {want.rot:g}"
             )
@@ -83,9 +92,6 @@ def check_job(job: CompiledJob, pcb_path: Path, tol_mm: float = 0.05) -> list[st
             if f'(name "{area.name}")' not in text:
                 failures.append(f"missing rule area {area.name}")
 
-    dru = pcb_path.with_suffix(".kicad_dru")
-    if job.dru and not dru.exists():
-        failures.append(f"missing {dru.name}")
     failures.extend(sensitive_airwire_failures(job, text))
     from .stackup import get_stackup
 

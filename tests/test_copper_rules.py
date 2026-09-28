@@ -173,13 +173,13 @@ def test_fiducials_take_free_corners_and_are_kept_clear(tmp_path: Path):
 
 
 def test_the_stackup_is_the_one_source_of_fab_limits(tmp_path: Path):
-    """KiCad's defaults judged the vias once KRT stopped rewriting the rules: 0.2 mm drills on a
-    2-layer board, 0.075 mm rings, tracks 0.236 from holes. The project, the classes, the router
-    and the gate now all read the same Stackup."""
+    """KiCad's defaults judged the vias once the old router stopped rewriting the rules: 0.2 mm drills
+    on a 2-layer board, 0.075 mm rings, tracks 0.236 from holes. The project, the classes, the router
+    and the gate all read the same Stackup."""
     import json
 
-    from pcbc.route import krt_plan
-    from pcbc.seed import seed_job
+    from pcbc.route_cost import lattice_step, net_cost
+    from pcbc.seed import emit_pro
     from pcbc.stackup import board_rules, get_stackup
 
     two = get_stackup("jlcpcb_2l_1oz")
@@ -192,16 +192,16 @@ def test_the_stackup_is_the_one_source_of_fab_limits(tmp_path: Path):
         default = next(c for c in job.classes if c.name == "Default")
         assert (default.via_diameter_mm, default.via_drill_mm) == (stack.via_diameter, stack.via_drill)
         assert all(c.via_drill_mm >= stack.via_drill and c.clearance_mm >= stack.clearance_min for c in job.classes)
-        out = tmp_path / board / "layout.kicad_pcb"
-        out.parent.mkdir(parents=True)
-        seed_job(design, out, name=board)
-        rules = json.loads(out.with_suffix(".kicad_pro").read_text())["board"]["design_settings"]["rules"]
+        rules = json.loads(emit_pro(design, name=board))["board"]["design_settings"]["rules"]
         assert rules == board_rules(stack)
-        plan = krt_plan(job, design, Path("p.kicad_pcb"), Path("r"), Path("/krt"))
-        for _name, cmd in plan:
-            assert cmd[cmd.index("--via-drill") + 1] == f"{stack.via_drill:g}"
-            if "--routing-clearance-margin" in cmd:
-                assert float(cmd[cmd.index("--routing-clearance-margin") + 1]) >= 1.0
+        # The native router's numbers are the same Stackup's: every net's via is at least the fab's
+        # drill, its lattice is the fab's finest track pitch, and a net no NetReq names gets the
+        # Default class's via, which is the stackup's.
+        cs = job.constraints
+        for net in sorted(design.nets):
+            nc = net_cost(cs, net)
+            assert nc.via_drill >= stack.via_drill and nc.clearance_mm >= stack.clearance_min, (board, net)
+        assert lattice_step(stack) == round(stack.track_min + stack.clearance_min, 6)
 
 
 def test_an_edge_placed_header_keeps_its_pads_off_the_edge(tmp_path: Path):

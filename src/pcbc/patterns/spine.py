@@ -1,11 +1,8 @@
 """`spine` — a power net with three or more pads and no plane (`docs/r2-design.md` B.4).
 
-The power nets are **37 % of all routed copper** on the five boards and the last big block: buck is
-86 % power and carries the worst detour on any board, c3_usb 66 %, ds2 38 %. Left to KRT they are
-routed like signals — the soft rule `width_power` counts every place a power track was necked below
-its class, 39 times on buck, 51 on c3_usb, 15 on node — and a necked power track is not a style
-preference, it is the IPC-2221 and IPC-2152 arithmetic R1 already compiled being ignored. Driving
-that count to zero is what this pattern is for.
+A power rail is a trunk, not a tree of pad-to-pad links: this pattern writes it as one, at the class
+width the IPC-2221 and IPC-2152 arithmetic compiled, before the router runs. What it leaves open the
+router links (`route_native.route_nets`), also at the class width.
 
 Two forms, in B.4's order:
 
@@ -20,7 +17,7 @@ Two forms, in B.4's order:
   shared link builder, at the trunk width. A middle station is a T: the link ends on the pad and the
   next one starts there, and KiCad joins tracks that touch. A link that fails splits the spine and
   **both halves are kept** — partial copper is legal, useful and honest, and `net_open` hands what
-  is left to KRT.
+  is left to the router.
 
 **The spine never necks, and that is the whole point.** B.0's "a pattern never degrades" is sharper
 here than anywhere else: a trunk narrower than its class is the bug this pattern exists to fix, so
@@ -46,7 +43,7 @@ import math
 import statistics
 from dataclasses import dataclass
 
-from ..blocking import move_line
+from ..moves import move_line
 from ..copper_bar import airwire_mm
 from ..route_checks import _principal_order
 from ..route_emit import Piece
@@ -85,16 +82,16 @@ B.4 uses this number one way — a net with three or more pads that is *not* `po
 it is at least this wide — and S7 applies it to every spine, which is a **deviation from B.4** with
 a measurement behind it.
 
-A spine is copper locked before KRT sees the board, and it costs the corridor it takes. What it buys
+A spine is copper written before the router runs, and it costs the corridor it takes. What it buys
 is the difference between the class width and what a maze router would have necked to, so on a net
 whose class is 0.25 mm against a fab floor of 0.127 the pattern is spending a corridor to save
 0.123 mm of copper width. ds2 is that board — two layers, a dense TSSOP, and **six** `vias=False`
 single-layer analog nets whose only corridors are the ones a spine would take — and it is the board
 where the trade was measured: at every locality cap tried (6, 8, 12 mm and none) ds2's 0.25 mm spines
 broke the gate outright, `AIN0` or `AIN1` losing its path to `U1` entirely or `3V3`, `GND` and `VSS`
-finding no path on any layer. C.1 predicts it — the constrained nets are step 3 and the spine is
-step 5, but until `chain` (S6) lands step 3 is KRT's and runs *after* the whole pre stage — and the
-number that separates a board where a spine pays from one where it does not is the width it is
+finding no path on any layer. The order predicts it — the constrained nets are routed by the router
+after every pattern stage (`route_native.route_stage`), so a spine takes their corridors first — and
+the number that separates a board where a spine pays from one where it does not is the width it is
 protecting. `docs/r2-measurements.md` S7, and it is S7's first open issue.
 
 It is also the Power class's own width on c3_usb, node and the DS2 Addon's 4-layer sibling, so
@@ -657,7 +654,7 @@ def _backbone(ctx: PatternCtx, spec: SpineSpec) -> tuple[tuple[Piece, ...], list
     time, because a mitre moves copper that was already accepted.
 
     A link that fails ends the run and starts a new one: B.4 says a pad whose link fails splits the
-    spine into two components and **both** are kept, and `net_open` then hands what is left to KRT.
+    spine into two components and **both** are kept, and `net_open` then hands what is left to the router.
     """
     stations = station_order(spec)
     mine = frozenset(it.id for it in ctx.scene.items if it.owner in {t.owner for t in spec.stations})
@@ -738,8 +735,8 @@ def crowded(a: Terminal, b: Terminal, exits_a, exits_b) -> bool:
     22): `C_IN1.1 -> U1.3` are 1.7160 mm apart with their widest exits **1.3156 and 1.1266** mm out,
     `U1.3 -> C_IN2.1` 1.5432 mm with 1.1266 and 1.3156, and on `5V` `L1.2 -> C_OUT1.1` 2.1620 mm with
     2.4006 and 1.3156. Every exit-to-exit candidate for those links doubles back on itself, `mitre`
-    refuses the hairpin, and three quarters of buck's `VIN` and `5V` went to KRT for a reason that is
-    about the exits and not about the board.
+    refuses the hairpin, and three quarters of buck's `VIN` and `5V` went to the router for a reason
+    that is about the exits and not about the board.
 
     `C_IN2.1 -> R_EN.1` (3.0093 mm against 1.3156 + 0.9106) used to be listed here as a fourth case
     and is **not** one: it measures roomy, gets six candidates rather than 112, and still fails with
@@ -858,7 +855,7 @@ def _result(ctx: PatternCtx, spec: SpineSpec, pieces: tuple[Piece, ...], **kw) -
 
 
 def run(ctx: PatternCtx, spec: SpineSpec) -> PatternResult:
-    """One net: the comb if it fits, the backbone if it does not, and what is left for KRT."""
+    """One net: the comb if it fits, the backbone if it does not, and what is left for the router."""
     if not spec.layer:
         return PatternResult(reason=REASON, net=spec.net, refusal=_refuse_layer(ctx, spec))
     if spec.amps > 0 and spec.width + 1e-9 < spec.trunk_need:
@@ -967,11 +964,10 @@ def _refuse_amps(ctx: PatternCtx, spec: SpineSpec) -> Refusal:
 def _refuse(ctx: PatternCtx, spec: SpineSpec, comb: dict, seen: list[Clash], failed, tried: int) -> Refusal:
     """B.4's refusal, and this is where `free_intervals` earns its place.
 
-    **Soft** (C.6), by `hop._refuse`'s argument: KRT's own `{class}_nets` step honours a `vias=False`
-    or single-layer `NetReq` with the same numbers, so a refused spine costs a route pcbc would have
-    drawn wider — never the constraint itself. What it does cost is written down rather than waved
-    at: the net falls back to being routed like a signal, which is the `width_power` warning this
-    pattern was built to remove.
+    **Soft** (C.6), by `hop._refuse`'s argument: the router honours a `vias=False` or single-layer
+    `NetReq` with the same numbers, so a refused spine costs the trunk shape — never the constraint
+    itself. What it does cost is written down rather than waved at: the net falls back to being
+    linked pad to pad by the router.
 
     The line says the trunk it wanted, the widest lane there actually was and the width that lane
     needed to be, names the two blockers sitting in it worst first, and ends in a `board.py` edit.

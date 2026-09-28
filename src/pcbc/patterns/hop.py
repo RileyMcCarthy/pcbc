@@ -16,15 +16,15 @@ from __future__ import annotations
 
 import math
 
-from ..blocking import move_line
+from ..moves import move_line
 from ..route_geom import MICRO_MM, path_mm
 from ..route_scene import blocked, pad_exits
 from . import ALL_SHAPES, MAX_LINKS, mitre, PatternCtx, PatternResult, Refusal, Terminal, lane_ok, legs_of, legs_ok, link_candidates, pieces_of, shape_ok, terminals, toward_first
 
 HOP_MM = 6.0
-"""How far apart two pads may be and still be a hop on distance alone. `route.LOCAL_MM` is 5.0; 6.0
-catches ds2's `nRESET` at 3.11 mm and node's `CC2` at 4.13 mm with headroom and still refuses ds2's
-`ADC_RX` at 10.14 mm, which is the maze router's job."""
+"""How far apart two pads may be and still be a hop on distance alone. 6.0 catches ds2's `nRESET`
+at 3.11 mm and node's `CC2` at 4.13 mm with headroom and still refuses ds2's `ADC_RX` at 10.14 mm,
+which is the router's job (`route_native.route_nets`)."""
 
 DETOUR_MAX = 1.5
 """How far past the straight line between the two pads a hop's copper may run.
@@ -32,7 +32,7 @@ DETOUR_MAX = 1.5
 B.0 says a pattern never degrades — it does not bend a candidate to make it fit — and the whole claim
 of R2 is that pcbc's own structured copper is *better* than what a maze router leaves. A hop that
 walks twice the airwire is neither: it is a routing problem wearing a pattern's clothes, and the
-honest thing is to say so and let KRT have it. The same argument B.1 makes for its straight-line
+honest thing is to say so and let the router have it. The same argument B.1 makes for its straight-line
 clause, applied to the answer instead of to the question.
 
 Measured on the five boards: every hop that fits is at **1.00 to 1.24x** except c3_usb's `LED_A`,
@@ -217,8 +217,8 @@ def _allowed_shapes(ctx, net, a: Terminal, b: Terminal, span: float, exits_a, ex
     Measured on the five boards: blinky's `LED` is the only long two-pad net that takes the
     permissive branch. Letting the "no straight line at all" case take it too locked 33 mm of copper
     across the DS2 Addon before anything else was routed — `GPIO0` at 17.34 mm, `ADC_TX` at 12.76 mm,
-    `ADC_DRDY` at 16.8 mm — after which `GND` could not reach five of its pads. That is `route.py`'s
-    own recorded failure mode, seen from the other side. `docs/r2-measurements.md` S4.
+    `ADC_DRDY` at 16.8 mm — after which `GND` could not reach five of its pads: copper locked before
+    the router runs takes the corridors the router needs. `docs/r2-measurements.md` S4.
     """
     if span <= HOP_MM:
         return (ALL_SHAPES, "")
@@ -247,7 +247,7 @@ def _allowed_shapes(ctx, net, a: Terminal, b: Terminal, span: float, exits_a, ex
         # around: the net is a route, not a hop. This is the case the permissive branch must not
         # swallow — on ds2 it let three signals (GPIO0 at 17.3 mm, ADC_TX at 12.8 mm, ADC_DRDY) lock
         # 33 mm of copper across the board before anything else was routed, and GND could then not
-        # reach five of its pads. Exactly the failure `route.py`'s own comment records.
+        # reach five of its pads.
         return (frozenset({"direct"}), "no straight line between their exits")
     return (ALL_SHAPES, "")
 
@@ -309,12 +309,12 @@ def _moves(ctx, net: str, a: Terminal, b: Terminal, layer: str, clash, sides, ot
 
 
 def _refuse(ctx, net, a: Terminal, b: Terminal, layer: str, clash, rule: str, na: int, nb: int, built: int, tried: int, links: int = MAX_LINKS, lane: str = "", strangers: str = "", ratio: float = 0.0, sides=((), ())) -> Refusal:
-    """The refusal sentence, in the one shape every pcbc move line uses (`blocking.move_line`).
+    """The refusal sentence, in the one shape every pcbc move line uses (`moves.move_line`).
 
-    Always **soft** (C.6). A hard refusal is for intent KRT structurally cannot honour, and a hop is
-    not that: a net with `vias=False` or one layer is routed by KRT's own constrained `*_nets` step,
-    on those layers, with the via cost that keeps it there. So a refused hop costs a route pcbc would
-    have drawn better and never costs the constraint itself.
+    Always **soft** (C.6). A hard refusal is for intent the router structurally cannot honour, and a
+    hop is not that: a net with `vias=False` or one layer is routed by `route_native.route_nets` on
+    those layers only and with no via (`route_cost.net_cost`). So a refused hop costs a route the
+    pattern would have drawn more simply and never costs the constraint itself.
 
     It says the number it measured against the number it needed, names the rule of A.4 that decided
     it, counts what it tried so "it did not try hard enough" is answerable, and ends in a `board.py`

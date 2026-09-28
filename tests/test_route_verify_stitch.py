@@ -17,6 +17,10 @@ a millimetre of copper is designed around either:
   0.527 A. Four groups on the checked-in board, **three** on a fresh build — which is why
   `docs/stitch-plan.md` §2(o) tells S4 to re-measure the count rather than copy it.
 
+**Native router, 2026-09-25.** The KRT-era counts above are history. On the native router's copper:
+c3_usb has two `lost` vias (both `USB_DP`), and technique 1 fires on buck's `VIN` (3 groups) and
+node's `VBUS` (2 groups); each re-pinned number below says so where it is asserted.
+
 Every board here is read **read-only**, including the DS2 Addon's, which lives outside this repo.
 Nothing in `~/Documents/MaD` is written by this suite.
 """
@@ -33,7 +37,7 @@ from pcbc.build import _barrel_gate, _return_gate
 from pcbc.compile import compile_design
 from pcbc.constraints import clearance_table, return_rules
 from pcbc.language import load_board
-from pcbc.route_scene import _vias as board_vias
+from pcbc.route_verify import board_vias
 from pcbc.route_scene import plane_targets
 from pcbc.route_verify import (
     RETURN_MM,
@@ -61,7 +65,7 @@ def _board(name: str) -> Path:
 
 
 
-# A **routed** board is not a pure function of `board.py`: it needs KiCad and KRT and minutes of
+# A **routed** board is not a pure function of `board.py`: it needs KiCad and minutes of
 # work, and `examples/**/layout/` is gitignored build output that a clean checkout does not have.
 # So every test here that reads one is marked `kicad` + `krt` — which is what those markers already
 # promise — and skips when the artifact is absent rather than raising `FileNotFoundError` in the
@@ -70,7 +74,6 @@ def _board(name: str) -> Path:
 # jobs, so the suite was green only on a machine that had built the boards before.
 pytestmark = [
     pytest.mark.kicad,
-    pytest.mark.krt,
 ]  # no skipif: `_routed` BUILDS the board (conftest.routed_board), so nothing on disk is needed.
 
 def _routed(name: str) -> Path:
@@ -87,7 +90,7 @@ def _routed(name: str) -> Path:
     return routed_board(name, _board(name))
 
 
-# Collection must not build: `_routed` is a real KiCad+KRT build, so the list is the boards whose
+# Collection must not build: `_routed` is a real KiCad build, so the list is the boards whose
 # **source** is here, and the build happens inside the test that asks for it.
 BOARDS = [n for n in ("blinky", "buck", "c3_usb", "node", "ds2") if _board(n).exists()]
 """The boards whose **source** is here, which is now the same as the boards this file can read.
@@ -149,8 +152,11 @@ def test_the_one_board_that_has_a_population_has_one_verdict_and_it_is_the_stack
     assert {r.net: r.verdict for r in return_rules(_cs("node"))} == {"USB_DN": "net_change", "USB_DP": "net_change"}, (
         "the stackup still says what a layer change would cost; there is no layer change to cost"
     )
+    # Re-recorded 2026-09-25 for the native router: c3_usb carries **two** vias on a referenced net
+    # (was five on KRT's copper), both `USB_DP` vias of the single-net joins at `U3`, and both are
+    # still `lost` — the verdict is the stackup's, so the count moved and the verdict did not.
     c3 = return_vias(_text("c3_usb"), _cs("c3_usb"))
-    assert len(c3) == 5 and {r.verdict for r in c3} == {"lost"}, c3
+    assert len(c3) == 2 and {r.verdict for r in c3} == {"lost"}, c3
     assert {(r.from_ref, r.to_ref) for r in c3} == {(("B.Cu", "GND"), None)}, c3
     assert all("cannot be its own reference" in r.why for r in c3), [r.why for r in c3]
 
@@ -207,11 +213,15 @@ def test_the_nearest_reference_net_via_on_either_board_is_2_2472_mm_away():
     argument nothing — and the argument was never the number, it is that `net_change` and `lost` are
     decided before a distance is taken at all (`test_the_threshold_decides_nothing_on_any_board...`).
     """
+    # Re-recorded 2026-09-25 for the native router: two distances, 1.96 and 2.8041 mm, the nearest
+    # being c3_usb's `USB_DP` via at (20.874,20.366) to the GND via at (21.8,18.6385). The margin
+    # over `RETURN_MM` shrank from 2.25x to 1.96x and is still a margin; the test name keeps the KRT
+    # number because the argument never rested on it.
     near = []
     for name in ("c3_usb", "node"):
         near += [r.near[2] for r in return_vias(_text(name), _cs(name)) if r.near]
-    assert len(near) == 5 and round(min(near), 4) == 2.2472, sorted(near)
-    assert min(near) > RETURN_MM, "not one of the five has a reference-net via inside the threshold"
+    assert len(near) == 2 and round(min(near), 4) == 1.96, sorted(near)
+    assert min(near) > RETURN_MM, "not one of them has a reference-net via inside the threshold"
     for name, pitch in (("c3_usb", 0.8), ("node", 0.7)):
         cs = _cs(name)
         stack = cs.stackup
@@ -233,7 +243,8 @@ def test_the_threshold_decides_nothing_on_any_board_in_this_repo(monkeypatch):
     base = {name: tuple(r.verdict for r in return_vias(_text(name), _cs(name))) for name in BOARDS}
     # 2.2472 is the nearest reference-net via on any board, re-measured 2026-09-21 (it was 1.6279 on
     # the stale artifacts). The sweep steps over it and past it by 4x and nothing moves.
-    for tol in (0.0, 0.5, 0.7, 0.8, 1.0, 2.2472, 3.0, 5.0, 10.0):
+    # Re-recorded 2026-09-25: 1.96 is the nearest on the native router's copper, and is swept too.
+    for tol in (0.0, 0.5, 0.7, 0.8, 1.0, 1.96, 2.2472, 3.0, 5.0, 10.0):
         monkeypatch.setattr(rv, "RETURN_MM", tol)
         for name in BOARDS:
             got = tuple(r.verdict for r in return_vias(_text(name), _cs(name)))
@@ -372,7 +383,10 @@ def test_every_parallel_via_group_on_an_unpoured_rail_is_rated(name: str):
 
 
 def test_technique_one_fires_on_exactly_one_net_on_exactly_one_board():
-    """node's `VBUS`: three groups on a 1 A rail, `via_amps(0.2)` = 0.527 A per barrel and
+    """(Native router, 2026-09-25: buck's `VIN`; node's `VBUS` is unrouted and ships no copper, so it has
+    no via group at all. The KRT-era account follows.)
+
+    node's `VBUS`: three groups on a 1 A rail, `via_amps(0.2)` = 0.527 A per barrel and
     `vias_per_change(1.0, 0.2)` = 2, so a singleton is short by one and a pair is rated.
 
     **Re-recorded 2026-09-21 off a board this test builds, and the population went 4 singletons to
@@ -390,19 +404,28 @@ def test_technique_one_fires_on_exactly_one_net_on_exactly_one_board():
     13 -> 14 on a fresh build and **not one `need` moves**, which is what "structural" has to mean.
     """
     assert "node" in BOARDS, "node's board.py is in this repo, and `_routed` builds the rest"
+    # Re-recorded 2026-09-25 for the native router: the native router sizes a power net's vias at
+    # 0.4 mm drill (`via_amps(0.4)` = 0.871 A), so buck's 2 A `VIN` owes 3 barrels at each of its three
+    # single-via changes (6 more vias). Re-recorded again the same day for the refuters' D1: node's
+    # `VBUS` is unrouted, an unfinished net ships no generated copper, so node has no `VBUS` via and
+    # owes nothing (it read two single-via groups of copper that is now dropped). pcbc writes no rung.
     short = {name: [r for r in via_parallelism(_text(name), _cs(name)) if r.add] for name in BOARDS}
-    assert [name for name, rows in short.items() if rows] == ["node"], {k: len(v) for k, v in short.items()}
-    node = short["node"]
-    assert {r.net for r in node} == {"VBUS"} and len(node) == 2, node
-    assert {(r.n, r.drill, r.carries, r.need, r.add) for r in node} == {(1, 0.2, 0.527, 2, 1)}, node
+    assert [name for name, rows in short.items() if rows] == ["buck"], {k: len(v) for k, v in short.items()}
+    buck = short["buck"]
+    assert {r.net for r in buck} == {"VIN"} and len(buck) == 3, buck
+    assert {(r.n, r.drill, r.carries, r.need, r.add) for r in buck} == {(1, 0.4, 0.871, 3, 2)}, buck
+    assert not [v for v in board_vias(_text("node")) if v["net"] == "VBUS"], "node's VBUS is unrouted: no VBUS via on its board"
     assert via_amps(0.2, 0.018, 10.0) == 0.527 and vias_per_change(1.0, 0.2, 0.018, 10.0) == 2
-    assert sum(r.add for r in node) == 2, "two rungs owed, one per short cluster"
-    # And the third group, which is the one pcbc already answered: two barrels, `need` met, no `add`.
+    assert via_amps(0.4, 0.018, 10.0) == 0.871 and vias_per_change(1.0, 0.4, 0.018, 10.0) == 2
+    assert sum(r.add for r in buck) == 6, "two rungs per short buck cluster"
+    # No group anywhere is already answered: the native build places no stitch rung.
     rated = [r for r in via_parallelism(_text("node"), _cs("node")) if not r.add]
-    assert [(r.net, r.at, r.n, r.need) for r in rated] == [("VBUS", (28.0, 33.4), 2, 2)], rated
+    assert rated == [], rated
     if HAS_DS2:
         ds2 = via_parallelism(_text("ds2"), _cs("ds2"))
-        assert len(ds2) == 14 and {r.need for r in ds2} == {1} and {r.drill for r in ds2} == {0.3}, ds2
+        # Re-recorded 2026-09-25: 13 groups on the native router's copper (was 14 on KRT's), every one
+        # `need` 1; the barrels are 0.3 and 0.4 mm drill, both rated over 0.1 A.
+        assert len(ds2) == 13 and {r.need for r in ds2} == {1}, ds2
         assert vias_per_change(0.1, 0.3, 0.018, 10.0) == 1, "0.1 A under one 0.707 A barrel: no rung can ever be owed"
 
 
@@ -423,7 +446,10 @@ def test_a_poured_rail_is_exempt_and_the_exemption_is_what_keeps_the_count_hones
     and on the largest cluster instead. A multi-via cluster on a poured rail is the exemption doing
     *more* work, not less.
     """
-    for name, net, amps, groups, biggest in (("buck", "GND", 2.0, 7, 1), ("node", "GND", 1.0, 42, 10), ("node", "3V3", 1.0, 15, 2)):
+    # Re-recorded 2026-09-25 for the native router: buck's `GND` reads 6 clusters (was 7 on KRT's
+    # copper); node's `GND` 42 / largest 10 and `3V3` 15 / largest 2 are unchanged, because those
+    # are tap fields and the tap pattern is the same code under either router.
+    for name, net, amps, groups, biggest in (("buck", "GND", 2.0, 6, 1), ("node", "GND", 1.0, 42, 10), ("node", "3V3", 1.0, 15, 2)):
         text = _text(name)
         cs = _cs(name)
         assert net in {n for n, _lay in poured_planes(text)}, (name, net)
@@ -462,7 +488,17 @@ def test_the_two_cluster_walks_agree_on_every_via_of_every_board():
     # `examples/**/layout/` artifacts', which predate the tap pattern. A fresh build has 3.4x as many
     # vias on c3_usb and 2.2x on node, and blinky now carries one (its `GND` tap) where it used to
     # contribute no key at all, so the walk is held to agree over **177** vias rather than 93.
-    want = {n: c for n, c in (("blinky", 1), ("buck", 7), ("c3_usb", 55), ("node", 86), ("ds2", 28)) if n in BOARDS}
+    # ds2 re-recorded 28 -> 27 on 2026-09-24 (fourth review, C4): the route stage sweeps the router's
+    # dangling copper before emit (`layout_job._drop_dangling`), and ds2's `GPIO0` fanout via at
+    # (20.87, 16.85) was one — joined on F.Cu by its 1.78 mm escape and on B.Cu by nothing, KiCad's
+    # `via_dangling` on the unswept board; the via and then its orphaned escape are taken off, KiCad's
+    # unconnected count stays 0 (`scratchpad/step1b/fix5/measure_moved.py`).
+    # Re-recorded 2026-09-25 for the native router: every via on each emitted board, 1 / 11 / 53 / 84
+    # / 24 (KRT's were 1 / 7 / 55 / 86 / 27), so the walks are held to agree over 173 vias.
+    # Re-recorded the same day for the refuters' D1 (an unfinished net ships no copper): node 84 -> 82,
+    # its two `VBUS` router vias dropped with the rest of `VBUS`; c3_usb's three `VBUS` vias were already
+    # removed as dangling, so it holds at 53; ds2's `REFN_F` had none. 171 vias.
+    want = {n: c for n, c in (("blinky", 1), ("buck", 11), ("c3_usb", 53), ("node", 82), ("ds2", 24)) if n in BOARDS}
     assert seen == want, (seen, want, "every via on every board, and blinky has one now")
 
 
@@ -487,22 +523,31 @@ def test_this_is_not_the_same_question_as_the_bottlenecks_kind():
     three via bottlenecks are all `ok` and owe no rung — a via bottleneck is not the same thing as an
     under-rated one (`docs/stitch-plan.md` §2(p)), and ds2 is the board that shows it.
     """
-    job = compile_design(load_board(_board("node")))
-    text = _text("node")
-    row = power_bottlenecks(job, text)["VBUS"]
-    assert (row["kind"], row["carries"], row["width_mm"], row["verdict"]) == ("via", 0.527, 0.0, "under current"), row
-    assert row["at_mm"].startswith("27.8,36.3 on "), row["at_mm"]
+    # Re-recorded 2026-09-25 for the native router. node's `VBUS` is unrouted at N0 (the path walk
+    # reads `open`), so the illustration moved to buck's `VIN`: the walk names one via, 0.871 A at
+    # (18.588,5.38), `under current`, and the census finds **three** short groups on that net.
+    node = power_bottlenecks(compile_design(load_board(_board("node"))), _text("node"))["VBUS"]
+    assert (node["kind"], node["verdict"]) == ("open", "open"), node
+    job = compile_design(load_board(_board("buck")))
+    text = _text("buck")
+    row = power_bottlenecks(job, text)["VIN"]
+    assert (row["kind"], row["carries"], row["width_mm"], row["verdict"]) == ("via", 0.871, 0.0, "under current"), row
+    assert row["at_mm"].startswith("18.588,5.38 on "), row["at_mm"]
     short = [r for r in via_parallelism(text, job.constraints) if r.add]
-    assert len(short) == 2 and (27.8, 36.3) in {r.at for r in short}, "the walk names one of the two the census finds"
-    # A via bottleneck is not an under-rated via: ds2's three are every one of them rated.
+    assert len(short) == 3 and (18.588, 5.38) in {r.at for r in short}, "the walk names one of the three the census finds"
+    # A via bottleneck is not an under-rated via: ds2's three are every one of them rated (0.871 A
+    # on `3V3` and `VSS`, 0.707 A on `VDDA`, re-recorded 2026-09-25; KRT's were all 0.707).
     if HAS_DS2:
         rows = power_bottlenecks(compile_design(load_board(_board("ds2"))), _text("ds2"))
         vias = {n: r["carries"] for n, r in rows.items() if r["kind"] == "via"}
-        assert sorted(vias) == ["3V3", "VDDA", "VSS"] and set(vias.values()) == {0.707}, vias
+        assert vias == {"3V3": 0.871, "VDDA": 0.707, "VSS": 0.871}, vias
         assert all(r["verdict"] == "ok" for n, r in rows.items() if r["kind"] == "via"), rows
         assert [r for r in via_parallelism(_text("ds2"), _cs("ds2")) if r.add] == [], "and none of them owes a rung"
-    c3 = power_bottlenecks(compile_design(load_board(_board("c3_usb"))), _text("c3_usb"))["VBUS"]
-    assert (c3["kind"], c3["width_mm"], c3["verdict"]) == ("track", 0.127, "under floor"), c3
+    # c3_usb: `VBUS` is unrouted at N0 (was a 0.127 mm track on KRT's copper) and its `3V3` via
+    # bottleneck is rated, so c3_usb still owes no rung.
+    c3 = power_bottlenecks(compile_design(load_board(_board("c3_usb"))), _text("c3_usb"))
+    assert (c3["VBUS"]["kind"], c3["VBUS"]["verdict"]) == ("open", "open"), c3["VBUS"]
+    assert (c3["3V3"]["kind"], c3["3V3"]["carries"], c3["3V3"]["verdict"]) == ("via", 0.871, "ok"), c3["3V3"]
     assert [r for r in via_parallelism(_text("c3_usb"), _cs("c3_usb")) if r.add] == [], "c3_usb owes no rung either"
 
 
@@ -515,26 +560,34 @@ def test_the_lines_say_what_is_there_including_when_nothing_is():
     assert parallel_lines(via_parallelism(_text("blinky"), _cs("blinky"))) == [
         "parallel: no via on any unpoured power net, so there is no group to rate"
     ]
+    # Re-recorded 2026-09-25 for the native router: c3_usb has two rated groups (was four), and
+    # node's `VBUS` has two groups of one 0.4 mm barrel each (0.871 A of 1 A; KRT's were 0.2 mm).
     assert parallel_lines(via_parallelism(_text("c3_usb"), _cs("c3_usb"))) == [
-        "parallel: 4 via group(s) on unpoured power nets, every one rated for its declared current"
+        "parallel: 2 via group(s) on unpoured power nets, every one rated for its declared current"
     ]
-    node = parallel_lines(via_parallelism(_text("node"), _cs("node")))
-    assert node[0] == "VBUS via group at (27.8,36.3): 1 x 0.2 mm drill carries 0.527 A of 1 A [needs 2, so 1 more]", node[0]
-    assert node[-1] == (
-        "parallel: 2 of 3 via group(s) under their rail's declared current (VBUS); 2 more via(s) would carry it"
-    ), node[-1]
+    # Re-recorded 2026-09-25 for the refuters' D1: node's `VBUS` is unrouted and ships no copper, so node
+    # is the empty case too (it read two short `VBUS` groups of copper that is now dropped).
+    assert parallel_lines(via_parallelism(_text("node"), _cs("node"))) == [
+        "parallel: no via on any unpoured power net, so there is no group to rate"
+    ]
+    buck = parallel_lines(via_parallelism(_text("buck"), _cs("buck")))
+    assert buck[0] == "VIN via group at (18.588,5.38): 1 x 0.4 mm drill carries 0.871 A of 2 A [needs 3, so 2 more]", buck[0]
+    assert buck[-1] == (
+        "parallel: 3 of 3 via group(s) under their rail's declared current (VIN); 6 more via(s) would carry it"
+    ), buck[-1]
     # node's return line is the **other** empty case and the sentence has to say which: two nets are
     # watched and neither carries a via, which is not the same as nothing being watched.
     assert return_lines(return_vias(_text("node"), _cs("node")), referenced_nets(_cs("node"))) == [
         "returns: USB_DN, USB_DP carry a reference plane and no via at all, so nothing here changes one"
     ]
+    # Re-recorded 2026-09-25 for the native router: c3_usb's two `USB_DP` vias (was five).
     ret = return_lines(return_vias(_text("c3_usb"), _cs("c3_usb")))
     assert ret[0] == (
-        "USB_DN via at (15.45,1.9) F.Cu->B.Cu [lost]: the via lands the copper in the GND pour's own layer "
+        "USB_DP via at (19.604,21.382) F.Cu->B.Cu [lost]: the via lands the copper in the GND pour's own layer "
         "(B.Cu), which cannot be its own reference; F.Cu was referenced to GND on B.Cu and there is no "
-        "second plane to reach; nearest GND via 2.2472 mm away at (16.25,4)"
+        "second plane to reach; nearest GND via 2.8041 mm away at (16.7999,21.3628)"
     ), ret[0]
-    assert ret[-1] == "returns: 5 via(s) on a referenced net — 5 lost", ret[-1]
+    assert ret[-1] == "returns: 2 via(s) on a referenced net — 2 lost", ret[-1]
 
 
 @pytest.mark.parametrize("name", BOARDS)
@@ -571,8 +624,10 @@ def test_both_counts_run_in_the_build_and_the_census_half_can_stop_nothing(name:
     assert par["fails"] == [] and par["rungs"] == [], (name, par["fails"], par["rungs"])
     assert [(v["net"], tuple(v["at"]), v["verdict"], v["near"][2] if v["near"] else None) for v in ret["vias"]] == [tuple(r) for r in RETURNS[name]], name
     assert ret["verdicts"] == ({} if not RETURNS[name] else {RETURNS[name][0][2]: len(RETURNS[name])}), (name, ret["verdicts"])
+    # Re-recorded 2026-09-25 for the native router: buck's `VIN` is short; node's `VBUS` was too until
+    # the refuters' D1 fix dropped the copper of an unfinished net (node's `VBUS` is unrouted).
     short_nets = sorted({g["net"] for g in par["short"]})
-    assert short_nets == (["VBUS"] if name == "node" else []), (name, short_nets)
+    assert short_nets == {"buck": ["VIN"]}.get(name, []), (name, short_nets)
 
 
 @pytest.mark.parametrize("name", BOARDS)
@@ -592,7 +647,8 @@ def test_the_recorded_dicts_cover_every_board_and_are_internally_consistent():
     # Five, not eleven, and one verdict rather than two: node's seven `net_change` rows were the
     # stale `examples/**/layout/` artifact's and a fresh build gives it none (see `RETURNS`). The
     # `net_change` verdict survives in `RULES`, which is compiled from `board.py` and needs no copper.
-    assert sum(len(v) for v in RETURNS.values()) == 5, "five signal vias on a referenced net, in total"
+    # Re-recorded 2026-09-25 for the native router: two (was five on KRT's copper), both c3_usb's.
+    assert sum(len(v) for v in RETURNS.values()) == 2, "two signal vias on a referenced net, in total"
     assert {v for rows in RETURNS.values() for _net, _at, v, _mm in rows} == {"lost"}
     assert "net_change" in {r for rules in RULES.values() for r in rules.values()}, (
         "the verdict with no copper behind it is still the compiler's, and node is the board that carries it"

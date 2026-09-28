@@ -12,7 +12,6 @@ class BoardSpec:
     pcb: str | None = None
     planes: tuple[tuple[str, str], ...] = ()
     padding: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)
-    net_order: str | None = None
 
 
 @dataclass
@@ -45,12 +44,155 @@ class PlaceSpec:
     edge: str | None = None
     overhang: float = 0.0
     rot_set: bool = False
+    source: str = "board"
+    line: int = 0  # board.py line of the Place(); 0 when not loaded from a board file (a move names it)
 
     def has_css(self) -> bool:
         return any(
             getattr(self, k) is not None
             for k in ("top", "right", "bottom", "left", "width", "height")
         ) or self.position == "absolute"
+
+
+@dataclass
+class Copper:
+    """One KiCad copper primitive: a `(segment)`, an `(arc)`, a `(via)` or a `(zone)`, field for field.
+
+    `kind` picks the primitive (`seg`, `arc`, `via`, `pour`) and every other field is one KiCad
+    token of it — `docs/layout-properties.md` has the table. Fields a primitive does not have stay
+    at their default and are never written. A segment does not declare connectivity; it is copper
+    on a net.
+
+    `id`, `source`, `comment` and `where` are pcbc's, not KiCad's: the handle a `Group` or a core
+    lock names, which file wrote the object, and the file:line it was written on.
+    """
+
+    kind: str  # seg | arc | via | pour
+    id: str
+    net: str | None
+    layer: str | None = "F.Cu"
+    a: tuple[float, float] | None = None  # (start x y)
+    b: tuple[float, float] | None = None  # (end x y)
+    mid: tuple[float, float] | None = None  # arc (mid x y)
+    at: tuple[float, float] | None = None  # via (at x y)
+    width: float | None = None
+    drill: float | None = None
+    size: float | None = None
+    layers: tuple[str, ...] | None = None  # via: its two layers; zone: `(layers ...)` instead of `(layer)`
+    points: tuple[tuple[float, float], ...] = ()  # zone: the first `(polygon (pts ...))`
+    connect: str = "thermal"  # zone connect_pads mode: thermal (no atom) | solid (yes) | none (no) | thru_hole_only
+    via_type: str = "through"  # through | blind | buried | micro
+    source: str = "core"
+    comment: str = ""
+    uuid: str | None = None
+    locked: bool = False
+    # segment and arc
+    solder_mask: bool = False  # `(layers "<cu>" "<side>.Mask")` in place of `(layer "<cu>")`
+    solder_mask_margin: float | None = None
+    # via
+    free: bool = False
+    remove_unused_layers: bool = False
+    keep_end_layers: bool = False
+    zone_layer_connections: tuple[str, ...] = ()
+    tenting: dict | None = None  # {"front": "yes", "back": "no"}
+    covering: dict | None = None
+    plugging: dict | None = None
+    capping: bool | None = None
+    filling: bool | None = None
+    padstack: tuple | None = None  # (mode, ((layer, size), ...))
+    backdrill: tuple | None = None  # (backdrill (size) (layers from to)): (size, (from, to))
+    tertiary_drill: tuple | None = None  # (tertiary_drill (size) (layers from to)): (size, (from, to))
+    front_post_machining: dict | None = None  # (front_post_machining counterbore|countersink (size) (depth) (angle))
+    back_post_machining: dict | None = None  # {"mode": ..., "size": ..., "depth": ..., "angle": ...}, the keys KiCad wrote
+    teardrops: dict | None = None  # the via's (teardrops ...) parameters, KiCad's names
+    # zone
+    name: str | None = None
+    hatch: tuple[str, float] = ("edge", 0.5)
+    priority: int | None = None
+    teardrop_type: str | None = None  # (attr (teardrop (type X)))
+    clearance: float | None = None  # (connect_pads (clearance X))
+    min_thickness: float | None = None
+    filled_areas_thickness: bool | None = None
+    keepout: dict | None = None  # {"tracks": "not_allowed", ...}, KiCad's names and values
+    placement: dict | None = None  # {"enabled": False, "sheetname": ""}
+    filled: bool | None = False  # `(fill yes ...)`: KiCad's flag that the zone is filled; None (a hand-written line) = what KiCad's refill leaves
+    fill_mode: str | None = None  # (fill (mode hatch)); None is solid
+    thermal_gap: float | None = None
+    thermal_bridge_width: float | None = None
+    smoothing: str | None = None
+    radius: float | None = None
+    island_removal_mode: int | None = None
+    island_area_min: float | None = None
+    hatch_thickness: float | None = None
+    hatch_gap: float | None = None
+    hatch_orientation: float | None = None
+    hatch_smoothing_level: int | None = None
+    hatch_smoothing_value: float | None = None
+    hatch_border_algorithm: str | None = None
+    hatch_min_hole_area: float | None = None
+    # zone `(property (layer "F.Cu") (hatch_position (xy x y)))`, one per layer: the hatch fill's
+    # per-layer offset, `{"F.Cu": (x, y)}` in file order; None when KiCad wrote none.
+    hatch_position: dict | None = None
+    # `points` and each of `holes` is a `(polygon (pts ...))`: an entry is an `(xy x y)` point
+    # `(x, y)`, or an `(arc (start) (mid) (end))` entry as the triple `((sx, sy), (mx, my), (ex, ey))`
+    # (`layout_prims.is_arc`). KiCad 10 writes arcs into a zone outline and a `gr_poly` alike.
+    holes: tuple[tuple[tuple[float, float], ...], ...] = ()  # every `(polygon)` after the first, in file order
+    where: str = ""  # file:line the object was written on (provenance, not a KiCad field)
+
+
+@dataclass
+class Pose:
+    """A footprint's pose on the board: its `(at x y rot)`, its `(layer)` and its `(locked)`.
+
+    The one board object of `layout.gen.py` that is not copper. It is written by the generator only;
+    `Place()` in `board.py` says where a part should go (CSS, relations), and a `Pose` is where it is.
+    Everything else on the footprint (pads, graphics, properties, the 3D model) is the `.kicad_mod`'s
+    and `board.py`'s and is not a layout field.
+    """
+
+    ref: str
+    at: tuple[float, float]
+    rot: float = 0.0
+    layer: str = "F.Cu"
+    locked: bool = False
+    source: str = "gen"
+    where: str = ""
+
+
+@dataclass
+class Graphic:
+    """One KiCad board drawing, field for field: a `gr_line`, `gr_rect`, `gr_circle`, `gr_arc`, `gr_poly`,
+    `gr_curve`, `gr_text`, `gr_text_box`, `dimension`, `group`, `image`, `table`, `barcode`, `target`,
+    `point` or `generated`.
+
+    `kind` is the KiCad token itself and `f` holds every field KiCad writes for it, keyed by the Python
+    keyword `layout_prims.SCHEMAS[kind]` names (the same keyword the constructor takes and
+    `layout.gen.py` writes). `id`, `source`, `comment` and `where` are pcbc's, not KiCad's.
+    Footprint pads and graphics stay in the `.kicad_mod`.
+    """
+
+    kind: str
+    id: str
+    f: dict = field(default_factory=dict)
+    source: str = "core"
+    comment: str = ""
+    where: str = ""
+
+    @property
+    def uuid(self) -> str | None:
+        return self.f.get("uuid")
+
+    @uuid.setter
+    def uuid(self, value: str | None) -> None:
+        self.f["uuid"] = value
+
+    @property
+    def layer(self) -> str | None:
+        return self.f.get("layer")
+
+    @property
+    def locked(self) -> bool:
+        return bool(self.f.get("locked"))
 
 
 @dataclass
@@ -97,6 +239,7 @@ class RegionSpec:
     padding_bottom: object = 0
     padding_left: object = 0
     parent: str | None = None
+    title: str | None = None
 
 
 @dataclass
@@ -321,3 +464,16 @@ class Design:
     sch_regions: list[RegionSpec] = field(default_factory=list)
     sch_wire_mm: float = 25.4
     source: str | None = None
+    # Every Python module file under the board's directory that executing `board.py` imported
+    # (`from helper import LEFT`), relative to that directory: a source the build hashes with
+    # `board.py` (`build.part_files`' companion), so an edit to one is stale, never shipped.
+    modules: list[str] = field(default_factory=list)
+    # Every file loading `board.py` was seen to open (`trace`, M2), by content: `{path: sha256}`, the
+    # path relative to the board's directory when under it. Every stage's stamp carries it.
+    reads: dict[str, str] = field(default_factory=dict)
+    # Copper and placement locks. `source` is "board", "core", or "gen".
+    copper: list[Copper] = field(default_factory=list)
+    # Footprint poses read from `layout.gen.py` (`Pose`); `board.py`'s `Place()` stays in `places`.
+    poses: list["Pose"] = field(default_factory=list)
+    # Board graphics that are not copper: outline, silk, text, dimensions, groups.
+    graphics: list[Graphic] = field(default_factory=list)

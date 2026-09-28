@@ -11,10 +11,8 @@ from . import __version__
 from .build import STAGES, build_job, constraint_lines, pcb_job, rules_line
 from .compile import compile_design
 from .language import check_board, load_board
-from .netcheck import KicadMissing, check_erc, check_schematic
 from .project import layout_dir
 from .review import review_job
-from .sch_emit import emit_schematic_file
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -28,7 +26,7 @@ def main(argv: list[str] | None = None) -> int:
     ck.add_argument("--json", action="store_true", help="with --constraints: the ConstraintSet as JSON instead of the lines")
     ck.set_defaults(func=cmd_check)
 
-    bd = sub.add_parser("build", help="check → seed → sch → place → route → fab")
+    bd = sub.add_parser("build", help="check → sch → place → route → fab (native: no board file is an intermediate)")
     bd.add_argument("board")
     bd.add_argument("--upto", default="fab", choices=STAGES)
     bd.add_argument("--force", action="store_true")
@@ -58,7 +56,7 @@ def main(argv: list[str] | None = None) -> int:
     ro = sub.add_parser("route", help="Routing questions about a placed board (today: --channels)")
     ro.add_argument("board")
     ro.add_argument("--channels", action="store_true", help="the congestion map: every channel between two obstacles, what fits through it, and the pads with no way out")
-    ro.add_argument("--json", action="store_true", help="with --channels: the block that goes into copper.json")
+    ro.add_argument("--json", action="store_true", help="with --channels: the congestion map as JSON")
     ro.set_defaults(func=cmd_route)
 
     rv = sub.add_parser("review", help="HTML: schematic, copper, 3D")
@@ -149,7 +147,13 @@ def cmd_build(args: argparse.Namespace) -> int:
         "PCBC_STRICT_POWER": getattr(args, "strict_power", False),
     }
     with _env({k: "1" for k, on in strict.items() if on}):
-        result = build_job(path, upto=args.upto, force=args.force)
+        try:
+            result = build_job(path, upto=args.upto, force=args.force)
+        except ValueError as exc:
+            # A refusal that escaped a stage as an exception is still a refusal with a line, not a
+            # traceback (third review T3).
+            print(f"build: {exc}", file=sys.stderr)
+            return 1
     print(json.dumps(result, indent=2, default=str))
     # On stderr as well as in the JSON: a rail that cannot carry its declared current is the one
     # thing a passing build says that a reader must not scroll past (`ampacity.power_moves`).
@@ -182,20 +186,21 @@ def cmd_sch(args: argparse.Namespace) -> int:
             print(f, file=sys.stderr)
         return 1
     design = load_board(path)
-    sch = layout_dir(path) / "schematic.kicad_sch"
-    report: dict = {}
-    emit_schematic_file(design, sch, title=path.stem, report=report)
-    report["sch"] = str(sch)
-    try:
-        mismatch = check_schematic(design, sch)
-        report["netlist"] = "verified" if not mismatch else mismatch
-        erc = check_erc(sch)
-        report["erc"] = "clean" if not erc["errors"] else erc["errors"]
-        report["erc_warnings"] = erc["warnings"]
-    except KicadMissing as exc:
-        mismatch = []
-        erc = {"errors": [], "warnings": {}}
-        report["netlist"] = report["erc"] = f"unchecked: {exc}"
+    # The same stage `pcbc build` runs (`build.sch_stage`): one writer of `schematic.kicad_sch`, and
+    # its record (`schematic.inputs.json`) written only when KiCad read the netlist and ERC passed.
+    from .build import sch_stage
+
+    step, _err = sch_stage(design, path.resolve(), layout_dir(path.resolve()), name=path.stem)
+    if "sch" not in step:
+        print(f"schematic: {step.get('error')}", file=sys.stderr)
+        return 1
+    sch = Path(step["sch"])
+    report: dict = {"sch": str(sch), "issues": step.get("readability", []), "notes": step.get("notes", [])}
+    report["netlist"] = step.get("netlist")
+    report["erc"] = step.get("erc")
+    report["erc_warnings"] = step.get("erc_warnings", {})
+    mismatch = step["netlist"] if isinstance(step.get("netlist"), list) else []
+    erc = {"errors": step["erc"] if isinstance(step.get("erc"), list) else [], "warnings": step.get("erc_warnings", {})}
     if args.json:
         print(json.dumps(report, indent=2, default=str))
         return 1 if (mismatch or erc["errors"]) else 0
@@ -291,8 +296,8 @@ def cmd_pcb(args: argparse.Namespace) -> int:
 def cmd_route(args: argparse.Namespace) -> int:
     """`pcbc route --channels`: the congestion map of a placed board.
 
-    It places the board first — `pcb_job` is check + seed + place, a pure function of `board.py` with
-    no KiCad and no router in it — and then measures the air between the obstacles. That is the whole
+    It places the board first, in memory (`place_native.place`, a pure function of `board.py` with no
+    KiCad and no router in it) — and then measures the air between the obstacles. That is the whole
     point of the command: the answer is available *before* anything is routed, which is when a
     `Place()` line can still be written.
     """
@@ -319,11 +324,13 @@ def cmd_route(args: argparse.Namespace) -> int:
         for f in result["check"]:
             print(f"  - {f}")
         return 2
+    from .place_native import place
+
     design = load_board(path)
-    job = compile_design(design)
-    text = Path(result["placed"]).read_text()
+    pl = place(design, name=path.stem, base=Path(result["layout"]) / "routed")
+    job = pl.job
     t0 = time.perf_counter()
-    scene = build_scene(design, job, job.constraints, text)
+    scene = build_scene(design, job, job.constraints, pl.feet)
     widths = class_widths(job)
     layers_of = {c.net: c.layers for c in (job.constraints.constraints if job.constraints is not None else ())}
     maps = channels(scene)

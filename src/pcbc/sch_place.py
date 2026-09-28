@@ -317,7 +317,7 @@ def _auto_gap(part, our, other, kinds: dict[str, str] | None) -> float:
     return need
 
 
-def _apply_along(spec: SchPlaceSpec, part, other, occupied: list, kinds=None) -> None:
+def _apply_along(spec: SchPlaceSpec, part, other, occupied: list, kinds=None, gap_extra: dict | None = None) -> None:
     side = spec.side if spec.side in _SIDES else "bottom"
     _, tpin = parse_refpin(spec.along or "?.1")
     op = _find_pin(other, tpin)
@@ -377,6 +377,7 @@ def _apply_along(spec: SchPlaceSpec, part, other, occupied: list, kinds=None) ->
         gap = 2.54
     else:
         gap = _auto_gap(part, our, other, kinds)
+    gap += float((gap_extra or {}).get(part.ref, 0.0))
     plx, ply = lib_to_sheet(our.lx, our.ly, part.rot, part.mirror)
     for i in range(24):
         d = gap + i * 1.27
@@ -392,6 +393,7 @@ def _apply_along(spec: SchPlaceSpec, part, other, occupied: list, kinds=None) ->
                     part.shoved_mm = getattr(part, "shoved_mm", 0.0) + i * 1.27
                     part.shoved_by = blockers[0] if blockers else "?"
                 part.attach_dir = (sx, sy)
+                part.attach_ref = other.ref
                 part.attach_wire = ((owx, owy), pin_world(part, our))
                 part.placed = True
                 return
@@ -420,18 +422,20 @@ def _apply_along(spec: SchPlaceSpec, part, other, occupied: list, kinds=None) ->
                 part.shoved_mm = getattr(part, "shoved_mm", 0.0) + i * 1.27
                 part.shoved_by = blockers[0] if blockers else "?"
             part.attach_dir = (sx, sy)
+            part.attach_ref = other.ref
             part.attach_wire = ((owx, owy), pin_world(part, our))
             part.placed = True
             return
     part.x, part.y = owx - plx, oy1 + gap + part.hh
     part.stuck_on = set(blockers)
     part.attach_dir = (sx, sy)
+    part.attach_ref = other.ref
     part.placed = True
 
 
-def _apply_attach(spec: SchPlaceSpec, part, other, other_pin_name: str, occupied: list, kinds=None, degree=None) -> None:
+def _apply_attach(spec: SchPlaceSpec, part, other, other_pin_name: str, occupied: list, kinds=None, degree=None, gap_extra: dict | None = None) -> None:
     if spec.along:
-        _apply_along(spec, part, other, occupied, kinds)
+        _apply_along(spec, part, other, occupied, kinds, gap_extra)
         return
     op = _find_pin(other, other_pin_name)
     ox, oy = pin_world(other, op)
@@ -505,6 +509,7 @@ def _apply_attach(spec: SchPlaceSpec, part, other, other_pin_name: str, occupied
             gap = min(gap, 5.08)  # a symbol, not a label, goes on this stub
     else:
         poses = [facing]
+    gap += float((gap_extra or {}).get(part.ref, 0.0))
     # The first pose at the asked gap, then a stagger of a few grid steps,
     # then the other poses, then longer slides.
     _STAGGER = 10  # grid steps a part may step out before it changes pose or is reported (12.7 mm: a three-part staircase)
@@ -606,7 +611,7 @@ def _overlap_body(a, b, pad: float = _BODY_PAD) -> bool:
     return _boxes_overlap(body_aabb(a), body_aabb(b), pad)
 
 
-def apply_sch_places(design: Design, parts: list) -> None:
+def apply_sch_places(design: Design, parts: list, gap_extra: dict | None = None) -> None:
     """Set x/y/rot on schematic parts from design.sch_places."""
     by_ref = {p.ref: p for p in parts}
     specs = {s.ref: s for s in design.sch_places}
@@ -668,6 +673,7 @@ def apply_sch_places(design: Design, parts: list) -> None:
                 [by_ref[r] for r in placed],
                 kinds,
                 degree,
+                gap_extra,
             )
             placed.add(spec.ref)
         if len(nxt) == len(pending) and nxt:
@@ -677,6 +683,78 @@ def apply_sch_places(design: Design, parts: list) -> None:
             )
         pending = nxt
     _separate(parts, {s.ref for s in design.sch_places if not s.has_attach()}, kinds)
+    _pack_groups(design, parts)
+
+
+_PACK_ORIGIN = 12.7
+_PACK_PAD = 10.16
+_PACK_HEADER = 6.35
+_PACK_GUTTER = 25.4
+_PACK_ROW = 380.0
+
+
+def _snap(v: float) -> float:
+    return round(v / _GRID) * _GRID
+
+
+def _pack_groups(design, parts: list) -> None:
+    """Sit each SchRegion's parts in declaration order, one gutter apart.
+
+    The region's left/top/width/height only positioned the anchor while the
+    group was being built. The drawn box is fitted later, around the parts.
+    A part belongs to the region of the anchor it hangs from."""
+    regions = list(getattr(design, "sch_regions", []) or [])
+    if not regions:
+        return
+    by_ref = {p.ref: p for p in parts}
+    specs = {s.ref: s for s in design.sch_places}
+
+    def region_of(part) -> str | None:
+        seen: set[str] = set()
+        cur = part
+        while cur is not None and cur.ref not in seen:
+            seen.add(cur.ref)
+            spec = specs.get(cur.ref)
+            if spec is not None and spec.parent:
+                return spec.parent
+            cur = by_ref.get(getattr(cur, "attach_ref", None))
+        return None
+
+    members: dict[str, list] = {r.name: [] for r in regions}
+    for part in parts:
+        name = region_of(part)
+        if name in members:
+            members[name].append(part)
+    cursor_x = _PACK_ORIGIN
+    cursor_y = _PACK_ORIGIN
+    row_h = 0.0
+    for region in regions:
+        group = members[region.name]
+        if not group:
+            continue
+        xs: list[float] = []
+        ys: list[float] = []
+        for part in group:
+            x0, y0, x1, y1 = world_aabb(part)
+            xs += [x0, x1]
+            ys += [y0, y1]
+        x0, y0, x1, y1 = min(xs), min(ys), max(xs), max(ys)
+        width = (x1 - x0) + 2 * _PACK_PAD
+        height = (y1 - y0) + 2 * _PACK_PAD + _PACK_HEADER
+        if cursor_x > _PACK_ORIGIN and cursor_x + width > _PACK_ROW:
+            cursor_x = _PACK_ORIGIN
+            cursor_y += row_h + _PACK_GUTTER
+            row_h = 0.0
+        dx = _snap((cursor_x + _PACK_PAD) - x0)
+        dy = _snap((cursor_y + _PACK_HEADER + _PACK_PAD) - y0)
+        title = getattr(region, "title", None) or region.name
+        for part in group:
+            part.x += dx
+            part.y += dy
+            part.sch_group = region.name
+            part.sch_title = title
+        cursor_x += width + _PACK_GUTTER
+        row_h = max(row_h, height)
 
 
 def _axis(part, other) -> tuple[float, float]:

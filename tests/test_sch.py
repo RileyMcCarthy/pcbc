@@ -171,6 +171,13 @@ def test_rotated_symbol_fields_stay_horizontal():
     assert " 90)" in sch[i : i + 80]
 
 
+def test_regions_draw_a_fitted_titled_box():
+    sch = emit_from_design(load_board(C3_USB), title="c3_usb")
+    for title in ("USB", "3.3 V", "MCU"):
+        assert f'(text "{title}"' in sch
+    assert sch.count("(rectangle") >= 3
+
+
 def test_readability_report_is_empty_for_blinky():
     report: dict = {}
     emit_from_design(load_board(BLINKY), title="blinky", report=report)
@@ -250,12 +257,12 @@ def test_wire_label_sits_mid_wire_not_at_the_pin():
     x, y, just, vjust = float(m.group(1)), float(m.group(2)), m.group(3), m.group(4)
     w = _text_w("CC1") + 0.4
     x0, x1 = (x, x + w) if just == "left" else (x - w, x)
-    # R_CC1.1 sits 10.16 mm left of J1.CC1: the name lies along that wire, on
-    # top of it, and stays clear of the pin end where the number is.
+    # The name lies along the CC1 wire, on top of it, clear of the pin end.
     by = _placed(C3_USB)
     cc1 = pin_world(by["J1"], next(p for p in by["J1"].pins if p.name == "CC1"))
+    far = pin_world(by["R_CC1"], next(p for p in by["R_CC1"].pins if p.net == "CC1"))
     assert abs(y - cc1[1]) < 0.01 and vjust == "bottom"
-    assert cc1[0] - 10.16 - 0.6 <= x0 and x1 <= cc1[0] - 1.0
+    assert min(far[0], cc1[0]) - 0.6 <= x0 and x1 <= max(far[0], cc1[0]) - 1.0
 
 
 def test_the_same_board_gives_the_same_file():

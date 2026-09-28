@@ -96,20 +96,20 @@ Place("R_PD", to="Q1.G")
 Board(width=60, height=45, layers=4, stackup="jlcpcb_4l_1oz", planes=[("GND", "In1.Cu"), ("3V3", "In2.Cu")])
 
 # Schematic: six groups, one SchPlace() per part. Attached parts pose themselves.
-SchRegion("usb", left=12, top=12, width=170, height=110)
+SchRegion("usb", title="USB", left=12, top=12, width=170, height=110)
 SchPlace("J1", parent="usb", left=90, top=12)
 SchPlace("R_CC1", to="J1.CC1")
 SchPlace("R_CC2", to="J1.CC2")
 SchPlace("U3", to="J1.DP1", side="bottom", gap=15.24)
 
-SchRegion("pwr", left=200, top=12, width=170, height=60)
+SchRegion("pwr", title="3.3 V", left=200, top=12, width=170, height=60)
 SchPlace("U2", parent="pwr", left=60, top=20)
 SchPlace("C_VBUS", to="U2.VIN")
 SchPlace("C_VBUS_HF", along="C_VBUS.1", side="bottom")
 SchPlace("C_3V3", to="U2.VOUT")
 SchPlace("C_3V3_HF", along="C_3V3.1", side="bottom")
 
-SchRegion("mcu", left=200, top=90, width=190, height=150)
+SchRegion("mcu", title="MCU", left=200, top=90, width=190, height=150)
 SchPlace("U1", parent="mcu", left=90, top=10)
 SchPlace("C_MCU", to="U1.3V3")
 SchPlace("C_MCU_HF", along="C_MCU.1", side="bottom")
@@ -121,20 +121,20 @@ SchPlace("SW_BOOT", along="R_BOOT.2", side="bottom")
 SchPlace("R_LED", to="U1.IO10")
 SchPlace("D1", to="R_LED.2")
 
-SchRegion("sensor", left=12, top=140, width=170, height=60)
+SchRegion("sensor", title="Sensor", left=12, top=140, width=170, height=60)
 SchPlace("U4", parent="sensor", left=70, top=10)
 # Four pins on the left need three symbols and this cap: hangers sit out at 15.24 so the symbols have room.
 SchPlace("C_BME", to="U4.VDD", gap=15.24)
 SchPlace("R_SDA", to="U4.SDI", gap=15.24)
 SchPlace("R_SCL", to="U4.SCK", gap=15.24)
 
-SchRegion("analog", left=12, top=215, width=170, height=70)
+SchRegion("analog", title="Analog", left=12, top=215, width=170, height=70)
 SchPlace("U5", parent="analog", left=70, top=15)
 SchPlace("C_OPA", to="U5.V+")
 SchPlace("R_NTC", to="U5.+")
 SchPlace("R_TDIV", along="R_NTC.2", side="bottom")
 
-SchRegion("load", left=200, top=250, width=190, height=45)
+SchRegion("load", title="Load", left=200, top=250, width=190, height=45)
 SchPlace("R_G", parent="load", left=20, top=15, rotate=90)  # the group's anchor, lying left to right
 SchPlace("R_PD", along="R_G.2", side="bottom")
 SchPlace("Q1", to="R_G.2")

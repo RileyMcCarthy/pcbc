@@ -108,26 +108,6 @@
    "width": 4
   }
  ],
- "krt": {
-  "length_match": [],
-  "planes": [],
-  "power_nets": [
-   "VBUS",
-   "3V3",
-   "GND"
-  ],
-  "sensitive": [],
-  "skip_patterns": [],
-  "usb_pairs": [
-   {
-    "class": "USB",
-    "nets": [
-     "USB_DP",
-     "USB_DN"
-    ]
-   }
-  ]
- },
  "layers": 2,
  "nets": [
   {

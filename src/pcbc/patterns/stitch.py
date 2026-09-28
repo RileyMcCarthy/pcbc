@@ -3,9 +3,9 @@
 Every other pattern in this package connects something: a hop joins two pads, a spine feeds a rail,
 a tap welds a pad to its plane. Take any of their copper away and a pad is unreached. Take a stitch
 away and the board still works — worse, but connected. That difference is the whole reason this
-module can run in the `final` stage, **after every KRT step**, where nothing can react to it: a
-stitch that loses its site costs a shield or a barrel, not a pad, so no router step has to follow it
-and `route.krt_plan` schedules none (`patterns.FINAL`).
+module can run in the `final` stage, **after the router**, where nothing can react to it: a stitch
+that loses its site costs a shield or a barrel, not a pad, so no router step has to follow it and
+`route_native.route_stage` runs none (only the relaxer, which does not move a stitch: `RELAXABLE`).
 
 **Four carriers ship, and `CARRIERS` runs them least-free-first.** `parallel` (S4) doubles a barrel a
 power rail is limited by — a barrel's rating is a **count**, not a width, since `via_amps` is the
@@ -52,7 +52,7 @@ from typing import TYPE_CHECKING, Sequence
 
 from ..ampacity import VIA_PARALLEL_MM
 from ..constraints import ConstraintSet
-from ..blocking import move_line
+from ..moves import move_line
 from ..route_emit import Piece, seg_piece, via_piece
 from ..route_geom import EPS_MM, MICRO_MM, Pt, clears, gap, q, track_shape, via_shape
 from ..route_scene import Clash, Item, Run, Scene, antipad_clash, blocked, clear_runs, net_runs
@@ -118,8 +118,7 @@ CONNECTS = False
 
 The two halves of that are different for the two kinds of carrier and both end in `False`. A guard
 (S7) writes `GND` copper to shield *another* net, so `claimed.add(res.net)` would make
-`PatternPlan.done` — which `krt_plan` drops nets from and `signals` writes `!NET` for — say something
-false about a net no pattern routed. A **parallel** rung is on its own net and still connects no pad
+`PatternPlan.done` say something false about a net no pattern routed. A **parallel** rung is on its own net and still connects no pad
 to anything: the anchor was already joined to the rail and the twin is a second path beside it, so
 "this net is now done" would be a claim about pad connectivity that the copper does not make.
 `net_open` would answer the same before and after, which is exactly the sense in which a rung is
@@ -178,6 +177,13 @@ class StitchSpec:
     one of them (`route_verify.plane_stitch`). Carrying the pair alone would check two layers of a
     three-layer pour and call it done."""
 
+    blocks: tuple = ()
+    """Carrier `thermal`: the land's pads, one entry per `(pad ...)` it is drawn as (the ESP32-C3-MINI's
+    `49` is nine), each the boxes of that pad's primitives; `()` for the rest. A land drawn as several
+    pads gets **a barrel in every one of them** before any gets a second (`run`): a block with none
+    moves no heat through the board, and the gate on the finished board fails such a land with the
+    blocker that emptied it (`route_verify.ThermalArray.bare`, the third refutation round)."""
+
     pitch: float = 0.0
     """The lattice's centre-to-centre, mm (carrier `plane`); 0.0 for the rest.
 
@@ -187,9 +193,9 @@ class StitchSpec:
 
     guard: "GuardPath | None" = None
     """The run a `guard` spec shields and the two offset polylines it shields it with, `None` for
-    every other carrier — and `None` on a `guard` spec too when the net is one **KRT** routed, which
-    is the deferral of `docs/r2-design.md` B.6 and the one spec in this module built in order to write
-    nothing.
+    every other carrier — and `None` on a `guard` spec too when the net's copper is not pcbc's (a
+    core line, or none yet), which is the deferral of `docs/r2-design.md` B.6 and the one spec in this
+    module built in order to write nothing.
 
     Carried whole for `budget`'s reason one step further: the *path* is an earlier stage's copper and
     the *offset* is arithmetic over the compiled clearances, so a spec that flattened them into fields
@@ -1010,6 +1016,19 @@ def _vias_of(scene: Scene, net: str) -> list[dict]:
     return sorted(out, key=lambda v: v["at"])
 
 
+def _vias_in_land(scene: Scene, net: str, boxes: tuple, dia: float) -> tuple[Pt, ...]:
+    """The centres of every via of `net` already on the board whose ring (`dia`) lies inside one
+    primitive of the land (`boxes`, the primitives' boxes): the barrels a locked core array already
+    put there, which `_thermal_specs` counts toward the array instead of placing again."""
+    r = dia / 2.0
+    out = []
+    for v in _vias_of(scene, net):
+        x, y = v["at"]
+        if any(b[0] + r <= x <= b[2] - r and b[1] + r <= y <= b[3] - r for b in boxes):
+            out.append((x, y))
+    return tuple(out)
+
+
 def specs(ctx: PatternCtx) -> tuple[StitchSpec, ...]:
     """Every spec this module has, in `CARRIERS`' order: the parallel groups, the thermal lands, the
     guarded runs.
@@ -1053,7 +1072,18 @@ def _thermal_specs(ctx: PatternCtx) -> tuple[StitchSpec, ...]:
         pitch, why = thermal_pitch(ctx.scene, budget.net, budget.via)
         boxes = tuple(it.box() for it in prims)
         sites = sites_lattice(ctx, boxes, pitch, budget.via[0]) if boxes else ()
-        need = len(sites) if budget.fill else budget.need
+        # Barrels of this net already inside the land — a `layout.core.py` array locked verbatim from
+        # a previous build's `layout.gen.py` — are the array, or the start of it: they count toward
+        # `need` and their sites are spent. Measured before this (third review D2): every copper line
+        # of c3_usb locked verbatim gave a second nine-via array on top of the first, 68 drills for 59.
+        have = _vias_in_land(ctx.scene, budget.net, boxes, budget.via[0])
+        sites = tuple(at for at in sites if all(math.hypot(at[0] - v[0], at[1] - v[1]) >= budget.via[0] for v in have))
+        blocks = _land_blocks(prims)
+        # One barrel in every pad of the land is the floor, whatever the budget asks: a pad with none
+        # moves no heat through the board (the third refutation round: at 0.35 W the nine-block land
+        # asked for 9 and got 9 in 6 blocks, three bare).
+        bare = sum(1 for blk in blocks if not any(_in_boxes(v, blk, budget.via[0]) for v in have))
+        need = len(sites) if budget.fill else max(0, budget.need - len(have), bare)
         layer = _land_layer(ctx.scene, prims)
         out.append(
             StitchSpec(
@@ -1074,9 +1104,32 @@ def _thermal_specs(ctx: PatternCtx) -> tuple[StitchSpec, ...]:
                 at=prims[0].at() if prims else (0.0, 0.0),
                 width=0.0,  # an array via carries no link; see `_pieces`
                 budget=budget,
+                blocks=blocks,
             )
         )
     return tuple(out)
+
+
+def _land_blocks(prims: tuple[Item, ...]) -> tuple:
+    """The land's pads, in scene order: per `(pad ...)` (owner and `Item.block`), its primitives' boxes."""
+    out: dict[tuple[str, int], list] = {}
+    for it in prims:
+        out.setdefault((it.owner, it.block), []).append(it.box())
+    return tuple(tuple(v) for v in out.values())
+
+
+def _in_boxes(at: Pt, boxes, dia: float) -> bool:
+    """Is a ring of `dia` at `at` wholly inside one of `boxes`?"""
+    r = dia / 2.0
+    return any(b[0] + r <= at[0] <= b[2] - r and b[1] + r <= at[1] <= b[3] - r for b in boxes)
+
+
+def _block_of(spec: StitchSpec, at: Pt) -> int:
+    """Which pad of a thermal land a site sits in (its index in `spec.blocks`), -1 for none."""
+    for k, boxes in enumerate(spec.blocks):
+        if any(b[0] <= at[0] <= b[2] and b[1] <= at[1] <= b[3] for b in boxes):
+            return k
+    return -1
 
 
 def _land_layer(scene: Scene, prims: tuple[Item, ...]) -> str:
@@ -1103,9 +1156,9 @@ def _parallel_specs(ctx: PatternCtx) -> tuple[StitchSpec, ...]:
     file.** `scene.plane_of` is `route_scene.plane_targets`, which `poured_planes`' own docstring
     names as "the right source for a pattern deciding where to put copper"; `poured_planes` reads
     filled zones and is the right source for a check reading a board KiCad has already refilled. The
-    difference is not cosmetic at this stage and it is the largest single number in the slice:
-    measured on node at `patterns_final`, the two plane zones are **written but not yet filled**, so
-    `poured_planes` returns `()` and using it would have handed this pattern 13 `3V3` groups and 30
+    difference is not cosmetic at this stage and it is the largest single number in the slice: at
+    the `final` stage no pour is filled yet (KiCad fills the emitted board), so
+    `poured_planes` would return `()` and using it would have handed this pattern 13 `3V3` groups and 30
     `GND` groups — forty-three rungs of redundant copper through both inner planes, on two rails
     whose conductor is the plane and whose vias are taps carrying one pad's share. The compiled
     answer says `GND -> In1.Cu` and `3V3 -> In2.Cu` at every stage of the route, which is the fact
@@ -1171,14 +1224,13 @@ def _owned_runs(ctx: PatternCtx, net: str) -> tuple[tuple[Pt, ...], ...]:
     """The runs of `net` that **pcbc itself routed**, in `paths_of`' order.
 
     B.6's precondition, asked the only way it can be asked honestly: off `PatternCtx.owned`, the list
-    of pieces pcbc has written in this route. The board file cannot answer it — KRT locks its own
-    constrained-net copper, so `(locked yes)` is not a provenance — and the scene cannot either,
-    because a scene is a board and a board has no memory of who wrote what.
+    of pieces pcbc has written in this route. The scene cannot answer it — a scene is a board and a
+    board has no memory of who wrote what (a core line is locked copper pcbc did not write).
 
     `route_verify.paths_of` does the walk, and it is the right walk rather than a convenient one: it
     groups by `(net, reason, layer)` and **ends a chain at a junction**, so a spine's rib and its trunk
-    are two runs and each is guarded as the straight thing it is. A run that pcbc wrote and KRT then
-    extended comes back as pcbc's half alone, which is exactly the copper pcbc may offset.
+    are two runs and each is guarded as the straight thing it is. A run that pcbc wrote and a core
+    line extends comes back as pcbc's half alone, which is exactly the copper pcbc may offset.
     """
     from ..route_verify import paths_of
 
@@ -1193,17 +1245,12 @@ def _guard_specs(ctx: PatternCtx) -> tuple[StitchSpec, ...]:
 
     **The run pcbc owns** becomes a spec with a `GuardPath`: the two offset polylines, the offset's
     arithmetic, and the stitch sites along each flank. **A net pcbc did not route** becomes a spec
-    with no path at all, which `run` turns into B.6's deferral sentence and no copper. The second is
-    not an error case bolted on: measured 2026-09-21 on all five boards, it is what a real board does.
-    pcbc routes something end to end on four of the five — blinky's `LED`, c3_usb's `CC1`/`CC2`/`LED`,
-    node's `CC1`/`CC2`/`LED`/`LED_A`/`LOAD`, and ten hops on the DS2 Addon — but on the one board that
-    declares an analog net at all, **every declared-analog net is KRT's**: `AIN0..AIN3`, `REFP_F` and
-    `REFN_F` are `kind="analog"`, which compiles to one layer and `via.allowed=False`, and they are
-    routed by KRT's `analog_nets` step. The intersection of "a net pcbc routed" and "a net an author
-    guards" is empty on all five, and the deferral is therefore the *output*, not the exception.
+    with no path at all, which `run` turns into B.6's deferral sentence and no copper: a net whose
+    copper is a `layout.core.py` line, or that the router left unrouted (natively every routed net's
+    copper is pcbc's, the router's included).
 
     And where a pcbc run does exist, the flanks are mostly not there. Measured at the pre/mid stage —
-    an upper bound, because `final` sees every piece of KRT's copper too — the fraction of both flanks
+    an upper bound, because `final` sees every piece of the router's copper too — the fraction of both flanks
     that `clear_runs` reports clear at the derived offset is: blinky `LED` **90.4 %** (an almost empty
     board), node `LOAD` 65.3 %, c3_usb `3V3` 24-79 % over its four runs, the DS2 Addon's ten hops
     **7.2 to 15.5 %**, and node's `LED` and c3_usb's `LED` have one flank at **0.000 mm**. A hop
@@ -1261,12 +1308,10 @@ def _plane_specs(ctx: PatternCtx) -> tuple[StitchSpec, ...]:
 
     *"Plane edges stitched every 5 mm when two ground pours face each other across layers."* The
     population is exactly the nets `route_scene.plane_targets` gives more than one layer, and until
-    S8's enabling change **no board could have one**: `Board()` refused `planes=` below three layers
-    outright, `krt_plan` read `job.planes` only above two, and measured 2026-09-21 before the change
-    `plane_targets` was `(('GND','B.Cu'),)` on four boards and `(('GND','In1.Cu'),('3V3','In2.Cu'))`
-    on node — four boards with one pour and one board with two pours of two *different* nets, between
-    which a via is a short. That is `docs/stitch-plan.md` section 2(l)'s measurement and it is why the
-    technique was deferred; the router reading the declaration is what created the population.
+    S8's enabling change **no board could have one** (`docs/stitch-plan.md` section 2(l)): the five
+    boards pour one net once, or two *different* nets (node), between which a via is a short. A
+    declared `planes=` is read on every stackup (`route_scene.plane_targets`), and that is what creates
+    the population (`tests/fixtures/planes`).
 
     **One spec per net, not per layer pair, because every via pcbc writes is a through via.** A single
     lattice ties every pour of one net at once, so a net poured on three layers still gets one
@@ -1403,8 +1448,8 @@ def _run_ids(scene: Scene, net: str, layer: str, path: Sequence[Pt]) -> tuple[in
     Two readings of one run, and both are needed: `ctx.owned` says *who wrote it*, which no board file
     records, and `net_runs` says *which items it is* in the scene the candidates are judged against,
     which no list of pieces records. They are matched on the endpoints rather than trusted to agree,
-    so a run KRT extended past pcbc's copper contributes only the scene items whose ends lie on the
-    path pcbc owns.
+    so a run a core line extends past pcbc's copper contributes only the scene items whose ends lie on
+    the path pcbc owns.
     """
     want = set(path)
     out: list[int] = []
@@ -1555,9 +1600,36 @@ def run(ctx: PatternCtx, spec: StitchSpec) -> PatternResult:
     merged = 0
     crowded = 0
     unreached = 0
-    for at in spec.sites:
+    per_block: dict[int, list] = {}  # thermal: block -> [placed, sites tried, worst clash]
+
+    def walk():
+        """The sites in their order — except a thermal land's: every pad of the land first, each one's
+        sites in order until one takes a barrel, then the rest in rank-major order. So a pad whose best
+        site is blocked (a track under the top row of the ESP32's land) takes its next site before any
+        other pad takes a second barrel, and a pad left bare is one where every site was tried."""
+        if not (thermal and len(spec.blocks) > 1):
+            yield from spec.sites
+            return
+        order: dict[int, list] = {}
+        for at in spec.sites:
+            order.setdefault(_block_of(spec, at), []).append(at)
+        done: set = set()
+        for k, sites in order.items():
+            if k < 0:
+                continue
+            for at in sites:
+                done.add(at)
+                yield at
+                if per_block.get(k, [0])[0]:
+                    break
+        yield from (at for at in spec.sites if at not in done)
+
+    for at in walk():
         if len(placed) == spec.need:
             break
+        blk = per_block.setdefault(_block_of(spec, at), [0, 0, None]) if thermal else None
+        if blk is not None:
+            blk[1] += 1
         cand = _pieces(ctx, spec, at)
         if linked and cand[1].mm < MICRO_MM:
             continue  # a link KiCad's own `track_segment_length` rule would count; the ring is wider
@@ -1581,23 +1653,28 @@ def run(ctx: PatternCtx, spec: StitchSpec) -> PatternResult:
             seen.append(clash)
             if worst is None or (clash.need - clash.have) > worst[0]:
                 worst = (clash.need - clash.have, clash)
+            if blk is not None and (blk[2] is None or (clash.need - clash.have) > (blk[2].need - blk[2].have)):
+                blk[2] = clash
             continue
         fits, lane = lane_ok(scene, cand, ())
         if not fits:
             lane_why = lane_why or lane
             continue
         if any(not r.reaches(at, spec.via[0] / 2.0) for r in rasters):
-            # D.5, and `docs/stitch-plan.md` section 4 will not ship without it: on two layers the
-            # pour is `gnd_pour`'s, written before this stage but **not filled** until the gate
-            # refills, so a site the fill will not reach is a barrel welded to a pad on one layer and
+            # D.5, and `docs/stitch-plan.md` section 4 will not ship without it: an outer pour is
+            # written before this stage but **not filled** until KiCad fills the emitted board, so a
+            # site the fill will not reach is a barrel welded to a pad on one layer and
             # to nothing on the other. It is the array's far end that would be missing, which is the
             # half `thermal_budget` measures and the half the whole technique is for.
             unreached += 1
             continue
         placed.append(at)
         pieces.extend(cand)
+        if blk is not None:
+            blk[0] += 1
     got = len(placed)
-    if got == spec.need:
+    bare_notes = _bare_notes(ctx, spec, per_block) if thermal and len(spec.blocks) > 1 else ()
+    if got == spec.need and not bare_notes:
         return PatternResult(
             reason=_reason(spec),
             net=spec.net,
@@ -1612,9 +1689,11 @@ def run(ctx: PatternCtx, spec: StitchSpec) -> PatternResult:
             notes=(_cover(ctx, spec, got, "", placed).line(),) if spec.carrier == "plane" else (),
         )
     if not spec.required:
-        # R-S3's other half: a target applies partially and reports the shortfall, in **one** note.
+        # R-S3's other half: a target applies partially and reports the shortfall, in **one** note —
+        # and a thermal land with a bare pad one more per bare pad, naming what emptied it.
         stopped = _shortfall(spec, tried, worst[1] if worst else None, unreached, lane_why, crowded)
-        return PatternResult(reason=_reason(spec), net=spec.net, pieces=tuple(pieces), tried=tried, notes=(_cover(ctx, spec, got, stopped, placed).line(),))
+        cover = (_cover(ctx, spec, got, stopped, placed).line(),) if got < spec.need else ()
+        return PatternResult(reason=_reason(spec), net=spec.net, pieces=tuple(pieces), tried=tried, notes=cover + bare_notes)
     return PatternResult(
         reason=REASON,
         net=spec.net,
@@ -1627,12 +1706,12 @@ def run(ctx: PatternCtx, spec: StitchSpec) -> PatternResult:
 
 
 DEFERRED = (
-    "guard {net}: deferred - the net is routed by KRT, not by a pattern, so pcbc cannot offset a path "
-    "it does not own. R3 owns this."
+    "guard {net}: deferred - the net's copper is not pcbc's (a core line, or none yet), so pcbc cannot "
+    "offset a path it does not own."
 )
 """B.6's deferral, verbatim, and it is a **note** rather than a `Refusal`.
 
-Every refusal in this repo is a move ending in a `board.py` edit (`blocking.move_line`), and there is
+Every refusal in this repo is a move ending in a `board.py` edit (`moves.move_line`), and there is
 no edit that makes pcbc route the DS2 Addon's `AIN0`: it is `kind="analog"`, which compiles to one
 layer and `via.allowed=False`, and the pattern that would route a constrained net is the maze router
 R3 has not written. The only "edit" a refusal could offer is *delete the `Guard()` line*, which is not
@@ -1733,6 +1812,22 @@ def _run_guard(ctx: PatternCtx, spec: StitchSpec) -> PatternResult:
         if k not in held:
             dropped.append(f"a {mm:.3f} mm stretch on the {name} got no stitch via, so nothing would weld it to the {spec.net} pour")
             continue
+        # The shield ends on its outermost vias (fourth review, C4). A track end that overhangs the
+        # last via touches nothing, which is KiCad's `track_dangling`, and the build never ships a
+        # dangling track: before this, the route stage's dangling sweep took every guard track off
+        # the fixture board and then every stitch via it had orphaned, and the guard gate reported
+        # "pcbc wrote no guard copper". A stretch with one via has no track that is not dangling.
+        cut = _between_vias(pts, [v.a for v in held[k]])
+        if cut is None:
+            dropped.append(f"a {mm:.3f} mm stretch on the {name} got one stitch via; a shield track ends on a via at each end, so it needs two")
+            continue
+        if cut != pts:
+            if not shape_ok(cut):
+                dropped.append(f"a {mm:.3f} mm stretch on the {name} is not 0/45/90 once cut to its outer vias")
+                continue
+            pts = cut
+            mm = sum(math.dist(pts[i], pts[i + 1]) for i in range(len(pts) - 1))
+            segs = pieces_of(pts, [spec.width] * (len(pts) - 1), net=spec.net, reason=GUARD_REASON, layer=gp.layer, owner=spec.owner, board=ctx.board)
         pieces.extend(segs)
         pieces.extend(held[k])
         guarded += mm
@@ -1744,6 +1839,44 @@ def _run_guard(ctx: PatternCtx, spec: StitchSpec) -> PatternResult:
         floor_ok=got > 0 and guarded + 1e-9 >= floor, why=spec.owner, blocked="; ".join(dropped[:2]),
     )
     return PatternResult(reason=GUARD_REASON, net=spec.net, pieces=tuple(pieces), tried=tried, notes=(cover.line(),))
+
+
+def _between_vias(pts: Sequence[Pt], vias: Sequence[Pt]) -> tuple[Pt, ...] | None:
+    """`pts` cut to the stretch between the first and last of `vias` along it (each via taken at its
+    nearest point on the polyline, on KiCad's 1 nm grid), or None when that is a point.
+
+    Why: a track's end is joined only to what it lands on, so a shield whose end runs past its last
+    stitch via is dangling copper by KiCad's rule (`track_dangling`), however well its vias weld the
+    rest of it. Cut at the vias, both ends of every guard track land inside a via."""
+    legs = [(pts[i], pts[i + 1]) for i in range(len(pts) - 1)]
+    run = [0.0]
+    for a, b in legs:
+        run.append(run[-1] + math.dist(a, b))
+    params = []
+    for v in vias:
+        best = None
+        for i, (a, b) in enumerate(legs):
+            dx, dy = b[0] - a[0], b[1] - a[1]
+            L2 = dx * dx + dy * dy
+            t = 0.0 if L2 == 0 else max(0.0, min(1.0, ((v[0] - a[0]) * dx + (v[1] - a[1]) * dy) / L2))
+            p = (a[0] + t * dx, a[1] + t * dy)
+            d = math.dist(p, v)
+            if best is None or d < best[0] - 1e-12:
+                best = (d, run[i] + t * math.dist(a, b), i, p)
+        params.append(best)
+    lo = min(params, key=lambda b: b[1])
+    hi = max(params, key=lambda b: b[1])
+    if hi[1] - lo[1] < 1e-6:
+        return None
+
+    if lo[1] < 1e-6 and hi[1] > run[-1] - 1e-6:
+        return tuple(pts)
+    out = [(q(lo[3][0]), q(lo[3][1]))] + [pts[j] for j in range(lo[2] + 1, hi[2] + 1)] + [(q(hi[3][0]), q(hi[3][1]))]
+    clean: list[Pt] = []
+    for p in out:
+        if not clean or math.dist(clean[-1], p) > 1e-6:
+            clean.append(p)
+    return tuple(clean) if len(clean) >= 2 else None
 
 
 def _stretches(ctx: PatternCtx, spec: StitchSpec, poly: Sequence[Pt]) -> tuple[tuple[Pt, ...], ...]:
@@ -1861,17 +1994,17 @@ def _guard_refuse_pour(ctx: PatternCtx, spec: StitchSpec) -> Refusal:
 def _raster(ctx: PatternCtx, spec: StitchSpec) -> tuple:
     """Every pour this spec's via has to be reached by, as a predicted reach; `()` for the rest.
 
-    `tap._raster`'s body and its reason, asked for the barrels: on four layers KRT's `planes` step
-    has written the zone and `route_verify.plane_islands` judges it after the gate refills; on two the
-    pour is `gnd_pour`'s, written just before this stage and unfilled, so nothing is measurable yet
-    and the raster is the only thing between a barrel and an island.
+    `tap._raster`'s body and its reason, asked for the barrels: no pour is filled while the route
+    stage runs (KiCad fills the emitted board), so for an outer-layer pour the raster is the only thing
+    between a barrel and an island.
 
     **A tuple rather than one raster, because a plane spec has two pours and both of them decide.**
     A `thermal` spec lands in one pad and one pour and asks about the pour; a `plane` spec's whole
     point is the pair, so a via reached by the front pour and not the back is a via that ties one
     plane to nothing — the same orphan `route_verify.guard_cover` exists for, one layer over. Only
-    the outer layers are predicted: an inner pour is a zone KRT has already written, and
-    `plane_islands` and `plane_area` measure it after the refill, which is the stronger check.
+    the outer layers are predicted: an inner plane carries no signal copper on its layer
+    (`route_native.route_layers`), and `plane_islands` and `plane_area` measure it after the fill,
+    which is the stronger check.
     """
     from ..route_verify import pour_raster
 
@@ -1963,6 +2096,53 @@ def _thermal_refuse(ctx: PatternCtx, spec: StitchSpec, blockers: str, rule: str)
             sep="\n  ",
         ),
     )
+
+
+BARE = "bare pad"
+"""The words every bare-pad note of a thermal land starts its clause with (`_bare_notes`); the gate
+on the finished board quotes the notes that carry them (`build._thermal_gate`)."""
+
+
+def _bare_notes(ctx: PatternCtx, spec: StitchSpec, per_block: dict) -> tuple[str, ...]:
+    """One note per pad of a thermal land left with no barrel: where it is, how many of its sites were
+    tried, the worst blocker and the edit that moves it (`_moves`). Empty when every pad has one."""
+    out = []
+    for k, boxes in enumerate(spec.blocks):
+        placed, tried, clash = per_block.get(k, [0, 0, None])
+        if placed:
+            continue
+        x0 = min(b[0] for b in boxes)
+        y0 = min(b[1] for b in boxes)
+        x1 = max(b[2] for b in boxes)
+        y1 = max(b[3] for b in boxes)
+        at = ((x0 + x1) / 2.0, (y0 + y1) / 2.0)
+        n = sum(1 for s in spec.sites if _block_of(spec, s) == k)
+        if clash is not None:
+            why = f"all {tried} of its {n} site(s) tried, worst blocker {clash.item.label()} at {clash.at[0]:g},{clash.at[1]:g} leaving {clash.have:.3f} mm of {clash.need:.3f} mm (rule: {clash.rule})"
+        elif n == 0:
+            why = f"no {spec.via[0]:g} mm ring fits inside it"
+        else:
+            why = f"{tried} of its {n} site(s) tried and none cleared"
+        out.append(f"thermal {spec.owner}: {BARE} at ({at[0]:g},{at[1]:g}) (pad {k + 1} of the land's {len(spec.blocks)}) has no barrel: {why}. {_bare_moves(ctx, spec, clash)}")
+    return tuple(out)
+
+
+def _bare_moves(ctx: PatternCtx, spec: StitchSpec, clash: Clash | None) -> str:
+    """The edits that give a bare pad of a thermal land its barrel, each ending in a `board.py` line:
+    take the blocker off its layer (it is another net's copper; a `NetReq(layers=)` routes it on the
+    other side), or turn or move the land's part so the land clears it."""
+    ref = spec.owner.split(".")[0]
+    edits = []
+    if clash is not None and clash.item.reason == "core":
+        edits.append(f"move {clash.item.owner} off the land or delete it (it is a lock, so pcbc routes around it and never moves it)")
+    elif clash is not None and clash.item.kind in ("track", "via") and clash.item.net and clash.item.net != spec.net:
+        layer = sorted(clash.item.layers)[0] if len(clash.item.layers) == 1 else "this layer"
+        other = "F.Cu" if layer == "B.Cu" else _other(ctx)
+        edits.append(f'NetReq("{clash.item.net}", layers=["{other}"]) takes {clash.item.owner} off {layer} under the land')
+    elif clash is not None and clash.item.kind == "pad" and "." in clash.item.owner:
+        edits.append(f'move {clash.item.owner.split(".")[0]} (its Place()) off the land')
+    edits.append(f'turn or move {ref} (its Place(), e.g. rotate=) so the land clears it')
+    return "Moves: " + "; or ".join(edits) + "."
 
 
 def _shortfall(spec: StitchSpec, tried: int, clash: Clash | None, unreached: int, lane: str, crowded: int = 0) -> str:
@@ -2112,8 +2292,8 @@ def _in_a_pad(scene: Scene, spec: StitchSpec, at: Pt) -> Clash | None:
     anyway, because a via inside a passive's pad wicks the joint whatever net it is on. A tap exempts
     the one primitive it is welding — it has to, that is the connection it exists to make. A rung
     welds nothing: the twin's job is to sit beside a barrel, not on a pad, so every pad of its own
-    net is asked at `via_to_same_net_smd_pad`, which is the number `route.py` hands KRT as
-    `--same-net-pad-clearance` on every step that may place a via.
+    net is asked at `via_to_same_net_smd_pad`, the number every via pcbc places keeps from a same-net
+    SMD pad.
 
     **A `plane` barrel is asked the same question and for the same reason**, which is worth saying
     because a plane lattice's net is a poured net and most of its pads are the pour's: a ground pad is

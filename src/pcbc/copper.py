@@ -316,9 +316,10 @@ def power_ampacity_failures(
 ) -> list[str]:
     """The hard gate: **pcbc must not write a necked power track**, and a rail must have copper.
 
-    `owned` is `(net, reason, width_mm)` per piece pcbc wrote, off `routed/copper.json`; `fab_job`
-    reads the sidecar beside the board and passes it. With it empty only the missing-rail rule can
-    fire, which is what a board with no pattern copper has to be judged by.
+    `owned` is `(net, reason, width_mm)` per piece pcbc wrote, read off the board's own `pcbc:` role
+    groups with the width the board has (`fab.board_roles` -> `layout_job.roles_doc`); the router's
+    sidecar `copper.json` is consumed by normalise and nothing here reads it. With it empty only the
+    missing-rail rule can fire, which is what a board with no pattern copper has to be judged by.
 
     **What this deliberately does not judge, and why.** Until the S7 review this function compared
     the net's *widest* track (`copper_by_net`'s `width` is a `max`) against IPC, so one wide segment
@@ -326,11 +327,9 @@ def power_ampacity_failures(
     19.39 mm of 0.3905 mm copper on a 2 A rail, and returned `[]` just as readily on the
     patterns-off board whose `VIN` is two thirds fab-floor copper (findings 1, 7, 12, 20). The honest
     whole-net question is the **bottleneck** between the net's pads, and `ampacity.power_bottlenecks`
-    asks it and reports the answer. It is not this gate because three of the five boards fail it
-    today and R2 cannot fix them: the copper that necks is KRT's leftover, and R3's maze router owns
-    the leftover (`docs/r2-measurements.md` S7, open issues). Making a build-stopping error out of a
-    number no slice in R2 can move would stop every board instead of measuring the necks; the
-    numbers are pinned per board in `test_examples_fab.py` as a ledger that must fall.
+    asks it and reports the answer as a power move (`ampacity.power_moves`; `--strict-power` makes it
+    stop the build). The numbers are pinned per board in `test_examples_fab.py` (`BOTTLENECK`) as a
+    ledger that must not get worse.
 
     So the criterion here is the one pcbc *is* answerable for, and it is failable: a pattern's own
     copper, at the class width the pattern declared, with the one exemption R-I3 already grants

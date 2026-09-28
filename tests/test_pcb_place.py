@@ -11,6 +11,7 @@ from pcbc.cli import main
 from pcbc.compile import compile_design
 from pcbc.language import check_board, load_board
 from pcbc.pcb_place import Foot, Pad, _face, _farads, _rot_for_face, resolve_places
+from pcbc.place_native import seed_feet
 
 EXAMPLES = Path(__file__).resolve().parent.parent / "examples"
 C3_USB = EXAMPLES / "c3_usb" / "c3_usb.py"
@@ -45,6 +46,19 @@ REST = "".join(
 )
 
 
+# F.1's `usb_hs` budget line. `PRESETS` gives the fast kinds no `airwire_mm` and
+# `route_checks.FAST_KINDS` records the two derivations that were weighed and refuted, so a board
+# declaring `usb_hs` without `max_mm=` or `length_mm=` now gets a move saying so with its measured
+# span. c3_usb and node are both such boards (20.747 / 20.645 mm and 39.124 / 38.971 mm of
+# pad-to-pad MST, measured 2026-09-22) and `tests/test_route_checks.py` pins the text. The tests
+# below are about placement **relations**, so they assert those two lines are the only report there
+# is — a third move, or a different pair of nets, fails here rather than hiding.
+def _relations(report: list[str]) -> list[str]:
+    fast = [m for m in report if "no budget checks it" in m]
+    assert sorted(m.split(":")[0] for m in fast) == ["USB_DN", "USB_DP"], fast
+    return [m for m in report if "no budget checks it" not in m]
+
+
 def _placed(board: Path) -> tuple[dict, dict]:
     result = pcb_job(board)
     assert result.get("error") is None, result
@@ -70,7 +84,7 @@ def test_to_puts_the_pad_next_to_the_pin_outside_the_target(tmp_path: Path):
     result, poses = _placed(board)
     design = load_board(board)
     job = compile_design(design)
-    places, moves, _fids = resolve_places(design, job, Path(result["placed"]).read_text())
+    places, moves, _fids = resolve_places(design, job, seed_feet(design))
     assert moves == []
     from pcbc.layout import footprints_by_ref
     from pcbc.pcb_place import parse_foot
@@ -85,7 +99,7 @@ def test_to_puts_the_pad_next_to_the_pin_outside_the_target(tmp_path: Path):
     assert _dist(u2.pad_world(vout), cap.pad_world(cpad)) < 2.5
     ub, cb = u2.world_box(), cap.world_box()
     assert cb[0] >= ub[2] or cb[2] <= ub[0] or cb[1] >= ub[3] or cb[3] <= ub[1], "the cap sits inside U2's keepout"
-    assert result["layout_report"] == []
+    assert _relations(result["layout_report"]) == []
 
 
 def _pad_to_pin(result: dict, ref: str, target: str, net: str) -> float:
@@ -110,7 +124,7 @@ def test_two_parts_on_one_pin_share_it_in_file_order(tmp_path: Path):
     """The first Place() written gets the closest spot (pad to pin), whichever cap it is."""
     board = _c3(tmp_path, ANCHORS + REST)
     result, _poses = _placed(board)
-    assert result["layout_report"] == [], result["layout_report"]
+    assert _relations(result["layout_report"]) == [], result["layout_report"]
     assert _pad_to_pin(result, "C_MCU_HF", "U1", "3V3") < _pad_to_pin(result, "C_MCU", "U1", "3V3")
     swapped = _c3(tmp_path / "swapped", ANCHORS + REST.replace('Place("C_MCU_HF", to="U1.3V3")\nPlace("C_MCU", to="U1.3V3")\n', 'Place("C_MCU", to="U1.3V3")\nPlace("C_MCU_HF", to="U1.3V3")\n'))
     r2, _p2 = _placed(swapped)
@@ -150,7 +164,7 @@ def test_a_part_placed_on_a_closed_row_keeps_out_of_the_lane(tmp_path: Path):
     """U2 (SOT-23-5) has three 0.95 mm pads on one side; the cap on its VIN pad stops past the lane."""
     board = _c3(tmp_path, ANCHORS + REST)
     result, poses = _placed(board)
-    assert result["layout_report"] == [], result["layout_report"]
+    assert _relations(result["layout_report"]) == [], result["layout_report"]
     from pcbc.layout import footprints_by_ref
     from pcbc.pcb_place import lane_rules, parse_foot
 
@@ -245,7 +259,7 @@ def test_the_same_board_places_the_same(tmp_path: Path):
 def test_c3_usb_layout_bar():
     result = pcb_job(C3_USB)
     assert result.get("error") is None, result
-    assert result["layout_report"] == [], result["layout_report"]
+    assert _relations(result["layout_report"]) == [], result["layout_report"]
 
 
 def test_cli_pcb(capsys):

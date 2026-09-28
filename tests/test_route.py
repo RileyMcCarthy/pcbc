@@ -1,7 +1,9 @@
-"""Copper: KRT routes, KiCad judges, ids are pinned, the AI never draws a track."""
+"""Copper: the native router routes, KiCad judges, ids are derived from geometry, the AI never draws a
+track."""
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -9,7 +11,7 @@ import pytest
 from pcbc.build import build_job
 from pcbc.language import load_board
 from pcbc.netcheck import check_copper, compare, copper_nets, expected_nets
-from pcbc.route import copper_layers, krt_missing, pin_copper_ids, route_job
+from pcbc.stackup import copper_layers
 
 EXAMPLES = Path(__file__).resolve().parent.parent / "examples"
 BLINKY = EXAMPLES / "blinky" / "blinky.py"
@@ -19,18 +21,6 @@ C3_USB = EXAMPLES / "c3_usb" / "c3_usb.py"
 def test_copper_layers_by_count():
     assert copper_layers(2) == ["F.Cu", "B.Cu"]
     assert copper_layers(4) == ["F.Cu", "In1.Cu", "In2.Cu", "B.Cu"]
-
-
-def test_copper_ids_are_keyed_by_order_not_chance():
-    text = (
-        '(kicad_pcb\n\t(segment\n\t\t(start 0 0)\n\t\t(uuid "aaaa")\n\t)\n'
-        '\t(via\n\t\t(at 1 1)\n\t\t(uuid "bbbb")\n\t)\n'
-        '\t(segment\n\t\t(start 2 2)\n\t\t(uuid "cccc")\n\t)\n)\n'
-    )
-    once = pin_copper_ids(text, "b")
-    assert "aaaa" not in once and "bbbb" not in once and "cccc" not in once
-    assert once == pin_copper_ids(text.replace("aaaa", "zzzz"), "b")  # KRT's random ids do not matter
-    assert once != pin_copper_ids(text, "other-board")
 
 
 def test_copper_nets_reads_pad_bindings():
@@ -50,16 +40,6 @@ def test_compare_speaks_copper_when_asked():
     assert fails == ["LED: copper net 'LED' is missing D1.2"]
 
 
-def test_route_without_krt_says_how_to_get_it(tmp_path: Path, monkeypatch):
-    monkeypatch.setenv("KRT_HOME", str(tmp_path / "nowhere"))
-    assert "git clone" in (krt_missing() or "")
-    design = load_board(BLINKY)
-    src = tmp_path / "in.kicad_pcb"
-    src.write_text("(kicad_pcb)\n")
-    result = route_job(design, src, out=tmp_path / "out" / "layout.kicad_pcb")
-    assert result["router"] is None and "KiCadRoutingTools not found" in result["error"]
-
-
 @pytest.mark.kicad
 def test_placed_board_fails_the_copper_gate_as_unconnected(tmp_path: Path):
     import shutil
@@ -73,11 +53,10 @@ def test_placed_board_fails_the_copper_gate_as_unconnected(tmp_path: Path):
     gate = check_copper(load_board(board), placed)
     assert not gate["ok"]
     assert gate["unconnected"] > 0
-    assert gate["nets"] == [], gate["nets"]  # the seed binds every pad exactly as board.py says
+    assert gate["nets"] == [], gate["nets"]  # the placed footprints bind every pad exactly as board.py says
 
 
 @pytest.mark.kicad
-@pytest.mark.krt
 def test_blinky_routes_clean_and_the_same_twice(tmp_path: Path):
     outs = []
     for i in (1, 2):
@@ -87,92 +66,14 @@ def test_blinky_routes_clean_and_the_same_twice(tmp_path: Path):
         result = build_job(board, upto="route", force=True)
         assert result.get("error") is None, result
         step = result["steps"][-1]
-        assert step["stage"] == "route" and step["router"] == "krt"
-        assert step["segments"] > 0 and step["unrouted"] == []
+        assert step["stage"] == "route" and step["router"] == "native"
+        assert step["emitted"]["segments"] > 0 and not step.get("unrouted")
         assert step["copper"] == "verified", step
         outs.append((board.parent / "layout" / "blinky" / "routed" / "layout.kicad_pcb").read_bytes())
     assert outs[0] == outs[1], "routed copper is not byte-for-byte"
     design = load_board(tmp_path / "b1" / "blinky.py")
     text = outs[0].decode()
     assert copper_nets(text) == expected_nets(design)
-
-
-def test_route_starts_from_a_clean_work_dir(tmp_path: Path, monkeypatch):
-    """A killed build left 01_analog_nets.kicad_pro behind; KRT read it as the next step's
-    project and routed FB twice, shorting it into the JST's GND pad."""
-    monkeypatch.setenv("KRT_HOME", str(tmp_path / "nowhere"))
-    design = load_board(BLINKY)
-    src = tmp_path / "in.kicad_pcb"
-    src.write_text("(kicad_pcb)\n")
-    work = tmp_path / "routed"
-    work.mkdir()
-    for name in ("01_analog_nets.kicad_pcb", "01_analog_nets.kicad_pro", "03_signals.kicad_pcb"):
-        (work / name).write_text("stale")
-    route_job(design, src, out=work / "layout.kicad_pcb")
-    assert sorted(p.name for p in work.iterdir()) == ["layout.kicad_pcb"]
-
-
-def test_a_net_krt_could_not_finish_is_reported_as_a_move():
-    """KRT prints failed nets in its summary while the net still has copper; pcbc's open-net
-    check saw the copper and said nothing, and the gate then reported 'unconnected items'."""
-    from pcbc.route import _krt_summary
-
-    log = 'noise\nJSON_SUMMARY_MIN: {"failed": 3, "failed_single": ["VSS"], "multipoint_deficit": 3, "open_single": [], "routed": 5, "vias": 2}\nEXIT=0\n'
-    assert _krt_summary(log) == {"failed": 3, "failed_single": ["VSS"], "multipoint_deficit": 3, "open_single": [], "routed": 5, "vias": 2}
-    assert _krt_summary("nothing here") == {}
-
-
-def test_a_pad_krt_left_open_is_reported_whichever_field_names_it():
-    """The DS2 Addon's ground pin: route.py said `pad_pairs_open: {nets: [GND]}` with an empty
-    `failed_single`, route_planes.py said `unconnected pad U1 on 'GND' at (22.18, 15.07)`, and
-    pcbc read neither: 'unrouted: []', then the gate found the open item."""
-    from pcbc.route import _krt_summary, _unreached_pads
-
-    log = 'JSON_SUMMARY_MIN: {"failed": 1, "failed_single": [], "multipoint_deficit": 1, "open_single": [], "pad_pairs_open": {"count": 1, "nets": ["GND"]}, "routed": 0, "vias": 26}\n'
-    assert _krt_summary(log)["pad_pairs_open"] == {"count": 1, "nets": ["GND"]}
-    pour = "      GND: 4/5 pads connected to plane on B.Cu\n          unconnected pad U1 on 'GND' at (22.18, 15.07) [F.Cu]\n"
-    assert _unreached_pads(pour) == [("U1", "GND", "22.18", "15.07")]
-    assert _unreached_pads("all connected") == []
-    # The pour's list only annotates a net a route step left open: KRT's bare pour defers every
-    # tap to the route step after it (node: 55 GND pads "unconnected", all welded a step later).
-    from pcbc.compile import compile_design
-    from pcbc.language import load_board
-    from pcbc.route import _unrouted_move
-
-    design = load_board(Path(__file__).resolve().parent.parent / "examples" / "blinky" / "blinky.py")
-    move = _unrouted_move(compile_design(design), design, "GND", [f"P{i} at (0, {i})" for i in range(9)])
-    assert "the pour could not reach P0 at (0, 0), " in move and "P5 at (0, 5), ..." in move and "P6" not in move
-
-
-def test_an_unrouted_differential_pair_is_a_move_that_names_the_edit_that_works():
-    """A pair's refusal is the one that names a *step* rather than a shape, and the one whose move
-    had to be checked against the compiler before it could be written down.
-
-    `route_diff.py` routes one coupled path per net and nothing else, so a pair net with a third pad
-    -- a USB-C connector's flip-side `B6`/`B7`, an ESD array's second side -- has pads its own step
-    was never going to reach. c3_usb's `USB_DP` carries **five** (`J1.A6, J1.B6, U1.27, U3.1,
-    U3.6`), and the wildcard `signals` step is what reaches them: measured 2026-09-21, excluding
-    pairs from `signals` leaves 3 pads open on c3_usb and 6 on node and neither board builds. So a
-    pair that reaches this message is genuinely boxed in, or it is asking to stop being a pair.
-
-    The move says `autoroute=True` and says explicitly that `pair=False` is **not** the edit,
-    because `pair=False` compiles and does nothing: the `usb_hs` preset carries
-    `autoroute="diff_pair"` and `constraints.py`'s `if req.pair:` can only turn it on. Compiling
-    c3_usb with `pair=False` still yields `autoroute == "diff_pair"`; with `autoroute=True` it
-    yields `True`. A refusal whose move is a no-op is worse than no refusal.
-    """
-    from pcbc.compile import compile_design
-    from pcbc.language import load_board
-    from pcbc.route import _unrouted_move
-
-    design = load_board(Path(__file__).resolve().parent.parent / "examples" / "c3_usb" / "c3_usb.py")
-    job = compile_design(design)
-    move = _unrouted_move(job, design, "USB_DP")
-    assert "as a differential pair on F.Cu, B.Cu" in move
-    assert "NetReq('USB_DP', 'USB_DN', kind='usb_hs', autoroute=True)" in move
-    assert "**Not `pair=False`**" in move
-    # The generic branch is untouched: a plain net still gets the placement move.
-    assert "found no path on any layer" in _unrouted_move(job, design, "VBUS")
 
 
 def test_pair_false_is_the_no_op_the_pair_refusal_warns_about(tmp_path: Path):
@@ -197,3 +98,49 @@ def test_pair_false_is_the_no_op_the_pair_refusal_warns_about(tmp_path: Path):
 
     assert _auto(line.replace("pair=True", "pair=False")) == "diff_pair"  # the no-op
     assert _auto(line.replace("pair=True", "autoroute=True")) is True  # the edit that works
+
+
+@pytest.mark.kicad
+def test_the_route_stage_leaves_nothing_of_an_earlier_build(tmp_path: Path):
+    """Every output of the route stage from an earlier build is unlinked before it starts (so a refused
+    build never leaves an older board behind): the gen file, the emitted board, its sidecars, and the
+    unrouted problem files. What is left is exactly what this build wrote."""
+    board = tmp_path / "blinky.py"
+    board.write_text(BLINKY.read_text())
+    work = tmp_path / "layout" / "blinky" / "routed"
+    (work / "unrouted").mkdir(parents=True)
+    (work / "unrouted" / "LED-1.json").write_text("{}")
+    result = build_job(board, upto="route", force=True)
+    assert result.get("error") is None, result
+    assert not (work / "unrouted").exists(), "a problem file from an earlier build survived a clean route"
+    assert sorted(p.name for p in work.iterdir()) == ["layout.gen.py", "layout.kicad_dru", "layout.kicad_pcb", "layout.kicad_prl", "layout.kicad_pro"]
+
+
+@pytest.mark.kicad
+def test_an_unrouted_net_is_a_move_with_its_lines_and_a_problem_file():
+    """N0 (docs/native-plan.md §3.6, As built 12): a net the native router cannot finish ships no
+    generated copper at all; the build still emits, fills and runs every gate, then fails with
+    `unrouted:`, one move per missing link and a closing line saying what was dropped,
+    each naming what is in the way by its `board.py` line and pointing at a problem file; no stamp, no
+    fab; KiCad's unconnected nets are exactly the router's unrouted nets. Measured on c3_usb, whose
+    `VBUS` has no path out of the USB-C connector J1 (2026-09-25)."""
+    from conftest import routed_result
+
+    out, result = routed_result("c3_usb", C3_USB)
+    assert str(result["error"]).startswith("unrouted:"), result["error"]
+    route = next(s for s in result["steps"] if s["stage"] == "route")
+    assert set(route["unconnected_nets"]) == set(result["unrouted"]), (route["unconnected_nets"], result["unrouted"])
+    layout = out.parent.parent
+    assert not (layout / "fab").exists() and not (layout / "inputs.json").exists()
+    assert result["moves"], result
+    links = [m for m in result["moves"] if "cannot reach" in m]
+    closing = [m for m in result["moves"] if m not in links]
+    assert links and [m.split(":")[0] for m in closing] == sorted(result["unrouted"]), closing
+    assert all("unfinished, so none of its generated copper" in m for m in closing), closing
+    for move in links:
+        assert "Move:" in move and "Problem file:" in move, move
+        assert "board.py" in move or "layout.core.py" in move, move
+        name = move.split("Problem file: ")[1].split("/")[-1].strip()
+        doc = json.loads((out.parent / "unrouted" / name).read_text())
+        assert doc["net"] in result["unrouted"] and doc["scene_near"], doc
+    assert "Traceback" not in result["error"]

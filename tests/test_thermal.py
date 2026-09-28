@@ -24,8 +24,8 @@ from pcbc.language import load_board
 from pcbc.patterns import PatternCtx, pattern_copper
 from pcbc.patterns import stitch as st
 from pcbc.route_geom import EPS_MM, _nm
-from pcbc.route_scene import build_scene
 from pcbc.stackup import get_stackup, via_theta_c_per_w, vias_for_theta
+from boardtext import scene_from_text
 
 ROOT = Path(__file__).resolve().parent.parent
 EXAMPLES = ROOT / "examples"
@@ -46,7 +46,7 @@ def _ctx(name: str) -> PatternCtx:
     design = load_board(_board(name))
     job = compile_design(design)
     text = placed_board(name, _board(name)).read_text()
-    scene = build_scene(design, job, job.constraints, text)
+    scene = scene_from_text(design, job, job.constraints, text)
     return PatternCtx(scene=scene, design=design, job=job, cs=job.constraints, board=name, stage="final")
 
 
@@ -186,7 +186,8 @@ def test_a_net_with_no_pour_is_refused_and_the_move_is_the_one_that_writes_the_p
     )
     (refusal,) = compile_constraints(load_board(board)).refusals
     assert "3V3 has no plane or pour to reach" in refusal, refusal
-    assert 'NetReq("3V3", kind="power") is what makes krt_plan write the back pour' in refusal, refusal
+    # Re-worded 2026-09-25 for the native router: the pour rule is `route_scene.plane_targets`, not a router flag.
+    assert 'NetReq("3V3", kind="power") is what gives it the back pour (route_scene.plane_targets)' in refusal, refusal
 
 
 def test_a_foreign_plane_needs_consent_and_the_refusal_carries_the_arithmetic(tmp_path: Path):
@@ -448,7 +449,7 @@ def test_fill_places_every_site_that_fits_instead_of_the_budgets_count(tmp_path:
     design = load_board(board)
     job = compile_design(design)
     text = placed_board("c3_usb", _board("c3_usb")).read_text()
-    scene = build_scene(design, job, job.constraints, text)
+    scene = scene_from_text(design, job, job.constraints, text)
     ctx = PatternCtx(scene=scene, design=design, job=job, cs=job.constraints, board="c3_usb", stage="final")
     spec = st._thermal_specs(ctx)[0]
     assert job.constraints.thermals[0].need == 9 and spec.need == 36 == spec.bound
@@ -467,13 +468,13 @@ def test_the_array_is_via_in_pad_by_definition_and_the_blocker_list_does_not_gro
     `fab.via_in_pad_blockers` must not grow by one row: the array's barrels are IC / heatsink lands
     and the passive rule is untouched.
     """
-    from pcbc.route_emit import write_pieces
+    from boardtext import write_pieces
 
     for name, n in (("c3_usb", 9), ("node", 12)):
         design = load_board(_board(name))
         job = compile_design(design)
         text = placed_board(name, _board(name)).read_text()
-        plan = pattern_copper(design, job, job.constraints, text, name, stage="final")
+        plan = pattern_copper(design, job, job.constraints, name, stage="final", scene=scene_from_text(design, job, job.constraints, text))
         vias = [p for p in plan.pieces if p.reason == "thermal"]
         assert len(vias) == n, name
         before = via_in_pad(text)
@@ -579,7 +580,8 @@ def test_the_gate_can_fail_and_it_fails_on_the_thing_nothing_else_can_see():
     **refilled and saved**, which is the only moment both halves of the containment exist, and it is
     the same reason `plane_checks` calls a missing zone a sentence rather than a `continue`.
     """
-    from pcbc.route_emit import via_piece, write_pieces
+    from pcbc.route_emit import via_piece
+    from boardtext import write_pieces
     from pcbc.route_verify import thermal_budget
 
     design = load_board(_board("c3_usb"))
@@ -599,9 +601,14 @@ def test_the_gate_can_fail_and_it_fails_on_the_thing_nothing_else_can_see():
     assert ok.pitch_mm == 1.975, ok.pitch_mm
     # And the half nothing else can see: a barrel that is not under the land at all.
     adrift = list(good[:-1]) + [via_piece("GND", "thermal", (2.0, 2.0), 0.5, 0.3, owner="U1.49")]
-    (bad,) = thermal_budget(write_pieces(text, adrift[-1:]), adrift, job.constraints)
+    (bad,) = thermal_budget(write_pieces(placed_board("c3_usb", _board("c3_usb")).read_text(), adrift), adrift, job.constraints)
     assert (bad.got, bad.in_pad, bad.verdict) == (9, 8, "adrift"), bad
     assert "8 inside the land" in bad.line() and "(adrift)" in bad.line(), bad.line()
+    # A barrel of the net inside the land that no `pcbc:thermal` group names — a `layout.core.py`
+    # array locked verbatim — is the array too (third review D2): the board with all nine and only
+    # eight handed over as pieces still measures nine.
+    (locked,) = thermal_budget(text, list(good[:-1]), job.constraints)
+    assert (locked.got, locked.in_pad) == (9, 9), locked
 
 
 # --- determinism ------------------------------------------------------------------------------------
@@ -614,5 +621,5 @@ def test_the_array_is_a_function_of_the_board_and_not_of_the_run():
         design = load_board(_board(name))
         job = compile_design(design)
         text = placed_board(name, _board(name)).read_text()
-        runs = [pattern_copper(design, job, job.constraints, text, name, stage="final").text for _ in range(3)]
+        runs = [[(p.uuid, p.a, p.b, p.w) for p in pattern_copper(design, job, job.constraints, name, stage="final", scene=scene_from_text(design, job, job.constraints, text)).pieces] for _ in range(3)]
         assert runs[0] == runs[1] == runs[2], name

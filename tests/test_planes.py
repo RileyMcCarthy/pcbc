@@ -3,7 +3,7 @@
 `docs/router-plan.md` R-E1, `docs/stitch-plan.md` section 8 item 1, S8. R-E1 is one sentence —
 *"plane edges stitched every 5 mm when two ground pours face each other across layers"* — and it was
 deferred for a measured reason: **no board could pour one net on two facing layers.** `language.Board`
-refused `planes=` below three layers outright, `route.krt_plan` read `job.planes` only above two, and
+refused `planes=` below three layers outright, the old router read `job.planes` only above two, and
 so the five boards were four at `(('GND','B.Cu'),)` and node at `(('GND','In1.Cu'),('3V3','In2.Cu'))`
 — two pours of two *different* nets, between which a via is a short. Shipping R-E1 therefore meant
 landing a routing change first, which the panel judged "larger and riskier than the stitching feature
@@ -23,7 +23,7 @@ Three subjects, in the order the slice built them:
 Every board here is read **read-only**, the DS2 Addon's included (it lives outside this repo, and
 nothing in `~/Documents/MaD` is written by this suite). Nothing reads `examples/**/layout/`, which is
 gitignored build output: a **placed** board comes from `conftest.placed_board` (pure Python, no
-KiCad) and the one test that needs a **routed** one is marked `kicad` + `krt`.
+KiCad) and the one test that needs a **routed** one is marked `kicad`.
 """
 
 from __future__ import annotations
@@ -39,20 +39,21 @@ from pcbc.copper_bar import REDUNDANT
 from pcbc.fanout import fanout_pieces
 from pcbc.language import load_board
 from pcbc.patterns import PatternCtx, merge_plans, pattern_copper
-from pcbc.route import krt_plan
-from pcbc.route_emit import REASONS, via_piece, write_pieces
+from pcbc.route_native import plane_pours
+from pcbc.route_emit import REASONS, via_piece
+from boardtext import WithText, with_text, write_pieces
 from pcbc.route_geom import Pt
-from pcbc.route_scene import build_scene, plane_targets
+from pcbc.route_scene import plane_targets
 from pcbc.route_verify import BRANCH_REASONS, plane_stitch, plane_stitch_lines
 from pcbc.stackup import C_MM_PER_NS, get_stackup
 import pcbc.patterns.stitch as st
+from boardtext import scene_from_text
 
 ROOT = Path(__file__).resolve().parent.parent
 EXAMPLES = ROOT / "examples"
 FIXTURE = ROOT / "tests" / "fixtures" / "planes" / "planes.py"
 DS2 = Path.home() / "Documents" / "MaD" / "Hardware" / "DS2Addon" / "pcbc" / "ds2_addon.py"
 HAS_DS2 = DS2.exists()
-KRT_HOME = Path.home() / "Downloads" / "KiCadRoutingTools"
 
 EXAMPLE_BOARDS = ("blinky", "buck", "c3_usb", "node")
 
@@ -77,12 +78,13 @@ def _final_ctx(name: str):
     design = load_board(_board(name))
     job = compile_design(design)
     board = "ds2_addon" if name == "ds2" else name
-    pre = pattern_copper(design, job, job.constraints, _placed(name).read_text(), board, stage="pre")
-    fan, _n = fanout_pieces(design, job, pre.text, board, pre.scene, claimed=pre.claimed)
+    base = _placed(name).read_text()
+    pre = pattern_copper(design, job, job.constraints, board, stage="pre", scene=scene_from_text(design, job, job.constraints, base))
+    fan, _n = fanout_pieces(design, job, board, scene=pre.scene, claimed=pre.claimed)
     pre.scene.add(pre.scene.item_of(p) for p in fan)
-    mid = pattern_copper(design, job, job.constraints, write_pieces(pre.text, fan), board, stage="mid", scene=pre.scene)
-    merged = merge_plans(pre, mid)
-    scene = build_scene(design, job, job.constraints, merged.text)
+    mid = pattern_copper(design, job, job.constraints, board, stage="mid", scene=pre.scene)
+    merged = WithText(merge_plans(pre, mid), write_pieces(base, list(pre.pieces) + list(fan) + list(mid.pieces)))
+    scene = scene_from_text(design, job, job.constraints, merged.text)
     ctx = PatternCtx(scene=scene, design=design, job=job, cs=job.constraints, board=board, stage="final", owned=tuple(merged.pieces) + tuple(fan))
     return ctx, merged
 
@@ -172,38 +174,27 @@ def test_the_route_plan_of_every_example_board_is_unmoved_by_the_enabling_change
     for name, pours in want.items():
         job = compile_design(load_board(_board(name)))
         assert plane_targets(job) == pours, name
-    steps = {}
+    # The native route stage turns that one rule into `Pour` objects (`route_native.plane_pours`):
+    # one per target, clearance the Default class's, connected solid, inset by the stackup's edge
+    # clearance — the fields every shipped plane carried (tests/fixtures/native/krt_baseline.json).
+    got = {}
     for name in EXAMPLE_BOARDS:
         design = load_board(_board(name))
         job = compile_design(design)
-        plan = krt_plan(job, design, _placed(name), Path("/nonexistent-work"), KRT_HOME, post=True, final=True)
-        steps[name] = [s for s, _cmd in plan]
-        pour_args = [[c for c in cmd if not c.startswith("/")][:8] for s, cmd in plan if s in ("planes", "gnd_pour")]
-        if name == "node":
-            assert pour_args == [["-X", "utf8", "--nets", "GND", "3V3", "--plane-layers", "In1.Cu", "In2.Cu"]], pour_args
-        else:
-            assert pour_args == [["-X", "utf8", "--nets", "GND", "--plane-layers", "B.Cu", "--clearance", "0.16"]], (name, pour_args)
-    assert steps == {
-        "blinky": ["patterns_post", "signals", "gnd_pour", "finalize", "patterns_final"],
-        "buck": ["local_hops", "analog_nets", "switchnode_nets", "patterns_post", "signals", "gnd_pour", "finalize", "patterns_final"],
-        "c3_usb": ["local_hops", "pair_usb_dn", "patterns_post", "signals", "gnd_pour", "finalize", "patterns_final"],
-        "node": ["local_hops", "analog_nets", "pair_usb_dn", "planes", "patterns_post", "plane_taps", "signals", "patterns_final"],
-    }, steps
+        got[name] = [(p.net, p.layer, p.clearance, p.connect, p.points[0]) for p in plane_pours(design, job, name)]
+    assert got == {
+        "blinky": [("GND", "B.Cu", 0.16, "solid", (0.3, 0.3))],
+        "buck": [("GND", "B.Cu", 0.16, "solid", (0.3, 0.3))],
+        "c3_usb": [("GND", "B.Cu", 0.16, "solid", (0.3, 0.3))],
+        "node": [("GND", "In1.Cu", 0.18, "solid", (0.3, 0.3)), ("3V3", "In2.Cu", 0.18, "solid", (0.3, 0.3))],
+    }, got
 
 
-def test_a_two_layer_board_that_declares_two_pours_gets_a_gnd_pour_step_that_names_both():
-    """The branch S8 created, read off the plan: `gnd_pour` pours what `plane_targets` says, and the
-    repeat in `--nets` is load-bearing because `route_planes.py` pairs it with `--plane-layers`
-    positionally (`route._uniq`)."""
+def test_a_two_layer_board_that_declares_two_pours_gets_both_as_objects():
+    """The branch S8 created: the route stage pours what `plane_targets` says, both layers of one net."""
     design = load_board(FIXTURE)
     job = compile_design(design)
-    plan = krt_plan(job, design, _placed("planes"), Path("/nonexistent-work"), KRT_HOME, post=True, final=True)
-    names = [s for s, _cmd in plan]
-    assert names[-3:] == ["gnd_pour", "finalize", "patterns_final"], names
-    cmd = next(cmd for s, cmd in plan if s == "gnd_pour")
-    assert [c for c in cmd if not c.startswith("/")][:9] == [
-        "-X", "utf8", "--nets", "GND", "GND", "--plane-layers", "F.Cu", "B.Cu", "--clearance",
-    ], cmd
+    assert [(p.net, p.layer) for p in plane_pours(design, job, "planes")] == [("GND", "F.Cu"), ("GND", "B.Cu")]
 
 
 def test_plane_of_is_the_outermost_pour_and_not_the_order_the_author_wrote(tmp_path: Path):
@@ -296,8 +287,9 @@ def test_the_refusal_names_the_missing_keyword_and_is_a_move_a_board_can_act_on(
 
     design = load_board(work)
     job = compile_design(design)
-    pre = pattern_copper(design, job, job.constraints, placed_board("planes_noedge", work).read_text(), "noedge", stage="pre")
-    scene = build_scene(design, job, job.constraints, pre.text)
+    base = placed_board("planes_noedge", work).read_text()
+    pre = pattern_copper(design, job, job.constraints, "noedge", stage="pre", scene=scene_from_text(design, job, job.constraints, base))
+    scene = scene_from_text(design, job, job.constraints, write_pieces(base, pre.pieces))
     ctx = PatternCtx(scene=scene, design=design, job=job, cs=job.constraints, board="noedge", stage="final", owned=tuple(pre.pieces))
     (spec,) = st._plane_specs(ctx)
     assert spec.sites == () and spec.bound == 0 and spec.pitch == 0.0
@@ -526,7 +518,7 @@ def test_no_board_in_this_repo_pours_one_net_on_two_layers_so_the_carrier_writes
         by_net.setdefault(net, []).append(lay)
     assert all(len(v) == 1 for v in by_net.values()), (name, by_net)
     assert st._plane_specs(ctx) == (), name
-    assert not [p for p in pattern_copper(ctx.design, ctx.job, ctx.cs, _m.text, ctx.board, stage="final", owned=ctx.owned).pieces if p.reason == "plane"]
+    assert not [p for p in pattern_copper(ctx.design, ctx.job, ctx.cs, ctx.board, stage="final", owned=ctx.owned, scene=scene_from_text(ctx.design, ctx.job, ctx.cs, _m.text)).pieces if p.reason == "plane"]
 
 
 def test_node_with_gnd_on_both_inner_planes_flips_its_return_verdict_and_pays_for_it():
@@ -567,7 +559,6 @@ def test_node_with_gnd_on_both_inner_planes_flips_its_return_verdict_and_pays_fo
 
 
 @pytest.mark.kicad
-@pytest.mark.krt
 def test_the_fixture_builds_to_fab_with_the_plane_gate_verified(tmp_path: Path):
     """The three things a unit test cannot do: run the `final` stage inside `route_job`, prove a
     lattice barrel lands in a pour that only `gnd_pour` writes, and pin a report string.
@@ -596,19 +587,21 @@ def test_the_fixture_builds_to_fab_with_the_plane_gate_verified(tmp_path: Path):
     route = next(s for s in result["steps"] if s.get("stage") == "route")
     assert route["planes_stitched"]["fails"] == [], route["planes_stitched"]["lines"]
     assert route["planes_stitched"]["lines"] == [
-        "plane GND: 41 lattice via(s), all landing in B.Cu + F.Cu; 2204.19 mm2 of pour across 2 layer(s), 1 island(s) on the worst of them",
+        "plane GND: 43 lattice via(s), all landing in B.Cu + F.Cu; 2210.61 mm2 of pour across 2 layer(s), 1 island(s) on the worst of them",
         "planes: 1 of 1 lattice(s) landing in every pour they tie",
     ], route["planes_stitched"]["lines"]
     assert route["planes"]["islands"] == {"GND B.Cu": 1, "GND F.Cu": 1}, route["planes"]["islands"]
-    assert route["planes"]["area_mm2"] == {"GND B.Cu": 1137.97, "GND F.Cu": 1066.22}, route["planes"]["area_mm2"]
-    assert route["copper_bar"]["totals"]["vias_pattern"] == {"plane": 41, "tap": 5}
+    # Re-recorded 2026-09-25 for the native router: 41 -> 43 lattice vias, pours 1137.97/1066.22 ->
+    # 1139.54/1071.07 mm2. The lattice takes what the route leaves (R-S2), and the native router
+    # leaves more of the board free than the old one did (its copper is shorter), so two more of the
+    # 50 candidate sites clear and both pours keep more copper; still one island per plane.
+    assert route["planes"]["area_mm2"] == {"GND B.Cu": 1139.54, "GND F.Cu": 1071.07}, route["planes"]["area_mm2"]
+    assert route["copper_bar"]["totals"]["vias_pattern"] == {"plane": 43, "tap": 5}
     assert route["refusals"] == [], "a board that declares an edge rate has nothing to refuse"
-    assert any(n.startswith("style: stitch GND plane: 41 of 50 placed, 0.5 GHz of 1 GHz") for n in route["notes"]), route["notes"]
-    # Determinism, and this slice puts more copper behind it than any before: a `final` carrier reads
-    # KRT's finished board, and the lattice reads the *pour* KRT wrote one step earlier. Measured
-    # 2026-09-21, two builds of this board are byte-identical
-    # (sha256 4c9a214e544c464fb0dc94047befb5934f0819e52756627da41e4906962d7d74) — compared rather than
-    # pinned, because the digest is KRT's as much as pcbc's and a KRT bump must move it.
+    assert any(n.startswith("style: stitch GND plane: 43 of 50 placed, 0.5 GHz of 1 GHz") for n in route["notes"]), route["notes"]
+    # Determinism: a `final` carrier reads the router's finished copper, and the lattice reads the pour
+    # objects the route stage wrote. Two builds of this board are compared byte for byte rather than
+    # pinned to a digest, because any router change must move the digest.
     import hashlib
 
     first = hashlib.sha256((tmp_path / "layout" / "planes" / "routed" / "layout.kicad_pcb").read_bytes()).hexdigest()

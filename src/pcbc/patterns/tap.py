@@ -14,15 +14,14 @@ Three things decide this pattern, and all three are the fab's, not the router's
 (`docs/copper-plan.md`):
 
 - a via whose copper sits inside a pad wicks solder and `fab.via_in_pad_blockers` refuses the board,
-  so a tap clears every pad of its own net by `via_to_same_net_smd_pad` — the number `route.py`
-  already hands KRT as `--same-net-pad-clearance` — and every foreign pad by A.4 rule 1;
+  so a tap clears every pad of its own net by `via_to_same_net_smd_pad` and every foreign pad by
+  A.4 rule 1;
 - two holes closer than the fab's hole-to-hole is an **error** in pcbc's project, so A.4 rule 3 is
   asked of every candidate against every other hole on the board, this pattern's own earlier taps
   included (the stage adds each one to the scene before the next pad runs);
-- a pour judges nothing until it is filled, so on a two-layer board — where the pour is written
-  *after* the signals and does not exist when the tap is placed — a candidate the fill would not
-  reach is refused here rather than discovered by the gate as an unconnected item (`route_verify.
-  pour_raster`).
+- a pour judges nothing until it is filled, and no pour is filled while the route stage runs (KiCad
+  fills the emitted board), so on an outer-layer pour a candidate the fill would not reach is refused
+  here rather than discovered by the gate as an unconnected item (`route_verify.pour_raster`).
 """
 
 from __future__ import annotations
@@ -30,7 +29,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
-from ..blocking import move_line
+from ..moves import move_line
 from ..route_emit import Piece, seg_piece, via_piece
 from ..route_geom import EPS_MM, MICRO_MM, Pt, clears, gap, q
 from ..route_scene import Clash, Scene, antipad_clash, blocked, pad_exits
@@ -290,8 +289,7 @@ def _in_a_pad(scene: Scene, spec: TapSpec, at: Pt) -> Clash | None:
     Rule 1 skips a same-net pair, correctly — a via in its own net's copper is a connection, and
     without that skip a tap could not be emitted at all. But `fab.via_in_pad_blockers` refuses a
     board where a via's copper sits inside a passive's pad whatever net it is on, because it wicks
-    the joint, and `route.py` already hands KRT the same number as `--same-net-pad-clearance` on
-    every step that may place one. So the tap asks it here, of every pad of its own net except the
+    the joint. So the tap asks it here, of every pad of its own net except the
     one primitive it is welding — which it clears by `clearance_min` by construction, since that
     term is in the distance out.
 
@@ -404,12 +402,12 @@ def _neck_note(ctx: PatternCtx, spec: TapSpec, w: float) -> tuple[str, ...]:
 
 
 def _raster(ctx: PatternCtx, spec: TapSpec):
-    """The pour's predicted reach, or None when the plane is already on the board.
+    """The pour's predicted reach on an outer layer, or None for an inner plane.
 
-    On four layers KRT's `planes` step has run by the time the post stage does, so the zone exists
-    and `route_verify.plane_islands` judges it after the gate refills — the arbiter's own answer,
-    measured rather than predicted. On two layers the pour is `gnd_pour`, near the end, so there is
-    nothing to measure yet and the raster is the only thing between a tap and an island.
+    No pour is filled while the route stage runs (KiCad fills the emitted board). An inner plane has no
+    signal copper on its layer (`route_native.route_layers`) and `route_verify.plane_islands` judges it
+    after the fill — the arbiter's own answer. An outer pour shares its layer with pads and tracks, so
+    the raster is the only thing between a tap and an island.
     """
     from ..route_verify import pour_raster
 
@@ -453,15 +451,10 @@ def _other(ctx: PatternCtx, layer: str) -> str:
 def _refuse(ctx: PatternCtx, spec: TapSpec, clash: Clash | None, seen: list[Clash], sites: int, tried: int, lane: str, unreached: int) -> Refusal:
     """B.3's refusal: **soft**, and the sentence prices it.
 
-    Soft because the fall-through is exact: `route.py` runs KRT's own `plane_taps` step for the
-    plane nets a pad of which was refused, and skips it entirely when there are none. So a refused
-    tap never costs the connection — but it costs more than "a via pcbc would have placed better",
-    and the honest price is written here (finding 13). That step runs with
-    `--same-net-pad-clearance -1`, because with the keepout on it welded nothing (node: 4 of 59 GND
-    pads), so KRT's replacement via is under no obligation to clear the pad it welds: node's own
-    refused `U1.51` came back with a via overlapping that pad's copper by 0.025 mm, which is exactly
-    what `_in_a_pad` refuses. It is legal — an IC pin, same net, tented, and `via_in_pad_blockers`
-    exempts IC pads — and it is the difference between pcbc placing the via and KRT placing it.
+    Soft because the fall-through is exact: a refused pad stays open on its net, and the router links
+    it (`route_native.route_nets`: its terminals are the net's pads and every via already on it,
+    plane taps included). So a refused tap never costs the connection — it costs the via the tap
+    would have placed beside the pad, and the honest price is written here (finding 13).
 
     It lists the blockers **worst first** — B.3 asks for that, because the second one is usually the
     reason the first cannot simply be moved — names the rule of A.4 that decided each, counts the

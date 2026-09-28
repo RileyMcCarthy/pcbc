@@ -44,8 +44,9 @@ from pcbc.patterns.spine import WIDE_MM, anchor
 from pcbc.route_checks import _principal_order, build_ctx, check_chains
 from pcbc.route_emit import piece_key
 from pcbc.route_geom import clears, gap, track_shape
-from pcbc.route_scene import blocked, build_scene, pad_exits
+from pcbc.route_scene import blocked, pad_exits
 from pcbc.route_verify import verify_copper
+from boardtext import scene_from_text
 
 ROOT = Path(__file__).resolve().parent.parent
 EXAMPLES = ROOT / "examples"
@@ -80,7 +81,7 @@ def _ctx(name: str) -> PatternCtx:
     are pinned where they are measured and these are pinned where they are measured."""
     design = load_board(_board(name))
     job = compile_design(design)
-    scene = build_scene(design, job, job.constraints, _placed(name).read_text())
+    scene = scene_from_text(design, job, job.constraints, _placed(name).read_text())
     return PatternCtx(scene=scene, design=design, job=job, cs=job.constraints, board=_uuid_name(name), stage="mid")
 
 
@@ -651,7 +652,7 @@ def test_the_chain_is_written_and_deliberately_not_registered():
     for name in ALL:
         design = load_board(_board(name))
         job = compile_design(design)
-        stage = pattern_copper(design, job, job.constraints, _placed(name).read_text(), _uuid_name(name), stage="mid")
+        stage = pattern_copper(design, job, job.constraints, _uuid_name(name), stage="mid", scene=scene_from_text(design, job, job.constraints, _placed(name).read_text()))
         assert not [p for p in stage.pieces if p.reason == REASON], (name, "the mid stage must write no chain copper")
     # And the pattern is still whole: asked directly it still has a population and still writes.
     plan, _d, _j, _t = _mid("c3_usb")

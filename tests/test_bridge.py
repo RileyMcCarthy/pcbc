@@ -23,6 +23,7 @@ from pcbc.circuit import _untied_grounds, check_design
 from pcbc.compile import compile_design
 from pcbc.copper_bar import copper_bar
 from pcbc.language import load_board
+from boardtext import feet_of_text
 from pcbc.route_checks import build_ctx, check_bridge
 from pcbc.route_verify import bridge_ties
 
@@ -204,7 +205,7 @@ def test_the_example_boards_say_nothing_about_bridges(name: str):
     assert len(grounds) == 1, grounds
     assert _untied_grounds(design) == []
     job = compile_design(design)
-    ctx = build_ctx(design, job, _placed(name).read_text())
+    ctx = build_ctx(design, job, feet_of_text(design, _placed(name).read_text()))
     assert check_bridge(ctx) == []
     assert job.constraints.bridges == ()
 
@@ -237,7 +238,7 @@ DS2_AXES = (
 def test_ds2_has_no_axis_that_separates_its_two_grounds():
     design = load_board(_board("ds2"))
     job = compile_design(design)
-    ctx = build_ctx(design, job, _placed("ds2").read_text())
+    ctx = build_ctx(design, job, feet_of_text(design, _placed("ds2").read_text()))
     moves = check_bridge(ctx)
     assert len(moves) == 1
     move = moves[0]
@@ -258,7 +259,7 @@ def test_the_fixture_board_says_nothing_because_its_tie_is_already_at_the_closes
     notes: list[str] = []
     assert check_design(design, pcb=True, notes=notes) == []
     assert notes == []
-    ctx = build_ctx(design, job, _placed("bridge").read_text())
+    ctx = build_ctx(design, job, feet_of_text(design, _placed("bridge").read_text()))
     assert check_bridge(ctx) == []
     spec = job.constraints.bridges[0]
     assert (spec.a, spec.b, spec.tie_ref, spec.pads) == ("GND", "VSS", "R11", ("R11.2", "R11.1"))
@@ -277,7 +278,7 @@ def test_a_tie_away_from_the_closest_approach_is_a_place_move(tmp_path: Path):
     job = compile_design(design)
     from conftest import placed_board
 
-    ctx = build_ctx(design, job, placed_board("bridge_corner", board).read_text())
+    ctx = build_ctx(design, job, feet_of_text(design, placed_board("bridge_corner", board).read_text()))
     moves = check_bridge(ctx)
     assert moves, moves
     assert all(m.startswith("GND/VSS: R11 ties them at ") for m in moves), moves
@@ -334,7 +335,6 @@ def test_two_ties_read_as_multi_before_any_copper_exists(tmp_path: Path):
 DS2_TIE = {"verdict": "none", "closest": 0.2250, "facing_mm2": 20.052, "pf": 0.5338}
 
 @pytest.mark.kicad
-@pytest.mark.krt
 @pytest.mark.skipif(not DS2_ROUTED.exists(), reason="needs the DS2 Addon's routed board")
 def test_ds2_routed_board_has_two_grounds_and_nothing_joining_them():
     design = load_board(_board("ds2"))
@@ -356,7 +356,6 @@ def test_ds2_routed_board_has_two_grounds_and_nothing_joining_them():
 
 
 @pytest.mark.kicad
-@pytest.mark.krt
 def test_the_fixture_builds_to_fab_with_the_gate_verified(tmp_path: Path):
     """The whole path, on the board the DS2 Addon should be: `Bridge()` through check, schematic,
     placement, routing, KiCad's own DRC and fab, with `netcheck.check_copper` passing it and **no

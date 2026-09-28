@@ -19,7 +19,6 @@ from .netcheck import KicadMissing, check_schematic
 from .language import load_board
 from .project import layout_dir
 from .sch_emit import emit_schematic_file
-from .silk import silk_job
 
 
 def _kicad_3d_dir() -> Path | None:
@@ -144,16 +143,28 @@ def crop_svg_to_content(svg: str, *, pad_mm: float = 10.0, px_per_mm: float = 10
     return out
 
 
-def _best_pcb(layout: Path) -> Path | None:
-    # The most finished board there is: fab (filled pours, silk), routed, placed, seed.
-    for rel in ("fab/layout.kicad_pcb", "routed/layout.kicad_pcb", "placed/layout.kicad_pcb", "layout.kicad_pcb"):
-        p = layout / rel
-        if p.exists():
-            return p
-    return None
+# The board each fresh stage leaves, most finished first: `build.stale_reason`'s stage -> the file.
+_STAGE_PCB = {"fab": "fab/layout.kicad_pcb", "route": "routed/layout.kicad_pcb", "place": "placed/layout.kicad_pcb", "sch": "seed/layout.kicad_pcb", "seed": "seed/layout.kicad_pcb"}
 
 
-def _copper_note(design, pcb: Path) -> str:
+def _best_pcb(layout: Path, stage: str | None) -> Path | None:
+    """The board of the last stage whose stamp matches (`build.stale_reason`), never a board by its
+    presence alone: until the fifth review a hand-edited `fab/layout.kicad_pcb` the build called stale
+    was the one review read, plotted and called "KiCad DRC clean ... as board.py says"."""
+    rel = _STAGE_PCB.get(stage or "")
+    if rel is None:
+        return None
+    p = layout / rel
+    return p if p.exists() else None
+
+
+def _copper_note(design, pcb: Path, stage: str | None = None, stale: str | None = None) -> str:
+    if stale and "unfinished" in stale:
+        return "Copper: the route stopped unfinished and wrote no stamp. This picture is the board it emitted; it is not a finished build."
+    if stale:
+        return f"Copper: not judged — the build's outputs are stale ({stale}); run pcbc build."
+    if stage not in ("route", "fab"):
+        return "Copper: not routed yet (pcbc build routes it and judges it)."
     text = pcb.read_text()
     if "\n\t(segment" not in text and "\n\t(zone" not in text:
         return "Copper: not routed yet (pcbc build routes it and judges it)."
@@ -198,7 +209,15 @@ def render_html(
         else '<p class="empty">No board.py</p>'
     )
     sch_block = (
-        f'<div class="plot sch">{sch_svg}</div>'
+        '<div class="plot sch" id="sch-view">'
+        '<div class="sch-tools">'
+        '<button type="button" id="sch-out" title="Zoom out">−</button>'
+        '<button type="button" id="sch-fit" title="Show the whole sheet">Fit</button>'
+        '<button type="button" id="sch-in" title="Zoom in">+</button>'
+        "</div>"
+        f'<div class="sch-stage" id="sch-stage">{sch_svg}</div>'
+        '<p class="sch-hint">Scroll to zoom. Drag to move.</p>'
+        "</div>"
         if sch_svg
         else '<p class="hint">No schematic SVG. kicad-cli sch export svg failed.</p>'
     )
@@ -269,8 +288,27 @@ def render_html(
     overflow: auto; max-height: 78vh; padding: 8px;
   }}
   .plot svg {{ display: block; width: 100%; height: auto; }}
-  .plot.sch {{ background: #f4f0e4; }}
-  .plot.sch svg {{ width: auto; max-width: none; height: auto; }}
+  .plot.sch {{
+    background: #f4f0e4; height: 78vh; overflow: auto; padding: 0;
+    position: relative; cursor: grab; touch-action: none;
+  }}
+  .plot.sch.grabbing {{ cursor: grabbing; }}
+  .sch-stage {{
+    min-width: 100%; min-height: 100%;
+    display: flex; align-items: center; justify-content: center;
+  }}
+  .plot.sch svg {{ width: 100%; height: 100%; max-width: none; flex: none; }}
+  .sch-tools {{
+    position: absolute; top: 8px; right: 8px; display: flex; gap: 6px; z-index: 1;
+  }}
+  .sch-tools button {{
+    background: #181e16; color: var(--ink); border: 1px solid var(--line);
+    border-radius: 8px; padding: 4px 10px; cursor: pointer; font: inherit;
+  }}
+  .sch-hint {{
+    position: absolute; left: 10px; bottom: 8px; margin: 0;
+    color: #5c6b56; font-size: 12px; pointer-events: none;
+  }}
   .src {{
     background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
     padding: 14px; overflow: auto; max-height: 78vh; font: 12px/1.4 ui-monospace, Menlo, monospace;
@@ -324,6 +362,74 @@ def render_html(
     tabs.forEach(b => b.setAttribute("aria-selected", b === btn));
     sections.forEach(s => s.classList.toggle("active", s.id === btn.dataset.tab));
   }}));
+  const schView = document.getElementById("sch-view");
+  const schStage = document.getElementById("sch-stage");
+  const schSvg = schView && schView.querySelector("svg");
+  if (schView && schStage && schSvg) {{
+    let scale = 1;
+    const vb = schSvg.viewBox.baseVal;
+    const aspect = vb.width / vb.height || 1;
+    function fitted() {{
+      const bw = schView.clientWidth || 1;
+      const bh = schView.clientHeight || 1;
+      let w = bw, h = w / aspect;
+      if (h > bh) {{ h = bh; w = h * aspect; }}
+      return {{ w, h }};
+    }}
+    function layout() {{
+      const f = fitted();
+      const w = f.w * scale, h = f.h * scale;
+      schSvg.style.width = w + "px";
+      schSvg.style.height = h + "px";
+      if (scale === 1) {{
+        schStage.style.width = "100%";
+        schStage.style.height = "100%";
+      }} else {{
+        schStage.style.width = w + "px";
+        schStage.style.height = h + "px";
+      }}
+    }}
+    function zoomAt(next, clientX, clientY) {{
+      const prev = scale;
+      scale = Math.min(8, Math.max(1, next));
+      const rect = schView.getBoundingClientRect();
+      const ox = schView.scrollLeft + (clientX - rect.left);
+      const oy = schView.scrollTop + (clientY - rect.top);
+      layout();
+      const k = scale / prev;
+      schView.scrollLeft = ox * k - (clientX - rect.left);
+      schView.scrollTop = oy * k - (clientY - rect.top);
+    }}
+    layout();
+    window.addEventListener("resize", () => {{ if (scale === 1) layout(); }});
+    schView.addEventListener("wheel", (e) => {{
+      e.preventDefault();
+      zoomAt(scale * (e.deltaY < 0 ? 1.12 : 1 / 1.12), e.clientX, e.clientY);
+    }}, {{ passive: false }});
+    let drag = null;
+    schView.addEventListener("pointerdown", (e) => {{
+      if (e.target.closest(".sch-tools")) return;
+      drag = {{ x: e.clientX, y: e.clientY, sl: schView.scrollLeft, st: schView.scrollTop }};
+      schView.setPointerCapture(e.pointerId);
+      schView.classList.add("grabbing");
+    }});
+    schView.addEventListener("pointermove", (e) => {{
+      if (!drag) return;
+      schView.scrollLeft = drag.sl - (e.clientX - drag.x);
+      schView.scrollTop = drag.st - (e.clientY - drag.y);
+    }});
+    function endDrag() {{ drag = null; schView.classList.remove("grabbing"); }}
+    schView.addEventListener("pointerup", endDrag);
+    schView.addEventListener("pointercancel", endDrag);
+    document.getElementById("sch-in").addEventListener("click", () => zoomAt(scale * 1.25, schView.getBoundingClientRect().left + schView.clientWidth / 2, schView.getBoundingClientRect().top + schView.clientHeight / 2));
+    document.getElementById("sch-out").addEventListener("click", () => zoomAt(scale / 1.25, schView.getBoundingClientRect().left + schView.clientWidth / 2, schView.getBoundingClientRect().top + schView.clientHeight / 2));
+    document.getElementById("sch-fit").addEventListener("click", () => {{
+      scale = 1;
+      layout();
+      schView.scrollLeft = 0;
+      schView.scrollTop = 0;
+    }});
+  }}
 </script>
 </body>
 </html>
@@ -337,20 +443,39 @@ def review_job(board: Path, *, open_html: bool = True) -> dict:
     layout = layout_dir(board)
     out_dir = layout / "review"
     out_dir.mkdir(parents=True, exist_ok=True)
-    pcb = _best_pcb(layout)
+    # Review reads a stage's files only when that stage's stamp matches (C1): the freshest stage by
+    # `stale_reason`, and why the later ones are not, printed in place of their verdicts.
+    from .build import stale_reason
+
+    stage, stale = stale_reason(layout, board, design)
+    pcb = _best_pcb(layout, stage)
+    # A route that stops with a net unfinished emits the board and deliberately
+    # writes no success stamp, so the next build does not skip it. The picture
+    # is still that emit. A hand-edited or source-stale board does not get here:
+    # those come back as a different stage than "place" with this reason.
+    if pcb is None and stage == "place" and stale and "no record of what it was routed from" in stale:
+        routed = layout / "routed" / "layout.kicad_pcb"
+        if routed.is_file():
+            pcb = routed
+            stale = "the route stopped unfinished and wrote no stamp"
     steps: list[dict] = []
     result: dict = {
         "review": str(out_dir),
         "html": str(out_dir / "index.html"),
         "pcb": str(pcb) if pcb else None,
+        "stage": stage,
+        "stale": stale,
         "steps": steps,
         "error": None,
     }
     if pcb is None:
-        result["error"] = "no layout.kicad_pcb — run pcbc build first"
+        result["error"] = "no board the build stamped as fresh" + (f" ({stale})" if stale else "") + " — run pcbc build first"
         return result
 
-    sch_path = layout / "schematic.kicad_sch"
+    # Review's own drawing, in its own directory: never over the build's `schematic.kicad_sch`, which
+    # is the sch stage's output and stamped (fifth review: review rewrote it and the next build blamed
+    # pcbc's own write as a hand edit).
+    sch_path = out_dir / "schematic.kicad_sch"
     sch_report: dict = {}
     emit_schematic_file(design, sch_path, title=board.stem, report=sch_report)
     result["schematic"] = str(sch_path)
@@ -364,7 +489,7 @@ def review_job(board: Path, *, open_html: bool = True) -> dict:
 
     bom_path = layout / "fab" / "bom.csv"
     bom_rows: list[list[str]] = []
-    if bom_path.exists():
+    if stage == "fab" and bom_path.exists():
         with bom_path.open(newline="") as f:
             bom_rows = [row for row in csv.reader(f) if row]
 
@@ -379,9 +504,9 @@ def review_job(board: Path, *, open_html: bool = True) -> dict:
     if not cli.exists() and shutil.which(str(cli)) is None:
         result["error"] = f"kicad-cli not found ({cli})"
     else:
-        plot = out_dir / "silk.kicad_pcb"
-        silk_rep = silk_job(job, pcb, out=plot, backup=False)
-        plot_pcb = Path(silk_rep.get("pcb") or pcb)
+        # The board as the build left it: its silk references were placed by the place stage and are
+        # what ships (fab writes none), so review plots them as they are.
+        plot_pcb = pcb
         steps.append(_export_svg(cli, plot_pcb, front, "F.Cu,F.SilkS,Edge.Cuts"))
         steps.append(_export_svg(cli, plot_pcb, silk_svg_path, "F.SilkS,Edge.Cuts"))
         steps.append(_export_svg(cli, plot_pcb, back, "B.Cu,B.SilkS,Edge.Cuts", mirror=True))
@@ -423,7 +548,8 @@ def review_job(board: Path, *, open_html: bool = True) -> dict:
             else f"Schematic readability, {len(result['readability'])} to fix by moving parts: "
             + "; ".join(result["readability"])
         ),
-        _copper_note(design, pcb),
+        _copper_note(design, pcb, stage, stale),
+        *([f"BOM: not shown — the fab package is not fresh ({stale or 'the build stopped before fab'})."] if stage != "fab" else []),
         "3D is kicad-cli pcb export glb (tracks, pads, silk, mask).",
     ]
     if any(s.get("returncode") not in (0, None) for s in steps):

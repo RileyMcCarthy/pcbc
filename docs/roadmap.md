@@ -1,5 +1,7 @@
 # Roadmap
 
+> **2026-09-23:** item order is superseded by [`direction.md`](direction.md) — the layout language and the generator come first. The measurements here still stand.
+
 What pcbc is, measured, and what stands between it and a board like
 [OpenESC-20x20](https://github.com/OpenDrone-hw/OpenESC-20x20) — 6 layers, 1.6 mm, 2 oz copper,
 31.2 x 33.0 mm, **40 A continuous per channel** across four independent channels, four MCUs,
@@ -249,10 +251,48 @@ with a clear shape. This one needs a design panel before an estimate is worth an
   net, so a pair net's *other* pads — a USB-C connector's flip-side `B6`/`B7`, an ESD array's second
   side; five pads on c3_usb's `USB_DP` — are reached by the wildcard `signals` step as ordinary
   copper, and on node that copper is **19.5 mm** and is the whole of the skew. Four rearrangements of
-  the existing steps were measured and all are worse or leave pads open (item 0.5). **The bounded
-  next move is to give those pads pcbc's own `hop` copper before KRT runs**, so the run that reaches
-  `J1.B7` is the 2 mm one a hand router would draw and `signals` has nothing left to add; then, and
-  only then, excluding pairs from `signals` is safe. Ownership is the feature.
+  the existing steps were measured and all are worse or leave pads open (item 0.5). ~~**The bounded
+  next move is to give those pads pcbc's own `hop` copper before KRT runs**~~ — **built and refused
+  2026-09-22.** A probe pattern linked each pair net's pads that share a footprint, in `terminals()`
+  order, through `chain.py`'s link machinery unchanged, and ran in `PRE`. It wrote **9.94 mm** on node
+  and **9.74 mm** on c3_usb: a 1.0 mm U under the connector joining `A7` to `B7` and a 2.275 mm run
+  across the ESD array, per net. Fresh builds, `kicad_drc` the arbiter:
+
+  | | skew (budget 0.5) | uncoupled (budget 2.0) | new violation type |
+  |---|---|---|---|
+  | node, shipped | 11.9196 | 22.8098 | — |
+  | node, + 9.94 mm pre-KRT | **24.2937** | **74.0616** | `too_many_vias` |
+  | c3_usb, shipped | 0.6154 | 23.2594 | — |
+  | c3_usb, + 9.74 mm pre-KRT | **1.3903** | 21.8951 | — |
+
+  Narrowing it to the ESD link alone (4.55 mm, no copper under the connector) is no better: node
+  **12.2700 / 23.3409** with `track_width` 58 -> 69, c3_usb **2.7686 / 20.5796** with a new
+  `track_dangling`. **Both variants make skew worse on both boards and both introduce a violation
+  type the base board does not have.** This is `patterns.MID`'s recorded table on the `chain` pattern
+  — "locked copper moves KRT, and KRT's own copper closes the escape two stages later" — now measured
+  on the pair case, which is the one case this line named as bounded. On node the 9.94 mm bought a
+  pair whose coupled path leaves `U1` and runs the entire east and south edge: 75.6 mm against 65.4.
+  What is left of this item is not a smaller hop; it is choosing the pair's homotopy, which is item 3.
+- **Letting `route_relax` touch pairs was built and refused the same day, and the refusal is the
+  useful half.** Dropping the `diff_pair` clause from `_skip_nets` improves *every number the arbiter
+  reports* — c3_usb's `skew_out_of_range` **clears** (0.6154 -> 0.2730 against 0.5, the first build
+  here to meet that budget), uncoupled falls on both boards, c3_usb sheds 66 segments and node 21 —
+  and it destroys the pair: **c3_usb's coupled run goes 29.722 mm (78.9 %) to 6.654 mm (19.1 %)**,
+  because the halves relax as independent chains and take different answers to the same corner. The
+  0.2730 mm is two single-ended traces of equal length. KiCad cannot see it (its uncoupled metric
+  improves by losing its subject); the `("GND","B.Cu")` pour can, 1053.10 -> **1040.57 mm2**. Full
+  table in `route_relax._skip_nets`. **A pair relaxer has to move both halves as one object**, which
+  is a different module from the one that exists.
+- **The pair elbow is `route_relax.quality`, not the pair router.** node's `USB_DN` goes
+  `(17.515, 0.904)` at 45 deg for 24.579 mm out to `(34.896, 18.285)` and back at 135 deg for 14.256
+  mm to `(24.815, 28.496)`: **38.966 mm where the two-leg octilinear path between the same two points
+  is 30.615 mm**. With pairs relaxable the pull is generated (`_moves` i=4, j=7), it `holds`, and
+  `blocked` returns **None** — it is refused by the **`sharp`** term alone, `(2, 0, 3, 20, 57.975)`
+  against `(2, 1, 2, 19, 49.624)`, because the taut path meets the next leg at 90 deg. So **8.351 mm
+  of copper on a 90 ohm pair is the declared price of one `track_angle` warning**, and `_moves` only
+  ever offers *two*-leg replacements, so the three-leg shape that would be both taut and all-45 is
+  not in the candidate list at all. Both are changes to the relaxer's own C2 rule, they touch all
+  five boards, and neither is a pair problem.
 - **Length matching** with tuning (serpentines) does not exist. `match_mm` compiles and nothing
   routes to it.
 - **Layer assignment is a declaration, not a decision.** On six layers, which layer a net lives on is

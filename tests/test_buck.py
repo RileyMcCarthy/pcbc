@@ -84,4 +84,4 @@ def test_a_taken_lane_is_reported(tmp_path: Path):
 def test_buck_readability_bar():
     report: dict = {}
     emit_from_design(load_board(BOARD), title="buck", report=report)
-    assert report["count"] <= 1, report["issues"]
+    assert report["count"] == 0, report["issues"]

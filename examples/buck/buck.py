@@ -38,7 +38,7 @@ Place("U1", position="absolute", left=15, top=8, locked=True, reason="buck IC in
 
 # Schematic. This symbol has SW and VIN both on the left, so the output rail
 # runs left from the inductor and the input stage sits under the IC.
-SchRegion("sheet", left=12, top=12, width=380, height=200)
+SchRegion("sheet", title="Buck", left=12, top=12, width=380, height=200)
 SchPlace("U1", parent="sheet", left=150, top=60)
 SchPlace("L1", to="U1.SW")
 SchPlace("C_OUT1", to="L1.2")

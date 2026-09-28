@@ -115,52 +115,6 @@
    "width": 4
   }
  ],
- "krt": {
-  "length_match": [],
-  "planes": [
-   {
-    "layer": "In1.Cu",
-    "net": "GND"
-   },
-   {
-    "layer": "In2.Cu",
-    "net": "3V3"
-   }
-  ],
-  "power_nets": [
-   "GND",
-   "3V3",
-   "VBUS",
-   "LOAD"
-  ],
-  "sensitive": [
-   {
-    "clearance": 0.2,
-    "kind": "analog",
-    "layers": [
-     "F.Cu"
-    ],
-    "nets": [
-     "T_DIV",
-     "T_OUT"
-    ],
-    "width": 0.2
-   }
-  ],
-  "skip_patterns": [
-   "T_DIV",
-   "T_OUT"
-  ],
-  "usb_pairs": [
-   {
-    "class": "USB",
-    "nets": [
-     "USB_DP",
-     "USB_DN"
-    ]
-   }
-  ]
- },
  "layers": 4,
  "nets": [
   {

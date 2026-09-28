@@ -54,6 +54,7 @@ def instantiate(
     board: str,
     at: tuple[float, float],
     rot: float = 0.0,
+    base: Path | None = None,
 ) -> str:
     mod = footprint_path(inst.part).read_text()
     j = mod.find("(footprint ")
@@ -61,7 +62,8 @@ def instantiate(
         raise ValueError(f"{inst.ref}: not a kicad_mod")
     end = matching_paren(mod, j)
     body = mod[j : end + 1]
-    body = _absolute_models(body, footprint_path(inst.part).parent)
+    body = drop_degenerate_lines(body)
+    body = _absolute_models(body, footprint_path(inst.part).parent, base=base)
     stem = Path(footprint_path(inst.part)).stem
     lib_id = f"pcbc:{stem}"
     body = re.sub(r'^\(footprint "[^"]*"', f'(footprint "{lib_id}"', body, count=1)
@@ -93,17 +95,62 @@ def instantiate(
     return "\t" + block.replace("\n", "\n\t") + "\n"
 
 
+_FP_LINE = re.compile(r"\n[ \t]*\(fp_line\b")
+
+
+def drop_degenerate_lines(body: str) -> str:
+    """A footprint's `fp_line`s without the zero-length ones and without an exact repeat of one before
+    it (same ends, layer and stroke; its uuid aside). They draw nothing KiCad plots, and KiCad's save
+    does not keep their order: the DS2 Addon's `HDR-TH_5P-P2.54-V-M` carries the same zero-length
+    `F.CrtYd` line (-6.35, 0.67) twice, whose uuids swapped on every save, so the shipped board was not
+    a fixed point of KiCad's save (fifth review). The part file is the part's; the copy on the board is
+    the build's, and this is where it is made."""
+    out: list[str] = []
+    pos = 0
+    seen: set[str] = set()
+    for m in _FP_LINE.finditer(body):
+        start = m.start()
+        if start < pos:
+            continue
+        open_at = body.index("(", start)
+        end = matching_paren(body, open_at) + 1
+        node = body[open_at:end]
+        a = re.search(r"\(start\s+([-0-9.e]+)\s+([-0-9.e]+)\)", node)
+        b = re.search(r"\(end\s+([-0-9.e]+)\s+([-0-9.e]+)\)", node)
+        zero = bool(a and b and (float(a.group(1)), float(a.group(2))) == (float(b.group(1)), float(b.group(2))))
+        key = re.sub(r"\(uuid\s+\"[^\"]*\"\)", "", " ".join(node.split()))
+        if zero or key in seen:
+            out.append(body[pos:start])
+            pos = end
+            continue
+        seen.add(key)
+    out.append(body[pos:])
+    return "".join(out)
+
+
 _MODEL = re.compile(r'\(model\s+"([^"$]+)"')
 
 
-def _absolute_models(block: str, pkg: Path) -> str:
-    """A `(model "x.step")` fetched beside the footprint lives in the part dir; KiCad wants a path."""
+def _absolute_models(block: str, pkg: Path, *, base: Path | None = None) -> str:
+    """A `(model "x.step")` fetched beside the footprint lives in the part dir; KiCad wants a path.
+
+    With `base` (the directory the board file is written to) the path is written **relative to the
+    board file** — KiCad resolves a relative model path against the board's own directory — so two
+    builds of the same board from two absolute paths write the same bytes (third review D3: they
+    differed only in these paths). Every board the build writes sits one directory under
+    `layout/<name>/` (`seed/`, `placed/`, `routed/`, `fab/`), so the one relative path is right on
+    all four. Without `base` the path is absolute, as before."""
 
     def fix(m: re.Match) -> str:
         raw = m.group(1)
         if Path(raw).is_absolute():
             return m.group(0)
-        return f'(model "{(pkg / raw).resolve()}"'
+        target = (pkg / raw).resolve()
+        if base is not None:
+            import os
+
+            return f'(model "{Path(os.path.relpath(target, Path(base).resolve())).as_posix()}"'
+        return f'(model "{target}"'
 
     return _MODEL.sub(fix, block)
 
@@ -205,7 +252,9 @@ def _tenting(design: Design) -> str:
     return "\t\t(tenting\n\t\t\t(front yes)\n\t\t\t(back yes)\n\t\t)\n"
 
 
-def emit_pcb(design: Design, *, name: str) -> str:
+def emit_pcb(design: Design, *, name: str, base: Path | None = None) -> str:
+    """The seed board. `base` is the directory it will be written to: model paths are then relative
+    to it (`_absolute_models`)."""
     if design.board is None:
         raise ValueError("no Board()")
     w, h = design.board.size_mm
@@ -214,7 +263,7 @@ def emit_pcb(design: Design, *, name: str) -> str:
     for i, inst in enumerate(design.instances):
         gx = 5.0 + (i % cols) * 8.0
         gy = 5.0 + (i // cols) * 8.0
-        fps.append(instantiate(inst, board=name, at=(gx, gy)))
+        fps.append(instantiate(inst, board=name, at=(gx, gy), base=base))
     layers_n = design.board.layers
     return (
         "(kicad_pcb\n"
@@ -261,13 +310,3 @@ def emit_pro(design: Design, *, name: str) -> str:
         "text_variables": {},
     }
     return json.dumps(doc, indent=2) + "\n"
-
-
-def seed_job(design: Design, out_pcb: Path, *, name: str) -> dict:
-    out_pcb = Path(out_pcb)
-    out_pcb.parent.mkdir(parents=True, exist_ok=True)
-    pcb = emit_pcb(design, name=name)
-    pro = emit_pro(design, name=name)
-    out_pcb.write_text(pcb)
-    out_pcb.with_suffix(".kicad_pro").write_text(pro)
-    return {"pcb": str(out_pcb), "instances": len(design.instances)}

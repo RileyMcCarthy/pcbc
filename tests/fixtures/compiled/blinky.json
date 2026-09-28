@@ -57,17 +57,6 @@
   }
  ],
  "keepouts": [],
- "krt": {
-  "length_match": [],
-  "planes": [],
-  "power_nets": [
-   "VCC",
-   "GND"
-  ],
-  "sensitive": [],
-  "skip_patterns": [],
-  "usb_pairs": []
- },
  "layers": 2,
  "nets": [
   {

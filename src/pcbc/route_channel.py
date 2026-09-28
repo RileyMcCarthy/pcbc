@@ -859,7 +859,7 @@ def moves(es: Sequence[Escape]) -> tuple[str, ...]:
 
     `docs/topo-plan.md` house rule: every refusal is a move ending in a `board.py` edit. This one has
     a magnitude in millimetres and names the two obstacles that make the wall, and it is computed
-    from a **placed** board in milliseconds, with no router and no KRT run.
+    from a **placed** board in milliseconds, with no router run.
     """
     out: list[str] = []
     for e in sorted(es, key=lambda e: (e.slack, e.net, e.pad)):
@@ -939,9 +939,10 @@ def report(scene: Scene, *, widths: dict[str, float] | None = None, layers_of: d
 def class_widths(job) -> dict[str, float]:
     """Each net's class track width, off the constraint compiler. Never a guess.
 
-    The same number `krt_plan` puts on the command line, so a channel this module calls too narrow is
-    too narrow for the track the router will actually draw. A net with no `NetReq` has no entry and
-    the caller falls back to `stackup.track_min`, which is what KRT is handed for it.
+    The same number the router draws the net at (`route_cost.net_cost`), so a channel this module
+    calls too narrow is too narrow for the track the router will actually draw. A net with no
+    `NetReq` has no entry and the caller falls back to `stackup.track_min` (the router draws such a
+    net at the Default class width, never narrower).
     """
     cls = {c.name: c.track_width_mm for c in (job.classes or ())}
     cs = getattr(job, "constraints", None)

@@ -1,64 +1,40 @@
-"""Whole-board octilinear string-pull: the last thing that touches the copper.
+"""Whole-board octilinear string-pull: the route stage's last pass over the copper it wrote.
 
-A maze router draws the path it found, not the path a person would draw. KRT's output on a fresh
-`buck` is 175 segments for 149.3 mm of copper — 96 of them shorter than `MICRO_MM`, 1.031 corners
-and **50.9 degrees of turning per millimetre**, against the hand-routed DS2 Addon's 0.336 and 17.2.
-That gap is not homotopy and it is not net order: it is the staircase a grid leaves behind. This
-module pulls each run of copper taut inside the corridor the router already proved, and hands the
-same connectivity back with a tenth of the turning.
+A grid router draws the path it found, not the path a person would draw: staircases, micro-legs,
+doubled-back spurs at junctions. This module pulls each run of the route's copper taut inside the
+corridor the router already proved and hands back the same connectivity with far less turning
+(`route_native.route_stage` step 6; `docs/quality-plan.md` for the measurements behind each rule).
 
-**It is not a pattern.** A pattern proposes copper where there was none and `pattern_copper` ends in
-`write_pieces`, which only appends (`docs/stitch-plan.md` R-S1). This *replaces* — `route_emit.
-strip_segments` exists for this module and for nothing else — so R-S1's redundancy argument does not
-reach it and a different one has to. The argument is **positional plus contact**: `route.krt_plan`
-schedules nothing after this step, so there is no router left to react to what it writes
-(`docs/quality-plan.md` section 6), and every piece of copper that was touching another piece is
-still touching it, by a rule checked per candidate and then checked again over the whole board with
-`route_scene.components` — which is the same predicate `net_open` uses to decide whether a net still
-needs a router. Connectivity is proved here, not hoped for.
+**It is not a pattern.** A pattern adds copper where there was none; this *replaces* pieces in
+memory (`relax_pieces` returns the rewritten `owned` list), so the argument that makes it safe is
+**positional plus contact**: nothing routes after it (the route stage only drops unfinished nets and
+sweeps dangling copper afterwards), and every piece of copper that was touching another piece is still
+touching it, by a rule checked per candidate (`Holds`) and then over the whole board with
+`route_scene.components` and `orphan_copper` — a failure of either is raised as a pcbc bug.
 
-**Three decisions, each of which two independent prototypes got wrong first** (`docs/quality-plan.md`
-section 3, C2-C4):
+**Three decisions** (`docs/quality-plan.md` section 3, C2-C4):
 
 *The accept rule is lexicographic, and relative to the chain in hand.* See `quality`. "Strictly
-shorter and no more corners" is the rule that looks right and it accepted **0 of 21 chains** on
-buck, because collapsing a monotone staircase into two legs is exactly length-neutral.
+shorter and no more corners" accepts nothing on a monotone staircase, because collapsing one into two
+legs is exactly length-neutral.
 
-*The preserve set is the geometric contact set, not the endpoints.* See `holds`. Freezing the
-endpoints and the degree != 2 vertices looks correct in review and is **known-wrong**: it broke
-`5V`, `VBUS`, `AIN0` and `VSS` across three boards and took c3_usb's `track_dangling` from 1 to 2.
+*The preserve set is the geometric contact set, not the endpoints.* See `holds`: copper connects where
+it overlaps, not at vertices. And an end of copper this pass cannot move that only the run keeps
+joined is pinned where it is (`free_ends_held`), because KiCad asks `track_dangling` per end.
 
-*What may move is `leftover`, `hop`, `fanout` and `tap`, and nothing else.* See `RELAXABLE`. A
-relaxed guard is no longer a fixed offset from the path it shields, and `build.py`'s gates rebuild
-their `Piece`s from the sidecar's geometry and re-check semantics that were true by construction at
-emission time.
+*What may move is `RELAXABLE`, and nothing else.* A guard, a spine, a thermal array, a stitch rung
+carry a geometry the gates check for meaning; a relaxed one would no longer be what it is.
 
 There are two kinds of move, both in `_moves`: the string-pull proper, which replaces the inside of a
 run with the octilinear path between two of its vertices, and the **trim**, which drops a leading or
-trailing leg and draws nothing. A pull rewrites only the *inside* of a run, and a maze router's worst
-corners are at its ends — the doubled-back spur where a run lands on a stub and goes back along it
-before turning away — so the trim is the move that reaches them, **by moving an endpoint**. On buck
-it is worth 2.0 deg/mm on its own (20.4 without the two trim yields, 18.3 with) and it is what takes
-the off-45 count to zero; without it buck misses this slice's 20 deg/mm bar.
+trailing leg and draws nothing — **moving an endpoint**, which is how the spur at a run's end is
+removed. Because it moves an endpoint the trim is gated by `Holds`: the run's **centreline** stays
+inside the copper it joins, and `clearance_min` inside a **pad** (a rounded end cap merely grazing a
+pad outline is a joint the fab can open).
 
-Moving an endpoint is also the one thing in this module that can ship a board that fails in
-fabrication, so the trim is not gated by "the copper still touches" — that bound is a rounded end cap
-grazing a pad outline, and the first version of this pass reached it, leaving buck's `EN` track with
-23.5 um of overlap in `R_EN.2` where KRT had left 198.5. It is gated by `Holds`, which requires the
-run's **centreline** to stay inside the copper it joins, and on a **pad** to stay `clearance_min`
-inside it. That costs buck 0.4 deg/mm against the grazing version (17.9 -> 18.3) and *gains* ds2 0.1
-(15.4 -> 15.2), which is what decided the centreline half; the pad floor costs blinky, buck and node
-nothing at all, c3_usb 0.10 deg/mm and ds2 0.07, and it is what keeps two of the three joints this
-pass had cut to 76-118 um off the boards outright — c3_usb's `C_EN.2` does not retract at all now
-(0.2700 -> **0.2800** mm, deeper than it started) and neither does ds2's `R5.2` (0.5075 ->
-**0.5125**) — while c3_usb's `U1.23` still goes 0.2 -> 0.1, because it is a **square** pad whose
-`Shape` carries `r = 0` and the floor has nothing to be spent out of (`Holds`).
-
-Determinism comes from four things and not from the absence of search: a fixed chain order, a fixed
-scan order, **first**-accept rather than best-accept, and every coordinate through `route_geom.q`
-exactly once (`octile_path` quantises; everything read off the board is already on the grid, where
-`q` is the identity). Two runs of a board produce byte-identical output; `docs/quality-plan.md`
-section 6 is where that house rule was changed to allow this pass to exist at all.
+Determinism: a fixed chain order, a fixed scan order, **first**-accept rather than best-accept, and
+every coordinate through `route_geom.q` exactly once (`octile_path` quantises; everything read off the
+board is already on the grid). Two runs of a board produce byte-identical output.
 """
 
 from __future__ import annotations
@@ -69,8 +45,8 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-from .route_emit import Piece, piece_text, replace_segments, seg_key, seg_piece
-from .route_geom import MICRO_MM, Pt, Shape, gap, hull_dist2, octile_path, qp, track_shape, via_shape
+from .route_emit import Piece, seg_key, seg_piece
+from .route_geom import MICRO_MM, Pt, Shape, circle_shape, gap, hull_dist2, octile_path, qp, track_shape, via_shape
 from .route_scene import blocked, build_scene, components
 from .sexp import stable_uuid
 
@@ -79,28 +55,22 @@ if TYPE_CHECKING:  # pragma: no cover
     from .constraints import ConstraintSet
     from .model import Design
 
-__all__ = ["RELAXABLE", "RelaxResult", "Chain", "chains_of", "orphan_copper", "quality", "relax_board"]
+__all__ = ["RELAXABLE", "RelaxResult", "Chain", "chains_of", "orphan_copper", "quality", "relax_pieces"]
 
-RELAXABLE = ("fanout", "hop", "leftover", "tap")
+RELAXABLE = ("fanout", "hop", "leftover", "route", "tap")
 """The reasons whose geometry this pass may rewrite (`docs/quality-plan.md` C4).
 
-Everything else pcbc writes is skipped, and the reason is not caution — it is that `build.py`'s
-`_guard_gate`, `_thermal_gate`, `_barrel_gate` and `_chain_gate` rebuild `Piece`s from the sidecar's
-**geometry** keys and re-check semantics (`guard_cover`, `thermal_budget`, `parallel_joined`,
-`chain_order`) that were satisfied by construction when the copper was emitted. A guard is a fixed
-offset from the path it shields; move it and it is no longer that, and the gate is right to say so.
-`spine`, `guard`, `stitch`, `thermal`, `chain` and `plane` are therefore out of reach, as is any
-copper `route.lock_copper` locked on a constrained `NetReq` (see `_skip_nets`).
+These are judged by what they connect, not by the path they take: the router's own `route` runs, a
+`hop`, a `fanout` stub, a `tap` stub (`leftover` names copper no pattern claims, which natively is
+none). Everything else pcbc writes is skipped because a gate on the emitted board re-checks a meaning
+its geometry carries by construction — `_guard_gate`, `_thermal_gate`, `_barrel_gate`, `_chain_gate`
+read `guard_cover`, `thermal_budget`, `parallel_joined`, `chain_order` — so `spine`, `guard`,
+`stitch`, `thermal`, `chain` and `plane` are out of reach, as is every piece of a constrained net
+(one layer, no vias, a pair: `route_native.constrained_nets`) and all core copper.
 
-These four are in reach for the opposite reason: no gate reads their geometry for meaning. A
-`leftover` run is KRT's route and pcbc owns nothing about it but its shape; a `hop`, a `fanout` stub
-and a `tap` stub are judged by what they connect, not by the path they take to do it.
-
-**This pass does move a run's endpoints** — the `trim` in `_moves` retracts one — and an earlier
-version of this paragraph said it did not. That sentence is why nobody looked at what `Holds` was
-asking of a trimmed end, and a trim then pulled buck's `EN` track back until it had 23.5 um of
-overlap left in `R_EN.2`. What holds a stub to its pad is `Holds`, whose rule is that the copper's
-**centreline** stays `stackup.clearance_min` inside the pad's, and not any claim made here."""
+**This pass does move a run's endpoints** — the `trim` in `_moves` retracts one. What holds a stub to
+its pad is `Holds` (the centreline `stackup.clearance_min` inside the pad's copper) and what holds a
+lock's free end is `free_ends_held`, not any claim made here."""
 
 _ITER_CAP = 400
 """Passes over one chain before the relaxer gives up on it. A bound, not a tuning knob: `quality`
@@ -470,7 +440,7 @@ def orphan_copper(scene, net: str) -> float:
 
     The items and the touch predicate are `route_scene.components`': `_touch` is imported rather
     than restated, because two readers of one geometric question is the defect this pass has already
-    paid for once (`route_emit.strip_segments`). Only the question asked of the groups differs.
+    paid for once. Only the question asked of the groups differs.
 
     It is a **comparison** and never an absolute, because a track lying inside a same-net pour is
     connected to it and no `Item` says so (`Holds`): such a track reads as orphaned on both sides of
@@ -584,7 +554,38 @@ def holds(chain: Chain, pads: list, vias: list, others: list[dict], movable: fro
                 continue
             wit = qp(((pa[0] + pb[0]) * 0.5, (pa[1] + pb[1]) * 0.5))
             anchors.append((wit, _poly_pt_d(chain.pts, wit)))
+    anchors += free_ends_held(chain, pads, vias, others, movable)
     return Holds(tuple(shapes), tuple(sorted(set(anchors))))
+
+
+def free_ends_held(chain: Chain, pads: list, vias: list, others: list[dict], movable: frozenset) -> list[tuple[Pt, float]]:
+    """An end of copper this pass cannot move that **only this chain** keeps joined, pinned where it is.
+
+    The shape rule above holds a chain to *the copper* it touches, anywhere along it — right for a pad
+    or a stub a run may slide along, and wrong for the end of a track: KiCad's `track_dangling` is
+    asked per end. A locked core track whose two free ends the router joined to one pad (a loop: pad,
+    link, lock, link, pad) let the `trim` drop one link — the chain still touched the lock at its
+    other end — and the build then refused the author's valid lock as dangling (the second refutation
+    round, major 2: buck with `Seg("GND", (24, 2), (24, 6.5))`). So each end of an immovable track
+    that this chain touches and that no pad, via or other immovable track touches is an anchor at
+    that point: the chain may move, but it may not leave that end."""
+    own = frozenset(chain.keys)
+    fixed = [s for s in others if seg_key(s["layer"], s["start"], s["end"], s["width"]) not in own and seg_key(s["layer"], s["start"], s["end"], s["width"]) not in movable]
+    out: list[tuple[Pt, float]] = []
+    for s in fixed:
+        a, b = qp(s["start"]), qp(s["end"])
+        if a == b:
+            continue
+        for e in (a, b):
+            cap = circle_shape(e[0], e[1], s["width"])
+            if not _touches(cap, chain.pts, chain.width):
+                continue
+            held = any(it.copper is not None and chain.layer in it.layers and gap(cap, it.copper) <= 0.0 for it in pads)
+            held = held or any(gap(cap, via_shape(qp(v["at"]), v["size"])) <= 0.0 for v in vias)
+            held = held or any(o is not s and gap(cap, track_shape(qp(o["start"]), qp(o["end"]), o["width"])) <= 0.0 for o in fixed)
+            if not held:
+                out.append((e, _poly_pt_d(chain.pts, e)))
+    return out
 
 
 # --- chains ---------------------------------------------------------------------------------------
@@ -732,87 +733,92 @@ def chains_of(segs: list[dict], reason_of) -> tuple[list[Chain], list[dict]]:
 # --- the pass -------------------------------------------------------------------------------------
 
 
-def _skip_nets(job: "CompiledJob", design: "Design") -> frozenset[str]:
-    """Nets this pass will not touch a chain of, however the copper on them is labelled.
+def _core_ends_lost(core, before, after) -> list[str]:
+    """Every end of a core track that route copper touched before the pass and none touches after:
+    the self-check behind `free_ends_held` (a lock's end the router joined is never the relaxer's to open)."""
 
-    Two kinds, and both are `docs/quality-plan.md` C4 read one level up from the reason:
+    def touched(cap, net, layer, pieces) -> bool:
+        for q in pieces:
+            if q.net != net:
+                continue
+            if q.kind == "via":
+                if gap(cap, via_shape(qp(q.a), q.w)) <= 0.0:
+                    return True
+            elif q.layer == layer and qp(q.a) != qp(q.b) and gap(cap, track_shape(qp(q.a), qp(q.b), q.w)) <= 0.0:
+                return True
+        return False
 
-    **The constrained nets** — `NetReq(vias=False)` or a single-layer `NetReq` — are exactly the nets
-    `route.krt_plan` routes on their own layers while the board is empty and `route.lock_copper` then
-    locks, so that no later step can finish them with the vias their `NetReq` forbids. Their copper is
-    `leftover` by reason and untouchable by intent, and the lock in the file is the intent's only
-    mark. Derived from the same `job.nets` scan `krt_plan` uses so the two cannot drift; the lock is
-    read as well, belt and braces, in `relax_board._reason_of`.
-
-    **Differential pairs.** Not named in C4 — no board the panel measured has one where it matters —
-    and skipped here on the argument C4 makes for the gates: the pair step is the only one that emits
-    matched geometry, and `skew_*` and `uncoupled_*` are rules in millimetres that were satisfied by
-    construction when the two nets were routed together. Relaxing one half of a pair on its own is
-    exactly the move that breaks them. **Unmeasured on this slice's two boards**, because neither
-    buck nor ds2 declares a pair; c3_usb does, and slice 2 owns it.
-    """
-    from fnmatch import fnmatch
-
-    out: set[str] = set()
-    for cn in job.nets:
-        if cn.autoroute == "diff_pair" or cn.vias is False or len(cn.layers) == 1:
-            out.update(n for n in design.nets if any(fnmatch(n, p) for p in cn.patterns))
-    return frozenset(out)
+    out = []
+    for c in core:
+        if c.kind != "seg":
+            continue
+        for e in (qp(c.a), qp(c.b)):
+            cap = circle_shape(e[0], e[1], c.w)
+            if touched(cap, c.net, c.layer, before) and not touched(cap, c.net, c.layer, after):
+                out.append(f"{c.owner or 'a core track'}'s end at ({e[0]:g},{e[1]:g})")
+    return out
 
 
-def relax_board(
+def relax_pieces(
     design: "Design",
     job: "CompiledJob",
     cs: "ConstraintSet",
-    text: str,
+    feet,
     board: str,
     *,
     owned=(),
-    owned_steps=(),
+    core=(),
+    pours=(),
 ) -> RelaxResult:
-    """Pull every relaxable run of copper on this board taut, and hand back the rewritten board.
+    """Pull every relaxable run of the route's copper taut: the native route stage's last step.
 
-    `owned` is every piece pcbc has written in this route, in emission order, and `owned_steps` names
-    the step file that wrote each one. Both come back rewritten: a relaxed `tap` stub is still a
-    `tap` — `copper_bar` reads a piece's reason off `route.bar_key(p)` and would call pcbc's own
-    copper leftover the moment it moved — but the step that wrote its present geometry is this one,
-    and `copper.json` says so.
-
-    A chain that does not move is not rewritten at all: its bytes, its uuid and its position in the
-    file are the ones the step before this one wrote.
+    `feet` are the posed parts the scene reads its pads from (`place_native.Placement.feet`),
+    `owned` every piece pcbc wrote in this route (patterns and the router), `core` the core copper as
+    pieces (fixed, never moved), `pours` the plane `Pour` objects (their zone numbers). Returns the
+    rewritten `owned`: a moved chain's pieces replaced in place by the taut run, same reason, owner and
+    net; nothing else touched. Two self-checks, asked of the scene rebuilt from the result: no net's
+    pads fall into more connected groups (`components`) and no net's copper comes adrift
+    (`orphan_copper`) — either is a pcbc bug, raised, never a board move.
     """
-    from .copper_bar import segments as bar_segments, vias as bar_vias
+    from .route_native import constrained_nets, zone_rules_of
 
     t0 = time.perf_counter()
-    scene = build_scene(design, job, cs, text)
-    segs = bar_segments(text)
-    vias = bar_vias(text)
-    skip = _skip_nets(job, design)
-    owned = tuple(owned)
-    owned_steps = tuple(owned_steps) + ("",) * (len(owned) - len(owned_steps))
-    reason_at = {seg_key(p.layer, p.a, p.b, p.w): (p.reason, i) for i, p in enumerate(owned) if p.kind == "seg"}
+    owned = list(owned)
+    core = list(core)
+
+    def fresh():
+        sc = build_scene(design, job, cs, feet)
+        sc.zone_rules = tuple(sc.zone_rules) + zone_rules_of(pours)
+        return sc
+
+    scene = fresh()
+    everything = core + owned
+    added = scene.add(scene.item_of(p) for p in everything)
+    seg_of_item: dict[tuple, list[int]] = defaultdict(list)
+    segs: list[dict] = []
+    vias: list[dict] = []
+    reason_at: dict[tuple, tuple[str, int]] = {}
+    for k, (p, it) in enumerate(zip(everything, added)):
+        if p.kind == "seg":
+            key = seg_key(p.layer, p.a, p.b, p.w)
+            seg_of_item[key].append(it.id)
+            locked = p.reason == "core"
+            segs.append({"net": p.net, "layer": p.layer, "start": p.a, "end": p.b, "width": p.w, "length": p.mm, "locked": locked})
+            if k >= len(core):
+                reason_at.setdefault(key, (p.reason, k - len(core)))
+        else:
+            vias.append({"net": p.net, "at": p.a, "size": p.w, "locked": p.reason == "core"})
+    skip = constrained_nets(job, design)
 
     def _reason_of(s: dict) -> str:
-        """A segment's reason, and the two ways this pass declines to touch it.
-
-        A locked segment pcbc does not own is `route.lock_copper`'s work on a constrained net, and
-        reading it off the file is the same fact `_skip_nets` derives from `job.nets`. Both are here
-        because they fail differently — the net list goes stale if `krt_plan` changes and this does
-        not, the lock goes stale if some future step locks something new — and a pass that rewrites
-        copper should need both to agree before it moves anything.
-        """
         hit = reason_at.get(seg_key(s["layer"], s["start"], s["end"], s["width"]))
-        if hit is not None:
-            return hit[0]
-        if s["net"] in skip or s["locked"]:
+        if hit is None or s["locked"]:
             return "locked"
-        return "leftover"
+        if s["net"] in skip:
+            return "locked"
+        return hit[0]
 
     chains, untouched = chains_of(segs, _reason_of)
-    claimed = sum(len(c.keys) for c in chains)
-    if claimed + len(untouched) != len(segs):  # pragma: no cover - the partition is the contract
-        raise ValueError(f"relax: {len(segs)} segments split into {claimed} chained and {len(untouched)} left")
-
     pads_by_net: dict[str, list] = defaultdict(list)
     for it in scene.items:
         if it.kind == "pad" and it.net:
@@ -823,16 +829,6 @@ def relax_board(
     by_nl: dict[tuple[str, str], list[dict]] = defaultdict(list)
     for s in segs:
         by_nl[(s["net"], s["layer"])].append(s)
-    # The scene item behind each segment, so a chain that moves can take its old copper out of every
-    # later chain's way. Without it two chains that both move are each judged against where the other
-    # used to be, which is the one way this pass could write a clearance error KiCad then finds.
-    track_id: dict[tuple, list[int]] = defaultdict(list)
-    for it in scene.items:
-        if it.kind == "track" and it.copper is not None and len(it.copper.pts) == 2:
-            track_id[seg_key(next(iter(it.layers)), it.copper.pts[0], it.copper.pts[1], it.copper.r * 2.0)].append(it.id)
-    # Both halves of the self-check's "before", taken while the scene is still the input's: the loop
-    # below `scene.add`s every chain it moves, so a snapshot taken later would be of a board that is
-    # half relaxed.
     was = {net: components(scene, net) for net in sorted({c.net for c in chains})}
     was_loose = {net: orphan_copper(scene, net) for net in sorted(was)}
 
@@ -840,8 +836,6 @@ def relax_board(
     tally: dict[str, int] = {}
     stats: dict = dict(chains=len(chains), moved=0, accepts=0, tried=0, passes=0, mm_saved=0.0)
     final: list[Chain] = []
-    # A run with no interior has no move (`_moves` yields nothing under three points), so its copper
-    # is as fixed as a spine's and `holds` may use the direct contact rule against it.
     movable = frozenset(k for c in chains if len(c.pts) >= 3 for k in c.keys)
     for chain in chains:
         others = by_nl[(chain.net, chain.layer)]
@@ -890,98 +884,55 @@ def relax_board(
             stats["moved"] += 1
             stats["mm_saved"] += math.fsum(math.dist(a, b) for a, b in zip(chain.pts, chain.pts[1:])) - math.fsum(math.dist(a, b) for a, b in zip(cur, cur[1:]))
             for key in chain.keys:
-                dead.update(track_id.get(key, ()))
+                dead.update(seg_of_item.get(key, ()))
             scene.add(scene.item_of(seg_piece(got.net, got.reason, got.layer, a, b, got.width)) for a, b in zip(cur, cur[1:]))
     stats["mm_saved"] = round(stats["mm_saved"], 4)
     stats["rejected"] = dict(sorted(tally.items()))
 
-    # --- emit -------------------------------------------------------------------------------------
-    keys: list[tuple] = []
-    items: list[str] = []
+    # --- the rewritten ownership ----------------------------------------------------------------
     stood_in: dict[int, list[Piece]] = {}
     consumed: set[int] = set()
-    out_segs = 0
     for before, after in zip(chains, final):
         if after.pts == before.pts:
-            out_segs += len(before.keys)
             continue
-        keys += list(after.keys)
         mine = sorted({reason_at[k][1] for k in after.keys if k in reason_at})
         consumed.update(mine)
         owner = owned[mine[0]].owner if mine else ""
         made: list[Piece] = []
         for a, b in zip(after.pts, after.pts[1:]):
-            uid = stable_uuid(board, "relax", after.reason, after.net, after.layer, f"{a[0]:.6f}", f"{a[1]:.6f}", f"{b[0]:.6f}", f"{b[1]:.6f}", f"{after.width:g}")
-            piece = seg_piece(after.net, after.reason, after.layer, a, b, after.width, owner=owner, uuid=uid)
-            items.append(piece_text(piece, locked=after.reason != "leftover"))
-            made.append(piece)
-            out_segs += 1
+            uid = "" if after.reason == "route" else stable_uuid(board, "relax", after.reason, after.net, after.layer, f"{a[0]:.6f}", f"{a[1]:.6f}", f"{b[0]:.6f}", f"{b[1]:.6f}", f"{after.width:g}")
+            made.append(seg_piece(after.net, after.reason, after.layer, a, b, after.width, owner=owner, uuid=uid))
         if mine:
             stood_in[mine[0]] = made
     new_owned: list[Piece] = []
-    new_steps: list[str] = []
     for i, p in enumerate(owned):
         if i in stood_in:
             new_owned += stood_in[i]
-            new_steps += ["relax"] * len(stood_in[i])
         elif i not in consumed:
             new_owned.append(p)
-            new_steps.append(owned_steps[i])
-    out_text = replace_segments(text, keys, items) if keys else text
 
-    # --- the whole-board self-check ---------------------------------------------------------------
-    # Per candidate this pass keeps contact by a witness rule; here it asks the board. `components` is
-    # what `net_open` reads, so a net whose pads fall into the same number of connected groups is a
-    # net pcbc itself calls no less connected than it was — which is the claim the whole step rests
-    # on, checked rather than argued. `pattern_copper` raises on its own self-check for this reason,
-    # and this raises for the same one: a broken net is not a board move, it is a bug in this module.
-    #
-    # And `orphan_copper` beside it, because `components` groups **pads** and is therefore blind to
-    # copper that comes adrift while every pad stays connected — the exact damage a crossing-blind
-    # `_seg_closest` did to blinky's `LED`, invisible to the check above by construction. Same
-    # precedent, same verdict: a board this pass disconnected copper on is a bug in this module.
-    if keys:
-        after_scene = build_scene(design, job, cs, out_text)
+    lost = _core_ends_lost(core, owned, new_owned)
+    if lost:
+        raise ValueError(f"relax left {lost[0]} open: the router had joined it. This is a pcbc bug, not a board move")
+    stats["orphans_in"] = round(sum(was_loose.values()), 4)
+    stats["orphans_out"] = stats["orphans_in"]
+    if stood_in:
+        after_scene = fresh()
+        after_scene.add(after_scene.item_of(p) for p in core + new_owned)
+        stats["orphans_out"] = round(sum(orphan_copper(after_scene, net) for net in sorted(was)), 4)
         for net in sorted(was):
             now = components(after_scene, net)
             if len(now) > len(was[net]):
                 raise ValueError(f"relax broke {net}: its pads were {len(was[net])} connected group(s) and are now {len(now)}. This is a pcbc bug, not a board move")
             loose = orphan_copper(after_scene, net)
             if loose > was_loose[net] + 1e-6:
-                raise ValueError(
-                    f"relax orphaned copper on {net}: {was_loose[net]} piece(s) of its track/via copper reached no pad "
-                    f"of it before and {loose} do now, while its pads stayed in {len(now)} group(s). This is a pcbc bug, "
-                    "not a board move"
-                )
-        stats["orphans_in"] = sum(was_loose.values())
-        stats["orphans_out"] = sum(orphan_copper(after_scene, net) for net in sorted(was))
-    stats["segments_in"] = len(segs)
-    stats["segments_out"] = len(untouched) + out_segs
-    # **Ask the board, not the decision.** `segments_out` above is a statement about what this pass
-    # chose to do; the two lines below are what the file actually carries. They are separate on
-    # purpose: defect 1 was `strip_segments` silently degrading to an append, which left every old
-    # staircase on the board under its taut replacement — 203 segments where a replace gives 73 —
-    # while `segments_out` reported the decision's number and no self-check could see it, because
-    # duplicate copper only ever *merges* connectivity groups. This comparison catches that class
-    # outright, and it is the cheapest check in the module.
-    from .copper_bar import _SEG
-
-    on_board = len(_SEG.findall(out_text))
-    if on_board != stats["segments_out"]:
-        raise ValueError(
-            f"relax wrote {on_board} segments but decided on {stats['segments_out']}: the replace did not "
-            f"replace. This is a pcbc bug, not a board move — see `route_emit.strip_segments`."
-        )
+                raise ValueError(f"relax orphaned copper on {net}: {was_loose[net]} before, {loose} after. This is a pcbc bug, not a board move")
+    n_in = sum(1 for p in owned if p.kind == "seg")
+    n_out = sum(1 for p in new_owned if p.kind == "seg")
+    stats["segments_in"], stats["segments_out"] = n_in, n_out
     stats["skipped_segments"] = len(untouched)
     note = (
-        f"relax: {stats['moved']} of {len(chains)} chains pulled taut, {len(segs)} segments -> {stats['segments_out']}, "
-        f"{stats['mm_saved']:g} mm shorter; {len(untouched)} segments skipped (a reason outside {'/'.join(RELAXABLE)}, or a constrained net)"
+        f"relax: {stats['moved']} of {len(chains)} chains pulled taut, {n_in} segments -> {n_out}, "
+        f"{stats['mm_saved']:g} mm shorter; {len(untouched)} segments skipped (a reason outside {'/'.join(RELAXABLE)}, core copper, or a constrained net)"
     )
-    return RelaxResult(
-        text=out_text,
-        owned=tuple(new_owned),
-        owned_steps=tuple(new_steps),
-        notes=(note,),
-        stats=stats,
-        wall_ms=int(round((time.perf_counter() - t0) * 1000)),
-    )
+    return RelaxResult(text="", owned=tuple(new_owned), notes=(note,), stats=stats, wall_ms=int(round((time.perf_counter() - t0) * 1000)))

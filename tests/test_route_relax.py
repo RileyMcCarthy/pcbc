@@ -1,8 +1,8 @@
 """The whole-board string-pull: `docs/quality-plan.md` slice 1, one assertion per decision.
 
-Every test here is a **pure** test. The board is `conftest.placed_board`'s — check, seed and place,
-no KiCad and no KRT — and the copper it relaxes is written into that board by the test itself, so
-nothing reads `examples/**/layout/`, which is gitignored build output. The two boards the slice was
+Every test here is a **pure** test. The board is the native placer's in-memory footprint board
+(`place_native.place`) — no KiCad, no file — and the copper it relaxes is handed to
+`route_relax.relax_pieces` as pieces by the test itself. The two boards the slice was
 measured on, buck and the DS2 Addon, are routed boards and their numbers live in the report, not
 here.
 
@@ -21,21 +21,23 @@ import pytest
 
 from pcbc.compile import compile_design
 from pcbc.language import load_board
-from pcbc.route_emit import Piece, replace_segments, seg_key, seg_piece, strip_segments, write_pieces
+from pcbc.route_emit import Piece, seg_key, seg_piece
 from pcbc.route_geom import gap
 from pcbc.route_geom import track_shape
-from pcbc.route_relax import RELAXABLE, _seg_closest, _skip_nets, _straighten, chains_of, holds, orphan_copper, quality, relax_board
-from pcbc.route_scene import build_scene, components
+from pcbc.route_native import constrained_nets
+from pcbc.route_relax import RELAXABLE, _seg_closest, _straighten, chains_of, holds, orphan_copper, quality, relax_pieces
+from pcbc.route_scene import components
+from boardtext import scene_from_text, feet_of_text
 
 EXAMPLES = Path(__file__).resolve().parent.parent / "examples"
 
 
 def _blinky():
-    from conftest import placed_board
+    from pcbc.place_native import place
 
     board = EXAMPLES / "blinky" / "blinky.py"
     design = load_board(board)
-    return design, compile_design(design), placed_board("blinky", board).read_text()
+    return design, compile_design(design), place(design, name="blinky").text
 
 
 def _seg(net: str, a, b, w: float = 0.2, layer: str = "F.Cu", reason: str = "leftover") -> Piece:
@@ -122,17 +124,48 @@ def test_straighten_drops_a_collinear_vertex_and_keeps_a_reversal():
 # --- C4: what may be relaxed ------------------------------------------------------------------------
 
 
-def test_the_relaxable_reasons_are_the_four_with_no_gate_reading_their_geometry():
-    assert RELAXABLE == ("fanout", "hop", "leftover", "tap")
+def test_the_relaxable_reasons_are_the_five_with_no_gate_reading_their_geometry():
+    """`route` is the native router's copper (a shape nobody's gate reads for meaning, like the old
+    router's `leftover`, which stays for copper no group names)."""
+    assert RELAXABLE == ("fanout", "hop", "leftover", "route", "tap")
     for barred in ("spine", "guard", "stitch", "thermal", "chain", "plane"):
         assert barred not in RELAXABLE, f"{barred}'s gate rebuilds a Piece from the sidecar's geometry"
 
 
 def test_a_constrained_netreq_s_nets_are_skipped_whatever_their_copper_is_labelled():
     """buck declares `NetReq('SW', kind='switch_node')` and `NetReq('FB', kind='analog')`; both
-    route on one layer with no vias, `route.lock_copper` locks them, and C4 keeps this pass off."""
+    route on one layer with no vias, and C4 keeps this pass off. One function names them
+    (`route_native.constrained_nets`): the net order and this pass read it, so the two cannot drift."""
     design = load_board(EXAMPLES / "buck" / "buck.py")
-    assert _skip_nets(compile_design(design), design) == frozenset({"SW", "FB"})
+    assert constrained_nets(compile_design(design), design) == frozenset({"SW", "FB"})
+
+
+@pytest.mark.parametrize("name", ["c3_usb", "node"])
+def test_a_differential_pair_is_skipped_and_the_reason_is_coupling_not_skew(name: str):
+    """The two boards with a pair, and the clause that was removed, measured and put back.
+
+    Removing `autoroute == "diff_pair"` from `_skip_nets` improves **every number the arbiter
+    reports**: on a fresh c3_usb build `kicad_drc` stops raising `skew_out_of_range` at all (0.6154
+    -> 0.2730 mm against a declared 0.5, read with the rule tightened to `(max 0mm)` so KiCad prints
+    the actual on the passing arm), `diff_pair_uncoupled_length_too_long` falls 23.2594 -> 21.0732,
+    and the board sheds 66 segments, 5 off-45 legs and 52 micro legs.
+
+    It was refused on the number no rule in this repo reads: walking `USB_DP`'s centreline at 20 um
+    and asking how much of it has `USB_DN` within 0.35 mm on the same layer — the pair's own
+    `diff_pair_gap` is `(opt 0.127mm)` on 0.127 mm copper — **c3_usb goes 29.722 mm coupled (78.9 %)
+    to 6.654 mm (19.1 %)**, and the collapse survives every threshold tried (70.4 -> 16.2 % at 0.30
+    mm, 97.0 -> 71.7 % at 1.00 mm). The halves are separate chains in `sorted(net)` order and take
+    different answers to the same corner, so the skew that passed was two single-ended traces of
+    equal length. c3_usb's `("GND", "B.Cu")` pour says it a second way: 1053.10 -> 1040.57 mm2, one
+    island still, because two coupled tracks cut one clearance corridor through a coplanar pour and
+    two separated ones cut two.
+
+    This test is pure — `compile_design` only — and it pins the decision, not the measurement; the
+    table is in `route_relax`'s history (docs/quality-plan.md).
+    """
+    design = load_board(EXAMPLES / name / f"{name}.py")
+    skip = constrained_nets(compile_design(design), design)
+    assert {"USB_DP", "USB_DN"} <= skip, (name, skip)
 
 
 # --- C3, the half the contact rule could not see ------------------------------------------------------
@@ -166,20 +199,17 @@ def test_two_chains_joined_only_by_a_crossing_stay_joined_and_orphan_no_copper()
     run = [(9.305, 12.315), (20.0, 12.315), (20.0, 20.0), (31.08875, 20.0), (31.08875, 12.24375)]
     spur = [(24.0, 16.0), (20.5, 16.0), (16.0, 16.0), (16.0, 8.0)]  # meets the run only at (20, 16)
     pieces = [_seg("LED", p, q) for p, q in zip(run, run[1:])] + [_seg("LED", p, q) for p, q in zip(spur, spur[1:])]
-    board = _write(text, pieces)
     rows = [{"net": s.net, "layer": s.layer, "start": s.a, "end": s.b, "width": s.w, "length": s.mm, "locked": False} for s in pieces]
     chains, _left = chains_of(rows, lambda s: "leftover")
     movable = frozenset(k for c in chains if len(c.pts) >= 3 for k in c.keys)
     assert all(holds(c, [], [], rows, movable).anchors for c in chains), "the crossing must anchor both sides"
 
-    before = build_scene(design, job, job.constraints, board)
+    before = _after(design, job, text, pieces)
     got = _relax(design, job, text, pieces)
-    after = build_scene(design, job, job.constraints, got.text)
+    after = _after(design, job, text, got.owned)
     assert orphan_copper(before, "LED") == orphan_copper(after, "LED") == 0
     assert got.stats["orphans_in"] == got.stats["orphans_out"] == 0
-    from pcbc.copper_bar import segments as bar_segments
-
-    vertical = [s for s in bar_segments(got.text) if s["net"] == "LED" and s["start"][0] == s["end"][0] == 20.0]
+    vertical = [{"start": p.a, "end": p.b, "width": p.w} for p in got.owned if p.net == "LED" and p.kind == "seg" and p.a[0] == p.b[0] == 20.0]
     assert any(gap(track_shape(s["start"], s["end"], s["width"]), track_shape((20.5, 16.0), (16.0, 16.0), 0.2)) <= 0.0 for s in vertical), (
         "the spur no longer crosses the run: the contact rule is blind to a crossing again"
     )
@@ -199,13 +229,13 @@ def test_orphan_copper_measures_millimetres_because_a_count_gives_the_guard_slac
     joined = [_seg("LED", (9.305, 12.315), (31.08875, 12.24375))]
     adrift = joined + [_seg("LED", (20.0, 20.0), (24.0, 20.0))]  # touches neither pad nor the run
     for pieces, want in ((joined, 0.0), (adrift, 4.0)):
-        scene = build_scene(design, job, job.constraints, _write(text, pieces))
+        scene = _after(design, job, text, pieces)
         assert [sorted(g) for g in components(scene, "LED")] == [["D1.2", "R1.2"]], "the pads are one group either way"
         assert orphan_copper(scene, "LED") == want, "4.0 mm of centreline"
     # The count version's blind spot, made concrete: an island that tidies from many legs to one
     # loses items and keeps its millimetres, so a count leaves slack and a length does not.
     staircase = joined + [_seg("LED", (20.0 + 0.5 * i, 20.0), (20.5 + 0.5 * i, 20.0)) for i in range(8)]
-    sc = build_scene(design, job, job.constraints, _write(text, staircase))
+    sc = _after(design, job, text, staircase)
     assert orphan_copper(sc, "LED") == 4.0, "eight legs of the same 4 mm island measure exactly what one leg would"
 
 
@@ -224,7 +254,7 @@ def test_a_trim_may_not_retract_a_run_until_its_end_cap_merely_grazes_the_pad():
     blinky's `R1.2` is a roundrect whose hull is `x in [9.305, 9.575]` with `r = 0.135`, so its
     copper reaches `x = 9.71` and the rule bites at `x = 9.575 + 0.135 = 9.71` exactly."""
     design, job, text = _blinky()
-    scene = build_scene(design, job, job.constraints, text)
+    scene = scene_from_text(design, job, job.constraints, text)
     pad = next(it for it in scene.items if it.kind == "pad" and it.owner == "R1.2")
     assert pad.copper.r == 0.135 and pad.copper.pts[0] == (9.305, 12.315)
     chain = chains_of(_as_dicts([_seg("LED", (9.40, 12.5), (13.0, 12.5))]), lambda s: "leftover")[0][0]
@@ -259,7 +289,7 @@ def test_a_pad_joint_must_keep_the_process_floor_of_centreline_inside_the_pads_c
     design, job, text = _blinky()
     floor = get_stackup(job.stackup).clearance_min
     assert floor == 0.127, "blinky's process floor, off its own stackup"
-    scene = build_scene(design, job, job.constraints, text)
+    scene = scene_from_text(design, job, job.constraints, text)
     pad = next(it for it in scene.items if it.kind == "pad" and it.owner == "R1.2")
     chain = chains_of(_as_dicts([_seg("LED", (9.40, 12.5), (13.0, 12.5))]), lambda s: "leftover")[0][0]
 
@@ -297,75 +327,35 @@ def test_the_first_two_moves_are_trims_and_they_do_move_an_end():
 
 def test_seg_key_is_route_bar_key_and_copper_bar_bar_key():
     from pcbc.copper_bar import bar_key as bar
-    from pcbc.route import bar_key as route_bar
+    from boardtext import bar_key as route_bar
 
     p = _seg("N", (2.0, 1.0), (0.0, 0.0), 0.25)
     assert seg_key("F.Cu", (2.0, 1.0), (0.0, 0.0), 0.25) == bar("seg", "F.Cu", (2.0, 1.0), (0.0, 0.0), 0.25) == route_bar(p)
     assert seg_key("F.Cu", (0.0, 0.0), (2.0, 1.0), 0.25) == seg_key("F.Cu", (2.0, 1.0), (0.0, 0.0), 0.25), "order-free"
 
 
-def test_strip_and_replace_touch_the_named_segments_and_nothing_else():
-    base = "(kicad_pcb\n)\n"
-    keep, drop = _seg("N", (0.0, 0.0), (1.0, 0.0)), _seg("N", (1.0, 0.0), (2.0, 0.0))
-    text = write_pieces(base, [keep, drop])
-    out = strip_segments(text, {seg_key("F.Cu", (1.0, 0.0), (2.0, 0.0), 0.2)})
-    assert out.count("(segment") == 1 and "0.000000 0.000000" in out
-    assert strip_segments(text, set()) == text
-    from pcbc.route_emit import piece_text
-
-    back = replace_segments(text, [seg_key("F.Cu", (1.0, 0.0), (2.0, 0.0), 0.2)], [piece_text(_seg("N", (1.0, 0.0), (2.0, 1.0)))])
-    assert back.count("(segment") == 2 and "2.000000 1.000000" in back
-
-
-def test_strip_finds_a_segment_whatever_indents_it_and_a_replace_cannot_degrade_to_an_append():
-    """The anchor on the strip side must match whatever the reader on the find side matches.
-
-    `copper_bar._SEG`, which is what chooses the keys, is whitespace-agnostic; the strip anchored on
-    the literal bytes `\\n\\t(segment`, which is what KiCad >= 8 writes and not what KiCad <= 7 does.
-    On a board re-indented to two spaces the strip removed **nothing**, `replace_segments` became
-    `strip(0) + append(all)`, and buck came back at 203 segments / 242.21 mm against a correct
-    replace's 71 / 145.7 — every staircase still there under its taut replacement, `stats` still
-    reporting 71, and no exception. Neither self-check could have caught it: extra copper only ever
-    merges `components` groups, never splits them.
-    """
-    base = "(kicad_pcb\n)\n"
-    keep, drop = _seg("N", (0.0, 0.0), (1.0, 0.0)), _seg("N", (1.0, 0.0), (2.0, 0.0))
-    tabbed = write_pieces(base, [keep, drop])
-    key = seg_key("F.Cu", (1.0, 0.0), (2.0, 0.0), 0.2)
-    for label, text in (("tabs", tabbed), ("two spaces", tabbed.replace("\n\t", "\n  ").replace("\n\t\t", "\n    ")), ("none", tabbed.replace("\n\t", "\n"))):
-        out = strip_segments(text, {key})
-        assert out.count("(segment") == 1, f"{label}: the strip is a no-op and the replace is an append"
-        assert "0.000000 0.000000" in out, f"{label}: it removed the wrong one"
-    # And when the two readers do disagree it is loud, because silence here is the worst failure
-    # mode this pass has: the caller believes it replaced and the board was only added to.
-    with pytest.raises(ValueError, match="not on the board"):
-        strip_segments(tabbed, {seg_key("F.Cu", (9.0, 9.0), (9.5, 9.5), 0.2)})
-
-
-def test_a_leftover_segment_is_written_unlocked_and_a_pattern_s_stays_locked():
-    """KRT's route is not pcbc's to claim, and a board whose every track is locked cannot be
-    dragged in KiCad's editor. `route_emit.segment`'s default is unchanged, so `test_fanout.py`'s
-    byte contract is untouched."""
-    from pcbc.route_emit import piece_text
-
-    assert "(locked yes)" in piece_text(_seg("N", (0.0, 0.0), (1.0, 0.0)))
-    assert "(locked yes)" not in piece_text(_seg("N", (0.0, 0.0), (1.0, 0.0)), locked=False)
-
-
 # --- end to end, on a placed board -------------------------------------------------------------------
 
 
-def _write(text, pieces, owned=()):
-    """The board with this copper on it, locked only where pcbc owns it — which is what the routed
-    board looks like: `route_emit.write_pieces` locks, and KRT's own copper is not locked."""
-    from pcbc.route_emit import piece_text
-
-    keys = {seg_key(p.layer, p.a, p.b, p.w) for p in owned}
-    return replace_segments(text, [], [piece_text(p, locked=seg_key(p.layer, p.a, p.b, p.w) in keys) for p in pieces])
+def _relax(design, job, text, pieces):
+    return relax_pieces(design, job, job.constraints, feet_of_text(design, text), "blinky", owned=pieces)
 
 
-def _relax(design, job, text, pieces, owned=(), steps=()):
-    return relax_board(design, job, job.constraints, _write(text, pieces, owned), "blinky", owned=owned, owned_steps=steps)
+def _after(design, job, text, pieces):
+    """The scene of the footprint board with these pieces on it: what the checks read."""
+    sc = scene_from_text(design, job, job.constraints, text)
+    sc.add(sc.item_of(p) for p in pieces)
+    return sc
+
+
+def test_router_copper_is_written_unlocked_and_a_pattern_s_stays_locked():
+    """The router's route is a shape the generator chose and a person may drag in KiCad's editor; a
+    pattern's copper is written locked, as it always was (`route_native.to_objects`)."""
+    from pcbc.route_native import to_objects
+
+    cu, groups = to_objects([_seg("N", (0.0, 0.0), (1.0, 0.0), reason="route"), _seg("N", (1.0, 0.0), (2.0, 0.0), reason="hop")], "t")
+    assert [c.locked for c in cu] == [False, True]
+    assert sorted(g.f["name"] for g in groups) == ["pcbc:hop:N", "pcbc:route:N"]
 
 
 def _staircase(a, b, n=8):
@@ -384,10 +374,10 @@ def test_a_staircase_between_two_pads_collapses_and_the_net_stays_one_component(
     pieces = [_seg("LED", p, q) for p, q in zip(pts, pts[1:])]
     got = _relax(design, job, text, pieces)
     assert got.stats["segments_in"] == len(pieces) and got.stats["segments_out"] < len(pieces) / 3
-    after = build_scene(design, job, job.constraints, got.text)
+    after = _after(design, job, text, got.owned)
     assert [sorted(g) for g in components(after, "LED")] == [["D1.2", "R1.2"]], "the pads are still one component"
     assert got.stats["skipped_segments"] == 0 and got.stats["moved"] == 1
-    assert "(locked yes)" not in got.text.split("(segment")[-1], "leftover copper stays KRT's"
+    assert {p.reason for p in got.owned} == {"leftover"}
 
 
 def test_two_runs_of_the_same_board_are_byte_identical():
@@ -396,7 +386,7 @@ def test_two_runs_of_the_same_board_are_byte_identical():
     design, job, text = _blinky()
     pts = _staircase((9.44, 12.5), (31.3075, 16.0)) + [(31.3075, 12.5)]
     pieces = [_seg("LED", p, q) for p, q in zip(pts, pts[1:])]
-    assert _relax(design, job, text, pieces).text == _relax(design, job, text, pieces).text
+    assert _relax(design, job, text, pieces).owned == _relax(design, job, text, pieces).owned
 
 
 def test_a_mid_span_contact_survives_and_the_endpoint_only_design_would_have_lost_it():
@@ -409,12 +399,11 @@ def test_a_mid_span_contact_survives_and_the_endpoint_only_design_would_have_los
     run = [_seg("LED", p, q) for p, q in zip(pts, pts[1:])]
     stub = _seg("LED", (20.0, 18.0), (20.0, 16.0))  # lands on the run away from every vertex of it
     got = _relax(design, job, text, run + [stub])
-    after = build_scene(design, job, job.constraints, got.text)
+    after = _after(design, job, text, got.owned)
     assert [sorted(g) for g in components(after, "LED")] == [["D1.2", "R1.2"]]
     stub_shape = track_shape((20.0, 18.0), (20.0, 16.0), 0.2)
-    from pcbc.copper_bar import segments as bar_segments
 
-    kept = [s for s in bar_segments(got.text) if s["net"] == "LED"]
+    kept = [{"start": p.a, "end": p.b, "width": p.w} for p in got.owned if p.net == "LED" and p.kind == "seg"]
     assert any(gap(stub_shape, track_shape(s["start"], s["end"], s["width"])) <= 0.0 for s in kept if s["start"] != (20.0, 18.0)), (
         "the run no longer touches the stub: the preserve set has been reduced to the endpoints"
     )
@@ -427,19 +416,17 @@ def test_a_spine_is_not_rewritten_even_when_it_is_the_worst_copper_on_the_board(
     design, job, text = _blinky()
     pts = _staircase((9.44, 12.5), (31.3075, 16.0)) + [(31.3075, 12.5)]
     pieces = [_seg("LED", p, q, reason="spine") for p, q in zip(pts, pts[1:])]
-    got = _relax(design, job, text, pieces, owned=tuple(pieces), steps=("patterns_pre",) * len(pieces))
+    got = _relax(design, job, text, pieces)
     assert got.stats["skipped_segments"] == len(pieces) and got.stats["segments_out"] == len(pieces)
-    assert got.text == _write(text, pieces, pieces), "not one byte of a spine moves"
-    assert got.owned == tuple(pieces) and set(got.owned_steps) == {"patterns_pre"}
+    assert got.owned == tuple(pieces), "not one piece of a spine moves"
 
 
-def test_a_relaxed_tap_keeps_its_reason_and_reports_the_step_that_redrew_it():
-    """`copper_bar` reads a piece's reason off `route.bar_key(p)`, so pcbc's own copper would read
-    as leftover the moment it moved; `copper.json` records the step that wrote the geometry."""
+def test_a_relaxed_tap_keeps_its_reason():
+    """A relaxed piece is still what its pattern wrote it as: its role group (`pcbc:tap:...`) is where
+    the gates read it, so pcbc's own copper would read as another's the moment it moved."""
     design, job, text = _blinky()
     pts = _staircase((9.44, 12.5), (31.3075, 16.0)) + [(31.3075, 12.5)]
     pieces = [_seg("LED", p, q, reason="tap") for p, q in zip(pts, pts[1:])]
-    got = _relax(design, job, text, pieces, owned=tuple(pieces), steps=("patterns_post",) * len(pieces))
-    assert {p.reason for p in got.owned} == {"tap"} and set(got.owned_steps) == {"relax"}
+    got = _relax(design, job, text, pieces)
+    assert {p.reason for p in got.owned} == {"tap"}
     assert len(got.owned) == got.stats["segments_out"] < len(pieces)
-    assert "(locked yes)" in got.text.split("(segment")[-1], "pcbc's own copper is still locked"

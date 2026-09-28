@@ -21,11 +21,11 @@ single 0.2 mm vias, each rated 0.527 A, and nothing in the build looked at a via
 stitch are treated as parallel and carry `n x via_amps`; a lone via on a path carries one via's
 worth, which is what a cut edge is.
 
-**This is a measurement, not the gate.** Three of the five boards fail it today and R2 cannot fix
-them: the copper that necks is KRT's leftover, which R3's maze router owns. `docs/r2-measurements.md`
-S7 records the numbers and `test_examples_fab.py` pins them as a ledger that must improve. The gate
-(`copper.power_ampacity_failures`) judges the copper **pcbc itself wrote**, where a neck is a bug
-pcbc committed rather than one it inherited.
+**This is a measurement, not the gate.** A rail short of its declaration is a printed move
+(`power_moves`; `--strict-power` makes it stop the build), because the fix is an edit only the author
+can make — a placement, a plane, a declaration. `test_examples_fab.py` pins the numbers (`BOTTLENECK`)
+as a ledger that must not get worse. The gate (`copper.power_ampacity_failures`) judges each piece of
+copper the `pcbc:` groups name against its class, where a neck is a bug pcbc committed.
 """
 
 from __future__ import annotations
@@ -191,12 +191,15 @@ def net_nodes(text: str, net: str, pads: list, *, dt: float, stack, plane_h: flo
             continue
         vs.append({"at": (float(m.group(1)), float(m.group(2))), "size": float(m.group(3)), "drill": float(m.group(4))})
     parallel = _via_clusters(vs)
+    # A through via spans the board's copper layers, not a fixed four: a move naming its layers on a
+    # two-layer board said "B.Cu/F.Cu/In1.Cu/In2.Cu" (the refuters, buck's VIN).
+    through = frozenset(stack.copper_layers()) if hasattr(stack, "copper_layers") else ALL_CU
     for i, v in enumerate(vs):
         out.append(
             Node(
                 key=("via", i),
                 shape=via_shape(v["at"], v["size"]),
-                layers=ALL_CU,
+                layers=through,
                 amps=round(parallel[i] * via_amps(v["drill"], plating, dt), 3),
                 mm=0.0,
             )
@@ -260,8 +263,8 @@ def power_bottlenecks(job: CompiledJob, text: str, *, redundant: frozenset = fro
     every one of those boards has a poured `GND` in the routed file (finding 1).
 
     `redundant` is `copper_bar.bar_key`s of copper that is **not on the rail being measured**, read off
-    `routed/copper.json` by the caller — today `NOT_A_RAIL`, which is the `guard` reason and nothing
-    else. Measured on `tests/fixtures/guard/guard.py`: the two flanks of one 16 mm run are 27.04 mm of
+    the board's own `pcbc:` role groups by the caller (`fab.board_roles`; the router's sidecar is not
+    read after normalise) — today `NOT_A_RAIL`, which is the `guard` reason and nothing else. Measured on `tests/fixtures/guard/guard.py`: the two flanks of one 16 mm run are 27.04 mm of
     0.127 mm `GND` copper, and without this `under_mm` on `GND` reads **27.727 mm** of under-width
     rail where the board really has **0.683** — a ground plane reported as three quarters necked
     because a shield was counted as a rail.
@@ -275,8 +278,7 @@ def power_bottlenecks(job: CompiledJob, text: str, *, redundant: frozenset = fro
     for connectivity and fully load-bearing for current; a guard is the only one of the three that is
     not on the net whose current is in question at all.
 
-    Empty by default, so a caller with no sidecar — `PCBC_PATTERNS=off`, or a board routed before
-    this existed — measures exactly what it measured before."""
+    Empty by default, so a caller that names no redundant copper measures the whole net."""
     cs = job.constraints
     if cs is None:
         return {}
@@ -287,7 +289,16 @@ def power_bottlenecks(job: CompiledJob, text: str, *, redundant: frozenset = fro
     for net in job.nets:
         if net.kind != "power" or not net.amps:
             continue
-        for name in sorted(n for n in census if any(fnmatch.fnmatch(n, p) for p in net.patterns)):
+        # Every net on the board's pads as well as every net with copper: a declared rail the build left
+        # with no copper at all (an unfinished net ships none, docs/direction.md §5) reads `open`, and
+        # does not drop out of the table (the refuters' D1 fix emptied node's and c3_usb's `VBUS`).
+        # A net on one pad has nothing to join and stays out, as it did (blinky's `VCC`).
+        pad_count: dict[str, set] = {}
+        for p in pads:
+            if p.net:
+                pad_count.setdefault(p.net, set()).add((p.ref, p.num))
+        on_board = set(census) | {n for n, ps in pad_count.items() if len(ps) >= 2}
+        for name in sorted(n for n in on_board if any(fnmatch.fnmatch(n, p) for p in net.patterns)):
             if name in out:
                 continue
             c = cs.by_net(name)
@@ -296,13 +307,10 @@ def power_bottlenecks(job: CompiledJob, text: str, *, redundant: frozenset = fro
             cur = c.current
             need = round(max(cur.width_ipc2221.value, cur.width_ipc2152.value), 4)
             cls = round(float(c.width_mm.value), 4)
-            # The zone **in the file**, and nothing else. `job.planes` used to be an alternative
-            # here and it is a predictive exemption: `krt_plan` reads `planes=` only when
-            # `job.layers > 2`, so `Board(planes=[("VIN", "B.Cu")])` on a two-layer board pours no
-            # copper at all and would have stopped `VIN` being measured — which is the shape of the
-            # move `power_moves` prints, so the tool could have talked an author into silencing it.
-            # The census reads the routed board, where every real pour is a zone, so nothing is lost.
-            zoned = bool(census[name].get("zone"))
+            # The zone **in the file**, and nothing else: whether a rail is poured is read off the
+            # emitted board, where every pour the route stage wrote is a zone, and never predicted
+            # from `job.planes` (a prediction is how a move could silence a rail it did not pour).
+            zoned = bool(census.get(name, {}).get("zone"))
             nodes = net_nodes(text, name, pads, dt=cur.temp_rise_c, stack=cs.stackup, plane_h=cur.plane_h_mm)
             if redundant:
                 # Filtered before `_adjacency` and before `under_mm`, so a shield is neither counted
@@ -461,19 +469,17 @@ def _plane_layer(layers: Sequence[str], taken: Sequence[tuple[str, str]] = ()) -
     """Which layer a `Board(planes=...)` suggestion should name, or `None` for no suggestion at all.
 
     A free **inner** copper layer, because a plane layer is what an inner layer is for, and nothing
-    otherwise: not on two layers, where `Board(planes=...)` is not an edit that does anything at all,
-    and not on the outer layers of a four-layer board, where every part is already standing.
+    otherwise: not on two layers, where a declared `planes=` **replaces** the implicit back GND pour
+    (`route_scene.plane_targets`), so a rail plane there takes the ground away; and not on the outer
+    layers of a four-layer board, where every part is already standing.
 
     Three things a move must never do, and the first version of this did all three. Name a layer the
     board does not have (`In1.Cu` to a two-layer board). Name a layer another net already pours: node
     pours `GND` on `In1.Cu` and `3V3` on `In2.Cu`, and its `VBUS` move said `In1.Cu`, an edit that
     lays a second plane over the ground plane on a board whose own D.5 check then asks why `GND` is
-    in two pieces. And — the one that matters most — **name an edit that silences the measurement
-    without pouring any copper**: `route.krt_plan` reads `planes=` only when `job.layers > 2`
-    (`plane_nets = ... if job.planes and job.layers > 2 else []`), so on buck a
-    `Board(planes=[("VIN", "B.Cu")])` pours nothing whatever, while `power_bottlenecks` would mark
-    `VIN` zoned and stop measuring it. A move that makes the warning disappear and the board no
-    better is worse than no move.
+    in two pieces. And name an edit that makes the warning disappear and the board worse: on two
+    layers `Board(planes=[("VIN", "B.Cu")])` pours `VIN` where the ground plane was. A move that makes
+    the warning disappear and the board no better is worse than no move.
     """
     if len(tuple(layers)) <= 2:
         return None
@@ -493,8 +499,8 @@ def power_moves(
 
     The four edits, in the order an author should consider them:
 
-    1. **Move the parts.** The neck is almost always KRT's leftover copper filling a gap pcbc's own
-       patterns did not span, and the gap is a placement fact: bring the parts either side of that
+    1. **Move the parts.** The neck is almost always the router's copper filling a gap between parts,
+       and the gap is a placement fact: bring the parts either side of that
        copper together with `Place()` and the path the current takes is shorter and wider. The move
        names the neck's **coordinate** (`at_mm`), not the pad pair the walk happened to end on.
     2. **Give the rail a plane.** `Board(planes=[(net, layer)])` makes the conductor a pour rather
@@ -513,19 +519,13 @@ def power_moves(
     naming the pad pair instead of `at_mm` did. What a via bottleneck wants is a second via beside
     it — technique 1 — and since S4 `patterns/stitch.py` places one wherever the ring around the
     anchor has room, so the sentence now points at the `stitch` move rather than at a slice that has
-    not shipped. Measured 2026-09-20, the population is node's `VBUS` and nothing else: singleton
-    groups of a 0.2 mm drill carrying 0.527 A of a 1 A rail, four of them on the checked-in board and
-    three on a fresh build, every one short by exactly one via. Re-measured 2026-09-21 with the
-    carrier live: one of node's three rings has room and the rail still reads `kind == "via"` at
-    0.527 A, because the barrel this line names is one of the two whose ring is full of `J1`'s pads
-    and KRT's `USB_DN` — so this move and the two `stitch` moves above it are the same finding said
-    from both ends. `route_verify.via_parallelism` is where the count lives and
+    not shipped. Where the ring around the anchor has no room the `stitch` refusal and this move are
+    the same finding said from both ends. `route_verify.via_parallelism` is where the count lives and
     `route_verify.parallel_joined` is where the rungs are checked.
 
-    Deliberately *not* a build failure by default (`--strict-power` makes it one): the copper that
-    necks is the router's leftover, R3's maze router owns it, and a gate that stops three of five
-    boards on a fault the tool cannot yet repair teaches an author to pass `--force`, which is worse
-    than a move they read.
+    Deliberately *not* a build failure by default (`--strict-power` makes it one): every fix is an
+    edit only the author can make, and a gate that stops a board on one teaches an author to pass
+    `--force`, which is worse than a move they read.
     """
     plane = _plane_layer(layers, planes)
     out = []

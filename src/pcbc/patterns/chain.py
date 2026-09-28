@@ -7,17 +7,14 @@ it — and that is a sentence no router infers from a netlist, because every one
 three pads connects the same three pads. So the chain is linked consecutively in the order it was
 given, and it is never re-ordered to close the net.
 
-**Every refusal this pattern makes is soft**, declared or not (C.6), and S6's review is why. The
-slice shipped a declared chain as a *hard* refusal — an abort of the whole build before KRT runs —
-on the argument that "falling through to KRT would produce copper that violates the intent rather
-than merely a worse route, because KRT would branch". Two measurements retired it. On the only board
-in the repo with a declared chain that is not a pair, KRT honours the order: it runs a single
-straight 45-degree trace **across** `C4.1`'s pad, 1.1185 mm of that trace's centre line inside the
-pad's own copper. And the invariant the abort was protecting was checked nowhere at all —
-`docs/router-plan.md` line 202 tags R-X4 "**P** (chain), **V**" and the **V** did not exist. It does
-now (`route_verify.chain_order`, run on the routed board by `build._chain_gate`), so a declared order
-that is genuinely violated fails the build on a measurement of the finished copper rather than on a
-guess about what KRT was going to do. `--strict-patterns` still turns every refusal here into a stop
+**This pattern is not in any stage** (`patterns._STAGES`; the table under `patterns.MID` is why). A
+declared `Chain()` is linked by the router, station to station before any other link of its net
+(`route_native.net_links`), and `build._chain_gate` fails the build when the emitted copper does not
+feed the stations in order (`route_verify.chain_order`). The module is kept whole, with its tests, as
+the starting point for a pattern-level chain.
+
+**Every refusal this pattern makes is soft**, declared or not (C.6): the order is checked on the
+finished copper by the gate, not predicted here. `--strict-patterns` turns every refusal into a stop
 for the author who wants one.
 
 Two populations, and B.2's own split:
@@ -44,9 +41,8 @@ and recorded here so they are not re-decided silently:
 1. **R-X4's distance is `stackup.clearance_min + w/2`, not B.2's `between(net, net) + w/2 +
    pad_half`.** `ClearanceTable.between` returns `(0.0, "same net")` for a net against itself, so
    B.2's formula collapses to "must not *touch* a later pad" — a rule quantised geometry steps
-   around. `stackup.clearance_min` is the number `route.py` already hands KRT as
-   `--same-net-pad-clearance` and the one `ClearanceTable.via_to_same_net_smd_pad` returns for
-   exactly this same-net-pad question.
+   around. `stackup.clearance_min` is the number `ClearanceTable.via_to_same_net_smd_pad` returns
+   for exactly this same-net-pad question.
 2. **`blocked()` cannot express R-X4 at all.** `route_scene._pair_clashes` skips the copper rule for
    same-net pairs by design (and must: a chain link *lands* on its own stations), so the standard
    clash path can never report a later chain member. `stub_clash` below is an explicit test that
@@ -90,7 +86,7 @@ this link needs is a six-corner detour of 14.744 mm around three sides of the `U
 every point out of `ax, ay, bx, by` and all 96 candidate points for this link lie inside the two
 exits' own bounding box. That is R3's maze router's job and not a defect in this enumeration, and it
 is why the refusal is **soft**: the pattern is saying "not with these shapes", which is not the same
-sentence as "not at all". KRT then routes it — in the declared order, measured — and
+sentence as "not at all". The router then links it station to station, and
 `route_verify.chain_order` is what checks that it did.
 """
 
@@ -99,7 +95,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
-from ..blocking import move_line
+from ..moves import move_line
 from ..copper_bar import airwire_mm
 from ..route_checks import CHAIN_HOP_MM, _principal_order
 from ..route_emit import Piece
@@ -646,9 +642,9 @@ def _run(ctx: PatternCtx, spec: ChainSpec) -> tuple[tuple[Piece, ...], list[tupl
             # | bounded, declared included (0 seg) | builds, exactly as with the pattern off |
             #
             # None of the copper was near what broke. The 14.4 mm declared link sits 3.4 mm from the
-            # tap that failed and on the opposite layer from the plane that split: locked copper
-            # moves KRT, and KRT's own copper closes the escape two stages later. That is the cost a
-            # long link carries and the reason the bound is not a tidy round number but this one.
+            # tap that failed and on the opposite layer from the plane that split: copper written
+            # before the router changes every route after it. That is the cost a long link carries
+            # and the reason the bound is not a tidy round number but this one.
             return (grown, joins, (i, a, b, None, "not local"), tried)
         got, n, clash, why = _link(ctx, spec, a, b, mine, head, spec.stations[i + 2 :])
         tried += n
@@ -710,11 +706,9 @@ def _refuse_layer(ctx: PatternCtx, spec: ChainSpec) -> Refusal:
     """The stations share no copper layer, and R2 puts no via on a chain (B.2: a chain is a feed
     order on one layer).
 
-    Soft, like every other chain refusal (C.6). A net whose own `NetReq(layers=)` leaves its stations
-    without a shared layer is one of the two cases `Refusal.hard` is *for* — KRT cannot hold a
-    single-layer constraint it is not given — but this refusal is not that case: it fires when the
-    stations' **pads** share no layer, which is a placement fact KRT is free to route around with a
-    via. Nothing here sets `hard`."""
+    Soft, like every other chain refusal (C.6): it fires when the stations' **pads** share no layer,
+    which is a placement fact the router is free to route around with a via (where the net allows
+    one). Nothing here sets `hard`."""
     where = ", ".join(f"{label} on {'/'.join(sorted(t.layers)) or 'no copper layer'}" for t, label in zip(spec.stations[:3], spec.labels[:3]))
     return Refusal(
         pattern=REASON,
@@ -832,20 +826,10 @@ def _refuse(ctx: PatternCtx, spec: ChainSpec, failed: tuple, tried: int) -> Refu
     """B.2's refusal: the failing link named by its number and its two stops, a real blocker with its
     own number, what was emitted before it, and a `board.py` edit.
 
-    **Soft, declared or not** (C.6). Until S6's review a declared chain refused *hard* — aborting the
-    build before KRT ran — on the premise that "KRT would connect the same pads by branching and the
-    branch is exactly what the order was written to forbid". The premise was never checked and the
-    one board that could check it says otherwise: on ds2's routed `VDDA`, KRT runs a straight
-    45-degree trace across `C4.1`'s pad with 1.1185 mm of centre line inside the pad's own copper,
-    and the declared order is honoured in the finished board. An implicit chain was already soft for
-    `hop._refuse`'s reason — nothing was declared, so a fall-through to KRT disobeys nothing and
-    costs a route pcbc would have drawn straighter.
-
-    What replaced the hard refusal is the check it was standing in for. `route_verify.chain_order`
-    reads the routed board and fails the build when a **declared** order really is violated there
-    (`build._chain_gate`), so the stop happens on a measurement of KRT rather than on a prediction
-    about it — "KiCad is the arbiter" applied to the one question the arbiter's own netlist gate
-    cannot ask, because connectivity is order-blind.
+    **Soft, declared or not** (C.6). A declared order is checked where it can be measured:
+    `route_verify.chain_order` reads the emitted board and fails the build when the order is violated
+    there (`build._chain_gate`) — the one question KiCad's own netlist gate cannot ask, because
+    connectivity is order-blind. An implicit chain declares nothing, so a refusal disobeys nothing.
     """
     i, a, b, clash, why = failed
     la, lb = spec.labels[i], spec.labels[i + 1]

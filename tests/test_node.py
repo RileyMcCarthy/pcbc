@@ -78,4 +78,10 @@ def test_node_layout_bar():
 
     result = pcb_job(BOARD)
     assert result.get("error") is None, result
-    assert result["layout_report"] == [], result["layout_report"]
+    # node's one route-aware move, and it is a finding rather than a regression: the `usb_hs` pair
+    # declares neither `max_mm=` nor `length_mm=`, so no placement budget has ever looked at a span
+    # of 39.124 / 38.971 mm of pad-to-pad MST on a 75.000 mm diagonal (`route_checks.FAST_KINDS`
+    # records why no preset number was invented instead). `tests/test_route_checks.py` pins the text.
+    fast = [m for m in result["layout_report"] if "no budget checks it" in m]
+    assert sorted(m.split(":")[0] for m in fast) == ["USB_DN", "USB_DP"], fast
+    assert [m for m in result["layout_report"] if m not in fast] == [], result["layout_report"]

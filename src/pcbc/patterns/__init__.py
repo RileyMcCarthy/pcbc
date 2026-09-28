@@ -8,25 +8,25 @@ byte-identical copper and why a refusal is a sentence the AI can act on rather t
 
 `pattern_copper` is the stage. It walks the patterns of C.1 in C.1's order, adds each pattern's
 copper to the scene before the next one runs — so a later pattern sees it as an obstacle and the
-whole stage is one left-to-right pass with no revisiting — and hands back a `PatternPlan`: the board
-text with the copper in it, the census, the moves, and which nets still need KRT.
+whole stage is one left-to-right pass with no revisiting — and hands back a `PatternPlan`: the
+pieces, the census, the moves, and which nets the patterns finished (the router links the rest).
 
 Nothing here decides geometry. `route_geom` owns the shapes and the paths, `route_scene` owns the
-five rules and the exits, `route_emit` owns the text; this module owns the *order*.
+five rules and the exits, `route_emit` owns the pieces; this module owns the *order*.
 """
 
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Sequence
 
 from ..compile import CompiledJob
 from ..constraints import ConstraintSet
 from ..model import Design
-from ..route_emit import Piece, census as _census, seg_piece, write_pieces
+from ..route_emit import Piece, census as _census, seg_piece
 from ..route_geom import Pt, is_octilinear, legs_ok, octant, qp, turn_ok
-from ..route_scene import Clash, Exit, Item, Scene, build_scene, net_open, pad_exits
+from ..route_scene import Clash, Exit, Item, Scene, net_open, pad_exits
 from ..sexp import stable_uuid
 
 __all__ = [
@@ -66,33 +66,16 @@ __all__ = [
 class Refusal:
     """Why a pattern emitted nothing, and what the AI can do about it.
 
-    `hard` is fatal even in R2 (C.6): it aborts the route stage before KRT is run at all
-    (`route.py`). It exists for the case where honouring the refusal would break a constraint KRT
-    structurally **cannot** hold whatever it does with the net — a net whose `NetReq` sets
-    `vias=False`, or a net that lives on one layer — because there the fall-through does not produce
-    a worse route, it produces copper the author forbade.
+    `hard` is fatal (C.6): `route_native.route_stage` raises `PatternRefused` and the build stops with
+    the move. It exists for the case where honouring the refusal would leave the router a constraint
+    it structurally **cannot** hold. **Nothing sets it today**: every producer passes `hard=False`
+    (a pattern that would put a via on a `vias=False` net is refused softly by `_no_banned_vias`),
+    and `--strict-patterns` (`PCBC_STRICT_PATTERNS=1`) reads the same path to make every refusal
+    fatal on demand.
 
-    **Nothing in this codebase sets it today, and that is deliberate rather than an oversight.**
-    Every producer passes `hard=False`: `hop`, `spine`, `tap`, and — since S6's review — `chain`.
-    The field and `hard_refusals` are kept because the two cases above are real and unimplemented,
-    and because `--strict-patterns` (`PCBC_STRICT_PATTERNS=1`) reads the same path to make every
-    refusal fatal on demand. A dead field with a live reason is better than a rediscovered one.
-
-    **A declared `Chain()` was the one thing that set it, and the justification did not survive being
-    measured.** The argument was that falling through to KRT "would produce copper that violates the
-    intent rather than merely a worse route, because KRT would branch". On the only board in the repo
-    with a declared chain that is not a pair — the DS2 Addon's `Chain("VDDA", "J2.1", "C4.1",
-    "U1.12")` — KRT honours the order: it runs one straight 45-degree trace **across** `C4.1`'s pad,
-    with 1.1185 mm of that trace's centre line inside the pad's own copper and its junction 0.4300 mm
-    inside it (`docs/r2-measurements.md`, S6). The refusal was aborting the build on a prediction
-    about KRT that the board contradicts. Worse, the invariant it was protecting was checked
-    **nowhere**: R-X4's `**V**` half did not exist. It exists now — `route_verify.chain_order`, run
-    on the routed board by `build._chain_gate` — so a declared order that really is violated fails
-    the build on a measurement instead of on an assumption, and the refusal that could not know is
-    soft.
-
-    Everything else is soft: the move is printed, the net falls through to KRT, the build passes,
-    and the **count** is pinned per board so a new refusal is a test failure rather than a drift.
+    Soft is the rule: the move is printed, the router links what the pattern did not, and the
+    **count** is pinned per board so a new refusal is a test failure rather than a drift. A declared
+    `Chain()` order is not predicted here; it is measured on the emitted board (`build._chain_gate`).
     """
 
     pattern: str
@@ -160,35 +143,30 @@ class PatternCtx:
     """Which of `_STAGES`' keys is running: `"pre"` | `"mid"` | `"post"` | `"final"`.
 
     The four are not interchangeable and a pattern may read this to say so. `pre` and `mid` see a
-    board with no KRT copper on it at all; `post` sees the planes but not the signals; `final` sees
-    every piece of copper the board will ever have, because nothing routes after it (`FINAL`). On two
-    layers that difference is the whole of D.5: at `post` the back pour does not exist and
-    `route_verify.pour_raster` has to predict it, while at `final` `gnd_pour` has already written it.
+    board with no router copper on it; `post` sees the planes' fields (`route_native.plane_pours`)
+    but not the signals; `final` sees every piece of copper the router wrote, because nothing routes
+    after it (`FINAL`; the relaxer only straightens `route_relax.RELAXABLE` runs). No pour is filled
+    at any stage — KiCad fills the emitted board — so an outer-layer pour's reach is predicted
+    (`route_verify.pour_raster`) wherever a pattern needs it.
     """
 
     owned: tuple[Piece, ...] = ()
     """Every piece pcbc has written on this board **so far in this route**, in emission order.
 
     Empty for the `pre` stage, which is the first thing that runs; the pre and mid stages' copper at
-    `post`; all of it at `final`. It is not the scene — the scene holds KRT's copper too and cannot
-    tell the two apart — and that distinction is the whole of `docs/r2-design.md` B.6's precondition:
-    **a guard may only be offset from a path pcbc itself routed**, because pcbc cannot offset a path
-    it does not own. Read off the run rather than inferred from the file, because the only provenance
-    signal a board file carries is `(locked yes)` and KRT locks its own constrained-net copper too
-    (`route.lock_copper`), so a board's locked tracks are not pcbc's tracks.
-
-    `route_job` has held exactly this list since S2 — it is what `_lost` checks for survival after
-    every KRT step and what the copper bar reads a reason off — so this is that list reaching the one
-    pattern whose candidate list is derived from it. Everything else here is a question about the
-    board; this is the one question about the *route*.
+    `post`; all of it, the router's included, at `final`. It is not the scene — the scene holds the
+    core lines' copper too and cannot tell the two apart — and that distinction is the whole of
+    `docs/r2-design.md` B.6's precondition: **a guard may only be offset from a path pcbc itself
+    routed**, because pcbc cannot offset a path it does not own (a `layout.core.py` line is the
+    author's). `route_native.route_stage` keeps this list (`owned`); everything else here is a
+    question about the board, and this is the one question about the *route*.
     """
 
 
 @dataclass(frozen=True)
 class PatternPlan:
-    """What the stage hands to KRT (C.4)."""
+    """What the stage hands back: the pieces, the census, the moves, which nets are done."""
 
-    text: str  # the board with the pattern copper in it
     pieces: tuple[Piece, ...] = ()
     ids: tuple[int, ...] = ()  # scene item id of each piece, in the same order
     census: dict = field(default_factory=dict)
@@ -547,8 +525,8 @@ def legs_of(pieces: Sequence[Piece]) -> tuple[Pt, ...]:
 # --- C.1: the stage -------------------------------------------------------------------------------
 
 PRE = ("hop",)
-"""The pre stage, in C.1's order, least free first. `fanout` is not here: it is `route.py`'s own
-step, run **after** the hops so `fanout._excluded` can drop the nets the hops claimed — a closed
+"""The pre stage, in C.1's order, least free first. `fanout` is not here: it is the route stage's own
+step (`route_native.route_stage`), run **after** the hops so `fanout._excluded` can drop the nets the hops claimed — a closed
 row's lane is better spent on the hop that needed it than on a via the hop then has to start from."""
 
 MID = ("spine",)
@@ -579,7 +557,7 @@ copper is:
 
 The last row is the one that decided it: 16.4 mm of short, local, legal copper on the far side of a
 47 x 25.4 mm board, none of it within 3.4 mm of the tap that fails and none of it on the layer of the
-plane that splits. Locked copper moves KRT, and KRT's own copper closes the escape two stages later.
+plane that splits. Copper written before the router changes every route after it.
 The other four boards agree in the smaller way: with the chain registered, `test_examples_fab`
 fails on buck, c3_usb and node (node's `angles` 102 against a ceiling of 100), and only blinky is
 untouched.
@@ -600,14 +578,13 @@ POST = ("tap",)
 """The post stage, in C.1's order. `tap` (B.3) is S5's; `guard` and `stitch` (B.6) are S8's and are
 fixture-only, because no example declares `Guard()`.
 
-It runs between KRT's `planes` and `signals` steps in both stackups, which is a measured choice and
-not a tidy one: of the four orderings the design tried on node, taps before KRT boxed the USB pair in
-(detour 1.72 -> 1.83) and taps after the signals left **21 unconnected** pads, because the signals had
-taken every tap site. C.1's table has all four."""
+It runs after the pours' fields exist and before the router (`route_native.route_stage`), which is a
+measured choice: C.1 tried four orderings on node, and taps after the signals left **21 unconnected**
+pads because the signals had taken every tap site. C.1's table has all four."""
 
 
 FINAL = ("stitch",)
-"""The stage after KRT's last step: copper whose absence leaves nothing unconnected.
+"""The stage after the router: copper whose absence leaves nothing unconnected.
 
 The governing rule is `docs/stitch-plan.md` **R-S1** — *copper whose absence leaves nothing
 unconnected is written after the last router step that could have used the space it takes* — with
@@ -616,36 +593,11 @@ left; it is never an input to a route. **R-S3:** a stitch whose count is an *ele
 is all-or-nothing, and one whose count is a *target* applies partially and reports the shortfall.
 
 `POST` cannot hold that copper, and the reason is structural rather than a preference. A tap has to
-be followed by a router step — a pad the tap could not weld is an unconnected pad, and KRT's
-`plane_taps` is what repairs it — which is why C.1's four-way measurement on node put the taps
-between `planes` and `signals` and why taps after the signals left **21 unconnected** pads. A stitch
-is the opposite shape: losing its site costs a shield, not a pad, so nothing has to run after it, and
-`krt_plan` schedules nothing after `patterns_final` on either stackup. The ds2 mechanism — KRT
-reacting to pcbc's locked copper, the table under `MID` and `spine.WIDE_MM` — is therefore not
-*bounded* here, it is **absent**.
-
-**It was empty when the stage landed, and the emptiness was the measurement.** With `FINAL = ()` the
-stage ran for real on every board — `build_scene` over the finished copper, `pattern_copper`'s
-self-check, a step file of its own — and wrote nothing, so a fresh build's `routed/layout.kicad_pcb`
-was byte-identical (sha256) to the same build without the stage. Measured on all five, each in its
-own temp dir, the extra step file being a byte copy of the board before it:
-
-| board | `routed/layout.kicad_pcb` | the step it adds, and its input |
-|---|---|---|
-| ds2    | identical | `06_patterns_final` == `05_finalize` |
-| blinky | identical | `05_patterns_final` == `04_finalize` |
-| buck   | identical | `08_patterns_final` == `07_finalize` |
-| c3_usb | identical | `07_patterns_final` == `06_finalize` |
-| node   | identical | `08_patterns_final` == `07_signals` |
-
-**`stitch` is the first copper it writes, and the claim held.** Measured 2026-09-21 with
-`FINAL = ("stitch",)`: node gains **one rung** — a 0.35/0.2 twin at (28.9,33.4) beside its `VBUS`
-barrel at (28,33.4), with a 0.4 mm link on F.Cu and one on B.Cu — and `BAR`, `DETOURS`, `SOFT`,
-`LEFTOVER`, `SPINE_LINKS`, `SPINE_NETS`, `SPINE_REFUSED` and `TAP_REFUSED` are byte-identical on it,
-as are the `hop`, `spine` and `tap` entries of `REFUSED`. Nothing routes after the stage, so there is
-nothing left to react to its copper; that is the whole architecture and it is now tested rather than
-argued. What did move is exactly the list §1.2 says can: `VIAS_PATTERN`, `OWNS`, and the two inner
-plane areas by the antipads the rung carves.
+be followed by the router — a pad the tap could not weld is an unconnected pad the router must link.
+A stitch is the opposite shape: losing its site costs a shield or a barrel, not a pad, so nothing has
+to run after it, and nothing does (`route_native.route_stage`: after `final` come only the relaxer,
+which does not move a stitch, and the sweeps of unfinished and dangling copper). Nothing routes after
+the stage, so nothing can react to its copper; `docs/stitch-plan.md` S2-S4 record the measurements.
 
 **ds2 is the board that matters, and it is still empty with the first carrier down** — for want of a trigger,
 not for want of a tuned bound. Its four power nets (`3V3`, `GND`, `VDDA`, `VSS`) each declare 0.1 A
@@ -657,10 +609,8 @@ paragraph that could be moved to make ds2 place a stitch. `docs/stitch-plan.md` 
 
 
 _STAGES = {"pre": PRE, "mid": MID, "post": POST, "final": FINAL}
-"""Which patterns each stage runs. `pre` and `mid` are the two halves of C.1's pre stage, with
-`route.py`'s own fanout step between them; `post` sits inside the KRT sequence and `final` after all
-of it. The keys are the `--stage` values `route.pcbc_step` writes into the plan and `route_job` reads
-back out of the command, so a stage exists here or it does not run."""
+"""Which patterns each stage runs, in `route_native.route_stage`'s order: `pre`, the fanout, `mid`,
+the pours' fields, `post`, the router, `final`. A stage exists here or it does not run."""
 
 
 def _modules() -> dict:
@@ -673,22 +623,20 @@ def pattern_copper(
     design: Design,
     job: CompiledJob,
     cs: ConstraintSet,
-    text: str,
     board: str,
     *,
     stage: str = "pre",
-    scene: Scene | None = None,
+    scene: Scene,
     verify: bool = True,
     owned: Sequence[Piece] = (),
 ) -> PatternPlan:
-    """Run the stage's patterns over one board, in order, and hand back what KRT still owes.
+    """Run the stage's patterns over one scene, in order, and hand back what the router still owes.
 
     Each pattern's copper enters the scene before the next pattern runs, so the stage is a single
     left-to-right pass: no pattern ever revisits a decision, and the board is a pure function of the
     placed board plus the `ConstraintSet`.
     """
     t0 = time.perf_counter()
-    scene = scene if scene is not None else build_scene(design, job, cs, text)
     ctx = PatternCtx(scene=scene, design=design, job=job, cs=cs, board=board, stage=stage, owned=tuple(owned))
     pieces: list[Piece] = []
     ids: list[int] = []
@@ -704,12 +652,11 @@ def pattern_copper(
         # (`docs/stitch-plan.md` §2k). Every module in `_modules()` says True and the read is a no-op
         # today; it is here so the one that will say False cannot be added without deciding. Without
         # it, a guard that wrote only `GND` copper would `claimed.add` the *guarded* net, and
-        # `PatternPlan.done` — which `krt_plan` drops nets from and `signals` writes `!NET` for —
-        # would then say something false about a net no pattern routed. Read as an attribute, not a
+        # `PatternPlan.done` would then say something false about a net no pattern routed. Read as an attribute, not a
         # `getattr` default: a new module that forgets to declare it should fail here, loudly.
         connects = mod.CONNECTS
         for spec in mod.specs(ctx):
-            res = mod.run(ctx, spec)
+            res = _no_banned_vias(ctx, reason, mod.run(ctx, spec))
             if res.links != (0, 0) or res.coverage:
                 links.setdefault(reason, {})[res.net] = [res.links[0], res.links[1], res.coverage]
             if res.pieces:
@@ -724,7 +671,6 @@ def pattern_copper(
             notes.extend(res.notes)
     done = frozenset(n for n in sorted(claimed) if not net_open(scene, n))
     plan = PatternPlan(
-        text=write_pieces(text, pieces) if pieces else text,
         pieces=tuple(pieces),
         ids=tuple(ids),
         census=_census(pieces),
@@ -747,12 +693,39 @@ def pattern_copper(
     return plan
 
 
+def _no_banned_vias(ctx: PatternCtx, reason: str, res: PatternResult) -> PatternResult:
+    """A result whose copper puts a via on a net whose `NetReq` forbids vias is not written: it becomes
+    a soft refusal whose move names that `NetReq` line (the refuters: a tap on a `vias=False` power
+    rail reached `verify_copper`'s self-check and ended the build as "internal router error ... pcbc
+    bug", with no move). The self-check stays the backstop; this is the first thing that notices."""
+    import fnmatch
+
+    bad: dict[str, int] = {}
+    for p in res.pieces:
+        if p.kind == "via":
+            c = ctx.cs.by_net(p.net)
+            if c is not None and not c.via.allowed:
+                bad[p.net] = bad.get(p.net, 0) + 1
+    if not bad:
+        return res
+    parts = []
+    for net, n in sorted(bad.items()):
+        r = next((r for r in ctx.design.netreqs if any(fnmatch.fnmatch(net, x) for x in r.nets)), None)
+        where = f"its NetReq at board.py:{r.line}" if r is not None and getattr(r, "line", 0) else "its NetReq"
+        others = [x for x in (r.nets if r is not None else ()) if x != net]
+        split = f" (split {net} out of that line first: it also names {', '.join(others)})" if others else ""
+        parts.append(f"{n} via(s) on {net}, and {where} forbids vias: add vias=True there{split} if this {reason} copper is wanted")
+    what = res.net
+    move = f"{reason} {res.net}: not written — it needs " + "; ".join(parts) + f". Without it the router joins {', '.join(sorted(bad))} on one layer or reports the link."
+    return replace(res, pieces=(), joins=(), links=(0, res.links[1]), coverage=0.0, refusal=Refusal(reason, res.net, what, None, "vias forbidden", False, move))
+
+
 def merge_plans(first: PatternPlan, second: PatternPlan) -> PatternPlan:
-    """The two halves of C.1's pre stage, with the fanout between them, as the one plan KRT is handed.
+    """The two halves of C.1's pre stage, with the fanout between them, as one plan.
 
     `second` ran on `first`'s own scene, so the scene is already shared and `done` is recomputed over
     both stages' claims against it: a net the hops half-claimed and the spine finished is `done`, and
-    asking each half on its own would call it `partial` twice and hand it to KRT anyway.
+    asking each half on its own would call it `partial` twice.
     """
     scene = second.scene if second.scene is not None else first.scene
     pieces = first.pieces + second.pieces
@@ -762,7 +735,6 @@ def merge_plans(first: PatternPlan, second: PatternPlan) -> PatternPlan:
     for n, rs in second.refused.items():
         refused[n] = tuple(refused.get(n, ())) + tuple(rs)
     return PatternPlan(
-        text=second.text,
         pieces=pieces,
         ids=first.ids + second.ids,
         census=_census(pieces),
@@ -788,16 +760,3 @@ def hard_refusals(plan: PatternPlan) -> tuple[Refusal, ...]:
 
     strict = os.environ.get("PCBC_STRICT_PATTERNS", "").lower() in ("1", "true", "yes", "on")
     return tuple(r for r in plan.refusals() if r.hard or strict)
-
-
-def patterns_off() -> bool:
-    """`PCBC_PATTERNS=off` restores the pre-R2 plan exactly — one env check around one call. It is
-    the difference between a bad pattern being a rollback and being a revert (C.6)."""
-    import os
-
-    return os.environ.get("PCBC_PATTERNS", "").lower() in ("off", "0", "false", "no")
-
-
-def empty_plan(text: str, scene: Scene | None = None) -> PatternPlan:
-    """What the stage gives when it is switched off: the board unchanged and nothing claimed."""
-    return PatternPlan(text=text, scene=scene)

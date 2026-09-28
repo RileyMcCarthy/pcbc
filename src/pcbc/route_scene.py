@@ -1,8 +1,8 @@
 """The placed board as obstacles, and the five rules a candidate is judged by.
 
-`build_scene` reads a placed or partly routed board file and turns everything on it — every pad
-primitive, every drill, every track, every via, every keepout and rule area, every closed row's
-fanout lane, and the board edge — into one flat, sorted tuple of `Item`s, each carrying the copper
+`build_scene` turns the Python model of the placed board — every pad primitive and drill of every
+posed `.kicad_mod` (`foot_native`), every closed row's fanout lane, every keepout and rule area, and
+the board edge — into one flat, sorted tuple of `Item`s, each carrying the copper
 shape, the hole shape and the mask shape `route_geom` decides with. `clashes` and `blocked` are the
 only places a candidate is judged, they apply A.4's five rules in A.4's order, and every number they
 use comes from `constraints.ClearanceTable` so the router cannot drift from the rules KiCad is
@@ -10,7 +10,7 @@ handed (`docs/r2-design.md` A.6).
 
 Three things make byte-identical output arguable rather than hoped for. `Scene.items` is sorted by
 `(KIND_ORDER[kind], net, owner, x_nm, y_nm)` and ids are assigned after the sort, so `item.id` is
-the canonical tie-break and no answer depends on the order a file happened to list its footprints.
+the canonical tie-break and no answer depends on the order the footprints were listed in.
 Copper added mid-run by `Scene.add` is appended above every existing id, in the order the patterns
 emitted it. And nothing here iterates a `set` or a dict keyed on a float in a decision path.
 
@@ -22,20 +22,17 @@ a handful of ids against a linear scan of 152 pads alone.
 from __future__ import annotations
 
 import math
-import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Iterable, Sequence
 
 from .compile import CompiledJob
 from .constraints import ClearanceTable, ConstraintSet, clearance_table
 from .copper import _rotate
-from .copper_bar import segments as _segments
-from .layout import content_rect, footprints_by_ref, resolve_keepout, resolve_regions
+from .layout import content_rect, resolve_keepout, resolve_regions
 from .model import Design
-from .pads import PadGeom, pad_geoms
-from .pcb_place import _EDGE_OUT, _pins_of, Foot, lane_rules, parse_foot
+from .pads import PadGeom
+from .pcb_place import _EDGE_OUT, Foot
 from .route_emit import Piece, seg_piece
-from .sexp import matching_paren
 from .route_geom import (
     Box,
     EPS_MM,
@@ -53,7 +50,6 @@ from .route_geom import (
     track_shape,
     via_shape,
 )
-from .sexp import footprint_at
 from .stackup import Stackup, get_stackup
 
 __all__ = [
@@ -72,16 +68,14 @@ __all__ = [
     "clashes",
     "clear_runs",
     "components",
-    "copper_items",
     "free_intervals",
-    "krt_grid",
+    "pattern_grid",
     "lane_run_mm",
     "lane_strips",
     "net_open",
     "net_runs",
     "pad_exits",
     "plane_targets",
-    "zone_rules",
 ]
 
 KIND_ORDER = {"pad": 0, "hole": 1, "track": 2, "via": 3, "keepout": 4, "lane": 5, "edge": 6}
@@ -121,6 +115,13 @@ class Item:
     candidate loop would be a second reader of what a pad is — which is the drift `pads.py` exists
     to prevent. Empty is the honest answer for a track, a via, a lane or the edge, none of which
     KiCad gives properties to."""
+    block: int = 0
+    """For a pad item, which `(pad ...)` of its footprint drew it (its index among the footprint's
+    pads). Two items of one owner are **one pad** only when they share it: a custom pad's primitives
+    are one copper, and they touch through the pad; two pads that share a number are two coppers that
+    KiCad joins only by copper (its ratsnest counts each). The ESP32-C3-MINI's exposed land is nine
+    `(pad "49" ...)` blocks, and a router that took them for one terminal called GND routed where
+    KiCad found two blocks open (the third refutation round, `tests/fixtures/thermal` at 0.35 W)."""
 
     def box(self) -> Box:
         boxes = [aabb(s) for s in (self.copper, self.hole, self.mask) if s is not None]
@@ -172,8 +173,12 @@ pcbc has not measured what 0.10 mm costs in tap sites, and R1's procedure for ex
 count first and promote in the PR that shows the zeros."""
 
 
-def krt_grid(job: CompiledJob) -> float:
-    """KRT's routing grid for this board; `fanout.krt_grid` is this function and imports it."""
+def pattern_grid(job: CompiledJob) -> float:
+    """The patterns' candidate step and the scene's interval tolerance (`Scene.grid`): 0.05 mm on two
+    layers, 0.1 on four. The value the old router's grid had, kept on purpose: the tap, spine, stitch
+    and fanout candidate lists and `free_intervals`/`clear_runs` are built on it, and changing it would
+    change every pattern's copper (docs/native-plan.md, critique #7). The native router's lattice has
+    its own pitch (`route_cost.lattice_step`)."""
     return 0.05 if job.layers <= 2 else 0.1
 
 
@@ -202,8 +207,8 @@ def _plane_of(stack: Stackup, pours: tuple[tuple[str, str], ...]) -> dict[str, s
 
 
 def plane_targets(job: CompiledJob) -> tuple[tuple[str, str], ...]:
-    """(net, layer) for every net that gets a plane or a pour — `krt_plan`'s own rule, factored out
-    so the scene and the tap pattern read the same fact (C.2).
+    """(net, layer) for every net that gets a plane or a pour — the one rule the route stage's `Pour`
+    objects (`route_native.plane_pours`), the scene and the tap pattern all read (C.2).
 
     **A declared `planes=` is the board's answer on every stackup; the implicit back pour is what a
     board that declares nothing gets, and only two layers have one.** That composition is the whole
@@ -228,9 +233,8 @@ def plane_targets(job: CompiledJob) -> tuple[tuple[str, str], ...]:
         return tuple(job.planes)
     if job.layers > 2:
         return ()
-    # `krt_plan` writes the back pour when GND is one of the power nets, which it reads off the
-    # design; the same question asked of the compiled job is whether a `kind="power"` net's
-    # patterns match GND. The two agree on every board here, and this form is pure in `job`.
+    # The back pour exists when GND is one of the power nets: whether a `kind="power"` net's
+    # patterns match GND, a pure function of the compiled job.
     if any(cn.kind == "power" and any(fnmatch("GND", p) for p in cn.patterns) for cn in job.nets):
         return (("GND", "B.Cu"),)
     return ()
@@ -282,7 +286,7 @@ def pad_items(geoms: Sequence[PadGeom], layers: tuple[str, ...]) -> list[Item]:
     its own obstacle, which is tighter than hulling them together and is why `PadGeom.copper` is a
     tuple. An NPTH has a hole and no copper at all, so it becomes a `hole` item."""
     out: list[Item] = []
-    for g in geoms:
+    for k, g in enumerate(geoms):
         if not g.copper:
             if g.hole is not None:
                 out.append(Item(0, "hole", g.net, frozenset(layers), None, g.hole, None, g.id))
@@ -299,74 +303,9 @@ def pad_items(geoms: Sequence[PadGeom], layers: tuple[str, ...]) -> list[Item]:
                     _mask_of(shape, g.mask_margin),
                     g.id,
                     prop=g.prop,
+                    block=k,
                 )
             )
-    return out
-
-
-def copper_items(text: str, stack: Stackup) -> list[Item]:
-    """Every track and via already on the board, as items. A via's hole is its drill, which is what
-    rules 2 and 3 measure; its copper is the ring."""
-    out: list[Item] = []
-    for s in _segments(text):
-        a, b = qp(s["start"]), qp(s["end"])
-        if a == b:
-            continue  # a zero-length segment is not copper anything can clash with
-        out.append(
-            Item(
-                0,
-                "track",
-                s["net"],
-                frozenset({s["layer"]}),
-                track_shape(a, b, s["width"]),
-                None,
-                None,
-                f"{s['net'] or 'no net'} track on {s['layer']}",
-                locked=s["locked"],
-            )
-        )
-    for v in _vias(text):
-        at = qp(v["at"])
-        out.append(
-            Item(
-                0,
-                "via",
-                v["net"],
-                frozenset(stack.copper_layers()),
-                via_shape(at, v["size"]),
-                circle_shape(at[0], at[1], v["drill"]),
-                None,
-                f"{v['net'] or 'no net'} via at ({at[0]:g},{at[1]:g})",
-                locked=v["locked"],
-            )
-        )
-    return out
-
-
-def _vias(text: str) -> list[dict]:
-    """`copper_bar.vias` plus the drill, which the bar does not need and rules 2 and 3 do."""
-    import re
-
-    from .copper import net_table
-
-    names = net_table(text)
-    pat = re.compile(
-        r'\(via\s*\(at ([-0-9.]+) ([-0-9.]+)\)\s*\(size ([-0-9.]+)\)\s*\(drill ([-0-9.]+)\)\s*\(layers "([^"]+)" "([^"]+)"\)'
-        r'(?:\s*\(locked yes\))?\s*\(net (?:(\d+)|(?:\d+\s+)?"([^"]*)")\)'
-    )
-    out = []
-    for m in pat.finditer(text):
-        net = names.get(int(m.group(7))) if m.group(7) else m.group(8)
-        out.append(
-            {
-                "net": net or "",
-                "at": (float(m.group(1)), float(m.group(2))),
-                "size": float(m.group(3)),
-                "drill": float(m.group(4)),
-                "layers": (m.group(5), m.group(6)),
-                "locked": "(locked yes)" in m.group(0),
-            }
-        )
     return out
 
 
@@ -380,7 +319,7 @@ def _sort_key(it: Item) -> tuple:
 
 @dataclass(frozen=True)
 class ZoneRule:
-    """One copper pour's fill arithmetic, read off the board file it is written in.
+    """One copper pour's fill arithmetic, from its `Pour` object (`route_native.zone_rules_of`).
 
     A pour is not an obstacle (A.4), so nothing in the scene modelled it until S5's review. What it
     still decides is the copper it *keeps*: a foreign hole in a plane carves an antipad of the hole's
@@ -389,54 +328,14 @@ class ZoneRule:
     eleven taps on node's `U1` at the footprint's own 0.8 mm pitch cut an 8.65 mm slot through the
     3V3 plane, and the path across it went from 1.80 mm to 8.09 mm).
 
-    Only the header is read, never the fill: on four layers the zone exists when the post stage runs
-    and its polygons do not (`04_planes.kicad_pcb` has zero `filled_polygon`), which is the whole
-    reason the numbers are worth having at placement time.
+    Only the pour's own fields are read, never a fill: no pour is filled while the route stage runs
+    (KiCad fills the emitted board), which is the whole reason the numbers are worth having then.
     """
 
     net: str
     layer: str
     pad_clearance: float
     min_thickness: float
-
-
-_ZONE_HEAD = re.compile(r"\n\t\(zone\b")
-_ZONE_NET_RE = re.compile(r'\(net_name "([^"]*)"\)|\(net "([^"]*)"\)')
-_ZONE_LAYER_RE = re.compile(r'\(layers? "([^"]+)"')
-_ZONE_CLEAR_RE = re.compile(r"\(connect_pads[^()]*(?:\s*\(clearance ([-0-9.]+)\))")
-_ZONE_MINTHICK_RE = re.compile(r"\(min_thickness ([-0-9.]+)\)")
-
-
-def zone_rules(text: str) -> tuple[ZoneRule, ...]:
-    """Every copper pour's `(net, layer, connect_pads clearance, min_thickness)`, in file order.
-
-    A keepout zone has no net and several layers and is skipped: it pours no copper, so it has no
-    antipads to merge. A zone naming more than one layer is skipped for the same reason — every pour
-    pcbc's plans write names exactly one.
-    """
-    out: list[ZoneRule] = []
-    for m in _ZONE_HEAD.finditer(text):
-        end = matching_paren(text, m.start() + 2)
-        head = text[m.start() : end + 1].split("(polygon", 1)[0]
-        if "(keepout" in head:
-            continue
-        nm = _ZONE_NET_RE.search(head)
-        lm = _ZONE_LAYER_RE.search(head)
-        net = (nm.group(1) or nm.group(2)) if nm else ""
-        layers = lm.group(1) if lm else ""
-        if not net or " " in layers or not layers:
-            continue
-        cm = _ZONE_CLEAR_RE.search(head)
-        tm = _ZONE_MINTHICK_RE.search(head)
-        out.append(
-            ZoneRule(
-                net=net,
-                layer=layers,
-                pad_clearance=float(cm.group(1)) if cm else 0.0,
-                min_thickness=float(tm.group(1)) if tm else 0.0,
-            )
-        )
-    return tuple(out)
 
 
 ANTIPAD_QUERY_MM = 3.0
@@ -497,7 +396,7 @@ class Scene:
     outline: Box  # the content rect inset by `stack.edge_clearance` exactly (A.4 rule 5)
     plane_of: dict[str, str]  # net -> the plane or pour layer it is welded to (C.2)
     layers: tuple[str, ...]
-    grid: float  # krt_grid(job)
+    grid: float  # pattern_grid(job): the patterns' candidate step, not the router's lattice
     feet: dict[str, Foot]
     zone_rules: tuple[ZoneRule, ...] = ()  # the filled zones' own fill numbers, read off the board
     _cells: dict = field(default_factory=dict, repr=False)
@@ -532,12 +431,22 @@ class Scene:
         added: list[Item] = []
         n = len(self.items)
         for i, it in enumerate(items):
-            fresh = Item(n + i, it.kind, it.net, it.layers, it.copper, it.hole, it.mask, it.owner, it.reason, it.locked, it.prop)
+            fresh = replace(it, id=n + i)
             added.append(fresh)
         self.items = self.items + tuple(added)
         self._index(added)
         self._max_r = max([self._max_r] + [s.r for it in added for s in (it.copper, it.hole, it.mask) if s is not None])
         return tuple(added)
+
+    def fork(self) -> "Scene":
+        """A copy a caller may add trial copper to and throw away: the items are immutable and shared,
+        the index is copied (cell lists are the only mutable state). The native router tries a
+        differential pair on a fork and adds it to the real scene only when every piece of it fits."""
+        from dataclasses import replace as _replace
+
+        twin = _replace(self, _cells={k: list(v) for k, v in self._cells.items()})
+        twin._max_r = self._max_r
+        return twin
 
     def item_of(self, piece: Piece, *, reason: str = "") -> Item:
         """A `Piece` as an obstacle, so a pattern's own copper joins the scene it was judged against."""
@@ -583,39 +492,41 @@ def _layer_list(stack: Stackup) -> tuple[str, ...]:
     return tuple(stack.copper_layers())
 
 
-def build_scene(design: Design, job: CompiledJob, cs: ConstraintSet, pcb_text: str) -> Scene:
-    """Everything on the placed board, sorted, indexed, and with its numbers attached.
+def build_scene(design: Design, job: CompiledJob, cs: ConstraintSet, feet, *, extra: Iterable[Item] = (), zones: Sequence[ZoneRule] = ()) -> Scene:
+    """The placed board as obstacles, from the Python model: `feet` (`foot_native.posed_feet`, each
+    part's `.kicad_mod` posed by its `Pose`), the design's keepouts and rule areas, and the outline
+    from `Board()`. Sorted, indexed, with its numbers attached. No board file is read.
 
-    The footprint pass is `fanout.py`'s own, kept identical on purpose: the same `parse_foot`, the
-    same net binding from the design, the same `Foot.lane(...)` — so the lanes the scene holds are
-    the lanes the fanout spent and `route_checks` guards, and there is no second reading of a
-    footprint that could disagree with the first.
+    `extra` is copper already on the board as items (merged before the sort, so their ids are
+    canonical too) and `zones` the pours' fill numbers; the route stage passes neither and adds its
+    copper with `Scene.add` as it writes it. The lanes are `Foot.lane`'s, the same `Foot`s `fanout`
+    escapes from and `route_checks` guards and `pcb_place.layout_report` reports on — one reading,
+    `pcb_place.posed_feet_of`, so no second reading of a footprint can disagree (the third refutation
+    round found the placer's reports still reading a board text's box, with the board-angle bug).
     """
+    from .foot_native import pad_geoms_of
+    from .pcb_place import posed_feet_of
+
     stack = get_stackup(job.stackup)
     layers = _layer_list(stack)
     table = clearance_table(cs)
-    lane_stack, lane_clear = lane_rules(job)
-    nets_of = _pins_of(design)
     items: list[Item] = []
-    feet: dict[str, Foot] = {}
-    for ref, block in sorted(footprints_by_ref(pcb_text).items()):
-        at = footprint_at(block)
-        if at is None:
-            continue
-        foot = parse_foot(ref, block)
-        foot.at, foot.rot = (at[0], at[1]), at[2]
-        for pad in foot.pads:
-            pad.net = nets_of.get(ref, {}).get(pad.num, pad.net)
-        foot.lane(lane_stack, lane_clear)
-        feet[ref] = foot
-        items.extend(pad_items(pad_geoms(block, at, ref=ref, nets=nets_of.get(ref), layers=layers), layers))
+    ordered = sorted(feet, key=lambda f: f.ref)
+    feet_by_ref: dict[str, Foot] = posed_feet_of(job, ordered)
+    for pf in ordered:
+        foot = feet_by_ref[pf.ref]
+        items.extend(pad_items(pad_geoms_of(pf, layers), layers))
         for side, strip in sorted(lane_strips(foot).items()):
             # A lane is a policy obstacle, not copper: a piece may cross it and may not run along
             # it (A.7), which is the DS2 Addon's lesson — analog copper ran *along* a lane and
             # walled AVDD, DVDD and the UART pins in. `clashes` never refuses on a lane; the lane
             # rule is the caller's, and `lane_run_mm` is how it asks.
-            items.append(Item(0, "lane", "", frozenset(layers), rect_shape((strip[0] + strip[2]) / 2.0, (strip[1] + strip[3]) / 2.0, strip[2] - strip[0], strip[3] - strip[1]), None, None, f"{ref} lane {side}"))
-    items.extend(copper_items(pcb_text, stack))
+            items.append(Item(0, "lane", "", frozenset(layers), rect_shape((strip[0] + strip[2]) / 2.0, (strip[1] + strip[3]) / 2.0, strip[2] - strip[0], strip[3] - strip[1]), None, None, f"{pf.ref} lane {side}"))
+    items.extend(extra)
+    return _finish(design, job, cs, stack, layers, table, items, feet_by_ref, tuple(zones))
+
+
+def _finish(design, job, cs, stack, layers, table, items, feet, zones) -> Scene:
     regions = resolve_regions(design.board, design.regions) if design.regions else {}
     for ko in sorted(job.keepouts, key=lambda k: k.name):
         x0, y0, x1, y1 = resolve_keepout(ko, design.board, regions)
@@ -628,7 +539,7 @@ def build_scene(design: Design, job: CompiledJob, cs: ConstraintSet, pcb_text: s
     outline = (q(content.x0 + e), q(content.y0 + e), q(content.x1 - e), q(content.y1 - e))
     items.append(Item(0, "edge", "", frozenset(layers), rect_shape((outline[0] + outline[2]) / 2.0, (outline[1] + outline[3]) / 2.0, outline[2] - outline[0], outline[3] - outline[1]), None, None, "board edge"))
     ordered = tuple(
-        Item(i, it.kind, it.net, it.layers, it.copper, it.hole, it.mask, it.owner, it.reason, it.locked, it.prop)
+        replace(it, id=i)
         for i, it in enumerate(sorted(items, key=_sort_key))
     )
     scene = Scene(
@@ -639,9 +550,9 @@ def build_scene(design: Design, job: CompiledJob, cs: ConstraintSet, pcb_text: s
         outline=outline,
         plane_of=_plane_of(stack, plane_targets(job)),
         layers=layers,
-        grid=krt_grid(job),
+        grid=pattern_grid(job),
         feet=feet,
-        zone_rules=zone_rules(pcb_text),
+        zone_rules=zones,
     )
     scene._index(ordered)
     scene._max_r = max([0.0] + [s.r for it in ordered for s in (it.copper, it.hole, it.mask) if s is not None])
@@ -873,8 +784,8 @@ def pad_exits(scene: Scene, pad: Item, width: float, layer: str, *, check: bool 
         # it is every two-pad passive and every IC row, where the pad beside this one is the same size
         # and sits at the same offset, so a link leaving at this distance runs past it at exactly the
         # clearance. Measured: blinky's `LED` had all sixteen of its candidates refused at
-        # `0.2 mm of the 0.2 mm` before this term, which left the one net on the simplest board in the
-        # repo to KRT. `free_intervals` already carries the same term for the same reason.
+        # `0.2 mm of the 0.2 mm` before this term. `free_intervals` carries the same term for the same
+        # reason.
         d = max(half + worst + width / 2.0 + EPS_MM, MICRO_MM)
         at = qp((cx + dx * d, cy + dy * d))
         ex = Exit(at=at, dir=(dx, dy), stub=(qp((cx, cy)), at), side=side, width=width, layer=layer)
@@ -1157,7 +1068,7 @@ def net_runs(scene: Scene, net: str, layer: str | None = None) -> tuple[Run, ...
     return tuple(sorted(out, key=lambda r: (r.layer, r.pts)))
 
 
-# --- A.9: who still needs KRT ---------------------------------------------------------------------
+# --- A.9: what is still open ---------------------------------------------------------------------
 
 
 def _touch(a: Item, b: Item) -> bool:

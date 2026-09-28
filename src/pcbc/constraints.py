@@ -229,7 +229,7 @@ class Constraint:
     for that is made here where the netlist is (`_compile`), not in a pattern that has only a scene.
     """
     isolation_side: str | None  # Region name
-    autoroute: bool | str  # unchanged meaning for route.py
+    autoroute: bool | str  # `diff_pair` marks a pair (routed as one object); False a sensitive preset, whose layer/via constraint the router honours
     soft: tuple[str, ...]  # rule kinds written as warnings in R1: subset of SOFT_RULES
     notes: tuple[str, ...]  # honest caveats, e.g. the 2-layer USB line
     req_index: int = -1  # index into Design.netreqs; -1 when synthesised from Pair/Bus alone
@@ -401,9 +401,9 @@ def _thermal_refusals(design: Design, stack: Stackup, pours: tuple[tuple[str, st
                 f"the track with NetReq(\"{net}\", amps=...) instead"
             )
             continue
-        # The array's whole job is to reach a plane. Without one the vias land in nothing, which on a
-        # two-layer board is `krt_plan` writing no `gnd_pour` at all — the blinky trap, where sixteen
-        # stitch vias would have gone into a pour that was never written.
+        # The array's whole job is to reach a plane. Without one the vias land in nothing: on a
+        # two-layer board whose GND is not a power net the route stage writes no back pour at all
+        # (`route_scene.plane_targets`), and sixteen stitch vias would go into a pour never written.
         plane = next((lay for pnet, lay in pours if pnet == net), "")
         if not plane:
             refusals.append(
@@ -412,7 +412,7 @@ def _thermal_refusals(design: Design, stack: Stackup, pours: tuple[tuple[str, st
                 + (
                     f'Board(planes=[("{net}", "In1.Cu")]) gives it one'
                     if stack.layers > 2
-                    else f'NetReq("{net}", kind="power") is what makes krt_plan write the back pour'
+                    else f'NetReq("{net}", kind="power") is what gives it the back pour (route_scene.plane_targets)'
                 )
             )
             continue
@@ -563,10 +563,10 @@ class ReturnRule:
         }
 
     def line(self) -> str:
-        """The report line, in `blocking.move_line`'s one sentence shape so a compile finding and a
+        """The report line, in `moves.move_line`'s one sentence shape so a compile finding and a
         routing failure read the same (E.2) — `<net>: <what> cannot reach <goal>. In the way: <...>.
         <the board.py edit>`. `kept` and `pinned` have no failure to report and say so plainly."""
-        from .blocking import move_line
+        from .moves import move_line
 
         if self.verdict in ("kept", "pinned"):
             return f"{self.net}: returns {self.verdict}, {self.why}"
@@ -672,7 +672,7 @@ def return_rule(stack: Stackup, planes: tuple[tuple[str, str], ...], c: Constrai
         layers_txt = ", ".join(f'"{lay}"' for lay in with_ref)
         lost_fixes.append(f"NetReq(layers=[{layers_txt}]) on line {c.line} keeps it on the layer{'' if len(with_ref) == 1 else 's'} that has one.")
     elif stack.layers <= 2:
-        lost_fixes.append('NetReq("GND", kind="power") is what makes krt_plan write the back pour this net would reference.')
+        lost_fixes.append('NetReq("GND", kind="power") is what gives this board the back pour this net would reference (route_scene.plane_targets).')
     if stack.layers > 2:
         # One neighbour, not both: `gone` needs *a* plane, and declaring two would be a larger edit
         # than the fault asks for.
@@ -763,12 +763,12 @@ class ConstraintSet:
     (`"B.Cu pour"`). Without this, classifying a layer change needed a PCB file, and the whole value
     of `docs/stitch-plan.md` S5 is that it does not.
 
-    On four layers it is `Board(planes=)` verbatim. On two it is the back `GND` pour `krt_plan`
-    schedules when `GND` is a power net — which `Board` refuses to let an author declare, deliberately
-    ("a declaration the router never reads is a lie the board tells its author"). Measured 2026-09-21
-    it agrees with `route_scene.plane_targets` on all five boards, and
-    `tests/test_return_rules.py::test_the_compiled_planes_are_the_route_plans_own` holds them
-    together so the two readings of one idea cannot drift.
+    On four layers it is `Board(planes=)` verbatim. On two it is the back `GND` pour the route stage
+    writes when `GND` is a power net — and only that: a two-layer `Board(planes=)` is not read here,
+    while `route_scene.plane_targets` (what the route stage pours) takes it on every stackup. The two
+    agree on the five boards, none of which declares `planes=` on two layers
+    (`tests/test_return_rules.py::test_the_compiled_planes_are_the_route_plans_own`); they differ on a
+    two-layer board that does (`tests/fixtures/planes`).
 
     **Not `CompiledJob.planes`**, which is `Board(planes=)` verbatim on every stackup and is therefore
     `()` on all four two-layer boards here. The two differ exactly where it matters — the 2L pour — so
@@ -1453,12 +1453,9 @@ def compile_constraints(design: Design) -> ConstraintSet:
 
     # -- the pours this board will have, and the caveat they put on `Constraint.reference` ---------
     #
-    # `krt_plan` writes the back pour when GND is one of the power nets; asked of the compiled
-    # constraints that is "GND compiled to kind=power", which is the same question with the globs
-    # already expanded. `route_scene.plane_targets` asks it of a `CompiledJob` and the two agree on
-    # all five boards (measured 2026-09-21; the test that holds them together is named in the field's
-    # docstring). `Board` refuses `planes=` on two layers, so this is the only place the 2L pour is
-    # written down before geometry exists.
+    # On two layers the route stage pours the back GND when GND is one of the power nets; asked of the
+    # compiled constraints that is "GND compiled to kind=power", the same question with the globs
+    # already expanded. A two-layer `planes=` is not read here (see `ConstraintSet.planes`).
     pours = (
         planes
         if stack.layers > 2
@@ -2239,8 +2236,8 @@ class ClearanceTable:
         return self.cs.stackup.hole_to_hole
 
     def via_to_same_net_smd_pad(self) -> float:
-        """A via in a passive's own pad wicks solder and the fab stage refuses it; `route.py` passes
-        this same number to KRT as `--same-net-pad-clearance` on the steps that may place one."""
+        """A via in a passive's own pad wicks solder and the fab stage refuses it; the number a via keeps
+        from a same-net SMD pad."""
         return self.cs.stackup.clearance_min
 
     def mask_bridge(self) -> float:

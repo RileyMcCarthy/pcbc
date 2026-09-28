@@ -14,14 +14,15 @@ from pathlib import Path
 import pytest
 
 from pcbc import netcheck
-from pcbc.apply import _apply_pro, _apply_rule_areas, _apply_slot, apply_job, write_dru
+from pcbc.apply import _apply_pro, write_dru
 from pcbc.compile import compile_design
 from pcbc.constraints import DruRule, RuleArea
 from pcbc.copper import copper_by_net, power_ampacity_failures
 from pcbc.dru import KNOWN_CONSTRAINTS, PROJECT_CLASS_ORDER, netclass_patterns, project_classes, render, rules, soft_kind, validate
 from pcbc.fab import _IGNORE_DRC, _write_notes, copper_drc_errors
 from pcbc.language import load_board
-from pcbc.seed import emit_pcb, emit_pro, seed_job
+from pcbc.seed import emit_pcb, emit_pro
+from boardtext import seed_job
 
 EXAMPLES = Path(__file__).resolve().parent.parent / "examples"
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
@@ -301,42 +302,44 @@ def test_apply_pro_keeps_what_kicad_added_to_a_row(tmp_path: Path):
 # ---------------------------------------------------------------------------------------------
 
 
-def _seed_and_apply(tmp_path: Path, name: str, text: str):
+def _placed(tmp_path: Path, name: str, text: str):
+    """The place-only board, as the place stage emits it (`place_native.place` then `emit_board`), in a
+    file, and the placement: the rule areas and slots are layout objects now."""
+    from pcbc.place_native import emitted_text, place
+
     board = _board(tmp_path, name, text)
     design = load_board(board)
-    job = compile_design(design)
+    pl = place(design, name=name, base=tmp_path / name)
     pcb = tmp_path / name / "layout.kicad_pcb"
-    seed_job(design, pcb, name=name)
-    apply_job(job, pcb, backup=False)
-    return job, pcb
+    pcb.parent.mkdir(parents=True, exist_ok=True)
+    pcb.write_text(emitted_text(design, pl, name=name))
+    write_dru(pl.job, pcb)
+    return pl, pcb
 
 
 def test_an_isolation_writes_its_rule_area_zone_and_check_misses_it_when_gone(tmp_path: Path):
     from pcbc.check import check_job
+    from pcbc.layout_emit import strip_layout
 
-    job, pcb = _seed_and_apply(tmp_path, "iso", ISO_HEAD + ISO + ISO_TAIL)
-    text = pcb.read_text()
+    pl, pcb = _placed(tmp_path, "iso", ISO_HEAD + ISO + ISO_TAIL)
+    job = pl.job
     assert job.constraints.rule_areas[0].box == (18.0, 0.0, 22.0, 25.0)
-    zone = text[text.index('(name "ISO_primary_secondary")') - 200 : text.index('(name "ISO_primary_secondary")') + 400]
-    assert '(layers "F&B.Cu")' in zone and "(tracks allowed)" in zone and "(vias allowed)" in zone and "(pads allowed)" in zone and "(copperpour allowed)" in zone and "(footprints allowed)" in zone, "E.15: pads and footprints stay allowed so the isolator straddles; the .kicad_dru rule carries the disallow"
-    assert "(xy 18.00 0.00)" in zone and "(xy 22.00 25.00)" in zone
+    (area,) = [c for c in pl.copper if c.name == "ISO_primary_secondary"]
+    assert area.layers == ("F.Cu", "B.Cu") and area.keepout == {k: "allowed" for k in ("tracks", "vias", "pads", "copperpour", "footprints")}, "E.15: pads and footprints stay allowed so the isolator straddles; the .kicad_dru rule carries the disallow"
+    assert area.points == ((18.0, 0.0), (22.0, 0.0), (22.0, 25.0), (18.0, 25.0))
+    text = pcb.read_text()
     assert text.count('(name "ISO_primary_secondary")') == 1
-    assert "slot" not in text and text.count('(layer "Edge.Cuts")') == 1, "no slot without slot=True"
+    assert not [g for g in pl.graphics if g.f.get("uuid") != pl.graphics[0].f.get("uuid")], "no slot without slot=True"
     assert "missing rule area ISO_primary_secondary" not in check_job(job, pcb)
-    assert apply_job(job, pcb, backup=False) and pcb.read_text() == text, "re-applying replaces the zone, never duplicates it"
-    from pcbc.apply import _drop_named_zone
-
-    pcb.write_text(_drop_named_zone(text, "ISO_primary_secondary"))
+    pcb.write_text(strip_layout(text))
     assert "missing rule area ISO_primary_secondary" in check_job(job, pcb)
 
 
 def test_slot_true_cuts_a_1_mm_slot_centred_in_the_corridor(tmp_path: Path):
-    job, pcb = _seed_and_apply(tmp_path, "iso_slot", ISO_HEAD + ISO_SLOT + ISO_TAIL)
-    text = pcb.read_text()
-    slot = "\t(gr_rect\n\t\t(start 19.5 3)\n\t\t(end 20.5 22)\n\t\t(stroke (width 0.05) (type default))\n\t\t(fill none)\n\t\t(layer \"Edge.Cuts\")\n"
-    assert slot in text, "F.7: 1.0 mm wide (IEC 60664-1 groove rule at PD2), centred in the 18..22 corridor, 3 mm of web at each end of the 25 mm board"
-    assert text.count('(layer "Edge.Cuts")') == 2
-    assert _apply_slot(_apply_rule_areas(text, job), job) == text, "idempotent"
+    pl, pcb = _placed(tmp_path, "iso_slot", ISO_HEAD + ISO_SLOT + ISO_TAIL)
+    slots = [g for g in pl.graphics if g.kind == "gr_rect" and g.f["start"] != (0.0, 0.0)]
+    assert [(g.f["start"], g.f["end"], g.f["layer"], g.f["width"]) for g in slots] == [((19.5, 3.0), (20.5, 22.0), "Edge.Cuts", 0.05)], "F.7: 1.0 mm wide (IEC 60664-1 groove rule at PD2), centred in the 18..22 corridor, 3 mm of web at each end of the 25 mm board"
+    assert pcb.read_text().count('(layer "Edge.Cuts")') == 2
 
 
 # ---------------------------------------------------------------------------------------------
@@ -369,21 +372,24 @@ def test_check_copper_counts_every_rule_and_the_soft_ones_and_keeps_them_out_of_
     gate = netcheck.check_copper(design, pcb)
     assert gate["canary"] is True and gate["geometry"] == {"segments": 1, "angles": 1}
     assert gate["soft"] == {"vias_usb_dn": 0, "vias_usb_dp": 1, "skew_usb_dn_usb_dp": 1, "uncoupled_usb": 1, "width_power": 2}
-    assert gate["rules"] == {"pcbc_geometry_segments": 1, "pcbc_geometry_angles": 1, "width_power": 2, "vias_usb_dn": 0, "vias_usb_dp": 1, "skew_usb_dn_usb_dp": 1, "usb_pair_gap": 1, "uncoupled_usb": 1, "pads_of_one_footprint": 0, "pcbc_canary": 1}, "every pcbc rule's hits, errors included (the pair-gap error itself is dropped by fab._IGNORE_DRC, not here)"
+    assert gate["rules"] == {"pcbc_geometry_segments": 1, "pcbc_geometry_angles": 1, "width_power": 2, "vias_usb_dn": 0, "vias_usb_dp": 1, "skew_usb_dn_usb_dp": 1, "usb_pair_gap": 1, "uncoupled_usb": 1, "pads_of_one_footprint": 0, "pcbc_canary": 1}, "every pcbc rule's hits, errors included"
     assert gate["drc_warnings"] == 1, "the silk warning only: soft rules, geometry and the canary are excluded"
-    assert gate["drc_errors"] == [] and gate["nets"] == [] and gate["ok"], "the seed binds every pad as board.py says"
+    assert [e.split(":")[0] for e in gate["drc_errors"]] == ["diff_pair_gap_out_of_range"] and gate["nets"] == [] and not gate["ok"], "the pair-gap error gates now (no router exemption); the footprints bind every pad as board.py says"
     assert netcheck.names_rule("Track width (rule 'width_power' min width 0.2500 mm)", "width_power") and netcheck.names_rule("(uncoupled_usb maximum uncoupled length 2 mm)", "uncoupled_usb")
     assert not netcheck.names_rule("Track width (rule 'width_power_2' min width 0.4 mm)", "width_power")
 
 
-def test_fab_ignores_the_rewritten_pair_gap_but_gates_on_length():
-    assert "diff_pair_gap_out_of_range" in _IGNORE_DRC and "length_out_of_range" not in _IGNORE_DRC, "E: the canary is a warning and never reaches the error gate; an explicit length_mm= must gate"
+def test_fab_gates_the_pair_gap_and_the_length():
+    """The old router rewrote the two-layer pair gap and fab ignored `diff_pair_gap_out_of_range`; with
+    the old router gone the exemption went too (docs/native-plan.md, critique #1): a KiCad error is an
+    error."""
+    assert "diff_pair_gap_out_of_range" not in _IGNORE_DRC and "length_out_of_range" not in _IGNORE_DRC, "E: the canary is a warning and never reaches the error gate; an explicit length_mm= must gate"
     drc = {"violations": [
         {"type": "length_out_of_range", "severity": "error", "description": "Track length out of range (rule 'length_sda' max length 80.0000 mm; actual 90.0000 mm)"},
         {"type": "diff_pair_gap_out_of_range", "severity": "error", "description": "(usb_pair_gap minimum gap 0.1000 mm; actual 0.0900 mm)"},
         {"type": "length_out_of_range", "severity": "warning", "description": "Track length out of range (rule 'pcbc_canary' max length 0.0010 mm; actual 46.5664 mm)"},
     ]}
-    assert [v["type"] for v in copper_drc_errors(drc)] == ["length_out_of_range"]
+    assert [v["type"] for v in copper_drc_errors(drc)] == ["length_out_of_range", "diff_pair_gap_out_of_range"]
 
 
 def test_fab_notes_print_the_constraint_lines_and_the_rule_count(tmp_path: Path):
@@ -568,7 +574,8 @@ def ds2_routed(tmp_path_factory) -> tuple[Path, Path]:
 
     board = _ds2_copy(tmp_path_factory.mktemp("ds2"))
     result = build_job(board, upto="route", force=True)
-    assert result.get("error") is None, result.get("error")
+    # N0: the native router may leave a net of the DS2 Addon open; the board is emitted and judged anyway.
+    assert result.get("error") is None or str(result["error"]).startswith("unrouted:"), result.get("error")
     return board, board.parent / "layout" / "ds2_addon" / "routed" / "layout.kicad_pcb"
 
 
@@ -599,7 +606,12 @@ def _probe(routed_board: tuple[Path, Path], tmp_path: Path, name: str, probe_rul
     work.mkdir()
     for ext in (".kicad_pcb", ".kicad_pro", ".kicad_prl"):
         shutil.copy2(routed.with_suffix(ext), work / f"layout{ext}")
-    text = _apply_rule_areas((work / "layout.kicad_pcb").read_text(), replace(job, constraints=replace(job.constraints, rule_areas=(area,))))
+    from pcbc.layout_emit import render, splice, stamp
+    from pcbc.place_native import _keepout_pour, _zone_layers, geometry_uuids
+
+    zone = geometry_uuids([_keepout_pour(area.name, _zone_layers(area.layers, job.layers), area.box, {k: "allowed" for k in ("tracks", "vias", "pads", "copperpour", "footprints")})], "probe")
+    zone = [replace(z, id="probe-area") for z in stamp(load_board(_board_py), zone)]
+    text = splice((work / "layout.kicad_pcb").read_text(), render(load_board(_board_py), zone, board="probe"))
     (work / "layout.kicad_pcb").write_text(text)
     write_dru(replace(job, dru=probe_rules + [canary]), work / "layout.kicad_pcb")
     violations = _drc(work)
@@ -608,7 +620,6 @@ def _probe(routed_board: tuple[Path, Path], tmp_path: Path, name: str, probe_rul
 
 
 @pytest.mark.kicad
-@pytest.mark.krt
 def _rule_kind_probe(routed_board: tuple[Path, Path], tmp_path: Path, analog: tuple[str, str], area_box: tuple[float, float, float, float]) -> None:
     """Every E row's constraint and condition form, one at a time on a deliberately violating
     fixture, with the canary firing every time (H.7: the probe is the safety net for the rule
@@ -639,7 +650,6 @@ def _rule_kind_probe(routed_board: tuple[Path, Path], tmp_path: Path, analog: tu
 
 
 @pytest.mark.kicad
-@pytest.mark.krt
 def test_each_rule_kind_fires_alone_on_an_example_and_then_all_together(buck_routed, tmp_path: Path):
     """On `examples/buck`, so the probe runs in CI: FB and SW carry the Analog and SwitchNode
     copper, and the strip crosses the middle of the 40 x 25 board."""
@@ -647,24 +657,22 @@ def test_each_rule_kind_fires_alone_on_an_example_and_then_all_together(buck_rou
 
 
 @pytest.mark.kicad
-@pytest.mark.krt
 def test_each_rule_kind_fires_alone_on_the_routed_ds2_board_and_then_all_together(ds2_routed, tmp_path: Path):
     """The same probe on the real board, when it is on this machine."""
     _rule_kind_probe(ds2_routed, tmp_path, ("AIN0", "AIN1"), (22.0, 0.0, 25.0, 25.4))
 
 
 @pytest.mark.kicad
-@pytest.mark.krt
 def test_the_gate_reports_soft_and_rule_counts_on_the_routed_ds2_board(ds2_routed):
     board, routed = ds2_routed
     design = load_board(board)
     gate = netcheck.check_copper(design, routed, refill=False)
-    assert gate["ok"] and gate["canary"], gate["fails"]
-    # Re-recorded 2026-09-20 for R2 S4: 5 -> 3. The hop pattern claims ten of ds2's two-pad nets
-    # before KRT runs and `nRESET`'s escape is no longer spent, so KRT necks a power track below its
-    # class twice less often (`docs/r2-measurements.md` S4). A fall, which is the direction a soft
-    # rule is allowed to move; promotion still needs zero on every board (H.3).
-    assert gate["soft"] == {"width_power": 3}, "H.3: the DS2 power stubs on closed rows are track_min wide; a soft hit, pinned (promotion needs zero on every board)"
+    # N0: the only failure the gate may report is the unconnected items of the nets the router left open.
+    assert gate["canary"] and all("unconnected item" in f for f in gate["fails"]), gate["fails"]
+    # Re-recorded 2026-09-25 for the native router: 3 -> 0. `width_power` counts power copper below its
+    # class width; the old router necked power tracks at closed rows, and the native router draws every
+    # net at its compiled class width (`route_cost.NetCost.width_mm`), so the hit count is zero.
+    assert gate["soft"] == {"width_power": 0}, "H.3: no power copper below its class width on the natively routed DS2 board"
     assert set(gate["rules"]) == {"pcbc_geometry_segments", "pcbc_geometry_angles", "width_power", "novia_ain0", "novia_ain1", "novia_ain2", "novia_ain3", "novia_refn_f", "novia_refp_f", "pads_of_one_footprint", "pcbc_canary"}
     assert gate["rules"]["pcbc_canary"] == 1 and all(gate["rules"][n] == 0 for n in gate["rules"] if n.startswith("novia_"))
     assert gate["rules"]["pcbc_geometry_segments"] == gate["geometry"]["segments"] and gate["rules"]["pcbc_geometry_angles"] == gate["geometry"]["angles"]

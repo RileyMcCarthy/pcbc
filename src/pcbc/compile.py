@@ -2,7 +2,7 @@
 
 Since R1 the numbers live in `constraints.compile_constraints` (docs/r1-design.md section A.3):
 `CompiledClass`, `CompiledNet` and the rule list are projections of the `ConstraintSet`, and every
-existing consumer (`route.py`, `fanout.py`, `copper.py`, `apply.py`, `seed.py`) reads them unchanged.
+consumer (`route_cost.py`, `fanout.py`, `copper.py`, `apply.py`, `seed.py`) reads them.
 """
 
 from __future__ import annotations
@@ -59,9 +59,7 @@ class CompiledJob:
     nets: list[CompiledNet]
     dru: list[DruRule]
     skip_autoroute_patterns: list[str]
-    krt: dict
     constraints: ConstraintSet | None = None
-    net_order: str | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -70,7 +68,7 @@ class CompiledJob:
             "stackup": self.stackup,
             "pcb": self.pcb,
             "planes": [list(p) for p in self.planes],
-            "places": [asdict(p) for p in self.places],
+            "places": [{k: v for k, v in asdict(p).items() if k not in ("source", "line")} for p in self.places],
             "keepouts": [asdict(k) for k in self.keepouts],
             "regions": [asdict(r) for r in self.regions],
             "padding": list(self.padding),
@@ -86,8 +84,6 @@ class CompiledJob:
             ],
             "dru": [asdict(r) for r in self.dru],
             "skip_autoroute_patterns": self.skip_autoroute_patterns,
-            "krt": self.krt,
-            "net_order": self.net_order,
             "constraints": self.constraints.to_dict() if self.constraints is not None else None,
             "rule_areas": [asdict(a) for a in self.constraints.rule_areas] if self.constraints is not None else [],
         }
@@ -163,30 +159,6 @@ def compile_design(design: Design) -> CompiledJob:
     region_rects = resolve_regions(board, design.regions)
     keepouts = [replace(ko, box=resolve_keepout(ko, board, region_rects)) for ko in design.keepouts]
 
-    krt = {
-        "skip_patterns": skip,
-        "planes": [{"net": n, "layer": l} for n, l in board.planes],
-        "usb_pairs": [
-            {"nets": list(n.patterns), "class": n.class_name}
-            for n in compiled_nets
-            if n.autoroute == "diff_pair"
-        ],
-        "length_match": [
-            {"nets": list(n.match_group), "tolerance_mm": tol}
-            for n, tol in zip(compiled_nets, tolerances)
-            if n.match_group
-        ],
-        "power_nets": [n for n, _ in board.planes]
-        + [
-            p
-            for req in design.netreqs
-            if req.kind == "power"
-            for p in req.nets
-            if p not in {a for a, _ in board.planes}
-        ],
-        "sensitive": _sensitive_groups(compiled_nets, class_by_name),
-    }
-
     return CompiledJob(
         board_size_mm=board.size_mm,
         layers=board.layers,
@@ -201,39 +173,8 @@ def compile_design(design: Design) -> CompiledJob:
         nets=compiled_nets,
         dru=_dru.rules(cs),
         skip_autoroute_patterns=skip,
-        krt=krt,
         constraints=cs,
-        net_order=board.net_order,
     )
-
-
-def _sensitive_groups(
-    compiled_nets: list[CompiledNet],
-    classes: dict[str, CompiledClass],
-) -> list[dict]:
-    by_kind: dict[str, dict] = {}
-    for net in compiled_nets:
-        if net.autoroute is not False:
-            continue
-        kind = net.kind or "analog"
-        cls = classes.get(net.class_name)
-        group = by_kind.setdefault(
-            kind,
-            {
-                "kind": kind,
-                "nets": [],
-                "width": cls.track_width_mm if cls else 0.20,
-                "clearance": cls.clearance_mm if cls else 0.20,
-                "layers": list(net.layers) or ["F.Cu"],
-            },
-        )
-        group["nets"].extend(net.patterns)
-    ordered: list[dict] = []
-    for kind in ("switch_node", "analog"):
-        if kind in by_kind:
-            ordered.append(by_kind.pop(kind))
-    ordered.extend(by_kind.values())
-    return ordered
 
 
 __all__ = [

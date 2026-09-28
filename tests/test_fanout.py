@@ -10,7 +10,7 @@ import pytest
 
 from pcbc.build import pcb_job
 from pcbc.compile import compile_design
-from pcbc.fanout import fanout_copper
+from boardtext import fanout_copper
 from pcbc.language import load_board
 from pcbc.stackup import get_stackup
 

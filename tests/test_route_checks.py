@@ -16,6 +16,7 @@ from pcbc.compile import CompiledClass, compile_design
 from pcbc.constraints import compile_constraints
 from pcbc.language import check_board, load_board
 from pcbc.pcb_place import lane_rules
+from boardtext import feet_of_text
 from pcbc.route_checks import _mst_mm, build_ctx, check_airwires, check_loops, route_aware_report
 
 EXAMPLES = Path(__file__).resolve().parent.parent / "examples"
@@ -61,7 +62,7 @@ def _placed(board: Path):
     from conftest import placed_board
 
     text = placed_board(board.stem, board).read_text()
-    return design, job, build_ctx(design, job, text)
+    return design, job, build_ctx(design, job, feet_of_text(design, text))
 
 
 @pytest.fixture(scope="module")
@@ -84,21 +85,34 @@ def stock(tmp_path_factory) -> dict[str, tuple[Path, list[str], list[str]]]:
 
 
 def test_the_five_boards_add_no_route_aware_move(stock):
-    """Acceptance: pcb_job on the five boards adds no new move — except the one F.8 found.
+    """Acceptance: pcb_job on the five boards adds no new move — except the ones F.8 and F.1 found.
 
     The intent lines the checks asked for are in the examples (c3_usb's and node's Chain lines; the
     DS2 Chain line is suggested in the PR). **The DS2 Addon gained exactly one move when F.8 landed**
     (`docs/stitch-plan.md` S3): `GND` and `VSS` are both `Ground()`, nothing ties them, and their
-    pads overlap on all four separating axes, so there is no line to draw between them either. That
-    is a finding on a real board and not a regression in a check — the four example boards each
-    declare one `Ground()` and stay at zero. It is pinned here as one move and nothing more, so a
-    second one would fail this test rather than hide behind it; `tests/test_bridge.py` holds its
-    text.
+    pads overlap on all four separating axes, so there is no line to draw between them either.
+
+    **c3_usb and node gained two each on 2026-09-22, and they are findings on real boards.**
+    `route_checks.FAST_KINDS` records why no preset number was invented for `usb_hs`; the
+    consequence is that the two boards that declare it declare **no length budget of any kind**, and
+    until now nothing said so. Measured on fresh placements, `_unbudgeted_fast` reports c3_usb's
+    `USB_DP`/`USB_DN` at 20.747 / 20.645 mm of pad-to-pad MST on a 50.000 mm board diagonal and
+    node's at 39.124 / 38.971 mm on a 75.000 mm one — node's pair spans **52 %** of its board's
+    diagonal, over five pads, with nothing checking it. That span is what the review of node's
+    routing came back to: a two-segment elbow on `USB_DN`, reported at 38.84 mm against a 30.62 mm
+    best octilinear path for the same two segments and the same one corner. blinky, buck and ds2
+    declare no fast kind and stay where they were.
+
+    Pinned as exactly these counts and prefixes, so a third move on any board fails this test rather
+    than hiding behind it; `tests/test_bridge.py` holds F.8's text and the F.1 texts are below.
     """
+    expect = {"blinky": 0, "buck": 0, "c3_usb": 2, "node": 2, "ds2_addon": 1}
     for name, (_board, moves, _notes) in stock.items():
-        expected = 1 if name == "ds2_addon" else 0
-        assert len(moves) == expected, (name, moves)
-        assert all(m.startswith("GND/VSS: no axis separates the two grounds") for m in moves), (name, moves)
+        assert len(moves) == expect[name], (name, moves)
+        for m in moves:
+            assert m.startswith("GND/VSS: no axis separates the two grounds") or (
+                m.startswith(("USB_DP:", "USB_DN:")) and "no budget checks it" in m
+            ), (name, m)
 
 
 def test_lane_rules_read_the_kinds_clearance_not_the_voltage_row():
@@ -126,7 +140,11 @@ def test_stock_c3_usb_pair_airwires_agree_within_the_skew_budget(stock):
     dn = _mst_mm([(x, y) for _r, _n, x, y, _w, _h in ctx.pads_on["USB_DN"]])
     assert (round(dp, 3), round(dn, 3)) == (24.175, 24.079), "c3_usb as placed: MST of the 5 pads of each member (J1 A6/B6, U3 1/6, U1 27; measured 2026-09-20)"
     assert round(dp - dn, 3) == 0.096, "spread 0.096 mm under the 0.5 mm budget (preset usb_hs, TI usb_layout_basics)"
-    assert check_airwires(ctx) == []
+    assert not any("airwires" in m for m in check_airwires(ctx)), "the skew half stays silent"
+    # F.1's other half does not: the pair has no length budget at all, and 0.096 mm of MST spread is
+    # not evidence that it needs none. node's routed skew is 11.9196 mm against 0.5 on a board whose
+    # MST spread is 0.094 mm (docs/roadmap.md item 6), so this check is not the one that catches it.
+    assert [m.split(":")[0] for m in check_airwires(ctx)] == ["USB_DN", "USB_DP"]
 
 
 def test_a_moved_esd_part_skews_the_pair_and_the_move_says_how_much_serpentine(tmp_path: Path):
@@ -152,6 +170,87 @@ def test_the_whole_nets_airwire_is_held_to_max_mm(tmp_path: Path, stock):
     ) in moves, "buck with C_BOOT at (30, 4): U1.SW to L1.1 2.45 + U1.SW to C_BOOT.2 12.2 mm edge to edge (measured 2026-09-20)"
     assert any(m.startswith("SW: C_BOOT.2 is 14.7 mm from L1.1") for m in moves), "the existing nearest-pad line stays"
     assert not any("airwire" in m for m in stock["buck"][1]), "buck's SW as placed: 5.1 mm edge to edge under max_mm=6"
+
+
+def test_a_fast_kind_with_no_budget_is_a_move_naming_the_span_nobody_checked(stock):
+    """F.1: `PRESETS` gives `usb_hs`, `clock`, `spi` and `i2c` no `airwire_mm` — see
+    `route_checks.FAST_KINDS` for the two derivations that were weighed and refuted — so the
+    kind with the fastest edge on these boards was the one kind no placement budget ever saw.
+    Refusing to invent the number is half a refusal; this is the other half, with the measurement.
+
+    node as shipped: five pads per member, 38.971 and 39.124 mm of edge-to-edge MST on a 75.000 mm
+    board diagonal, and until this landed the router was handed that span with nothing said.
+    """
+    _board, moves, _notes = stock["node"]
+    assert (
+        'USB_DP: 39.1 mm of airwire (MST of 5 pads, edge to edge) and no budget checks it; '
+        'preset usb_hs sets no max_mm and pcbc will not invent one for a signalling standard it was not told '
+        '(NetReq line 143); the route is longer still: give NetReq("USB_DP", ..., max_mm=) or length_mm='
+    ) in moves, "node as placed, measured 2026-09-22: USB_DP 39.124 mm, USB_DN 38.971 mm"
+    assert sum("no budget checks it" in m for m in moves) == 2, moves
+    for name in ("blinky", "buck"):
+        assert not any("no budget checks it" in m for m in stock[name][1]), f"{name} declares no fast kind"
+
+
+def test_declaring_the_budget_turns_the_move_into_the_ordinary_over_budget_one(tmp_path: Path):
+    """F.1: the move ends in a `board.py` edit, and making that edit is what the check is for. node's
+    pair with `max_mm=30` stops printing "no budget checks it" and prints the F.1 line that names a
+    part — and the part it names is `U3`, the ESD array `Place("U3", to="J1.DP1")` put at the
+    connector, not `U1` or `J1`, which are the floorplan (the rule the test below pins)."""
+    src = _example("node")
+    line = 'NetReq("USB_DP", "USB_DN", kind="usb_hs", z_diff_ohm=90, pair=True)'
+    board = _copy(tmp_path / "node", src, [(line, line[:-1] + ", max_mm=30)")])
+    moves, _notes = _report(board)
+    assert not any("no budget checks it" in m for m in moves)
+    assert (
+        'USB_DP: 39.1 mm of airwire (MST of 5 pads, edge to edge) over max_mm=30 (NetReq line 143); '
+        'the route is longer still: Place("U3", to="U1.IO19") or raise max_mm'
+    ) in moves, "node with max_mm=30 on the pair, measured 2026-09-22"
+
+
+def test_a_derived_routed_length_is_a_placement_budget_one_stage_early(tmp_path: Path):
+    """F.1: `_airwire_budget`'s second source. The MST over a net's pads is a **lower bound** on the
+    copper that joins them, so a placement already over the net's *routed* budget cannot be routed
+    inside it by any router — which makes `length_max_mm` a placement budget for free, with no new
+    number anywhere.
+
+    `i2c` is the kind where that budget is already fully derived: `(pf_max - 10 pF x pins) / C_per_mm`
+    from UM10204 rev 7 section 7.1 and the exact per-mm capacitance of the class width on the board's
+    own stackup. Measured on node + an `i2c` NetReq, 2026-09-22: `SDA` spans 38.474 mm edge to edge,
+    and the derived budget is **4067.1441 mm** at the UM10204 default 400 pF, **109.9228** at 40 pF
+    and **32.9768** at 33 pF (3 device pins at 10 pF each, 0.091 pF/mm on 0.16 mm F.Cu). So the
+    derivation is sound and, at any capacitance a real I2C bus declares, **inert** — 400 pF buys four
+    metres of track on a 60 x 45 mm board. It is pinned at 33 pF, where it fires, precisely because
+    nothing on these five boards can reach it otherwise.
+    """
+    src = _example("node")
+    hook = 'NetReq("LOAD", kind="power", volts=3.3, amps=1)'
+    board = _copy(tmp_path / "node", src, [(hook, hook + '\nNetReq("SDA", "SCL", kind="i2c", pf_max=33)')])
+    moves, _notes = _report(board)
+    assert (
+        'SDA: 38.5 mm of airwire (MST of 3 pads, edge to edge) over max_mm=32.9768 '
+        '(routed length i2c_capacitance 33 pF (NetReq line 147) - 10 pF x 3 pins on the busiest line '
+        'at 0.091 pF/mm (0.16 mm F.Cu), and the MST is a lower bound on it); '
+        'the route is longer still: Place("R_SDA", to="U1.IO4") or raise max_mm'
+    ) in moves, "node + i2c at pf_max=33, measured 2026-09-22"
+    assert not any(m.startswith(("SDA:", "SCL:")) and "no budget checks it" in m for m in moves), "i2c is budgeted, not unbudgeted"
+
+
+def test_the_default_i2c_budget_is_derived_and_never_fires_at_this_board_size(tmp_path: Path):
+    """The same derivation at the UM10204 default: 4067.1441 mm against node's 38.474 mm span. It is
+    recorded because it is the honest reason `FAST_KINDS` could not simply be "use the routed budget
+    everywhere" — the one kind with a fully derived length budget has one three orders of magnitude
+    above anything a board of this size reaches, so on `i2c` the transfer is correct and silent."""
+    src = _example("node")
+    hook = 'NetReq("LOAD", kind="power", volts=3.3, amps=1)'
+    board = _copy(tmp_path / "node", src, [(hook, hook + '\nNetReq("SDA", "SCL", kind="i2c")')])
+    design = load_board(board)
+    cs = compile_constraints(design)
+    sda = next(c for c in cs.constraints if c.net == "SDA")
+    assert sda.length_max_mm is not None and sda.length_max_mm.value == 4067.1441
+    assert sda.airwire_max_mm is None, "the compiler's printed rules are unchanged; the transfer happens in the check"
+    moves, _notes = _report(board)
+    assert not any(m.startswith(("SDA:", "SCL:")) for m in moves)
 
 
 # ---------------------------------------------------------------- F.2 chains
@@ -228,9 +327,10 @@ def test_the_corridor_check_stays_under_the_bar_on_node(stock):
 
     text = placed_board("node", stock["node"][0]).read_text()
     t0 = time.perf_counter()
-    moves, _notes = route_aware_report(design, job, text)
+    moves, _notes = route_aware_report(design, job, feet_of_text(design, text))
     assert time.perf_counter() - t0 < 3.0, "H.8: node under 3 s is the bar"
-    assert moves == []
+    assert [m.split(":")[0] for m in moves] == ["USB_DN", "USB_DP"], "F.1's unbudgeted-fast move, and nothing from F.3"
+    assert not any("corridor" in m for m in moves)
 
 
 # ---------------------------------------------------------------- F.4 loops
@@ -431,8 +531,11 @@ def test_a_move_never_asks_the_ai_to_undo_its_own_floorplan(tmp_path: Path):
     line = next(l for l in src.read_text().splitlines() if l.startswith('NetReq("VBUS"'))
     board = _copy(tmp_path / "c3", src, [(line, line[:-1] + ", max_mm=5)")])
     moves, _notes = _report(board)
-    airwire = [m for m in moves if "airwire (MST" in m]
+    # The two usb_hs nets carry no budget at all and print the other F.1 line, which names no part:
+    # a missing declaration is not a misplaced part (`route_checks._unbudgeted_fast`).
+    airwire = [m for m in moves if "airwire (MST" in m and 'Place("' in m]
     assert len(airwire) == 3, airwire
+    assert len([m for m in moves if "no budget checks it" in m]) == 2
     named = {m.split('Place("')[1].split('"')[0] for m in airwire}
     assert named == {"R_BOOT", "D1", "U3"}, named
     assert not any(f'Place("{ref}"' in m for ref in ("U1", "J1") for m in airwire), "U1 is the module, J1 is edge-placed"

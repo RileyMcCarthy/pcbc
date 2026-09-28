@@ -19,7 +19,7 @@ pcbc check board.py               # loads it: unbound pins, missing lands, bad p
 pcbc check board.py --constraints # every number a NetReq/Pair/Bus line became, one per line with its source
 pcbc sch board.py                 # draws the sheet, proves the netlist with kicad-cli, ERC, lists moves
 pcbc pcb board.py                 # places the copper, lists moves (--constraints adds the numbers it was checked against)
-pcbc build board.py --force       # check → seed → sch → place → route (KRT) → copper gate → fab
+pcbc build board.py --force       # check → sch → place → route (native, in Python) → emit → gates → fab
 pcbc review board.py              # one HTML page: schematic, copper, 3D, BOM, notes
 ```
 
@@ -193,9 +193,10 @@ The examples stay at zero moves; hold a new board to the same bar before `build`
 - A number a `NetReq` becomes lives in one place: `constraints.py` derives it, `dru.py` writes
   the KiCad rule from it, `route_checks.py` checks placement against it, the report prints it.
   Never add a second copy in a consumer; read `job.constraints.by_net(name)`.
-- `PCBC_REQUIRE_KICAD=1 PCBC_REQUIRE_KRT=1 pytest` must stay green. KRT lives at
-  `KRT_HOME` (default `~/Downloads/KiCadRoutingTools`, pinned to `pcbc.route.KRT_SHA`).
+- `PCBC_REQUIRE_KICAD=1 pytest` must stay green. There is no external router: placement and
+  routing are pcbc's own Python and no KiCad board file exists before emit (`tests/test_native.py`).
 - Everything is deterministic: the same `board.py` gives the same files byte for byte. Keep it so.
 - Map: `language.py` (the DSL) → `circuit.py` (check) → `sch_place.py`/`sch_emit.py` (sheet) →
-  `pcb_place.py` (copper placement) → `route.py` (the KRT plan from `compile.py`'s classes) →
-  `netcheck.py` (both gates) → `fab.py`. Parts: `source.py`; fab limits: `stackup.py`.
+  `pcb_place.py` (copper placement) → `place_native.py` (the placement as layout objects) →
+  `route_native.py` (patterns, planes, `route_cost.py` router, `route_pair.py` pairs) → `layout_job.py`
+  (gen, emit) → `netcheck.py` (both gates) → `fab.py`. Parts: `source.py`; fab limits: `stackup.py`.

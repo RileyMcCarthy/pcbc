@@ -176,7 +176,7 @@ def _untied_grounds(design: Design) -> list[str]:
     Silent on all four example boards, and for a structural reason rather than a tuned one: each of
     them declares exactly one `Ground()`, so the pair loop has nothing to iterate.
     """
-    from .blocking import move_line
+    from .moves import move_line
 
     grounds = _grounds(design)
     if len(grounds) < 2:

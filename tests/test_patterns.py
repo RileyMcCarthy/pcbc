@@ -61,12 +61,14 @@ from pcbc.patterns.spine import (
 from pcbc.patterns import _nm as _spine_nm
 from pcbc.route_scene import _project as _spine_project
 from pcbc.patterns.tap import TAP_REACH_MM, anchor, specs as tap_specs, tap_via
-from pcbc.route import bar_key, krt_plan, pin_copper_ids, write_fab_overrides
-from pcbc.route_emit import piece_key, seg_piece, via_piece, write_pieces
+from boardtext import bar_key
+from pcbc.route_emit import piece_key, seg_piece, via_piece
+from boardtext import write_pieces
 from pcbc.route_geom import EPS_MM, MICRO_MM, is_octilinear, legs_ok, q, seg_lengths, turn_ok
 from pcbc.route_geom import track_shape
-from pcbc.route_scene import Exit, Item, blocked, build_scene, pad_exits
+from pcbc.route_scene import Exit, Item, blocked, pad_exits
 from pcbc.route_verify import POUR_CELL_MM, in_zone, paths_of, plane_area, plane_checks, plane_islands, pour_raster, verify_copper, zones
+from boardtext import scene_from_text
 
 ROOT = Path(__file__).resolve().parent.parent
 EXAMPLES = ROOT / "examples"
@@ -97,7 +99,7 @@ def _plan(name: str):
     design = load_board(_board(name))
     job = compile_design(design)
     text = _placed(name).read_text()
-    return pattern_copper(design, job, job.constraints, text, _uuid_name(name)), design, job, text
+    return pattern_copper(design, job, job.constraints, _uuid_name(name), scene=scene_from_text(design, job, job.constraints, text)), design, job, text
 
 
 def _post(name: str):
@@ -112,7 +114,7 @@ def _post(name: str):
     design = load_board(_board(name))
     job = compile_design(design)
     text = _placed(name).read_text()
-    return pattern_copper(design, job, job.constraints, text, _uuid_name(name), stage="post"), design, job, text
+    return pattern_copper(design, job, job.constraints, _uuid_name(name), stage="post", scene=scene_from_text(design, job, job.constraints, text)), design, job, text
 
 
 def _ctx(name: str, stage: str = "post"):
@@ -124,7 +126,7 @@ def _scene(name: str):
     design = load_board(_board(name))
     job = compile_design(design)
     text = _placed(name).read_text()
-    return build_scene(design, job, job.constraints, text), design, job, text
+    return scene_from_text(design, job, job.constraints, text), design, job, text
 
 
 def _exit(at, d, side, w=0.16, layer="F.Cu"):
@@ -385,69 +387,13 @@ def test_the_fanout_skips_the_nets_the_hops_claimed():
     """C.1: hops run FIRST and `fanout._excluded` gains what they took, so a closed row's lane is spent
     on the hop that needed it rather than on a via the hop then has to start from."""
     plan, design, job, text = _plan("ds2")
-    plain, _n = fanout_pieces(design, job, text, "ds2_addon")
-    after, _n = fanout_pieces(design, job, plan.text, "ds2_addon", plan.scene, claimed=plan.claimed)
+    plain, _n = fanout_pieces(design, job, "ds2_addon", scene=scene_from_text(design, job, job.constraints, text))
+    after, _n = fanout_pieces(design, job, "ds2_addon", scene=plan.scene, claimed=plan.claimed)
     assert len([p for p in plain if p.kind == "via"]) == 10 and len([p for p in after if p.kind == "via"]) == 9, (
         "ds2's `nRESET` is a hop now, so `R10.2`'s escape is not spent; docs/r2-measurements.md S4"
     )
     assert {p.net for p in plain} - {p.net for p in after} == {"nRESET"}, "a claimed net keeps its pads bare"
     assert {p.net for p in after} & plan.claimed == set()
-
-
-def test_krt_plan_drops_what_the_patterns_finished():
-    """C.4: `local_hops` is built from what the pattern refused and disappears when there is nothing
-    left; `signals` carries a `!NET` for every finished net, belt and braces."""
-    design = load_board(_board("blinky"))
-    job = compile_design(design)
-    placed = _placed("blinky")
-    plan, _d, _j, _t = _plan("blinky")
-    names = [n for n, _ in krt_plan(job, design, placed, Path("work"), Path("/krt"), plan)]
-    assert "local_hops" not in names, "blinky's one local net is a hop now, so KRT's hop step has nothing to do"
-    sig = dict(krt_plan(job, design, placed, Path("work"), Path("/krt"), plan))["signals"]
-    assert "!LED" in sig, sig
-    plain = [n for n, _ in krt_plan(job, design, placed, Path("work"), Path("/krt"))]
-    assert plain == [n for n, _ in krt_plan(job, design, placed, Path("work"), Path("/krt"), None)], "no plan is the pre-R2 plan"
-
-
-def test_write_fab_overrides_never_escalates_a_class(tmp_path: Path):
-    """C.5, scoped so it cannot raise a floor: the smallest class clearance, never the largest.
-
-    `max(class clearance)` on node is 0.2 and would raise the floor above the USB class's own 0.18 and
-    above the 0.15 mm gap the pair is dimensioned for; that is a different edit from the one the
-    docstring promises."""
-    want = {"blinky": 0.16, "buck": 0.16, "c3_usb": 0.155, "node": 0.18, "ds2": 0.16}
-    for name in ALL:
-        job = compile_design(load_board(_board(name)))
-        d = tmp_path / name
-        d.mkdir()
-        line = next(x for x in write_fab_overrides(job, d).read_text().splitlines() if x.startswith("clearance"))
-        got = float(line.split("=")[1])
-        assert got == want[name], (name, got, want[name], "docs/r2-design.md A.3's compiled numbers")
-        assert all(got <= c.clearance_mm + 1e-12 for c in job.classes), (name, [(c.name, c.clearance_mm) for c in job.classes])
-
-
-def test_pin_copper_ids_keeps_pcbcs_own_ids_and_re_keys_everything_else():
-    """C.3's second guard: pcbc's uuids derive from the same geometry key `copper.json` is keyed by, so
-    re-keying them would leave the sidecar pointing at ids that no longer exist."""
-    text = (
-        '(kicad_pcb\n\t(segment\n\t\t(start 0 0)\n\t\t(end 1 1)\n\t\t(width 0.2)\n\t\t(layer "F.Cu")\n\t\t(net "A")\n\t\t(uuid "mine")\n\t)\n'
-        '\t(segment\n\t\t(start 1 1)\n\t\t(end 2 2)\n\t\t(width 0.2)\n\t\t(layer "F.Cu")\n\t\t(net "A")\n\t\t(uuid "krt")\n\t)\n)\n'
-    )
-    out = pin_copper_ids(text, "b", frozenset({"mine"}))
-    assert '(uuid "mine")' in out and '(uuid "krt")' not in out, out
-    plain = pin_copper_ids(text, "b")
-    assert plain.count('(uuid "') == 2 and '(uuid "mine")' not in plain, "without keep, nothing is preserved: the pre-R2 behaviour"
-    assert out.split('(uuid "')[2] == plain.split('(uuid "')[2], "a kept id still consumes its position, so nothing else moves"
-
-
-def test_patterns_off_claims_nothing_and_is_a_rollback():
-    """C.6's escape hatch: `PCBC_PATTERNS=off` restores the pre-R2 plan exactly — one env check around
-    one call. Measured with the boards: every copper-bar number on all five is the S1b row."""
-    from pcbc.patterns import empty_plan, patterns_off
-
-    plan = empty_plan("(kicad_pcb)\n")
-    assert plan.pieces == () and plan.claimed == frozenset() and plan.done == frozenset() and plan.text == "(kicad_pcb)\n"
-    assert not patterns_off(), "the default is on; the test for the env var itself is the measurement in docs/r2-measurements.md S4"
 
 
 def test_the_board_is_a_pure_function_of_the_placed_board():
@@ -456,7 +402,6 @@ def test_the_board_is_a_pure_function_of_the_placed_board():
     for name in ALL:
         one, _d, _j, _t = _plan(name)
         two, _d2, _j2, _t2 = _plan(name)
-        assert one.text == two.text, name
         assert [piece_key(p) for p in one.pieces] == [piece_key(p) for p in two.pieces], name
         assert [p.uuid for p in one.pieces] == [p.uuid for p in two.pieces], name
 
@@ -592,27 +537,46 @@ def test_the_stage_is_fast_enough_to_run_on_every_build():
 
 # --- the DS2 Addon's own bar, recorded for the first time -----------------------------------------
 
-DS2_BAR = {"segments": 315, "vias": 17, "off45": 12, "micro": 96, "mm": 508.3, "detour": 3.23}
-"""The only board here drawn for a real order, and the only one `test_examples_fab.py` cannot hold:
-it lives outside this repo. S1 said its ceilings would be recorded and they never were, so they are
-recorded here — measured 2026-09-20 from a fresh build, `docs/r2-measurements.md` S5. Every number is
-a ceiling except the census and the refusals, which are exact, and `vias` is now `vias_leftover`
-(D.4's split: a tap via is the point of the pattern, so pinning the total pins the wrong thing).
+DS2_BAR = {"segments": 142, "vias": 0, "off45": 5, "micro": 0, "mm": 411.9, "detour": 2.48}
+"""The DS2 Addon's copper bar on the native router's emitted board (`copper_bar` totals), re-recorded
+2026-09-25 (`scratchpad/native/fix2/measure_r.py`; the KRT-era numbers, 315 segments / 17 leftover vias /
+508.3 mm, are the old router's and say nothing about this one). Ceilings, like `test_examples_fab.BAR`.
+The board stops at `REFN_F` (unrouted; its generated copper is dropped, `route_native.drop_unfinished`), so
+routing `REFN_F` will raise `segments` and `mm`, and that move should be read. `vias` is `vias_leftover`:
+copper no `pcbc:` group names, none natively. The worst detour is `ADC_TX`, 2.48. Re-recorded 2026-09-26
+(`scratchpad/native/fix3/acc/table.md`): 144 -> 142 segments and 415.3 -> 411.9 mm, exactly the 3.487 mm the
+third refutation round measured laid over same-net copper (two segments dropped, one cut back;
+`route_native.merge_overlaps`)."""
 
-At S5 every one of them improved or held: 340 -> 310 segments, 118 -> 91 micro segments, 509.9 ->
-507.4 mm, off-45 and the detour held, and the ceiling is the leftover router's vias rather than the
-board's 28 total. ds2's `GND` carries only five pads — its ground is mostly `VSS`, which has no pour —
-so two taps do all of that by taking `C5.2` and `C6.2` off KRT's list.
+DS2_OWNS = {"fanout": (6, 4), "hop": (10, 0), "route": (124, 18), "tap": (2, 2)}
+"""(segments, vias) per `pcbc:` role on the emitted board, exact. `fanout` is 6 stubs and 4 vias of the
+9 + 9 the fanout wrote on `U1`'s closed rows (`route["fanout"]` has 9 rows: pads 1, 2, 4, 5, 16, 15, 14,
+13, 12): the dangling sweep removes the other 3 stubs and 5 vias (`DS2_PRUNED`; 6 + 3 = 9, 4 + 5 = 9).
+Corrected by the third refutation round, which counted 9 where this said 10. `route` 126 -> 124
+(2026-09-26, `scratchpad/native/fix3/acc`): the two route segments that lay wholly on copper of their own
+net — VSS's B.Cu run along itself, 3V3's run over the fanout stub — are dropped (`merge_overlaps`)."""
 
-**Re-recorded 2026-09-20 for the S5 review, and four of them go up**: 310 -> 315 segments, 91 -> 96
-micro, 11 -> 12 off-45, 507.4 -> 508.3 mm, against `vias_leftover` 19 -> **17** and 2.13 mm2 more
-filled pour. One tap moved and KRT re-staircased the leftover around it: `C5.2`'s via sat 0.1221 mm
-inside `U1`'s top fanout lane, in the column `U1.11` (AIN0) escapes through, and neither `lane_ok` nor
-the D.1 self-check could see it because both skipped every piece that was not a segment (finding 6).
-The stub now leaves the pad upward instead of downward — (23.73,6.4411)->(23.73,5.589) where it was
-(23.73,6.4411)->(23.73,7.2931) — and the worst detour is unchanged at `REFP_F` 3.23."""
+DS2_PRUNED = [
+    # The route stage's dangling sweep (`route_native.prune_dangling`) on ds2, exact, in removal order
+    # (the second refutation round, major 7: ds2 lost five fanout vias silently). Each is copper pcbc
+    # wrote that joins its net on one side only, so removing it opens nothing, and KiCad would report it
+    # (`via_dangling`, `track_dangling`). Two kinds, read off the emitted board:
+    # - GPIO1 (U1.1) and 3V3 (U1.13): the router continued from the escape's end **on F.Cu** (its link
+    #   starts at the via's point), so the barrel joins nothing on B.Cu; the via goes, the stub stays as
+    #   the first leg of the route.
+    # - VSS (U1.5), ADC_RX (U1.16), ADC_TX (U1.15): the router reached the pad another way on F.Cu, so the
+    #   whole escape hangs off it; the via goes first, then the stub, whose far end then touches nothing.
+    ("via", "GPIO1", "fanout", "U1.1", "joined on F.Cu only"),
+    ("via", "VSS", "fanout", "U1.5", "joined on F.Cu only"),
+    ("via", "ADC_RX", "fanout", "U1.16", "joined on F.Cu only"),
+    ("via", "ADC_TX", "fanout", "U1.15", "joined on F.Cu only"),
+    ("via", "3V3", "fanout", "U1.13", "joined on F.Cu only"),
+    ("seg", "VSS", "fanout", "U1.5", "its end at (22.83,16.35) touches nothing once the pass before removed what it met"),
+    ("seg", "ADC_RX", "fanout", "U1.16", "its end at (20.22,8.05) touches nothing once the pass before removed what it met"),
+    ("seg", "ADC_TX", "fanout", "U1.15", "its end at (20.87,7.55) touches nothing once the pass before removed what it met"),
+]
 
-DS2_PLANE_MM2 = 1008.42
+DS2_PLANE_MM2 = 1009.0
 """The GND pour's filled copper on B.Cu, in mm2 (KiCad 10.0.6, re-recorded 2026-09-20).
 
 Pinned beside the island count because the count cannot see what this catches: under
@@ -620,51 +584,75 @@ Pinned beside the island count because the count cannot see what this catches: u
 `filled_polygon`, so the count stays at 1 while the copper goes (`route_verify.plane_area`, and
 `docs/r2-measurements.md` S5's review, finding 9). ds2 is the board that does it — five orphans,
 8.52 mm2 — and it does it with the patterns off as well, so this pins a condition rather than a
-regression."""
+regression.
+
+**Re-recorded 1008.42 -> 1009.0 on 2026-09-24** (fourth review, C4): the route stage sweeps the
+router's dangling copper before emit, and on ds2 that is `U1.2`'s fanout via at (20.87, 16.85),
+joined on B.Cu by nothing; its antipad in this pour goes with it (+0.58 mm2), the island count stays 1
+and KiCad's DRC loses exactly its one `via_dangling` warning (`scratchpad/step1b/fix5/measure_moved.py`,
+a build without the sweep against this tree's)."""
 
 
 @pytest.mark.kicad
-@pytest.mark.krt
 @pytest.mark.skipif("ds2" not in ALL, reason="the DS2 Addon is not checked out here")
-def test_the_ds2_addon_builds_to_fab_with_its_hops_in_it(tmp_path: Path):
-    """The DS2 Addon end to end: the gate verified, the hops locked and still there after every KRT
-    step, and the bar no worse than S1b's (`docs/r2-measurements.md`). Built into a temp copy — the
+def test_the_ds2_addons_hops_are_in_gen():
+    """The DS2 Addon end to end, natively: its five refused hops are still five, its ten local two-pad
+    nets are hops in `layout.gen.py` (each a `pcbc:hop:` group), the pour is one island with every tap
+    via inside it and no via in a pad. N0 does not require the board to complete (docs/native-plan.md
+    §5), so this reads the emitted board whether or not a net is left open. Built in a temp copy — the
     MaD checkout is never written to."""
-    import shutil
+    from conftest import routed_result
+    from pcbc.fab import via_in_pad, via_in_pad_blockers
+    from pcbc.layout_job import roles_doc
+    from pcbc.route_emit import via_piece
+    from pcbc.route_verify import plane_area, plane_checks, plane_islands
 
-    from pcbc.build import build_job
-
-    shutil.copytree(DS2, tmp_path / "ds2", ignore=shutil.ignore_patterns("layout"))
-    result = build_job(tmp_path / "ds2" / "ds2_addon.py", upto="fab", force=True)
-    assert result.get("error") is None, result.get("error")
+    out, result = routed_result("ds2", DS2 / "ds2_addon.py")
     route = next(s for s in result["steps"] if s.get("stage") == "route")
-    assert route["unrouted"] == [] and route["copper"] == "verified", route["unrouted"]
+    # Restored exact after the refuters found it loosened to `.get("hop") == 5` for no N0 reason: no other
+    # pattern refuses anything on ds2 natively either.
+    assert route["refused"] == {"hop": 5}, route["refused"]
+    gen = (out.parent / "layout.gen.py").read_text()
+    hops = sorted({line.split('"pcbc:hop:')[1].split('"')[0] for line in gen.splitlines() if line.startswith('Group("pcbc:hop:')})
+    assert len(hops) == 10, hops
+    routed = out.read_text()
+    doc = roles_doc(routed)
+    vias = [via_piece(i["net"], i["reason"], tuple(i["key"][1]), float(i["w"]), float(i["drill"]), owner=i["owner"]) for i in doc.items if i["key"][0] == "via" and i["reason"] == "tap"]
+    assert plane_islands(routed) == {("GND", "B.Cu"): 1}, plane_islands(routed)
+    assert plane_checks(routed, vias) == [] and via_in_pad_blockers(via_in_pad(routed), load_board(DS2 / "ds2_addon.py")) == []
+    # Restored from the KRT-era test (the refuters: dropped with no N0 reason): the two taps are still
+    # `C5.2` and `C6.2`, and the pour's filled area is pinned beside the island count (`DS2_PLANE_MM2`).
+    assert sorted(i["owner"] for i in doc.items if i["reason"] == "tap" and i["key"][0] == "via") == ["C5.2", "C6.2"], doc.items
+    assert abs(plane_area(routed)[("GND", "B.Cu")] - DS2_PLANE_MM2_NATIVE) <= 0.05, (plane_area(routed), DS2_PLANE_MM2_NATIVE)
+    # The census and the bar, on the emitted board (`DS2_BAR`, `DS2_OWNS`), and the dangling sweep's
+    # removals, each with its reason (`DS2_PRUNED`); every removal is also a `prune:` note.
     t = route["copper_bar"]["totals"]
     for key, got in (("segments", t["segments"]), ("vias", t["vias_leftover"]), ("off45", t["off45"]), ("micro", t["micro"])):
         assert got <= DS2_BAR[key], (key, got, DS2_BAR[key], route["copper_bar"]["lines"])
     assert t["routed_mm"] <= DS2_BAR["mm"] and t["worst_detour"][1] <= DS2_BAR["detour"] + 0.05, (t["worst_detour"], t["routed_mm"])
-    assert route["refused"] == {"hop": 5}, route["refused"]
-    assert t["vias_pattern"] == {"fanout": 9, "tap": 2}, (t["vias_pattern"], "D.4: exact per reason")
-    owns = {r: (v["segments"], v["vias"]) for r, v in t["by_reason"].items() if r != "leftover"}
-    assert owns == {"fanout": (9, 9), "hop": (10, 0), "tap": (2, 2)}, (owns, route["copper_bar"]["lines"])
-    # D.5 on the one board here drawn for a real order: the pour is still one island, every tap via
-    # is inside it, and there is not a via in a pad anywhere.
-    from pcbc.fab import via_in_pad, via_in_pad_blockers
-    from pcbc.route_emit import read_sidecar, via_piece
-    from pcbc.route_verify import plane_area, plane_checks, plane_islands
+    assert {r: (v["segments"], v["vias"]) for r, v in t["by_reason"].items() if r != "leftover"} == DS2_OWNS, t["by_reason"]
+    assert t["vias_pattern"] == {r: v for r, (_s, v) in DS2_OWNS.items() if v}, t["vias_pattern"]
+    pruned = route["route_stats"]["dangling_removed"]
+    assert [(r["kind"], r["net"], r["reason"], r["owner"], r["why"]) for r in pruned] == DS2_PRUNED, pruned
+    # The arithmetic of `DS2_OWNS`' sentence: 9 escapes written, and what the census keeps plus what the
+    # sweep removed is all of them, stubs and vias each.
+    assert len(route["fanout"]) == 9, route["fanout"]
+    # Same-net copper laid over itself (`route_native.merge_overlaps`), 3.487 mm on ds2 before the third
+    # refutation round: VSS's B.Cu route along itself and 3V3's route over the locked-in fanout stub are
+    # dropped, and a 3V3 run overlapping another is cut back to it; 0 mm is left.
+    assert route["route_stats"]["overlap_mm"] == 0.0
+    assert sorted((r["net"], "dropped" if "dropped" in r else "trimmed") for r in route["route_stats"]["overlaps_merged"]) == [("3V3", "dropped"), ("3V3", "trimmed"), ("VSS", "dropped")], route["route_stats"]["overlaps_merged"]
+    gone = {k: sum(1 for r in pruned if r["reason"] == "fanout" and r["kind"] == k) for k in ("seg", "via")}
+    assert DS2_OWNS["fanout"][0] + gone["seg"] == 9 and DS2_OWNS["fanout"][1] + gone["via"] == 9, (DS2_OWNS["fanout"], gone)
+    assert len([n for n in route["notes"] if n.startswith("prune: removed ")]) == len(DS2_PRUNED), route["notes"]
 
-    routed = (tmp_path / "ds2" / "layout" / "ds2_addon" / "routed" / "layout.kicad_pcb").read_text()
-    doc = read_sidecar(tmp_path / "ds2" / "layout" / "ds2_addon" / "routed" / "copper.json")
-    # The via's real size, so `plane_checks` asks about the ring and not only the centre (finding 12).
-    vias = [via_piece(i["net"], i["reason"], tuple(i["key"][1]), float(i["w"]), float(i["drill"]), owner=i["owner"]) for i in doc.items if i["key"][0] == "via"]
-    assert plane_islands(routed) == {("GND", "B.Cu"): 1}, plane_islands(routed)
-    # ds2's pour is the one place in this repo where the area and the island count disagree: KiCad
-    # deletes five orphan GND fragments (8.52 mm2) that the fill cannot reach and still writes one
-    # filled polygon (finding 9). It is a pre-existing condition — `PCBC_PATTERNS=off` drops three
-    # totalling 10.34 mm2 — so the number is recorded, and a sixth orphan would move it.
-    assert abs(plane_area(routed)[("GND", "B.Cu")] - DS2_PLANE_MM2) <= 0.05, (plane_area(routed), DS2_PLANE_MM2)
-    assert plane_checks(routed, vias) == [] and via_in_pad_blockers(via_in_pad(routed), load_board(tmp_path / "ds2" / "ds2_addon.py")) == []
-    assert sorted(i["owner"] for i in doc.items if i["reason"] == "tap" and i["key"][0] == "via") == ["C5.2", "C6.2"], doc.items
+
+DS2_PLANE_MM2_NATIVE = 980.41
+"""`DS2_PLANE_MM2` on the native router's copper, re-recorded 2026-09-25 (KiCad 10.0.6; the ds2 build of
+`scratchpad/native/fix1/acc/a`, `route_verify.plane_area`): 1009.0 -> 980.41 mm2, one island. The
+copper that shares B.Cu with the pour is the native router's, not KRT's, so the fill differs; it is
+pinned on an unfinished board (`REFN_F` unrouted), so routing `REFN_F` will move it, and that move
+should be read."""
 
 
 def test_strict_patterns_makes_every_refusal_fatal(monkeypatch):
@@ -737,10 +725,11 @@ def test_a_pad_already_welded_to_the_plane_is_not_tapped_twice():
     design = load_board(_board("c3_usb"))
     job = compile_design(design)
     text = _placed("c3_usb").read_text()
-    bare = pattern_copper(design, job, job.constraints, text, "c3_usb", stage="post")
-    pre = pattern_copper(design, job, job.constraints, text, "c3_usb", stage="pre")
-    fan, _n = fanout_pieces(design, job, pre.text, "c3_usb", pre.scene, claimed=pre.claimed)
-    withfan = pattern_copper(design, job, job.constraints, write_pieces(pre.text, fan), "c3_usb", stage="post")
+    bare = pattern_copper(design, job, job.constraints, "c3_usb", stage="post", scene=scene_from_text(design, job, job.constraints, text))
+    pre = pattern_copper(design, job, job.constraints, "c3_usb", stage="pre", scene=scene_from_text(design, job, job.constraints, text))
+    fan, _n = fanout_pieces(design, job, "c3_usb", scene=pre.scene, claimed=pre.claimed)
+    pre.scene.add(pre.scene.item_of(p) for p in fan)
+    withfan = pattern_copper(design, job, job.constraints, "c3_usb", stage="post", scene=pre.scene)
     tapped = {p.owner for p in withfan.pieces if p.kind == "via"}
     assert {p.owner for p in bare.pieces if p.kind == "via"} - tapped == {"U2.2", "U3.2"}, (
         "U2.2 and U3.2 carry an escape via once the fanout has run, and a second hole beside it welds nothing new"
@@ -872,7 +861,7 @@ def test_a_zone_header_is_read_for_the_numbers_a_fill_will_use():
     On four layers that is the point: KRT's `planes` step writes the zone and no `filled_polygon` at
     all, so when the post stage runs the numbers exist and the copper does not.
     """
-    from pcbc.route_scene import zone_rules
+    from boardtext import zone_rules
 
     text = (
         '(kicad_pcb\n\t(zone\n\t\t(net "GND")\n\t\t(layer "In1.Cu")\n\t\t(connect_pads yes\n\t\t\t(clearance 0.18)\n\t\t)\n'
@@ -953,73 +942,6 @@ def test_two_taps_keep_the_fabs_hole_to_hole_and_so_does_a_mounting_hole():
                 assert gap >= h2h - 1e-9, (name, via.owner, it.owner, round(gap, 4), h2h)
 
 
-def test_the_post_stage_runs_between_the_planes_and_the_signals():
-    """C.1, and the order is measured rather than tidy: of the four orderings the design tried on
-    node, taps before KRT boxed the USB pair in (1.72 -> 1.83) and taps after the signals left 21
-    pads unconnected, because the signals had taken every tap site. It is a step of the plan, in the
-    same shape as a KRT step, so the chain, the step files and `blocking.step_boards` all work on it
-    unchanged."""
-    from pcbc.route import PCBC_STEP
-
-    for name, want in (
-        ("node", ["local_hops", "analog_nets", "pair_usb_dn", "planes", "patterns_post", "plane_taps", "signals"]),
-        ("c3_usb", ["local_hops", "pair_usb_dn", "patterns_post", "signals", "gnd_pour", "finalize"]),
-    ):
-        design = load_board(_board(name))
-        job = compile_design(design)
-        plan, _d, _j, _t = _plan(name)
-        steps = krt_plan(job, design, _placed(name), Path("work"), Path("/krt"), plan, post=True)
-        assert [n for n, _ in steps] == want, (name, [n for n, _ in steps])
-        post = dict(steps)["patterns_post"]
-        assert post[0] == PCBC_STEP and post[4].endswith(("planes.kicad_pcb", "pair_usb_dn.kicad_pcb")) and post[5].endswith("patterns_post.kicad_pcb"), post
-        prev = str(_placed(name))
-        for n, cmd in steps:
-            assert cmd[4] == prev, (name, n, cmd[4], prev)
-            prev = cmd[5]
-    plain = [n for n, _ in krt_plan(compile_design(load_board(_board("node"))), load_board(_board("node")), _placed("node"), Path("w"), Path("/krt"))]
-    assert "patterns_post" not in plain, "`PCBC_PATTERNS=off` passes post=False, and the plan is then the pre-R2 one exactly (C.6)"
-
-
-def test_the_final_stage_is_the_last_step_of_the_plan_on_both_stackups():
-    """`docs/stitch-plan.md` R-S1 and §7 (S2): copper whose absence leaves nothing unconnected is
-    written after the last router step that could have used the space it takes.
-
-    The position is the whole architectural claim, and it is one a plan can be asked about rather
-    than argued over: `patterns_final` is **last**, on four layers after `signals` and on two after
-    `gnd_pour`/`finalize`, so there is no router step left to react to its copper. `post` and `final`
-    are separate flags because they answer different questions, and `route_job` passes both off the
-    same `patterns_off()` so the rollback stays a rollback (C.6).
-    """
-    from pcbc.route import PCBC_STEP
-
-    for name, want in (
-        ("node", ["local_hops", "analog_nets", "pair_usb_dn", "planes", "patterns_post", "plane_taps", "signals", "patterns_final"]),
-        ("c3_usb", ["local_hops", "pair_usb_dn", "patterns_post", "signals", "gnd_pour", "finalize", "patterns_final"]),
-    ):
-        design = load_board(_board(name))
-        job = compile_design(design)
-        plan, _d, _j, _t = _plan(name)
-        steps = krt_plan(job, design, _placed(name), Path("work"), Path("/krt"), plan, post=True, final=True)
-        assert [n for n, _ in steps] == want, (name, [n for n, _ in steps])
-        cmd = dict(steps)["patterns_final"]
-        assert cmd[0] == PCBC_STEP and cmd[-2:] == ["--stage", "final"], cmd
-        assert cmd[4].endswith(("signals.kicad_pcb", "finalize.kicad_pcb")), "it reads what the last router step wrote"
-        assert Path(cmd[5]).name.endswith("_patterns_final.kicad_pcb"), cmd
-        prev = str(_placed(name))
-        for n, c in steps:
-            assert c[4] == prev, (name, n, c[4], prev)
-            prev = c[5]
-        # The two flags are independent, and the `post` step keeps the position C.1 measured for it.
-        only_post = [n for n, _ in krt_plan(job, design, _placed(name), Path("work"), Path("/krt"), plan, post=True)]
-        only_final = [n for n, _ in krt_plan(job, design, _placed(name), Path("work"), Path("/krt"), plan, final=True)]
-        assert only_post == [n for n in want if n != "patterns_final"], (name, only_post)
-        assert only_final == [n for n in want if n != "patterns_post"], (name, only_final)
-        neither = [n for n, _ in krt_plan(job, design, _placed(name), Path("work"), Path("/krt"), plan)]
-        assert "patterns_post" not in neither and "patterns_final" not in neither, (
-            "`PCBC_PATTERNS=off` passes post=False and final=False, and the plan is then the pre-R2 one exactly (C.6)"
-        )
-
-
 def test_the_final_stage_writes_only_what_a_declaration_asked_for_on_a_placed_board():
     """`patterns.FINAL` is `("stitch",)`, and on a **placed** board it writes only the thermal arrays.
 
@@ -1052,7 +974,7 @@ def test_the_final_stage_writes_only_what_a_declaration_asked_for_on_a_placed_bo
         design = load_board(_board(name))
         job = compile_design(design)
         text = _placed(name).read_text()
-        plan = pattern_copper(design, job, job.constraints, text, _uuid_name(name), stage="final")
+        plan = pattern_copper(design, job, job.constraints, _uuid_name(name), stage="final", scene=scene_from_text(design, job, job.constraints, text))
         n = want.get(name, 0)
         assert len(plan.pieces) == n, (name, len(plan.pieces))
         assert plan.census == ({"thermal": {"segments": 0, "vias": n, "mm": 0.0}} if n else {}), (name, plan.census)
@@ -1061,7 +983,7 @@ def test_the_final_stage_writes_only_what_a_declaration_asked_for_on_a_placed_bo
         assert plan.claimed == frozenset() and plan.done == frozenset() and plan.partial == frozenset(), name
         assert plan.scene is not None, f"{name}: the scene is built, not skipped"
         if not n:
-            assert plan.text is text and plan.ids == () and plan.notes == (), name
+            assert plan.ids == () and plan.notes == (), name
 
 
 def test_every_pattern_module_says_whether_its_copper_connects_the_net_it_claims():
@@ -1081,24 +1003,6 @@ def test_every_pattern_module_says_whether_its_copper_connects_the_net_it_claims
     for reason, mod in sorted(mods.items()):
         assert mod.CONNECTS is (reason != "stitch"), reason
         assert mod.REASON == reason, reason
-
-
-def test_krts_tap_step_runs_only_for_the_nets_the_pattern_refused():
-    """C.4: KRT's `plane_taps` welds the pads pcbc could not, and does not run at all when there are
-    none. A pad the tap pattern **skipped** is not a refusal — a through-hole pad's barrel already
-    reaches the plane — so a skip never brings the step back."""
-    from pcbc.route import _with_nets
-
-    design = load_board(_board("node"))
-    job = compile_design(design)
-    plan, _d, _j, _t = _plan("node")
-    taps = dict(krt_plan(job, design, _placed("node"), Path("work"), Path("/krt"), plan, post=True))["plane_taps"]
-    i = taps.index("--nets")
-    assert taps[i + 1 : i + 3] == ["GND", "3V3"], taps
-    cut = _with_nets(taps, ["GND"])
-    j = cut.index("--nets")
-    assert cut[j : j + 3] == ["--nets", "GND", "--layers"], cut
-    assert cut[:j] == taps[:i] and cut[j + 2 :] == taps[i + 3 :], "only the net list changes; every other flag is the plan's"
 
 
 def test_a_tap_the_pour_cannot_reach_is_refused_before_it_is_written():
@@ -1273,7 +1177,7 @@ def _mid(name: str):
     design = load_board(_board(name))
     job = compile_design(design)
     text = _placed(name).read_text()
-    return pattern_copper(design, job, job.constraints, text, _uuid_name(name), stage="mid"), design, job, text
+    return pattern_copper(design, job, job.constraints, _uuid_name(name), stage="mid", scene=scene_from_text(design, job, job.constraints, text)), design, job, text
 
 
 def test_a_spine_is_a_wide_power_net_with_three_or_more_pads_and_no_plane():
@@ -1648,10 +1552,10 @@ def test_the_spine_stage_runs_after_the_fanout():
     design = load_board(_board("c3_usb"))
     job = compile_design(design)
     text = _placed("c3_usb").read_text()
-    pre = pattern_copper(design, job, job.constraints, text, "c3_usb", stage="pre")
-    fan, _n = fanout_pieces(design, job, pre.text, "c3_usb", pre.scene, claimed=pre.claimed)
+    pre = pattern_copper(design, job, job.constraints, "c3_usb", stage="pre", scene=scene_from_text(design, job, job.constraints, text))
+    fan, _n = fanout_pieces(design, job, "c3_usb", scene=pre.scene, claimed=pre.claimed)
     pre.scene.add(pre.scene.item_of(p) for p in fan)
-    mid = pattern_copper(design, job, job.constraints, write_pieces(pre.text, fan), "c3_usb", stage="mid", scene=pre.scene)
+    mid = pattern_copper(design, job, job.constraints, "c3_usb", stage="mid", scene=pre.scene)
     assert fan and mid.pieces, "c3_usb has five escapes and two spines"
     # Scoped to the spine's own copper since S6 put `chain` in front of it in MID. **This number has
     # moved and is deliberately not re-recorded**: with `chain` first, c3_usb's `BOOT` takes the
@@ -1665,7 +1569,7 @@ def test_the_spine_stage_runs_after_the_fanout():
     )
     merged = merge_plans(pre, mid)
     assert merged.pieces == pre.pieces + mid.pieces and merged.scene is pre.scene
-    assert merged.claimed == pre.claimed | mid.claimed and merged.text == mid.text
+    assert merged.claimed == pre.claimed | mid.claimed
     assert merged.wall_ms == pre.wall_ms + mid.wall_ms and merged.ids == pre.ids + mid.ids
 
 
@@ -1681,3 +1585,25 @@ def test_the_spine_stage_checks_its_own_copper_and_is_fast_enough():
         again, _d2, _j2, _t2 = _mid(name)
         assert [piece_key(p) for p in again.pieces] == [piece_key(p) for p in plan.pieces], (name, "pure: same board, same copper")
         assert [p.uuid for p in again.pieces] == [p.uuid for p in plan.pieces], name
+
+
+def test_the_native_stage_order_is_pre_fanout_mid_pours_post_router_final_relax(monkeypatch):
+    """docs/native-plan.md §3.4: one scene, one pass, least freedom first — `hop` (pre), the fanout,
+    `spine` (mid), the plane `Pour` objects (fields only), `tap` (post), the router, `stitch` (final),
+    and the relaxer last. Asserted by recording the calls `route_native.route_stage` makes on blinky."""
+    import pcbc.fanout as fanout_mod
+    import pcbc.route_native as rn
+    import pcbc.route_relax as rr
+    from pcbc.place_native import place
+
+    seen: list[str] = []
+    real_stage, real_fan, real_nets, real_pours, real_relax = rn._pattern_stage, fanout_mod.fanout_pieces, rn.route_nets, rn.plane_pours, rr.relax_pieces
+    monkeypatch.setattr(rn, "_pattern_stage", lambda a, stage, *r, **k: (seen.append(stage), real_stage(a, stage, *r, **k))[1])
+    monkeypatch.setattr(fanout_mod, "fanout_pieces", lambda *a, **k: (seen.append("fanout"), real_fan(*a, **k))[1])
+    monkeypatch.setattr(rn, "route_nets", lambda *a, **k: (seen.append("router"), real_nets(*a, **k))[1])
+    monkeypatch.setattr(rn, "plane_pours", lambda *a, **k: (seen.append("pours"), real_pours(*a, **k))[1])
+    monkeypatch.setattr(rr, "relax_pieces", lambda *a, **k: (seen.append("relax"), real_relax(*a, **k))[1])
+    design = load_board(_board("blinky"))
+    pl = place(design, name="blinky")
+    rn.route_stage(design, pl.job, pl, name="blinky")
+    assert seen == ["pre", "fanout", "mid", "pours", "post", "router", "final", "relax"], seen

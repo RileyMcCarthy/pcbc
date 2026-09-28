@@ -1,4 +1,7 @@
-"""Write compiled geometry into a KiCad board: locked poses, net classes, keepouts, dru."""
+"""Compiled geometry onto footprint blocks in memory (poses), and the compiled rules onto the sidecars.
+
+The outline, keepouts, rule areas and slots are layout objects now (`place_native.place_objects`);
+nothing here writes a board file."""
 
 from __future__ import annotations
 
@@ -22,44 +25,6 @@ from .sexp import (
     matching_paren,
     stable_uuid,
 )
-
-
-def apply_job(job: CompiledJob, pcb_path: Path, backup: bool = True) -> dict:
-    pcb_path = Path(pcb_path)
-    if not pcb_path.exists():
-        raise FileNotFoundError(pcb_path)
-    if backup:
-        bak = pcb_path.with_suffix(pcb_path.suffix + ".bak-pcbspace")
-        shutil.copy2(pcb_path, bak)
-
-    text = pcb_path.read_text()
-    placed, missing, resolved = _apply_places(text, job)
-    text = placed
-    text = _apply_outline(text, job)
-    text = _apply_keepouts(text, job)
-    text = _apply_rule_areas(text, job)
-    text = _apply_slot(text, job)
-    pcb_path.write_text(text)
-
-    write_dru(job, pcb_path)
-    pro_path = pcb_path.with_suffix(".kicad_pro")
-    if pro_path.exists():
-        _apply_pro(pro_path, job)
-
-    aliases = build_alias_index(pcb_path.read_text())
-    return {
-        "pcb": str(pcb_path),
-        "placed": [p.ref for p in job.places if p.ref not in missing],
-        "aliases": {p.ref: resolve_ref(p.ref, aliases) for p in job.places},
-        "resolved": [
-            {"ref": p.ref, "at": list(p.at), "rot": p.rot}
-            for p in resolved
-            if p.at is not None
-        ],
-        "missing": missing,
-        "classes": [c.name for c in job.classes],
-        "dru": str(pcb_path.with_suffix(".kicad_dru")),
-    }
 
 
 def _apply_places(text: str, job: CompiledJob) -> tuple[str, list[str], list]:
@@ -157,99 +122,6 @@ def _rewrite_footprint(block: str, place) -> str:
     return block
 
 
-def _edge_rect(w: float, h: float) -> str:
-    return (
-        f'\t(gr_rect\n'
-        f"\t\t(start 0 0)\n"
-        f"\t\t(end {w:g} {h:g})\n"
-        f"\t\t(stroke (width 0.05) (type default))\n"
-        f"\t\t(fill none)\n"
-        f'\t\t(layer "Edge.Cuts")\n'
-        f'\t\t(uuid "{stable_uuid("edge", w, h)}")\n'
-        f"\t)\n"
-    )
-
-
-def _apply_outline(text: str, job: CompiledJob) -> str:
-    w, h = job.board_size_mm
-
-    def repl(m):
-        return (
-            f"{m.group(1)}(start 0 0)\n"
-            f"\t\t(end {w:g} {h:g})\n"
-            f"\t\t(stroke (width 0.05) (type default))\n"
-            f"\t\t(fill none)\n"
-            f'\t\t(layer "Edge.Cuts")'
-        )
-
-    new, n = re.subn(
-        r'(\(gr_rect\n\t\t)\(start [^\n]+\)\n\t\t\(end [^\n]+\)\n\t\t\(stroke [^\n]+\n\t\t\(fill [^\n]+\n\t\t\(layer "Edge.Cuts"\)',
-        repl,
-        text,
-        count=1,
-    )
-    if n:
-        return new
-    if has_edge_cuts_shape(text):
-        return text
-    if not text.rstrip().endswith(")"):
-        raise ValueError("board file does not end with )")
-    stripped = text.rstrip()
-    return stripped[:-1] + _edge_rect(w, h) + ")\n"
-
-
-def _apply_keepouts(text: str, job: CompiledJob) -> str:
-    for ko in job.keepouts:
-        text = _drop_named_zone(text, ko.name)
-        x0, y0, x1, y1 = ko.box
-        tracks = "not_allowed" if "copper" in ko.no or "track" in ko.no else "allowed"
-        vias = "not_allowed" if "via" in ko.no else "allowed"
-        pour = "not_allowed" if "copper" in ko.no else "allowed"
-        zone = f'''	(zone
-		(net 0)
-		(net_name "")
-		(layers "F&B.Cu" "In1.Cu" "In2.Cu")
-		(uuid "{stable_uuid("keepout", ko.name)}")
-		(name "{ko.name}")
-		(hatch edge 0.5)
-		(keepout
-			(tracks {tracks})
-			(vias {vias})
-			(pads allowed)
-			(copperpour {pour})
-			(footprints allowed)
-		)
-		(polygon
-			(pts
-				(xy {x0:.2f} {y0:.2f})
-				(xy {x1:.2f} {y0:.2f})
-				(xy {x1:.2f} {y1:.2f})
-				(xy {x0:.2f} {y1:.2f})
-			)
-		)
-	)
-'''
-        if not text.rstrip().endswith(")"):
-            raise ValueError("board file does not end with )")
-        stripped = text.rstrip()
-        text = stripped[:-1] + zone + ")\n"
-    return text
-
-
-def _drop_named_zone(text: str, name: str) -> str:
-    start = 0
-    while True:
-        j = text.find("\n\t(zone", start)
-        if j < 0:
-            return text
-        open_at = text.find("(", j)
-        end = matching_paren(text, open_at)
-        block = text[open_at : end + 1]
-        if f'(name "{name}")' in block:
-            return text[:j] + text[end + 1 :]
-        start = end + 1
-
-
 def write_dru(job: CompiledJob, pcb_path: Path) -> Path:
     """Write compiled custom rules (.kicad_dru). Does not touch .kicad_pro.
 
@@ -257,10 +129,6 @@ def write_dru(job: CompiledJob, pcb_path: Path) -> Path:
     rule KiCad would choke on raises here, before the file exists, because one malformed rule
     silently disables every rule and kicad-cli says nothing.
 
-    KRT route steps rewrite USB pair-gap to 0.13/0.16; fab restores the
-    compiled 2-layer 0.10/0.10 rule. Do not also rewrite netclass clearance
-    — KRT lowers Default/Power to the routed floor and raising them
-    re-fails DRC on legal 0.10 mm copper.
     """
     errs = _dru.validate(job.dru)
     if errs:
@@ -268,15 +136,6 @@ def write_dru(job: CompiledJob, pcb_path: Path) -> Path:
     path = Path(pcb_path).with_suffix(".kicad_dru")
     path.write_text(_dru.render(job.dru))
     return path
-
-
-def restore_design_rules(job: CompiledJob, pcb_path: Path) -> None:
-    """Rewrite .kicad_pro net classes and .kicad_dru from the compiled job."""
-    pcb_path = Path(pcb_path)
-    write_dru(job, pcb_path)
-    pro_path = pcb_path.with_suffix(".kicad_pro")
-    if pro_path.exists():
-        _apply_pro(pro_path, job)
 
 
 def _apply_pro(pro_path: Path, job: CompiledJob) -> None:
@@ -318,104 +177,5 @@ def _render_dru(job: CompiledJob) -> str:
     return _dru.render(job.dru)
 
 
-def _rule_area_zone(name: str, box: tuple[float, float, float, float], layers: tuple[str, ...]) -> str:
-    """A named rule area with everything allowed: the .kicad_dru rule `A.intersectsArea('<name>')`
-    carries the disallow, so pads and footprints stay allowed and an isolator straddles it."""
-    x0, y0, x1, y1 = box
-    layer_list = " ".join(f'"{lay}"' for lay in layers)
-    return f'''	(zone
-		(net 0)
-		(net_name "")
-		(layers {layer_list})
-		(uuid "{stable_uuid("area", name)}")
-		(name "{name}")
-		(hatch edge 0.5)
-		(keepout
-			(tracks allowed)
-			(vias allowed)
-			(pads allowed)
-			(copperpour allowed)
-			(footprints allowed)
-		)
-		(polygon
-			(pts
-				(xy {x0:.2f} {y0:.2f})
-				(xy {x1:.2f} {y0:.2f})
-				(xy {x1:.2f} {y1:.2f})
-				(xy {x0:.2f} {y1:.2f})
-			)
-		)
-	)
-'''
-
-
-def _apply_rule_areas(text: str, job: CompiledJob) -> str:
-    """E.15: one zone per compiled RuleArea (the corridor between an Isolation's two Regions),
-    named so the rule and `check_job` find it; re-applying replaces the zone of the same name."""
-    if job.constraints is None:
-        return text
-    for area in job.constraints.rule_areas:
-        text = _drop_named_zone(text, area.name)
-        if not text.rstrip().endswith(")"):
-            raise ValueError("board file does not end with )")
-        stripped = text.rstrip()
-        text = stripped[:-1] + _rule_area_zone(area.name, area.box, area.layers) + ")\n"
-    return text
-
-
 SLOT_WIDTH_MM = 1.0  # IEC 60664-1 groove rule at PD2: a slot narrower than 1 mm does not count as a creepage path
 SLOT_WEB_MM = 3.0  # board left at each end of the slot so the two sides stay one board
-
-
-def _slot_rect(name: str, box: tuple[float, float, float, float], axis: str, board: tuple[float, float]) -> str:
-    x0, y0, x1, y1 = box
-    bw, bh = board
-    if axis == "x":  # the corridor is a vertical strip: the slot runs top to bottom
-        cx = (x0 + x1) / 2
-        sx0, sx1 = cx - SLOT_WIDTH_MM / 2, cx + SLOT_WIDTH_MM / 2
-        sy0, sy1 = SLOT_WEB_MM, bh - SLOT_WEB_MM
-    else:
-        cy = (y0 + y1) / 2
-        sy0, sy1 = cy - SLOT_WIDTH_MM / 2, cy + SLOT_WIDTH_MM / 2
-        sx0, sx1 = SLOT_WEB_MM, bw - SLOT_WEB_MM
-    return (
-        f"\t(gr_rect\n"
-        f"\t\t(start {round(sx0, 4):g} {round(sy0, 4):g})\n"
-        f"\t\t(end {round(sx1, 4):g} {round(sy1, 4):g})\n"
-        f"\t\t(stroke (width 0.05) (type default))\n"
-        f"\t\t(fill none)\n"
-        f'\t\t(layer "Edge.Cuts")\n'
-        f'\t\t(uuid "{stable_uuid("slot", name)}")\n'
-        f"\t)\n"
-    )
-
-
-def _drop_uuid_rect(text: str, uid: str) -> str:
-    j = text.find(f'(uuid "{uid}")')
-    if j < 0:
-        return text
-    start = text.rfind("\n\t(gr_rect", 0, j)
-    if start < 0:
-        return text
-    end = matching_paren(text, text.find("(", start))
-    return text[:start] + text[end + 1 :]
-
-
-def _apply_slot(text: str, job: CompiledJob) -> str:
-    """F.7 / C.8: `Isolation(slot=True)` cuts a 1 mm slot on Edge.Cuts centred in the corridor, the
-    full length of the strip less a web at each end; the creepage path then runs through the slot
-    (gap + 2 x board thickness) and no creepage rule is written. R1's one fab-visible addition."""
-    if job.constraints is None:
-        return text
-    areas = {a.name: a for a in job.constraints.rule_areas}
-    for spec in job.constraints.isolation_specs:
-        name = f"ISO_{spec.req.a}_{spec.req.b}"
-        area = areas.get(name)
-        if area is None or not spec.req.slot:
-            continue
-        text = _drop_uuid_rect(text, stable_uuid("slot", name))
-        if not text.rstrip().endswith(")"):
-            raise ValueError("board file does not end with )")
-        stripped = text.rstrip()
-        text = stripped[:-1] + _slot_rect(name, area.box, spec.axis, job.board_size_mm) + ")\n"
-    return text

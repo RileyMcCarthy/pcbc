@@ -74,43 +74,6 @@
   }
  ],
  "keepouts": [],
- "krt": {
-  "length_match": [],
-  "planes": [],
-  "power_nets": [
-   "3V3",
-   "GND",
-   "VDDA",
-   "VSS"
-  ],
-  "sensitive": [
-   {
-    "clearance": 0.2,
-    "kind": "analog",
-    "layers": [
-     "F.Cu"
-    ],
-    "nets": [
-     "AIN0",
-     "AIN1",
-     "AIN2",
-     "AIN3",
-     "REFP_F",
-     "REFN_F"
-    ],
-    "width": 0.2
-   }
-  ],
-  "skip_patterns": [
-   "AIN0",
-   "AIN1",
-   "AIN2",
-   "AIN3",
-   "REFP_F",
-   "REFN_F"
-  ],
-  "usb_pairs": []
- },
  "layers": 2,
  "nets": [
   {

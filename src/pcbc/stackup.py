@@ -111,8 +111,8 @@ class Stackup:
     via_drill: float = 0.3  # the standard via, no extra cost
     via_diameter: float = 0.5
     annular_min: float = 0.1
-    # Copper to a hole's edge. JLC quotes 10 mil (0.254); KRT keeps tracks off an NPTH by this on
-    # its 0.05 mm grid and lands at 0.25, so the gate holds 0.25 (4 um under any fab's tolerance).
+    # Copper to a hole's edge. JLC quotes 10 mil (0.254); the rule is 0.25 (4 um under any fab's
+    # tolerance), the number the router and KiCad's DRC both hold.
     hole_clearance: float = 0.25
     hole_to_hole: float = 0.5
     edge_clearance: float = 0.3  # copper to the board edge
@@ -264,7 +264,7 @@ class Stackup:
         The height decides impedance; the net decides whether a return via can exist at all.
 
         `planes` is what the board will **have**, not only what `Board(planes=)` declares — on two
-        layers that is the back `GND` pour `krt_plan` writes (`route_scene.plane_targets`), which
+        layers that is the back `GND` pour the route stage writes (`route_scene.plane_targets`), which
         `Board` refuses to let an author write down at all. `two_layer_pour=True`'s pseudo-layer
         `"B.Cu pour"` is deliberately not used: it is a printed name rather than a layer, so it
         cannot be compared with `Constraint.layers`, and the pour's *net* would still have to come
@@ -1127,3 +1127,9 @@ def capacitance_pf_per_mm(z0: float, eeff: float, *, exact: bool = False) -> flo
 def i2c_max_mm(pf_max: float, pins: int, c_pf_per_mm: float) -> float:
     """UM10204 rev 7 section 7.1: `Cb <= pf_max` with 10 pF per device pin; the rest is trace. 4 dp."""
     return round((pf_max - 10.0 * pins) / c_pf_per_mm, 4)
+
+
+def copper_layers(n: int) -> list[str]:
+    """The copper layer names of an n-layer board, outer front first: `F.Cu`, `In1.Cu` .. `B.Cu`."""
+    inner = [f"In{i}.Cu" for i in range(1, max(n, 2) - 1)]
+    return ["F.Cu", *inner, "B.Cu"]

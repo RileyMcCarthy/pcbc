@@ -79,6 +79,12 @@ def test_the_examples_references_all_fit():
     from pcbc.build import pcb_job
 
     root = Path(__file__).resolve().parent.parent / "examples"
+    # This test is about silkscreen: every reference designator finds room, so the layout report is
+    # empty. F.1's `usb_hs` budget line is not a silkscreen fact and is filtered by name — c3_usb and
+    # node declare a `usb_hs` pair with neither `max_mm=` nor `length_mm=`, and
+    # `route_checks.FAST_KINDS` records why pcbc prints a move rather than inventing the number.
+    # `tests/test_route_checks.py` pins that text and the boards it fires on.
     for name in ("blinky", "buck", "c3_usb", "node"):
         result = pcb_job(root / name / f"{name}.py")
-        assert result["layout_report"] == [], (name, result["layout_report"])
+        report = [m for m in result["layout_report"] if "no budget checks it" not in m]
+        assert report == [], (name, result["layout_report"])

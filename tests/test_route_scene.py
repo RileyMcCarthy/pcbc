@@ -25,14 +25,14 @@ from pcbc.dru import rules as dru_rules
 from pcbc.fanout import fanout_pieces
 from pcbc.language import load_board
 from pcbc.pads import pad_geoms
-from pcbc.route_emit import Piece, census, piece_key, read_sidecar, seg_piece, segment, sidecar, via, via_piece, write_pieces, write_sidecar
+from pcbc.route_emit import Piece, census, piece_key, seg_piece, via_piece
+from boardtext import read_sidecar, segment, sidecar, via, write_pieces, write_sidecar
 from pcbc.route_geom import EPS_MM, MICRO_MM, Shape, aabb, clears, gap, track_shape
 from pcbc.route_scene import (
     ADVISORY,
     KIND_ORDER,
     audit,
     blocked,
-    build_scene,
     clashes,
     components,
     free_intervals,
@@ -44,6 +44,7 @@ from pcbc.route_scene import (
 )
 from pcbc.sexp import board_footprint_spans, footprint_at, footprint_reference
 from pcbc.stackup import fanout_stagger
+from boardtext import scene_from_text
 
 ROOT = Path(__file__).resolve().parent.parent
 EXAMPLES = ROOT / "examples"
@@ -66,7 +67,11 @@ def _placed(name: str) -> Path:
 
 
 def _routed(name: str) -> Path:
-    return EXAMPLES / name / "layout" / name / "routed" / "layout.kicad_pcb"
+    """The board the native build emits for `name`, built in this session (`conftest.routed_result`).
+    `examples/**/layout/` is gitignored output of whatever last ran and is never read."""
+    from conftest import routed_board
+
+    return routed_board(name, _board(name))
 
 
 ALL = NAMES + (("ds2",) if (DS2 / "ds2_addon.py").exists() else ())
@@ -76,7 +81,7 @@ def _scene(name: str, pcb: Path | None = None):
     design = load_board(_board(name))
     job = compile_design(design)
     text = (pcb or _placed(name)).read_text()
-    return build_scene(design, job, job.constraints, text), design, job, text
+    return scene_from_text(design, job, job.constraints, text), design, job, text
 
 
 # --- A.1 on real pads: `pads.py` reads the copper KiCad draws --------------------------------------
@@ -298,7 +303,7 @@ def test_shuffling_the_footprints_in_the_file_gives_the_identical_scene():
     head, tail = text[: spans[0][0]], text[spans[-1][1] :]
     joiner = text[spans[0][1] : spans[1][0]]
     shuffled = head + joiner.join(reversed(blocks)) + tail
-    other = build_scene(design, job, job.constraints, shuffled)
+    other = scene_from_text(design, job, job.constraints, shuffled)
     assert [(it.id, it.kind, it.net, it.owner, it.copper, it.hole) for it in scene.items] == [
         (it.id, it.kind, it.net, it.owner, it.copper, it.hole) for it in other.items
     ], "reversing the footprint order moved an item"
@@ -508,18 +513,12 @@ def test_free_intervals_answers_the_whole_question_at_once_and_on_all_four_axes(
 
 
 @pytest.mark.kicad
-@pytest.mark.krt
-@pytest.mark.skipif(
-    not (EXAMPLES / "buck" / "layout" / "buck" / "routed" / "layout.kicad_pcb").exists(),
-    reason="the routed half needs a built board: run `pcbc build examples/buck/buck.py` first",
-)
 def test_a_placed_board_is_open_and_a_routed_one_is_not():
     """A.9: connectivity is computed, never declared, so a pattern that connects three of a net's
     four pads is honest by construction. On a placed board every pad is its own component.
 
-    Marked and guarded because the second half reads a **routed** board, which is not a pure
-    function of `board.py` the way a placed one is: it needs KiCad and KRT, and
-    `examples/**/layout/` is gitignored build output a clean checkout does not have.
+    Marked because the second half reads a **routed** board, which the native build emits and KiCad
+    fills in this session (`_routed`).
     """
     placed, _d, _j, _t = _scene("buck")
     assert net_open(placed, "GND"), "nothing is routed yet, so GND is open"
@@ -604,11 +603,11 @@ def test_the_fanout_writes_the_same_copper_through_the_new_core(name: str):
     boards. That is the proof the new core agrees with the code that already works — an emitter
     that writes the same bytes and a scene whose `Foot`s are the same objects."""
     scene, design, job, text = _scene(name)
-    pieces, notes = fanout_pieces(design, job, text, "t", scene)
+    pieces, notes = fanout_pieces(design, job, "t", scene=scene)
     assert len(pieces) == 2 * len(notes), "one stub and one via per escape"
-    again, _ = fanout_pieces(design, job, text, "t")
+    again, _ = fanout_pieces(design, job, "t", scene=scene_from_text(design, job, job.constraints, text))
     assert [piece_key(p) for p in pieces] == [piece_key(p) for p in again], f"{name}: not deterministic"
-    from pcbc.fanout import fanout_copper
+    from boardtext import fanout_copper
 
     out, notes2 = fanout_copper(design, job, text, "t", scene)
     assert notes2 == notes
@@ -625,7 +624,7 @@ def test_the_fanouts_own_copper_clears_the_scene_it_was_built_from(name: str):
     """The self-check of D.1 applied to the one pattern that already exists: every escape, judged by
     A.4's rules against the board it sits on, with the pad it leaves and its own via exempt."""
     scene, design, job, text = _scene(name)
-    pieces, notes = fanout_pieces(design, job, text, "t", scene)
+    pieces, notes = fanout_pieces(design, job, "t", scene=scene)
     added = scene.add([scene.item_of(p) for p in pieces])
     mine = frozenset(it.id for it in added)
     for p in pieces:
@@ -637,14 +636,26 @@ def test_the_fanouts_own_copper_clears_the_scene_it_was_built_from(name: str):
 
 # --- D.2 the agreement test -------------------------------------------------------------------------
 
-# What the checker flags on the four routed examples that KiCad does not, recorded with its shape
-# (docs/r2-measurements.md, S3). Both are the one-sided epsilon doing exactly what it is for: a gap
-# that lands exactly on the requirement is refused rather than handed to the arbiter to argue about.
+# What the checker flags that KiCad does not, per board, on the board the native build emits and on
+# the same board with three errors planted (`boardtext.plant_errors`). Measured 2026-09-25
+# (`scratchpad/native/fix2/plant.py`): the emitted boards carry no copper error at all, KiCad's or the
+# checker's. On a planted board the checker is stricter than KiCad in two places, both where two planted
+# vias of different nets sit 0.6 mm apart: it also reports the ring of each against the other's hole
+# (0.2 mm of 0.25; KiCad 10.0.6 reports a two-layer board's `hole_clearance` there not at all, and a
+# four-layer board's, 0.225 mm, it does), and the planted tracks' mask openings 0.1 mm apart (advisory,
+# A.4 rule 4). Both are the safe direction.
+_PLANTED_STRICT = (("hole_to_copper", 0.2, 0.25), ("hole_to_copper", 0.2, 0.25), ("mask", 0.1, 0.1), ("mask", 0.1, 0.1))
 STRICTER = {
-    "blinky": (),
-    "buck": (),
-    "c3_usb": (("copper", 0.2, 0.2),),  # 3V3 track against SW_BOOT.1 [BOOT], exactly 0.2 of 0.2
-    "node": (("hole_to_hole", 0.5, 0.5),),  # 3V3 via at (51.8,5.6) against a GND via, exactly 0.5
+    ("blinky", "built"): (),
+    ("buck", "built"): (),
+    ("c3_usb", "built"): (),
+    ("node", "built"): (),
+    ("ds2", "built"): (),
+    ("blinky", "planted"): _PLANTED_STRICT,
+    ("buck", "planted"): _PLANTED_STRICT,
+    ("c3_usb", "planted"): _PLANTED_STRICT,
+    ("node", "planted"): (("mask", 0.1, 0.1),),
+    ("ds2", "planted"): _PLANTED_STRICT,
 }
 _ACTUAL = re.compile(r"actual ([0-9.]+) mm")
 _KICAD_RULES = {
@@ -658,42 +669,57 @@ _KICAD_RULES = {
 
 
 @pytest.mark.kicad
-@pytest.mark.parametrize("name", NAMES)
+@pytest.mark.parametrize("name", ALL)
 def test_the_checker_rejects_every_copper_error_kicad_finds(name: str):
-    """D.2, the real proof and S3's gate, run over the examples' own routed boards.
+    """D.2, the real proof and S3's gate, graded on the copper the native build emits.
 
     The two directions are not symmetric. pcbc flagging something KiCad passes is a superset that
     costs a pattern a fit — allowed, and every instance is recorded in `STRICTER` above with its
     shape. KiCad flagging a clearance, hole or edge error pcbc passed means **pcbc's model is
     unsound** and the slice does not land.
 
-    It is not a vacuous test: the checked-in `blinky` board carries a genuine short (a `LED` track
-    crossing `D1.1 [GND]`, from a generation of the board older than the pinned bar) and the
-    checked-in `c3_usb` carries four real clearance errors, and the checker finds all six — the four
-    c3_usb ones at exactly the millimetre KiCad prints for them.
+    The emitted boards have no copper error for either side to find, so the same board is asked again
+    with three errors planted in free space (`boardtext.plant_errors`: two tracks 0.1 mm apart, two
+    vias whose holes are 0.3 mm apart, a via 0.15 mm from the edge), each of which KiCad reports and
+    the checker must find at the millimetre KiCad prints. Until 2026-09-25 this ran on
+    `examples/**/layout/`, gitignored boards the deleted router had drawn (the second refutation round,
+    major 6), and a clean checkout skipped it.
     """
+    import shutil
+
+    from boardtext import plant_errors
     from pcbc.netcheck import kicad_drc
 
-    scene, _d, _j, _t = _scene(name, _routed(name))
-    found = audit(scene)
-    doc = kicad_drc(_routed(name), refill=False)
-    errors = [v for v in doc.get("violations", []) if v.get("severity") == "error" and v.get("type") in _KICAD_RULES]
-    for v in errors:
-        rule = _KICAD_RULES[v["type"]]
-        m = _ACTUAL.search(v.get("description") or "")
-        hits = [(sub, c) for sub, c in found if c.rule == rule]
-        assert hits, f"{name}: KiCad reports {v['type']} ({v.get('description')}) and the checker passed it"
-        if m:
-            want = float(m.group(1))
-            assert any(abs(c.have - want) < 5e-4 for _s, c in hits), (
-                f"{name}: KiCad measures {want} mm for {v['type']} and the checker's nearest is "
-                f"{sorted(round(c.have, 4) for _s, c in hits)} — the same geometry, a different number"
-            )
-    extra = tuple(sorted((c.rule, round(c.have, 4), round(c.need, 4)) for _s, c in found if not _matched(c, errors)))
-    assert extra == tuple(sorted(STRICTER[name])), (
-        f"{name}: the checker is stricter than KiCad in {len(extra)} places and "
-        f"docs/r2-measurements.md records {len(STRICTER[name])}: {extra}"
-    )
+    pcb = _routed(name)
+    design = load_board(_board(name))
+    job = compile_design(design)
+    planted_text, what = plant_errors(design, job, pcb.read_text())
+    planted = pcb.with_name("planted.kicad_pcb")
+    planted.write_text(planted_text)
+    for ext in (".kicad_pro", ".kicad_dru"):  # the board's own rules, not KiCad's defaults
+        shutil.copy(pcb.with_suffix(ext), planted.with_suffix(ext))
+    for tag, board, text, refill in (("built", pcb, pcb.read_text(), False), ("planted", planted, planted_text, True)):
+        found = audit(scene_from_text(design, job, job.constraints, text))
+        doc = kicad_drc(board, refill=refill)
+        errors = [v for v in doc.get("violations", []) if v.get("severity") == "error" and v.get("type") in _KICAD_RULES]
+        if tag == "planted":
+            assert {v["type"] for v in errors} >= {"clearance", "hole_to_hole", "copper_edge_clearance"}, (name, what, [v["description"] for v in errors])
+        for v in errors:
+            rule = _KICAD_RULES[v["type"]]
+            m = _ACTUAL.search(v.get("description") or "")
+            hits = [(sub, c) for sub, c in found if c.rule == rule]
+            assert hits, f"{name} ({tag}): KiCad reports {v['type']} ({v.get('description')}) and the checker passed it"
+            if m:
+                want = float(m.group(1))
+                assert any(abs(c.have - want) < 5e-4 for _s, c in hits), (
+                    f"{name} ({tag}): KiCad measures {want} mm for {v['type']} and the checker's nearest is "
+                    f"{sorted(round(c.have, 4) for _s, c in hits)} — the same geometry, a different number"
+                )
+        extra = tuple(sorted((c.rule, round(c.have, 4), round(c.need, 4)) for _s, c in found if not _matched(c, errors)))
+        assert extra == tuple(sorted(STRICTER[(name, tag)])), (
+            f"{name} ({tag}): the checker is stricter than KiCad in {len(extra)} places and "
+            f"STRICTER records {len(STRICTER[(name, tag)])}: {extra}"
+        )
 
 
 def _matched(clash, errors) -> bool:

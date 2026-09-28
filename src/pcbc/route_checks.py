@@ -19,18 +19,15 @@ F.8 ground bridge (docs/stitch-plan.md) `check_bridge`
 from __future__ import annotations
 
 import math
-import re
 from dataclasses import dataclass, field
 
 from .compile import CompiledJob
 from .copper import _rotate
 from .constraints import DEFAULT_LOOP_MM2, ConstraintSet, Constraint, IsolationSpec
 from .css import Rect, rotate_local_bounds
-from .geom import _iter_tagged
-from .layout import content_rect, footprints_by_ref, resolve_keepout, resolve_regions
+from .layout import content_rect, resolve_keepout, resolve_regions
 from .model import Design, KeepoutSpec
-from .pcb_place import GAP, Foot, Pad, _board_of, _pin_name, _pins_of, lane_rules, parse_foot
-from .sexp import footprint_at
+from .pcb_place import GAP, Foot, Pad, _board_of, _pin_name, lane_rules
 from .stackup import is_outer
 
 WIDE_MM = 0.4  # a class this wide gets the corridor test (F.3)
@@ -39,8 +36,6 @@ CORRIDOR_GRID_MM = 0.1
 CORRIDOR_COARSE_MM = 0.2  # when the width is over 1 mm: the escape hatch of H.8
 CORRIDOR_COARSE_OVER_MM = 1.0
 _DIRS = {"right": (1.0, 0.0), "left": (-1.0, 0.0), "down": (0.0, 1.0), "up": (0.0, -1.0)}
-_PAD_LAYERS = re.compile(r'\(layers\s+([^)]*)\)')
-_FOOT_LAYER = re.compile(r'\n\t\t\(layer "([^"]+)"\)')
 
 
 @dataclass
@@ -58,27 +53,17 @@ class Ctx:
     insts: dict = field(default_factory=dict)  # ref -> Instance
 
 
-def build_ctx(design: Design, job: CompiledJob, pcb_text: str) -> Ctx:
-    """The placed board as `layout_report` reads it, plus what the route checks need."""
+def build_ctx(design: Design, job: CompiledJob, posed) -> Ctx:
+    """The placed parts as `layout_report` reads them (`posed`: `foot_native.PosedFoot`s, each
+    `.kicad_mod` posed by its `Pose`; `pcb_place.posed_feet_of` is the one reading), plus what the
+    route checks need. No board text is read (`docs/direction.md` §1)."""
+    from .pcb_place import posed_feet_of
+
     board = _board_of(job)
     content = content_rect(board)
     regions = resolve_regions(board, job.regions)
-    blocks = footprints_by_ref(pcb_text)
-    nets_of = _pins_of(design)
-    stack, clearance = lane_rules(job)
-    feet: dict[str, Foot] = {}
-    pad_layers: dict[str, list[frozenset[str]]] = {}
-    for ref, blk in blocks.items():
-        f = parse_foot(ref, blk)
-        at = footprint_at(blk)
-        if at is None:
-            continue
-        f.at, f.rot = (at[0], at[1]), at[2]
-        for pad in f.pads:
-            pad.net = nets_of.get(ref, {}).get(pad.num, pad.net)
-        f.lane(stack, clearance)
-        feet[ref] = f
-        pad_layers[ref] = _pad_layers(blk)
+    feet = posed_feet_of(job, posed)
+    pad_layers: dict[str, list[frozenset[str]]] = {pf.ref: _pad_layers(pf) for pf in posed}
     pads_on: dict[str, list[tuple[str, str, float, float, float, float]]] = {}
     for ref in sorted(feet):
         f = feet[ref]
@@ -107,9 +92,9 @@ def build_ctx(design: Design, job: CompiledJob, pcb_text: str) -> Ctx:
     )
 
 
-def route_aware_report(design: Design, job: CompiledJob, pcb_text: str) -> tuple[list[str], list[str]]:
-    """(moves, style notes) from the placed board: sections F.1 to F.7, in that order."""
-    ctx = build_ctx(design, job, pcb_text)
+def route_aware_report(design: Design, job: CompiledJob, posed) -> tuple[list[str], list[str]]:
+    """(moves, style notes) from the placed parts (`posed`): sections F.1 to F.7, in that order."""
+    ctx = build_ctx(design, job, posed)
     moves: list[str] = []
     notes: list[str] = []
     moves += check_airwires(ctx)
@@ -130,29 +115,22 @@ def route_aware_report(design: Design, job: CompiledJob, pcb_text: str) -> tuple
 # ---------------------------------------------------------------- geometry helpers
 
 
-def _pad_layers(block: str) -> list[frozenset[str]]:
-    """Per pad (in `parse_foot`'s order): the copper layers it sits on. A through hole is on every
-    copper layer; an SMD pad on its footprint's side."""
-    side = "F.Cu"
-    m = _FOOT_LAYER.search(block)
-    if m and m.group(1) == "B.Cu":
-        side = "B.Cu"
+def _pad_layers(pf) -> list[frozenset[str]]:
+    """Per pad (in `foot_native.foot_of`'s order, which is the `.kicad_mod`'s): the copper layers it sits
+    on. A through hole is on every copper layer; an SMD pad on the layers its `(layers ...)` names, or
+    its footprint's side when it names none."""
+    side = "B.Cu" if pf.layer == "B.Cu" else "F.Cu"
     out: list[frozenset[str]] = []
-    for pad in _iter_tagged(block, "pad"):
-        head = pad.split("\n", 1)[0]
-        if not re.match(r'\(pad\s+"[^"]*"', head) or "(at" not in pad or "(size" not in pad:
-            continue
-        if "thru_hole" in head:
+    for sp in pf.lib.pads:
+        if "thru_hole" in sp.kind:
             out.append(frozenset({"F.Cu", "B.Cu", "In1.Cu", "In2.Cu"}))
             continue
-        lm = _PAD_LAYERS.search(pad)
         layers = set()
-        if lm:
-            for tok in lm.group(1).replace('"', "").split():
-                if tok.endswith(".Cu"):
-                    layers.add(tok)
-                elif tok == "*.Cu":
-                    layers.update({"F.Cu", "B.Cu", "In1.Cu", "In2.Cu"})
+        for tok in sp.layers.replace('"', "").split():
+            if tok.endswith(".Cu"):
+                layers.add(tok)
+            elif tok == "*.Cu":
+                layers.update({"F.Cu", "B.Cu", "In1.Cu", "In2.Cu"})
         out.append(frozenset(layers) if layers else frozenset({side}))
     return out
 
@@ -381,19 +359,128 @@ def _airwire_src(ctx: Ctx, c: Constraint) -> str:
     return f"preset {c.kind}"
 
 
+def _airwire_budget(ctx: Ctx, c: Constraint) -> tuple[float, str] | None:
+    """The pad-to-pad MST this net's placement is allowed, in mm, and where the number came from.
+
+    Two sources, and **neither is a per-kind guess**. The first is the declared one: `NetReq(max_mm=)`
+    or the preset's own `airwire_mm`. The second is a derivation that invents nothing — the MST over a
+    net's pads is a **lower bound** on the copper that connects them, which is `docs/r1-design.md`
+    line 830 read from the other side ("`max_mm` never becomes a length rule (the maze path is longer
+    than the airwire)"), so a placement whose MST already exceeds the net's **routed** length budget
+    cannot be routed inside that budget by any router. `length_max_mm` is therefore a placement budget
+    one stage early, for free.
+
+    That second source is what gives a fast kind a number without one being made up, wherever the
+    board or the compiler already has one: `i2c`'s routed budget is fully derived today —
+    `(pf_max - 10 pF x pins) / C_per_mm` from UM10204 rev 7 section 7.1 and the exact per-mm
+    capacitance of the class width on the board's own stackup (`constraints._numbers`,
+    `stackup.i2c_max_mm`) — and `usb_hs` and `spi` have one whenever the board writes
+    `NetReq(length_mm=)`.
+    """
+    if c.airwire_max_mm is not None:
+        return c.airwire_max_mm, _airwire_src(ctx, c)
+    if c.length_max_mm is not None:
+        src = c.length_max_mm.source
+        inner = f"{src.formula} {src.ref}".strip()
+        return c.length_max_mm.value, f"routed length {inner}, and the MST is a lower bound on it"
+    return None
+
+
+FAST_KINDS = ("usb_hs", "clock", "spi", "i2c")
+"""The kinds named after a signalling standard. Every one of them carries `PRESETS[kind].airwire_mm
+is None`, and that is not fixed here.
+
+Measured 2026-09-22, `PRESETS`: `switch_node` 8.0, `feedback` 15.0, `analog` 25.0, `sense` 25.0 —
+and `None` for all four of these, for `generic` and for `power`. **The only nets on the five boards
+that no placement budget has ever looked at are the fast ones.** On fresh placements of the five,
+node's `USB_DP` spans **39.124 mm** of pad-to-pad MST over 5 pads and `USB_DN` **38.971 mm** on a
+75.000 mm board diagonal; c3_usb's are 20.747 and 20.645 on a 50.000 mm diagonal. Nothing asked, so
+node's router was handed the two ends of a 42.7 mm centre-to-centre span and drew the elbow that
+started this.
+
+**They still get no preset number, because neither candidate derivation survives being worked out.**
+
+*From the signal.* The arithmetic exists and is already cited in this repo — `stitch.knee_ghz`
+(`KNEE_OF_RISE / t_rise`, Johnson & Graham) and `cavity_velocity` — but it needs an edge rate, and
+`Constraint.rise_ps` is documented as "carried, never derived, and never defaulted":
+`docs/stitch-plan.md` section 8 item 3 refused four per-kind `rise_ps` defaults and
+`ConstraintSet.fastest_edge` returns `None` on all five boards because none declares one. Supplying
+one per kind here is that refusal reversed under a different name. It is also arithmetically
+unstable: at a **hypothetical** 500 ps edge — the illustration, not a number this module ships —
+the microstrip velocity this repo computes is **170.19 mm/ns** on node's
+`jlcpcb_4l_1oz` F.Cu over In1.Cu (h 0.2104, `microstrip` eeff 3.1028) and **172.56 mm/ns** on
+c3_usb's `jlcpcb_2l_1oz` F.Cu over B.Cu (h 1.53, eeff 3.0183), so the electrically-short length is
+**14.18 mm** at the `t_r*v/6` convention and **42.55 mm** at `t_r*v/2` — a **3x** spread decided by
+which textbook divisor is quoted, with node's 39.124 failing one and passing the other. And the
+criterion is the wrong one anyway: both pair nets declare `z_diff_ohm=90`, so they are transmission
+lines **by construction**, and "shorter than this and you may treat it as lumped" is not "longer than
+this is a defect".
+
+*From the board.* Refuted by measurement. If the shipped numbers were a fraction of the board
+diagonal they would move with the board and they do not: 8.0 is 0.170 of blinky's and buck's 47.170,
+0.160 of c3_usb's 50.000, 0.107 of node's 75.000 and 0.150 of ds2's 53.424 — a 1.59x spread across
+five boards for one constant. At a **fixed** board the three numbers stand at 8 : 15 : 25, so what
+separates them is the kind and not the geometry, which is the hypothesis' own claim inverted. It is
+also the wrong variable: a hot loop's budget is set by di/dt and a feedback node's by pickup, and
+neither says a bigger board may have a worse one. The one board-sized number in the repo is a
+`NetReq(max_mm=30)` **declaration** on ds2, which `docs/copper-plan.md` records as a 20 that "was a
+guess that failed on a 47 mm board" — evidence that the board's author scales to the board, through
+the mechanism that already exists for it.
+
+So a fast kind's budget comes from `_airwire_budget` when the board or the compiler has one, and
+from `_unbudgeted_fast` — a printed move — when it does not.
+"""
+
+
+def _unbudgeted_fast(ctx: Ctx) -> list[str]:
+    """F.1, second half: a fast net that **no budget reaches**, with the span nobody checked.
+
+    The first half compares an MST to a number. This one fires where there is no number: a net of a
+    `FAST_KINDS` kind whose `NetReq` gives neither `max_mm=` nor `length_mm=`, and whose preset gives
+    no `airwire_mm` either. Refusing to invent the number is only half a refusal; the other half is
+    saying so **with the measurement attached**, which is the house rule that a refusal is a move
+    ending in a `board.py` edit.
+
+    It is deliberately not a `Place()` move. The defect a missing budget names is a missing
+    declaration, and pcbc cannot know how long an ESP32-C3's USB run may be without being told what
+    drives it — the edit is on the `NetReq` line, not on a part.
+
+    Measured 2026-09-22 on fresh placements: it fires on **four nets of two boards** — c3_usb's
+    `USB_DP`/`USB_DN` (20.747 / 20.645 mm) and node's (39.124 / 38.971 mm). blinky, buck and ds2
+    declare no fast kind at all and print nothing.
+    """
+    out: list[str] = []
+    for c in ctx.cs.constraints:
+        if c.kind not in FAST_KINDS or c.airwire_max_mm is not None or c.length_max_mm is not None:
+            continue
+        sites = ctx.pads_on.get(c.net, [])
+        if len(sites) < 2:
+            continue
+        mst = _edge_mst_mm([_box_of(s) for s in sites])
+        where = f"NetReq line {c.line}" if c.line else f"kind {c.kind}"
+        out.append(
+            f"{c.net}: {mst:.1f} mm of airwire (MST of {len(sites)} pads, edge to edge) and no budget checks it; "
+            f"preset {c.kind} sets no max_mm and pcbc will not invent one for a signalling standard it was not told "
+            f'({where}); the route is longer still: give NetReq("{c.net}", ..., max_mm=) or length_mm='
+        )
+    return out
+
+
 def check_airwires(ctx: Ctx) -> list[str]:
     """F.1: the MST of a net's pads against `max_mm`; the spread of a pair's or bus's member MSTs
     against the skew budget. The router can only add length."""
     out: list[str] = []
     cs = ctx.cs
     for c in cs.constraints:
-        if c.airwire_max_mm is None:
+        budget = _airwire_budget(ctx, c)
+        if budget is None:
             continue
+        limit, limit_src = budget
         sites = ctx.pads_on.get(c.net, [])
         if len(sites) < 2:
             continue
         mst = _edge_mst_mm([_box_of(s) for s in sites])
-        if mst <= c.airwire_max_mm + 1e-9:
+        if mst <= limit + 1e-9:
             continue
         # The outlier: the pad farthest from its nearest other pad; it belongs next to the IC's pin.
         worst = None
@@ -415,9 +502,10 @@ def check_airwires(ctx: Ctx) -> list[str]:
         else:
             target = f"{ic[0]}.{ic[1]}"
         out.append(
-            f"{c.net}: {mst:.1f} mm of airwire (MST of {len(sites)} pads, edge to edge) over max_mm={_g(c.airwire_max_mm)} ({_airwire_src(ctx, c)}); "
+            f"{c.net}: {mst:.1f} mm of airwire (MST of {len(sites)} pads, edge to edge) over max_mm={_g(limit)} ({limit_src}); "
             f'the route is longer still: Place("{ref}", to="{target}") or raise max_mm'
         )
+    out += _unbudgeted_fast(ctx)
     # pairs and buses: member MSTs must agree within the skew budget
     seen: set[tuple[str, ...]] = set()
     for c in cs.constraints:
@@ -1486,6 +1574,7 @@ def check_bridge(ctx: Ctx) -> list[str]:
 
 __all__ = [
     "BRIDGE_AXES",
+    "FAST_KINDS",
     "Ctx",
     "build_ctx",
     "check_airwires",

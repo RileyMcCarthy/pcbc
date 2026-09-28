@@ -120,3 +120,88 @@ def pin_all_uuids(text: str, *key: object, keep: frozenset[str] = frozenset()) -
         return m.group(0) if m.group(1) in keep else f'(uuid "{stable_uuid(*key, "id", n)}")'
 
     return _ANY_UUID.sub(sub, text)
+
+
+# ------------------------------------------------------------------ a real reader, for the decompiler
+
+
+class Q(str):
+    """A quoted atom. KiCad writes some values in double quotes (`(layer "F.Cu")`) and some bare
+    (`(hatch edge 0.5)`); the difference is part of the file, so the tree keeps it."""
+
+
+# KiCad's escapes inside a quoted string (`EscapeString(..., CTX_QUOTED_STR)` and its inverse), measured
+# with `kicad-cli pcb upgrade` on a `gr_text` carrying every one of them (third review, P2): a newline
+# is written `\n`, a carriage return `\r`, a double quote `\"`, a backslash `\\`; a tab is written as
+# itself. The reader also accepts `\t`, which KiCad's reader takes, but never writes it.
+_UNESCAPE = {"n": "\n", "r": "\r", "t": "\t", '"': '"', "\\": "\\"}
+_ESCAPE = {"\\": "\\\\", '"': '\\"', "\n": "\\n", "\r": "\\r"}
+
+
+def parse_tree(text: str) -> list:
+    """The whole file as nested lists of atoms: bare atoms are `str`, quoted ones are `Q`.
+
+    The escapes KiCad writes inside a string (`_UNESCAPE`) are decoded, so a text with a real newline
+    in it reads back as that text and not as the two characters `\\n`."""
+    stack: list[list] = [[]]
+    i, n = 0, len(text)
+    while i < n:
+        c = text[i]
+        if c == "(":
+            stack.append([])
+            i += 1
+        elif c == ")":
+            node = stack.pop()
+            stack[-1].append(node)
+            i += 1
+        elif c in " \t\r\n":
+            i += 1
+        elif c == '"':
+            j = i + 1
+            buf: list[str] = []
+            while text[j] != '"':
+                if text[j] == "\\" and j + 1 < n and text[j + 1] in _UNESCAPE:
+                    buf.append(_UNESCAPE[text[j + 1]])
+                    j += 2
+                else:
+                    buf.append(text[j])
+                    j += 1
+            stack[-1].append(Q("".join(buf)))
+            i = j + 1
+        else:
+            j = i
+            while j < n and text[j] not in " \t\r\n()":
+                j += 1
+            stack[-1].append(text[i:j])
+            i = j
+    if len(stack) != 1 or not stack[0]:
+        raise ValueError("unbalanced parentheses")
+    return stack[0][0]
+
+
+def fmt_num(v: float) -> str:
+    """A number the way KiCad 10 writes a length: at most six decimals (1 nm), no trailing zeros."""
+    s = f"{float(v):.6f}".rstrip("0").rstrip(".")
+    return "0" if s in ("-0", "") else s
+
+
+def quote(text: str) -> str:
+    """A string as KiCad's writer spells it (`_ESCAPE`): a newline is `\\n`, never a raw line break,
+    which KiCad's parser cannot read inside a token."""
+    return '"' + "".join(_ESCAPE.get(ch, ch) for ch in str(text)) + '"'
+
+
+def fmt_exact(v: float) -> str:
+    """A number KiCad keeps as a double rather than in nanometres — a ratio, an angle, an area, a
+    percentage — written so it reads back as the very same float: the shortest decimal that
+    round-trips (`repr`), in positional form, no exponent, no trailing zeros. `fmt_num` would cut a
+    teardrop's `0.1234567891` to `0.123457`; this writes it back as KiCad wrote it."""
+    from decimal import Decimal
+
+    f = float(v)
+    if f == 0:
+        return "0"
+    s = format(Decimal(repr(f)), "f")
+    if "." in s:
+        s = s.rstrip("0").rstrip(".")
+    return s

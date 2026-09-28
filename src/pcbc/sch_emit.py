@@ -1024,6 +1024,44 @@ def _point_in_aabb(x: float, y: float, box: Box, pad: float = 0.0) -> bool:
     return (x0 - pad) <= x <= (x1 + pad) and (y0 - pad) <= y <= (y1 + pad)
 
 
+def _seg_through_box(x0: float, y0: float, x1: float, y1: float, box: Box) -> bool:
+    """The segment's middle passes through the box. A wire that only leaves a
+    symbol at its pin, along the box edge, does not."""
+    span = math.hypot(x1 - x0, y1 - y0)
+    if span < 1.0:
+        return False
+    for t in (0.35, 0.5, 0.65):
+        if _point_in_aabb(x0 + (x1 - x0) * t, y0 + (y1 - y0) * t, box, pad=-0.2):
+            return True
+    return False
+
+
+def _name_blocked(sheet: "_Sheet", box: Box, owner: str) -> bool:
+    """A name the readability report would reject. The part's own body does
+    not count: the name is allowed to sit against it."""
+    for x0, y0, x1, y1, _net in sheet.segs:
+        if _overlap_area(_seg_box(x0, y0, x1, y1), box) > 0.6:
+            return True
+    for o in sheet.occupants:
+        if (o.owner == owner or o.owner.startswith(owner + ".")) and o.kind in ("symbol", "pin", "pintext", "reserve"):
+            continue
+        if o.kind in ("hat", "label", "ref", "value", "symbol", "pin") and _overlap_area(o.box, box) > 0.6:
+            return True
+    return False
+
+
+def _graphic_box(o: "_Occupant") -> Box:
+    """The drawn arrow or diamond, not the name beside it. The name's box is
+    much wider, and a wire beside the word is not a wire through the symbol."""
+    cx = (o.box[0] + o.box[2]) / 2.0
+    rot = int(o.rot or 0)
+    down = o.gnd if rot == 0 else not o.gnd
+    pin_y = o.box[1] if down else o.box[3]
+    if down:
+        return (cx - 1.4, pin_y, cx + 1.4, pin_y + 2.8)
+    return (cx - 1.4, pin_y - 2.8, cx + 1.4, pin_y)
+
+
 def _collinear_touch(
     x0: float, y0: float, x1: float, y1: float, sx0: float, sy0: float, sx1: float, sy1: float
 ) -> bool:
@@ -1067,7 +1105,9 @@ class _Occupant:
     kind: str  # symbol | pintext | ref | value | label | hat
     owner: str
     net: str = ""
-    tag: str = ""  # placement this belongs to, so it can be taken back
+    tag: str = ""
+    rot: int = 0
+    gnd: bool = False  # placement this belongs to, so it can be taken back
     rot: int | None = None  # a power symbol's rotation, to re-score it in place
 
 
@@ -1448,12 +1488,25 @@ def _hat_candidates(sheet: _Sheet, members: list[_Site], net: str, gnd: bool, te
         natural = vertical and ((gnd and oy > 0) or (not gnd and oy < 0))
         jog_y = 1.0 if gnd else -1.0  # GND hangs down the sheet, a supply points up
         cands: list[tuple[list[tuple[float, float]], int]] = []
+        # Beside the pin, not further along it. The second symbol on a pin (a
+        # PWR_FLAG behind the VCC arrow) cannot slide out on that pin: the wire
+        # to reach it runs through the symbol already there. 7.62 mm clears the
+        # flag's own name.
+        px, py = -oy, ox
+        side_pts = [
+            [(s.x, s.y), (s.x + px * side, s.y + py * side)]
+            for side in (7.62, -7.62, 10.16, -10.16)
+        ]
         if natural:
             for length in (0.0, 2.54, 5.08):
                 cands.append(([(s.x, s.y), (s.x + ox * length, s.y + oy * length)], 0))
+            for pts in side_pts:
+                cands.append((pts, 0))
         elif vertical:
             for length in (2.54, 5.08, 7.62):
                 cands.append(([(s.x, s.y), (s.x + ox * length, s.y + oy * length)], 180))
+            for pts in side_pts:
+                cands.append((pts, 180))
         else:
             for length in (2.54, 5.08, 7.62, 10.16):
                 ex, ey = s.x + ox * length, s.y + oy * length
@@ -1489,6 +1542,18 @@ def _hat_candidates(sheet: _Sheet, members: list[_Site], net: str, gnd: bool, te
                 continue
             hard = sheet.hard_cost(box, net)
             c = sheet.cost(box, net)
+            # A same-net wire does not count in hard_cost, so a flag would
+            # happily sit on the arrow's stem or on another stub of its net.
+            for sx0, sy0, sx1, sy1, _snet in sheet.segs:
+                if _seg_through_box(sx0, sy0, sx1, sy1, box):
+                    hard += 5.0
+            for other in sheet.occupants:
+                if other.kind != "hat":
+                    continue
+                graphic = _graphic_box(other)
+                for (ax, ay), (bx, by) in zip(pts, pts[1:]):
+                    if _seg_through_box(ax, ay, bx, by, graphic):
+                        hard += 5.0
             if rot == 180 and not vertical:
                 # Upside down: a supply pointing down is seen often enough;
                 # a ground pointing up hardly ever.
@@ -1526,6 +1591,7 @@ def _commit_hat(
     out.append(_hat(net, hx, hy, gnd=gnd, rot=rot, lib=lib, value=value))
     sheet.occupy(_hat_box(net, hx, hy, gnd, rot, value), "hat", s.part.ref, net, tag)
     sheet.occupants[-1].rot = rot
+    sheet.occupants[-1].gnd = gnd and not (tag or "").startswith("flag:")
     sheet.anchor(hx, hy, net, tag)
     return out
 
@@ -1744,9 +1810,12 @@ def _place_box_text(sheet: _Sheet, part: Part) -> None:
     ]
     best = None
     for i, (_name, r, v) in enumerate(cands):
-        c = sheet.cost(_text_box(ref, *r)) + sheet.cost(_text_box(val, *v)) + 0.05 * i
-        if best is None or c < best[0]:
-            best = (c, r, v)
+        rb, vb = _text_box(ref, *r), _text_box(val, *v)
+        crossed = _name_blocked(sheet, rb, ref) or _name_blocked(sheet, vb, ref)
+        c = sheet.cost(rb) + sheet.cost(vb) + 0.05 * i
+        key = (1 if crossed else 0, c)
+        if best is None or key < best[0]:
+            best = (key, r, v)
     assert best is not None
     _c, r, v = best
     part.text_ref = r
@@ -1769,6 +1838,10 @@ def _place_passive_text(sheet: _Sheet, part: Part) -> None:
         ("left", (x0 - 0.8, cy - 1.0, "right", 0), (x0 - 0.8, cy + 1.0, "right", 0)),
         ("above", (cx, y0 - 2.7, None, 0), (cx, y0 - 1.0, None, 0)),
         ("below", (cx, y1 + 1.0, None, 0), (cx, y1 + 2.7, None, 0)),
+        # Both lines tucked against the body. The normal stack's second line
+        # falls on the next pin's wire (R_EN's 100k on FB).
+        ("below-tight", (cx, y1 - 0.2, None, 0), (cx, y1 + 1.4, None, 0)),
+        ("above-tight", (cx, y0 - 1.4, None, 0), (cx, y0 + 0.2, None, 0)),
         ("above-left", (x1, y0 - 2.7, "right", 0), (x1, y0 - 1.0, "right", 0)),
         ("above-right", (x0, y0 - 2.7, "left", 0), (x0, y0 - 1.0, "left", 0)),
         ("below-left", (x1, y1 + 1.0, "right", 0), (x1, y1 + 2.7, "right", 0)),
@@ -1789,14 +1862,47 @@ def _place_passive_text(sheet: _Sheet, part: Part) -> None:
             ("right-rot", (x1 + 1.2, y0 + wr, "left", 90), (x1 + 3.0, y0 + wv, "left", 90)),
             ("left-rot", (x0 - 3.0, y0 + wr, "left", 90), (x0 - 1.2, y0 + wv, "left", 90)),
         ]
+        # One row, name then value. Two stacked lines are taller than the
+        # gap between adjacent pin wires, so they cannot both fit there.
+        gap = _text_w(ref) + 0.6
+        for k in range(-3, 4):
+            y = cy + k * 1.27
+            cands.append(("row-right", (x1 + 0.6, y, "left", 0), (x1 + 0.6 + gap, y, "left", 0)))
+            cands.append(("row-left", (x0 - 0.6, y, "right", 0), (x0 - 0.6 - gap, y, "right", 0)))
     order = cands if vertical else cands[2:4] + cands[:2] + cands[4:]
     best = None
     for i, (side, r, v) in enumerate(order):
-        c = sheet.cost(_text_box(ref, *r)) + sheet.cost(_text_box(val, *v)) + 0.01 * i
+        rb, vb = _text_box(ref, *r), _text_box(val, *v)
+        # A wire through the name is a miss, not a small cost. The clear side
+        # wins even when it sits nearer the part's own stub.
+        crossed = _name_blocked(sheet, rb, ref) or _name_blocked(sheet, vb, ref)
+        c = sheet.cost(rb) + sheet.cost(vb) + 0.01 * i
         c += 0.4 if side.endswith("-rot") else 0.0  # upright reads better when it fits
-        if best is None or c < best[0]:
-            best = (c, r, v)
+        key = (1 if crossed else 0, c)
+        if _overlap_area(rb, vb) > 0.2:
+            continue
+        if best is None or key < best[0]:
+            best = (key, r, v)
     assert best is not None
+    if best[0][0]:
+        # The ranked spots are all crossed. Nudge the least-crossed pair by a
+        # grid step or two; the name moves, the part stays.
+        _k, r0, v0 = best
+        found = None
+        for dist in (1.27, 2.54, 3.81):
+            for dx, dy in ((dist, 0), (-dist, 0), (0, dist), (0, -dist)):
+                rr = (r0[0] + dx, r0[1] + dy, r0[2], r0[3])
+                vv = (v0[0] + dx, v0[1] + dy, v0[2], v0[3])
+                rb, vb = _text_box(ref, *rr), _text_box(val, *vv)
+                if _overlap_area(rb, vb) > 0.2:
+                    continue
+                if not _name_blocked(sheet, rb, ref) and not _name_blocked(sheet, vb, ref):
+                    found = (rr, vv)
+                    break
+            if found:
+                break
+        if found:
+            best = (best[0], found[0], found[1])
     _c, r, v = best
     part.text_ref = r
     part.text_val = v
@@ -1939,7 +2045,11 @@ def _lint(
     through: dict[tuple[str, str, str], tuple[_Occupant, list[str]]] = {}
     for x0, y0, x1, y1, net in sheet.segs:
         for o in occ:
-            if o.kind in text_kinds | {"pin"} and o.net != net and _overlap_area(_seg_box(x0, y0, x1, y1), o.box) > 0.6:
+            text_hit = o.kind in text_kinds | {"pin"} and o.net != net and _overlap_area(_seg_box(x0, y0, x1, y1), o.box) > 0.6
+            # A power symbol's own wire through its graphic is the same net, so the
+            # text test above never sees the flag stacked behind the VCC arrow.
+            symbol_hit = o.kind == "hat" and _seg_through_box(x0, y0, x1, y1, _graphic_box(o))
+            if text_hit or symbol_hit:
                 entry = through.setdefault((o.kind, o.owner, o.net), (o, []))
                 if net not in entry[1]:
                     entry[1].append(net)
@@ -1969,7 +2079,22 @@ def _lint(
                         f"{net}: {a.part.ref}.{a.pin.name} and {b.part.ref}.{b.pin.name} are in line "
                         f"{d:.0f} mm apart but joined by labels: something sits between them"
                     )
-    return {"issues": issues, "count": len(issues), "notes": notes}
+    # A net name that does not fit on its wire: push the downstream part one
+    # grid step out along the pin it hangs from. One step per pass.
+    pushes: dict[str, float] = {}
+    longest: dict[str, float] = {}
+    for x0, y0, x1, y1, net in sheet.segs:
+        if net in power_nets:
+            continue
+        longest[net] = max(longest.get(net, 0.0), math.hypot(x1 - x0, y1 - y0))
+    for net, length in longest.items():
+        if length + 0.05 >= _text_w(net) + 1.0:
+            continue
+        on = {p.ref for p in parts if any(getattr(pin, "net", "") == net for pin in p.pins)}
+        for p in parts:
+            if getattr(p, "attach_ref", None) in on and p.ref in on and getattr(p, "kind", "") in ("r", "c", "l", "d"):
+                pushes[p.ref] = 2.54
+    return {"issues": issues, "count": len(issues), "notes": notes, "pushes": pushes}
 
 
 _HANGERS: dict[str, list[str]] = {}
@@ -2295,7 +2420,15 @@ def _annotate(
             _place_passive_text(sheet, p)
     power_nets = {n for n in sites if is_power_net(n, kinds)}
     ground_nets = {n for n in sites if is_ground_net(n, kinds)}
-    return out, _lint(sheet, parts, sites, unions, power_nets, ground_nets, kinds)
+    report = _lint(sheet, parts, sites, unions, power_nets, ground_nets, kinds)
+    # Everything drawn for a part: its body, its name, and the symbols and
+    # labels hung on its pins. The region outline is the box around these.
+    report["marks"] = [
+        (o.owner, o.box)
+        for o in sheet.occupants
+        if o.kind != "reserve"
+    ]
+    return out, report
 
 
 def emit_from_design(design: Design, *, title: str = "", report: dict | None = None) -> str:
@@ -2309,15 +2442,128 @@ def emit_from_design(design: Design, *, title: str = "", report: dict | None = N
         _ids = None
 
 
+def _owner_ref(owner: str) -> str:
+    return owner.split(".", 1)[0]
+
+
+def _group_graphics(design: Design, parts: list[Part], marks: list[tuple[str, Box]]) -> list[str]:
+    """A dashed box around each SchRegion. Membership is the parts; the
+    outline is everything drawn for those parts, including names, pin
+    numbers, and the power symbols on their pins."""
+    regions = list(getattr(design, "sch_regions", []) or [])
+    if not regions:
+        return []
+    titles = {r.name: (getattr(r, "title", None) or r.name) for r in regions}
+    groups: dict[str, list[Part]] = {r.name: [] for r in regions}
+    for part in parts:
+        name = getattr(part, "sch_group", None)
+        if name in groups:
+            groups[name].append(part)
+    pad = 2.54
+    header = 5.08
+    # A flag or a label sits a short way off its pin. Farther than this, it
+    # is on a wire leaving the group, and the box should not chase it.
+    reach = 18.0
+    boxes: list[dict] = []
+    for region in regions:
+        group = groups[region.name]
+        if not group:
+            continue
+        refs = {part.ref for part in group}
+        xs: list[float] = []
+        ys: list[float] = []
+        for part in group:
+            x0, y0, x1, y1 = world_aabb(part)
+            xs += [x0, x1]
+            ys += [y0, y1]
+            # KiCad draws a pin number past the end of a pin when the number
+            # is wider than the pin. The body's box does not include that.
+            for pin in part.pins:
+                extra = _text_w(pin.number) - float(pin.length)
+                if extra <= 0.5:
+                    continue
+                px, py = pin_world(part, pin)
+                ox, oy = pin_outward(part, pin)
+                xs.append(px + ox * extra)
+                ys.append(py + oy * extra)
+        body = (min(xs), min(ys), max(xs), max(ys))
+        bx0, by0, bx1, by1 = body
+        for owner, box in marks:
+            if _owner_ref(owner) not in refs:
+                continue
+            mx0, my0, mx1, my1 = box
+            if mx1 < bx0 - reach or mx0 > bx1 + reach or my1 < by0 - reach or my0 > by1 + reach:
+                continue
+            xs += [mx0, mx1]
+            ys += [my0, my1]
+        x0, y0 = min(xs) - pad, min(ys) - pad - header
+        x1, y1 = max(xs) + pad, max(ys) + pad
+        boxes.append(
+            {
+                "name": region.name,
+                "title": titles[region.name].replace('"', "'"),
+                "x0": x0,
+                "y0": y0,
+                "x1": x1,
+                "y1": y1,
+            }
+        )
+    _align_region_boxes(boxes)
+    out: list[str] = []
+    for box in boxes:
+        x0, y0, x1, y1 = box["x0"], box["y0"], box["x1"], box["y1"]
+        title = box["title"]
+        out.append(
+            f'\t(rectangle\n'
+            f'\t\t(start {_fmt(x0)} {_fmt(y0)})\n'
+            f'\t\t(end {_fmt(x1)} {_fmt(y1)})\n'
+            f'\t\t(stroke (width 0.254) (type dash))\n'
+            f'\t\t(fill (type none))\n'
+            f'\t\t(uuid "{_uid(f"group:{box["name"]}")}")\n'
+            f'\t)\n'
+            f'\t(text "{title}"\n'
+            f'\t\t(exclude_from_sim no)\n'
+            f'\t\t(at {_fmt(x0 + 1.27)} {_fmt(y0 + 1.5)} 0)\n'
+            f'\t\t(effects (font (size 2.54 2.54)) (justify left top))\n'
+            f'\t\t(uuid "{_uid(f"group-title:{box["name"]}")}")\n'
+            f'\t)\n'
+        )
+    return out
+
+
+def _align_region_boxes(boxes: list[dict]) -> None:
+    """One row shares a top and a bottom, with the same gap between neighbors.
+
+    A row is the groups whose tops already sit together. Shorter boxes grow
+    down to the tallest, and the space between them is opened to one gutter
+    when the parts left more than that."""
+    gutter = 12.7
+    rows: list[list[dict]] = []
+    for box in boxes:
+        for row in rows:
+            if abs(box["y0"] - row[0]["y0"]) <= 15.0:
+                row.append(box)
+                break
+        else:
+            rows.append([box])
+    for row in rows:
+        top = min(box["y0"] for box in row)
+        bottom = max(box["y1"] for box in row)
+        for box in row:
+            box["y0"] = top
+            box["y1"] = bottom
+        row.sort(key=lambda box: box["x0"])
+        for left, right in zip(row, row[1:]):
+            extra = (right["x0"] - left["x1"]) - gutter
+            if extra <= 0:
+                continue
+            left["x1"] += extra / 2.0
+            right["x0"] -= extra / 2.0
+
+
 def _emit(design: Design, *, title: str, report: dict | None) -> str:
     kinds = {n.name: n.kind for n in design.nets.values()}
     parts = _parts_from_design(design, kinds)
-    apply_sch_places(design, parts)
-    if report is not None:
-        report["parts"] = [
-            {"ref": p.ref, "x": round(p.x, 3), "y": round(p.y, 3), "rot": p.rot, "mirror": p.mirror}
-            for p in parts
-        ]
     libs = [_lib_gnd(), _lib_vcc(), _lib_pwr_flag(), _lib_r(), _lib_c(), _lib_l(), _lib_led()]
     seen_lib: set[str] = {"power:GND", "power:VCC", "power:PWR_FLAG", "GND", "VCC", "R", "C", "L", "LED"}
     for p in parts:
@@ -2330,10 +2576,42 @@ def _emit(design: Design, *, title: str, report: dict | None) -> str:
             libs.append(_lib_box(p.lib_id, p.pins, p.ref[:1] or "U", kinds))
             seen_lib.add(p.lib_id)
     limits = {n.name: float(n.wire_mm) for n in design.nets.values() if n.wire_mm is not None}
-    annotations, lint = _annotate(parts, kinds, limits, design.sch_wire_mm)
+    # Names take a spot no wire crosses. When a net's name does not fit on its
+    # wire, the downstream part slides one grid step out and the sheet is
+    # drawn again. A slide that adds a readability hit is dropped.
+    extra: dict[str, float] = {}
+    annotations, lint = [], {}
+    best: tuple | None = None
+    for _pass in range(4):
+        parts = _parts_from_design(design, kinds)
+        apply_sch_places(design, parts, extra)
+        annotations, lint = _annotate(parts, kinds, limits, design.sch_wire_mm)
+        if best is None or len(lint["issues"]) <= len(best[2]["issues"]):
+            best = (parts, annotations, lint, dict(extra))
+        else:
+            break
+        pushes = dict(lint.get("pushes") or {})
+        grew = False
+        trial = dict(extra)
+        for ref, mm in pushes.items():
+            nxt = trial.get(ref, 0.0) + mm
+            if nxt <= 5.08 and nxt > trial.get(ref, 0.0) + 0.01:
+                trial[ref] = nxt
+                grew = True
+        if not grew:
+            break
+        extra = trial
+    assert best is not None
+    parts, annotations, lint, extra = best
     if report is not None:
+        report["parts"] = [
+            {"ref": p.ref, "x": round(p.x, 3), "y": round(p.y, 3), "rot": p.rot, "mirror": p.mirror}
+            for p in parts
+        ]
+        report["gap_extra"] = dict(extra)
         report.update(lint)
-    body: list[str] = [_instance(p) for p in parts]
+    body: list[str] = _group_graphics(design, parts, lint.get("marks") or [])
+    body.extend(_instance(p) for p in parts)
     body.extend(annotations)
     max_x, max_y = 100.0, 80.0
     for p in parts:

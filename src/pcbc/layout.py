@@ -88,10 +88,12 @@ def resolve_keepout(
 def resolve_place(
     place: PlaceSpec,
     board: BoardSpec,
-    footprint_block: str | None,
+    footprint_block,
     regions: dict[str, Rect] | None = None,
 ) -> PlaceSpec:
-    """Fill ``at`` from CSS. No-op for static places with no insets."""
+    """Fill ``at`` from CSS. No-op for static places with no insets. `footprint_block` is the part's
+    `foot_native.LibFoot` (placement) or a footprint block of a board text (`check`, on the emitted
+    board), or None."""
     if place.at is not None and not place.has_css():
         return place
     st = style_from(place)
@@ -102,8 +104,10 @@ def resolve_place(
     kind = st.from_box or "courtyard"
     if kind == "origin" or footprint_block is None:
         local = (0.0, 0.0, 0.0, 0.0)
-    else:
+    elif isinstance(footprint_block, str):
         local = footprint_box_local(footprint_block, kind)
+    else:
+        local = footprint_block.box(kind)  # a `foot_native.LibFoot`: the part's own `.kicad_mod`
     ox0, oy0, ox1, oy1 = rotate_local_bounds(*local, st.rotate)
     used_w, used_h = ox1 - ox0, oy1 - oy0
     cb = _cb_for(place, board, regions or {})

@@ -56,9 +56,10 @@ from pcbc.route_channel import (
     tightest,
     triangulate,
 )
-from pcbc.route_emit import Sidecar, read_sidecar, write_sidecar
+from pcbc.route_emit import Sidecar
+from boardtext import read_sidecar, write_sidecar
 from pcbc.route_geom import hull_dist2, qp
-from pcbc.route_scene import build_scene
+from boardtext import scene_from_text
 
 EXAMPLES = Path(__file__).resolve().parent.parent / "examples"
 DS2 = Path.home() / "Documents" / "MaD" / "Hardware" / "DS2Addon" / "pcbc" / "ds2_addon.py"
@@ -69,7 +70,7 @@ def _scene(name: str, board: Path):
 
     design = load_board(board)
     job = compile_design(design)
-    return design, job, build_scene(design, job, job.constraints, placed_board(name, board).read_text())
+    return design, job, scene_from_text(design, job, job.constraints, placed_board(name, board).read_text())
 
 
 def _blinky():
@@ -415,7 +416,6 @@ def test_sidecar_tolerates_a_file_without_the_key(tmp_path):
 
 
 @pytest.mark.kicad
-@pytest.mark.krt
 def test_calibration_no_false_full():
     """Every segment of a routed board crosses only channels the model calls open.
 

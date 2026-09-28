@@ -29,11 +29,13 @@ from pcbc.copper_bar import REDUNDANT
 from pcbc.fanout import fanout_pieces
 from pcbc.language import load_board
 from pcbc.patterns import PatternCtx, merge_plans, pattern_copper
-from pcbc.route_emit import REASONS, write_pieces
+from pcbc.route_emit import REASONS
+from boardtext import WithText, write_pieces
 from pcbc.route_geom import EPS_MM, clears, is_octilinear, track_shape, turn_ok
-from pcbc.route_scene import build_scene, clear_runs, net_runs
+from pcbc.route_scene import clear_runs, net_runs
 from pcbc.route_verify import BRANCH_REASONS, guard_cover, guard_lines
 import pcbc.patterns.stitch as st
+from boardtext import scene_from_text
 
 ROOT = Path(__file__).resolve().parent.parent
 EXAMPLES = ROOT / "examples"
@@ -73,13 +75,13 @@ def _routed_to_patterns(name: str):
     job = compile_design(design)
     text = _placed(name).read_text()
     board = _uuid_name(name)
-    pre = pattern_copper(design, job, job.constraints, text, board, stage="pre")
-    fan, _n = fanout_pieces(design, job, pre.text, board, pre.scene, claimed=pre.claimed)
+    pre = pattern_copper(design, job, job.constraints, board, stage="pre", scene=scene_from_text(design, job, job.constraints, text))
+    fan, _n = fanout_pieces(design, job, board, scene=pre.scene, claimed=pre.claimed)
     pre.scene.add(pre.scene.item_of(p) for p in fan)
-    mid = pattern_copper(design, job, job.constraints, write_pieces(pre.text, fan), board, stage="mid", scene=pre.scene)
-    merged = merge_plans(pre, mid)
+    mid = pattern_copper(design, job, job.constraints, board, stage="mid", scene=pre.scene)
+    merged = WithText(merge_plans(pre, mid), write_pieces(text, list(pre.pieces) + list(fan) + list(mid.pieces)))
     owned = tuple(merged.pieces) + tuple(fan)
-    scene = build_scene(design, job, job.constraints, merged.text)
+    scene = scene_from_text(design, job, job.constraints, merged.text)
     ctx = PatternCtx(scene=scene, design=design, job=job, cs=job.constraints, board=board, stage="final", owned=owned)
     return ctx, merged
 
@@ -87,7 +89,7 @@ def _routed_to_patterns(name: str):
 def _final(name: str):
     ctx, merged = _routed_to_patterns(name)
     design, job = ctx.design, ctx.job
-    return pattern_copper(design, job, job.constraints, merged.text, ctx.board, stage="final", owned=ctx.owned), ctx
+    return pattern_copper(design, job, job.constraints, ctx.board, stage="final", owned=ctx.owned, scene=scene_from_text(design, job, job.constraints, merged.text)), ctx
 
 
 # ---------------------------------------------------------------------------------------------
@@ -194,7 +196,7 @@ def test_clear_runs_agrees_with_clears():
     """
     design = load_board(_board("ds2"))
     job = compile_design(design)
-    scene = build_scene(design, job, job.constraints, _placed("ds2").read_text())
+    scene = scene_from_text(design, job, job.constraints, _placed("ds2").read_text())
     checked = 0
     for y in (6.0, 9.0, 12.0, 15.0, 18.0):
         ivs = clear_runs("x", (2.0, 40.0), y, 0.0635, "GND", scene, "F.Cu")
@@ -216,7 +218,7 @@ def test_clear_runs_is_the_duals_own_epsilon_and_rounds_inward():
     lane a router cannot use is not a lane."""
     design = load_board(_board("guard"))
     job = compile_design(design)
-    scene = build_scene(design, job, job.constraints, _placed("guard").read_text())
+    scene = scene_from_text(design, job, job.constraints, _placed("guard").read_text())
     ivs = clear_runs("x", (2.0, 38.0), 8.8199, 0.0635, "GND", scene, "F.Cu")
     assert ivs, "the fixture's north flank has room somewhere"
     for lo, hi in ivs:
@@ -237,7 +239,7 @@ def test_clear_runs_replays_its_golden_vectors():
     """
     design = load_board(_board("guard"))
     job = compile_design(design)
-    scene = build_scene(design, job, job.constraints, _placed("guard").read_text())
+    scene = scene_from_text(design, job, job.constraints, _placed("guard").read_text())
     cases = []
     for axis, span, offset in (
         ("x", (2.0, 38.0), 8.8199),
@@ -285,7 +287,7 @@ def test_net_runs_walks_a_net_into_runs_and_stops_at_a_junction():
     design = load_board(_board("guard"))
     job = compile_design(design)
     _ctx, merged = _routed_to_patterns("guard")
-    scene = build_scene(design, job, job.constraints, merged.text)
+    scene = scene_from_text(design, job, job.constraints, merged.text)
     runs = net_runs(scene, "SIG", "F.Cu")
     assert len(runs) == 1 and runs[0].layer == "F.Cu", runs
     assert runs[0].pts == ((7.5925, 9.35), (23.7675, 9.35)), runs[0].pts
@@ -342,7 +344,7 @@ def test_the_offset_matches_the_plans_two_measured_numbers():
             continue
         design = load_board(_board(name))
         job = compile_design(design)
-        scene = build_scene(design, job, job.constraints, _placed(name).read_text())
+        scene = scene_from_text(design, job, job.constraints, _placed(name).read_text())
         net = "AIN0" if name == "ds2" else "USB_DN"
         c = job.constraints.by_net(net)
         d = st.next_nm(0.2 / 2.0 + scene.table.between("GND", net)[0] + max(scene.stack.track_min, scene.stack.via_diameter) / 2.0 + EPS_MM)
@@ -407,7 +409,7 @@ def test_sites_along_is_b6s_rule_read_literally():
 # ---------------------------------------------------------------------------------------------
 
 
-def test_a_net_krt_routed_defers_with_b6s_message_and_writes_nothing():
+def test_a_net_pcbc_did_not_route_defers_with_b6s_message_and_writes_nothing():
     """B.6's deferral, verbatim, and it is a **note** and not a `Refusal`.
 
     Every refusal in this repo is a move ending in a `board.py` edit, and there is no edit that makes
@@ -415,10 +417,9 @@ def test_a_net_krt_routed_defers_with_b6s_message_and_writes_nothing():
     entry into `REFUSED`, which is pinned exactly per board.
     """
     plan, _ctx = _final("guard")
-    want = (
-        "guard AIN: deferred - the net is routed by KRT, not by a pattern, so pcbc cannot offset a "
-        "path it does not own. R3 owns this."
-    )
+    # Re-worded 2026-09-25 for the native router: there is no external router whose net this could be,
+    # so the deferral names what is true in this fixture — the net's copper is not pcbc's own.
+    want = "guard AIN: deferred - the net's copper is not pcbc's (a core line, or none yet), so pcbc cannot offset a path it does not own."
     assert want in plan.notes, plan.notes
     assert not [p for p in plan.pieces if p.owner.startswith("AIN")], "no copper for a deferred guard"
     assert not [r for r in plan.refusals() if r.net == "AIN"], "a deferral is a report, not a refusal"
@@ -475,14 +476,23 @@ def test_a_blocked_stretch_is_dropped_and_the_note_says_how_much_of_the_run_is_g
     """
     plan, _ctx = _final("guard")
     notes = [n for n in plan.notes if n.startswith("style: stitch SIG guard")]
+    # Re-recorded 2026-09-24 (fourth review, C4) from 10 of 16 / 24.898 mm / three tracks: a shield
+    # now ends on its outermost stitch vias (`stitch._between_vias`), because a track end running past
+    # its last via touches nothing and is KiCad's `track_dangling` — the build never ships one, and
+    # its dangling sweep had been taking the whole guard off the fixture board. The 3.518 mm stretch
+    # held one via, so no track of it can end on a via at both ends: dropped with its via (10 -> 9),
+    # and the other two are cut to their vias (24.898 -> 17.5 mm: 5.0 + 12.5, both at the 2.5 mm pitch).
     assert notes == [
-        "style: stitch SIG guard: 10 of 16 placed, 24.898 mm of 32.35 mm (above its floor); "
+        "style: stitch SIG guard: 9 of 16 placed, 17.5 mm of 32.35 mm (above its floor); "
+        "a 3.518 mm stretch on the left got one stitch via; a shield track ends on a via at each end, so it needs two; "
         "a 2.173 mm stretch on the left got no stitch via, so nothing would weld it to the GND pour"
     ], notes
-    assert len([p for p in plan.pieces if p.kind == "seg" and p.owner == "SIG guard"]) == 3
-    # 32.35 is both flanks of a 16.175 mm run; 24.898 is what fitted. The two 0402s on the north
-    # flank are what cut it, and the island between them is too short to hold a via at the declared
-    # pitch, so it is not written at all.
+    segs = [p for p in plan.pieces if p.kind == "seg" and p.owner == "SIG guard"]
+    vias = {p.a for p in plan.pieces if p.kind == "via" and p.owner == "SIG guard"}
+    assert len(segs) == 2 and all(s.a in vias and s.b in vias for s in segs), segs
+    # 32.35 is both flanks of a 16.175 mm run; 17.5 is what fitted between vias. The two 0402s on the
+    # north flank are what cut it, and the island between them is too short to hold a via at the
+    # declared pitch, so it is not written at all.
     assert round(2 * 16.175, 3) == 32.35
 
 
@@ -520,9 +530,12 @@ def test_guard_cover_is_the_check_and_it_can_fail():
     pieces = [p for p in plan.pieces if p.reason == "guard"]
     text = _with_gnd_pour(write_pieces(_routed_to_patterns("guard")[1].text, plan.pieces))
     rows = guard_cover(text, pieces)
-    assert sorted(r.net for r in rows) == ["SIG", "SIG2"]
+    # `SIG2` re-recorded out of this list 2026-09-24 (fourth review, C4): its two stretches held one
+    # stitch via each, and a track welded at one point has two free ends, KiCad's `track_dangling`
+    # both; a shield now needs a via at each end, so `SIG2` writes none (its `Coverage` says 0 of 10).
+    assert sorted(r.net for r in rows) == ["SIG"]
     assert all(r.ok for r in rows), [r.line() for r in rows]
-    assert guard_lines(rows)[-1] == "guards: 2 of 2 shield(s) welded to their pour on every piece"
+    assert guard_lines(rows)[-1] == "guards: 1 of 1 shield(s) welded to their pour on every piece"
     # Strip the vias and the same copper is an island on a named net that nothing else here can see.
     broken = guard_cover(text, [p for p in pieces if p.kind == "seg"])
     assert broken and all(not r.ok for r in broken), broken
@@ -555,7 +568,7 @@ def test_a_ground_with_no_pour_is_a_pattern_refusal_naming_the_board_edit():
     ctx, merged = _routed_to_patterns("guard")
     scene = ctx.scene
     scene.plane_of.pop("GND", None)
-    plan = pattern_copper(ctx.design, ctx.job, ctx.cs, merged.text, "guard", stage="final", owned=ctx.owned, scene=scene)
+    plan = pattern_copper(ctx.design, ctx.job, ctx.cs, "guard", stage="final", owned=ctx.owned, scene=scene)
     moves = [m for m in plan.moves if m.startswith("guard")]
     assert len(moves) == 2, moves
     assert "has no plane or pour on this board" in moves[0]
@@ -639,16 +652,15 @@ def test_the_example_boards_declare_no_guard_and_the_stage_writes_none(name: str
 
 
 @pytest.mark.kicad
-@pytest.mark.krt
 def test_the_fixture_builds_to_fab_with_the_guard_gate_verified(tmp_path: Path):
     """The one thing a unit test cannot do, and section 7.1 is the list of reasons: pin a report
     string, run the `final` stage inside `route_job`, and prove a stitch via lands in a pour that only
     `gnd_pour` writes.
 
-    Measured 2026-09-21: the guard survives every KRT step after it — there are none — and the plane
-    comes back as **one** island. The coverage is lower than the placed-board measurement above
-    because `final` sees KRT's copper too, which is the honest cost of the stage and the reason the
-    note is a `Coverage` and not a pass/fail.
+    Measured 2026-09-25 (native): nothing routes after the guard, and the plane comes back as **one**
+    island. The coverage is lower than the placed-board measurement above because `final` sees the
+    router's copper too, which is the honest cost of the stage and the reason the note is a
+    `Coverage` and not a pass/fail.
     """
     from pcbc.build import build_job
 
@@ -658,7 +670,32 @@ def test_the_fixture_builds_to_fab_with_the_guard_gate_verified(tmp_path: Path):
     assert result["error"] is None, result["error"]
     route = next(s for s in result["steps"] if s.get("stage") == "route")
     assert route["guards"]["fails"] == [], route["guards"]["lines"]
+    # Re-recorded 2026-09-24 (fourth review, C4) from "2 of 2" and 11 guard vias: a shield ends on its
+    # outermost stitch vias and needs one at each end (`stitch._between_vias`), so `SIG2`'s two
+    # one-via stretches are not written and `SIG` keeps 9 vias on two tracks. Before this the
+    # route stage's dangling sweep (`layout_job._drop_dangling`) took **every** guard track and then
+    # every via it orphaned off this board and the gate read "pcbc wrote no guard copper"; a shield
+    # is now never swept (`NEVER_SWEPT`), and none is dangling.
+    # Re-recorded 2026-09-25 for the native router: 1 of 1 -> 2 of 2 shields, 9 -> 18 guard vias. `AIN`
+    # was deferred because its copper was the old router's, which pcbc does not own (B.6's
+    # precondition); the native router's copper is pcbc's own (`PatternCtx.owned` carries it), so the
+    # guard now offsets AIN's path too: 12.5 mm of shield in 4 stretches on 9 vias, beside SIG's 17.5 mm
+    # on 9. Nothing is dangling (the emitted board carries no sweep, and KiCad reports none).
     assert route["guards"]["lines"][-1] == "guards: 2 of 2 shield(s) welded to their pour on every piece"
+    assert not any(k.endswith(("track_dangling", "via_dangling")) for k in route["drc_by_type"]), route["drc_by_type"]
     assert route["planes"]["islands"] == {"GND B.Cu": 1}, route["planes"]["islands"]
-    assert route["copper_bar"]["totals"]["vias_pattern"]["guard"] == 11
-    assert any(n.startswith("guard AIN: deferred") for n in route["notes"])
+    assert route["copper_bar"]["totals"]["vias_pattern"]["guard"] == 18
+    assert not any(n.startswith("guard AIN: deferred") for n in route["notes"])
+
+
+def test_a_shield_track_ends_on_its_outermost_stitch_vias():
+    """Fourth review, C4: a shield end that runs past its last stitch via touches nothing, which is
+    KiCad's `track_dangling`, and the build never ships a dangling track. `_between_vias` cuts a
+    stretch to its outer vias (through a corner when they straddle one) and has no answer for a
+    stretch with one via, which the pattern then drops as coverage."""
+    from pcbc.patterns.stitch import _between_vias
+
+    assert _between_vias(((0.0, 0.0), (10.0, 0.0)), [(7.0, 0.0), (2.0, 0.0)]) == ((2.0, 0.0), (7.0, 0.0))
+    assert _between_vias(((0.0, 0.0), (10.0, 0.0)), [(0.0, 0.0), (10.0, 0.0), (5.0, 0.0)]) == ((0.0, 0.0), (10.0, 0.0))
+    assert _between_vias(((0.0, 0.0), (4.0, 0.0), (6.0, 2.0)), [(1.0, 0.0), (5.0, 1.0)]) == ((1.0, 0.0), (4.0, 0.0), (5.0, 1.0))
+    assert _between_vias(((0.0, 0.0), (10.0, 0.0)), [(3.0, 0.0)]) is None

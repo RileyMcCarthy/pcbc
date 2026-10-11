@@ -497,7 +497,7 @@ def drift(rec: dict | None, root: Path, stage: str) -> str | None:
             if name in STAMP_NAMES or name in outs or not os.path.isfile(f):
                 continue
             if name not in ins:
-                return f"{_join(key, name)} is beside a file a {stage}-stage tool was handed and was not there when it ran (a tool reads its directory: KiCad reads a .kicad_pro beside the file it opens); delete it, or rebuild"
+                return f"{_join(key, name)} is beside a file a {stage}-stage tool was handed and was not there when it ran (a tool reads its directory: KiCad reads a .kicad_pro beside the file it opens)"
             if sha(f) != ins[name]:
                 return f"{_join(key, name)} changed since the {stage} stage handed its directory to a tool"
         for name in sorted(ins):

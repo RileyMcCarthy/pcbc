@@ -52,7 +52,7 @@ def footprint_path(part: Part) -> Path:
         if len(mods) == 1:
             return mods[0]
     raise FileNotFoundError(
-        f"{part.name}: no .kicad_mod (set footprint= or leave exactly one in the package)"
+        f"{part.name}: no footprint= and not exactly one .kicad_mod in the package"
     )
 
 

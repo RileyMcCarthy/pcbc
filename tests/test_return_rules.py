@@ -32,10 +32,11 @@ from pcbc.constraints import RETURN_VERDICTS, compile_constraints, return_rule, 
 from pcbc.language import load_board
 from pcbc.route_scene import plane_targets
 from pcbc.stackup import get_stackup
+from conftest import ds2_dir, write_split
 
 ROOT = Path(__file__).resolve().parent.parent
 EXAMPLES = ROOT / "examples"
-DS2 = Path.home() / "Documents" / "MaD" / "Hardware" / "DS2Addon" / "pcbc"
+DS2 = ds2_dir()
 
 # The verdict of every net the compiler gave a `Constraint.reference`, on all five boards, computed
 # from `board.py` alone. Measured 2026-09-21. blinky, buck and ds2 are **empty and stay empty** —
@@ -136,10 +137,11 @@ def test_node_prints_the_move_that_puts_one_net_under_both_layers(tmp_path: Path
     for net, r in rules.items():
         assert r.verdict == "net_change" and r.change == ("F.Cu", "B.Cu"), (net, r)
         assert r.refs == (("F.Cu", ("In1.Cu", "GND")), ("B.Cu", ("In2.Cu", "3V3"))), (net, r.refs)
-        assert NODE_MOVE in r.move, (net, r.move)
-        assert "Bridge()" in r.move and "ties two Ground() nets" in r.move, (net, "the net_change case belongs to the ground bridge and is handed over by name")
+        # docs/direction.md §7b: the verdict and its why are the facts; no edit is proposed.
+        assert r.move == "" and NODE_MOVE not in r.line(), (net, r.move)
+        assert r.line().endswith("so no return via anywhere carries this current (net_change)."), r.line()
         assert r.line() in cs.lines, (net, "the rule prints in the compile report")
-    assert sum(1 for line in cs.lines if NODE_MOVE in line) == 2, "one line per referenced net"
+    assert sum(1 for line in cs.lines if "(net_change)" in line) == 2, "one line per referenced net"
 
 
 def test_c3_usb_prints_the_move_that_keeps_the_pair_where_its_reference_is(tmp_path: Path):
@@ -156,10 +158,10 @@ def test_c3_usb_prints_the_move_that_keeps_the_pair_where_its_reference_is(tmp_p
     for net, r in rules.items():
         assert r.verdict == "lost" and r.change == ("F.Cu", "B.Cu"), (net, r)
         assert r.refs == (("F.Cu", ("B.Cu", "GND")), ("B.Cu", None)), (net, r.refs)
-        assert C3_MOVE in r.move and "on line 263" in r.move, (net, r.move)
-        assert 'Board(layers=4, stackup="jlcpcb_4l_1oz"' in r.move, (net, "the second answer, named as the different board it is")
+        assert r.move == "" and C3_MOVE not in r.line() and "Board(" not in r.line(), (net, r.move)
+        assert r.line().endswith("there is no second plane to reach (lost)."), r.line()
         assert r.line() in cs.lines, (net, "the rule prints in the compile report")
-    assert sum(1 for line in cs.lines if C3_MOVE in line) == 2, "one line per referenced net"
+    assert sum(1 for line in cs.lines if "(lost)" in line) == 2, "one line per referenced net"
 
 
 @pytest.mark.parametrize("name,spelling,tail", [
@@ -211,17 +213,18 @@ _HEAD = '''from pcbc import *
 VCC = Power("VCC"); GND = Ground("GND")
 Resistor("R1", "1k", package="0603", mpn="X", lcsc="C1", p1="D_P", p2="D_N")
 Resistor("R2", "1k", package="0603", mpn="X", lcsc="C1", p1=VCC, p2="Z50")
+Resistor("R3", "1k", package="0603", mpn="X", lcsc="C1", p1="Z50", p2=GND)
 Capacitor("C1", "1uF", package="0603", mpn="X", lcsc="C1", p1=VCC, p2=GND)
 '''
 _TAIL = '''
-for i, r in enumerate(["R1", "R2", "C1"]):
+for i, r in enumerate(["R1", "R2", "R3", "C1"]):
     Place(r, at=(5 + 6 * i, 5)); SchPlace(r, left=20 + 30 * i, top=20)
 '''
 
 
 def _fixture(tmp_path: Path, name: str, board_line: str, reqs: str) -> Path:
     p = tmp_path / f"{name}.py"
-    p.write_text(_HEAD + board_line + reqs + _TAIL)
+    write_split(p, _HEAD + board_line + reqs + _TAIL)
     return p
 
 
@@ -239,7 +242,7 @@ def test_one_ground_under_both_outer_layers_is_the_only_verdict_a_placer_could_s
         tmp_path,
         "kept",
         'Board(width=40, height=25, layers=4, stackup="jlcpcb_4l_1oz", planes=[("GND", "In1.Cu"), ("GND", "In2.Cu")])\n',
-        'NetReq("VCC", "GND", kind="power", volts=5, amps=1)\nNetReq("D_P", "D_N", kind="usb_hs")\n',
+        'NetReq("VCC", kind="power", volts=5); NetReq("GND", kind="power")\nPair("D_P", "D_N", kind="usb_hs")\n',
     )
     cs = compile_constraints(load_board(board))
     rules = {r.net: r for r in return_rules(cs)}
@@ -259,7 +262,7 @@ def test_a_net_that_cannot_change_layer_is_pinned_and_says_which_reason(tmp_path
         tmp_path,
         "one_layer",
         'Board(width=40, height=25, layers=4, stackup="jlcpcb_4l_1oz", planes=[("GND", "In1.Cu")])\n',
-        'NetReq("VCC", "GND", kind="power", volts=5, amps=1)\nNetReq("Z50", z_se_ohm=50, layers=["F.Cu"])\n',
+        'NetReq("VCC", kind="power", volts=5); NetReq("GND", kind="power")\nPath("Z50", "R2.2", "R3.1", z_se_ohm=50, layers=["F.Cu"])\n',
     )
     cs = compile_constraints(load_board(one))
     (r,) = return_rules(cs)
@@ -271,7 +274,7 @@ def test_a_net_that_cannot_change_layer_is_pinned_and_says_which_reason(tmp_path
         tmp_path,
         "no_via",
         'Board(width=40, height=25, layers=4, stackup="jlcpcb_4l_1oz", planes=[("GND", "In1.Cu")])\n',
-        'NetReq("VCC", "GND", kind="power", volts=5, amps=1)\nNetReq("Z50", z_se_ohm=50, vias=False)\n',
+        'NetReq("VCC", kind="power", volts=5); NetReq("GND", kind="power")\nPath("Z50", "R2.2", "R3.1", z_se_ohm=50, layers=["F.Cu", "B.Cu"], vias=False)\n',
     )
     (r2,) = return_rules(compile_constraints(load_board(no_via)))
     assert (r2.net, r2.verdict) == ("Z50", "pinned") and "vias are refused on Z50" in r2.why
@@ -311,8 +314,8 @@ def test_return_rule_takes_the_worse_of_two_verdicts_and_the_order_is_written_do
         tmp_path,
         "three",
         'Board(width=40, height=25, layers=4, stackup="jlcpcb_4l_1oz", planes=[("GND", "In1.Cu")])\n',
-        'NetReq("VCC", "GND", kind="power", volts=5, amps=1)\n'
-        'NetReq("Z50", z_se_ohm=50, layers=["F.Cu", "In2.Cu", "B.Cu"])\n',
+        'NetReq("VCC", kind="power", volts=5); NetReq("GND", kind="power")\n'
+        'Path("Z50", "R2.2", "R3.1", z_se_ohm=50, layers=["F.Cu", "In2.Cu", "B.Cu"])\n',
     )
     cs = compile_constraints(load_board(board))
     (r,) = return_rules(cs)
@@ -322,7 +325,7 @@ def test_return_rule_takes_the_worse_of_two_verdicts_and_the_order_is_written_do
     assert stack.reference_of("B.Cu", cs.planes) is None, "In2.Cu carries no plane, so B.Cu has none"
     assert r.verdict == "lost", "F.Cu->In2.Cu alone would be `kept`; the pair that reaches B.Cu is `lost` and `lost` wins"
     assert RETURN_VERDICTS.index("lost") < RETURN_VERDICTS.index("net_change") < RETURN_VERDICTS.index("kept")
-    assert 'NetReq(layers=["F.Cu", "In2.Cu"])' in r.move, r.move
+    assert r.move == "" and r.why == "B.Cu has no plane above or below it, and the via leaves F.Cu's GND on In1.Cu behind", (r.move, r.why)
 
 
 def test_a_rule_is_only_made_for_a_net_the_compiler_gave_a_reference(tmp_path: Path):
@@ -337,8 +340,8 @@ def test_a_rule_is_only_made_for_a_net_the_compiler_gave_a_reference(tmp_path: P
 def test_a_two_layer_board_whose_ground_is_not_a_power_net_is_told_its_reference_will_never_exist(tmp_path: Path):
     """The classifier's one unlooked-for finding, and it is about a number rather than a return.
 
-    `_reference_for` asks `height_to_reference(..., two_layer_pour=True)` **unconditionally**, so any
-    two-layer board's F.Cu gets `Constraint.reference = "B.Cu pour"` — while `krt_plan` only writes
+    `_reference_for` used to ask `height_to_reference(..., two_layer_pour=True)` **unconditionally**, so any
+    two-layer board's F.Cu got `Constraint.reference = "B.Cu pour"` — while `krt_plan` only writes
     that pour when `GND` is one of the power nets. Measured 2026-09-21 on the board below: `GND` is
     declared with `Ground()` and named by no `NetReq`, so it compiles to `kind="generic"`,
     `plane_targets` is `()` and **no pour is ever written** — yet the compiler prints
@@ -354,13 +357,18 @@ def test_a_two_layer_board_whose_ground_is_not_a_power_net_is_told_its_reference
         tmp_path,
         "no_pour",
         'Board(width=40, height=25, layers=2, stackup="jlcpcb_2l_1oz")\n',
-        'NetReq("Z50", z_se_ohm=50)\n',
+        'Path("Z50", "R2.2", "R3.1", z_se_ohm=50, layers=["F.Cu"])\n',
     )
     cs = compile_constraints(load_board(board))
     assert cs.planes == (), "GND is kind=generic here, so krt_plan writes no gnd_pour"
     z = cs.by_net("Z50")
-    assert z is not None and z.reference == "B.Cu pour", "the compiler names a pour this board will not have"
-    (r,) = return_rules(cs)
-    assert r.verdict == "lost" and r.refs == (("F.Cu", None), ("B.Cu", None))
-    assert r.why == "neither F.Cu nor B.Cu has a plane above or below it, so there is no reference on this board to return to"
-    assert 'NetReq("GND", kind="power")' in r.move, r.move
+    # Refutation round 2 (2026-10-01): the compiler used to name the "B.Cu pour" here, a pour this board
+    # will not have, and sized widths against it. It reads `cs.planes` now (`constraints._reference_for`).
+    assert z is not None and z.reference is None, "the compiler names no pour this board will not have"
+    # Refutation round 2: with no pour named, there is no reference to classify a return against, and
+    # an impedance with nothing to return through is refused at compile, as a fact (docs/direction.md §7b).
+    assert return_rules(cs) == ()
+    assert cs.refusals == (
+        "Z50: 50 ohm on F.Cu (Path line 8) has no reference plane: this two-layer board pours B.Cu only when GND is a power net "
+        "(route_scene.plane_targets), and no NetReq names GND with kind power",
+    ), cs.refusals

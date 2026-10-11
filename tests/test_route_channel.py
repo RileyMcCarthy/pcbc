@@ -60,9 +60,10 @@ from pcbc.route_emit import Sidecar
 from boardtext import read_sidecar, write_sidecar
 from pcbc.route_geom import hull_dist2, qp
 from boardtext import scene_from_text
+from conftest import declared_examples, ds2_dir
 
-EXAMPLES = Path(__file__).resolve().parent.parent / "examples"
-DS2 = Path.home() / "Documents" / "MaD" / "Hardware" / "DS2Addon" / "pcbc" / "ds2_addon.py"
+EXAMPLES = declared_examples()  # the examples as shipped with a declared outline (vehicles): conftest.declared_examples
+DS2 = ds2_dir() / "ds2_addon.py"
 
 
 def _scene(name: str, board: Path):
@@ -295,8 +296,8 @@ def test_slots_bounds_holds():
             assert g.sure_nm <= g.free_nm, g.label()
             assert g.holds <= g.slots, g.label()
     c = census(channels(scene))["F.Cu"]
-    assert c["gates"] == 196, "buck F.Cu, measured 2026-09-21; `docs/topo-plan.md` slice 1 says 196"
-    assert (c["holds"]["0"], c["holds"]["1"]) == (31, 37), "the plan's own census: 31 walls and 37 single-file"
+    assert c["gates"] == 198, "buck F.Cu: 196 measured 2026-09-21 (`docs/topo-plan.md` slice 1); 198 since decision 4 (2026-10-01) moved C_IN1 off U1.2's exit corridor"
+    assert (c["holds"]["0"], c["holds"]["1"]) == (29, 36), "the plan's own census: 29 walls and 36 single-file (31 and 37 before decisions 4 and 5 moved C_IN1 and narrowed VIN/GND)"
     assert c["slots"]["0"] == 0, "no channel on buck's F.Cu refuses every net"
 
 

@@ -1,0 +1,5 @@
+Outline(width=40, height=20)
+Place("R1", position="absolute", left=4, top=6, locked=True, reason="D_P at the west end")
+Place("R2", position="absolute", left=4, top=10, locked=True, reason="D_N at the west end, 4 mm below D_P")
+Place("R3", position="absolute", right=4, top=6, locked=True, reason="D_P at the east end")
+Place("R4", position="absolute", right=4, top=10, locked=True, reason="D_N at the east end")

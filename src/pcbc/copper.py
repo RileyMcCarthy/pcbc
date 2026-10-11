@@ -212,7 +212,9 @@ def pad_clearance_failures(text: str, clearance: float = 0.16) -> list[str]:
             px, py = float(am.group(1)), float(am.group(2))
             prot = float(am.group(3) or 0)
             lx, ly = _rotate(px, py, frot)
-            box = _pad_aabb(fx + lx, fy + ly, float(sm.group(1)), float(sm.group(2)), frot + prot)
+            # A board file writes the pad's angle with the footprint's already in it (KiCad's board-file
+            # convention, `pads.PadSpec.angle`); adding `frot` again turned a 90-degree part's pads by 180.
+            box = _pad_aabb(fx + lx, fy + ly, float(sm.group(1)), float(sm.group(2)), prot)
             layers = _cu_layers(lm.group(1) if lm else "")
             recs.append((ref, net, pad[5:20], box, layers or {"F.Cu"}))
     fails: list[str] = []
@@ -259,35 +261,30 @@ def sensitive_airwire_failures(job: CompiledJob, text: str) -> list[str]:
 
 
 def vias_on_no_via_nets(job: CompiledJob, text: str) -> list[str]:
-    copper = copper_by_net(text)
-    fails: list[str] = []
-    for net in job.nets:
-        if net.vias:
+    """E22 (`docs/physics-subjects.md` §7): a via on a link whose Path allows none, per link owner (a net writes no
+    `vias=` since PR 5). The owners are the board's own `pcbc:` role groups."""
+    cs = job.constraints
+    if cs is None:
+        return []
+    from .layout_job import roles_doc
+
+    try:
+        roles = roles_doc(text)
+    except ValueError:
+        return []
+    count: dict[str, int] = {}
+    for i in roles.items:
+        if i["key"][0] != "via":
             continue
-        for name, rec in copper.items():
-            if rec.get("via") and _match(name, net.patterns):
-                fails.append(f"{name} has {int(rec['via'])} via(s); NetReq vias=False")
+        lk = cs.link_by_key(str(i.get("owner", "")))
+        if lk is not None and not lk.via.allowed:
+            count[lk.key] = count.get(lk.key, 0) + 1
+    fails: list[str] = []
+    for key in sorted(count):
+        lk = cs.link_by_key(key)
+        said = f"Path line {lk.line} says vias=False" if lk.vias_src.startswith("Path line") else f"Path line {lk.line} is kind {lk.kind}, whose default is no vias"
+        fails.append(f"{lk.net}: link {lk.key} has {count[key]} via(s), and {said}")
     return fails
-
-
-def _class_need(job: CompiledJob, name: str, amps: float) -> float:
-    """What the current asks of a track: `max(IPC-2221 external, IPC-2152 with modifiers)`.
-
-    The same `max` `stackup.current_width_mm` takes and the same one `Constraint.width_mm` was
-    derived from, so the gate asks the question the width was an answer to. It used to read
-    `width_ipc2221` alone (finding 1), which is the smaller of the two on every net where the 2152
-    curve wins and made the gate quietly weaker than the number on the board."""
-    cs = job.constraints
-    c = cs.by_net(name) if cs is not None else None
-    if c is not None and c.current is not None:
-        return max(c.current.width_ipc2221.value, c.current.width_ipc2152.value)
-    return ipc2221_width_mm(amps)
-
-
-def _class_width(job: CompiledJob, name: str) -> float:
-    cs = job.constraints
-    c = cs.by_net(name) if cs is not None else None
-    return float(c.width_mm.value) if c is not None else 0.0
 
 
 PATTERN_NECK_OK = ("fanout", "guard", "tap")
@@ -312,14 +309,15 @@ stopped the build, on copper whose absence changes the rail by nothing. It is th
 
 
 def power_ampacity_failures(
-    job: CompiledJob, text: str, owned: Sequence[tuple[str, str, float]] = ()
+    job: CompiledJob, text: str, owned: Sequence[tuple] = (), necks: tuple = ()
 ) -> list[str]:
     """The hard gate: **pcbc must not write a necked power track**, and a rail must have copper.
 
-    `owned` is `(net, reason, width_mm)` per piece pcbc wrote, read off the board's own `pcbc:` role
-    groups with the width the board has (`fab.board_roles` -> `layout_job.roles_doc`); the router's
-    sidecar `copper.json` is consumed by normalise and nothing here reads it. With it empty only the
-    missing-rail rule can fire, which is what a board with no pattern copper has to be judged by.
+    `owned` is `(net, reason, width_mm[, owner, layer])` per piece pcbc wrote, read off the board's own
+    `pcbc:` role groups with the width the board has (`fab.board_roles` -> `layout_job.roles_doc`); the
+    router's sidecar `copper.json` is consumed by normalise and nothing here reads it. With it empty
+    only the missing-rail rule can fire, which is what a board with no pattern copper has to be judged
+    by.
 
     **What this deliberately does not judge, and why.** Until the S7 review this function compared
     the net's *widest* track (`copper_by_net`'s `width` is a `max`) against IPC, so one wide segment
@@ -332,30 +330,88 @@ def power_ampacity_failures(
     ledger that must not get worse.
 
     So the criterion here is the one pcbc *is* answerable for, and it is failable: a pattern's own
-    copper, at the class width the pattern declared, with the one exemption R-I3 already grants
-    (`PATTERN_NECK_OK`).
+    copper, at the width the compiler gave it **on the piece's own layer** (`Constraint.width_on`, PR 9
+    of `docs/net-path-physics.md`), with the one exemption R-I3 already grants (`PATTERN_NECK_OK`). A
+    piece whose role owner is a path's link is judged against that link's width on its layer, at that
+    link's current (§4.4) — the second loop, which also reaches nets whose only current is a path's (a
+    migrated `5V` writes no `NetReq(amps=)`; `SW` is not `power`).
+
+    Decision 1 (owner, 2026-10-01): on a path's link the only copper allowed narrower than the link is a
+    **pad neck** (`route_verify.pad_necks`). `necks` is `(accepted, refused)` from it, each a list of rows
+    keyed by `copper_bar.bar_key`, and `owned` rows then carry that key as their sixth element: an accepted
+    neck passes, a refused one fails with the fact that refused it, and `PATTERN_NECK_OK` no longer exempts
+    link copper (only a guard, which is not on the rail).
     """
     copper = copper_by_net(text)
     plane_nets = {n for n, _ in job.planes} | {n for n, r in copper.items() if r.get("zone")}
+    cs = job.constraints
     fails: list[str] = []
-    for net in job.nets:
-        if net.kind != "power" or not net.amps or net.amps < 0.2:
+
+    def row(r: tuple) -> tuple[str, str, float, str, str]:
+        return (str(r[0]), str(r[1]), float(r[2]), str(r[3]) if len(r) > 3 else "", str(r[4]) if len(r) > 4 else "")
+
+    links = {}
+    if cs is not None and hasattr(cs, "link_by_key"):
+        for c in cs.constraints:
+            for p in c.paths:
+                for lk in p.links:
+                    links[lk.key] = lk
+    # The path loop (`docs/physics-subjects.md` PR 3: a net carries no current, so every declared current is
+    # a path link's): copper a path's link owns, against that link's width on the piece's layer. A pad
+    # neck (decision 1) is the one narrower piece a link may carry.
+    ok_necks = {n["key"] for n in (necks[0] if necks else ())}
+    bad_necks = {n["key"]: n for n in (necks[1] if necks else ())}
+    for r in owned:
+        name, reason, width, owner, layer = row(r)
+        lk = links.get(owner)
+        if lk is None or reason == "guard" or (reason in PATTERN_NECK_OK and not necks):
             continue
-        need = _class_need(job, net.patterns[0], float(net.amps))
-        for name, reason, width in owned:
-            if reason in PATTERN_NECK_OK or not _match(name, net.patterns):
+        need_w = max(d.value for _l, d in lk.width) if reason == "route_group" else lk.width_on(layer)
+        key = tuple(r[5]) if len(r) > 5 else None
+        if key is not None and key in ok_necks:
+            continue
+        if key is not None and key in bad_necks:
+            from .route_verify import neck_refusal_lines
+
+            fails += neck_refusal_lines([bad_necks[key]])
+            continue
+        if width + 1e-6 < need_w:
+            amps = f"{lk.current.amps:g} A" if lk.current is not None and lk.amps_written else (f"kind {lk.kind}" if lk.kind else "the net's numbers")
+            what = "landing" if reason == "route_group" else "copper"
+            fails.append(f"{name} {reason} {what} {width:g} mm on {layer} < the {need_w:g} mm {lk.source}'s link {lk.key} needs on {layer} ({amps})")
+    # A path with a current whose net has no copper and no plane on the emitted board (it moved here
+    # from the net loop PR 3 deleted): at 1 A or more, the board carries nothing at all for it.
+    if cs is not None:
+        for c in cs.constraints:
+            for p in c.paths:
+                if p.amps is None or p.amps < 1.0:
+                    continue
+                if not any(n == c.net for n in list(copper) + list(plane_nets)):
+                    lk = next((x for x in p.links if x.current is not None), None)
+                    need = max(lk.current.width_ipc2221.value, lk.current.width_ipc2152.value) if lk is not None else 0.0
+                    fails.append(f"{c.net} has no copper/plane for Path line {p.line}'s {p.amps:g} A (need ≥ {need:.2f} mm)")
+    # The off-path loop: on a power net, and on a net whose paths carry a field, the copper no link owns
+    # (the off-path branches, §3.1) against the net's own width on the piece's layer (a pattern never
+    # writes a power net under its class width; the class is the floor since PR 3). The router lays it at those
+    # numbers; until this loop nothing on the emitted board checked it (refutation round 1, defect 10:
+    # buck's C_OUT2.1 branch narrowed 0.4 -> 0.25 mm passed every gate, fab and KiCad included,
+    # because KiCad's 5V rule is the 0.2 mm tap).
+    if cs is not None:
+        for r in owned:
+            name, reason, width, owner, layer = row(r)
+            if owner in links or reason in PATTERN_NECK_OK:
                 continue
-            cls = _class_width(job, name)
-            if cls and width + 1e-6 < cls:
+            c = cs.by_net(name)
+            if c is None or not (c.kind == "power" or (hasattr(c, "fielded") and c.fielded())):
+                continue
+            need_w = c.width_on(layer) if layer and hasattr(c, "width_on") else float(c.width_mm.value)
+            if width + 1e-6 < need_w:
                 fails.append(
-                    f"{name} {reason} copper {width:g} mm < the {cls:g} mm {name} class "
-                    f"({net.amps:g} A, IPC asks {_class_need(job, name, float(net.amps)):g} mm)"
-                )
-        # Pattern never seen as copper or plane
-        if not any(_match(n, net.patterns) for n in list(copper) + list(plane_nets)):
-            if net.amps >= 1.0:
-                fails.append(
-                    f"{net.patterns[0]} has no copper/plane for {net.amps:g} A "
-                    f"(need ≥ {need:.2f} mm)"
+                    f"{name} {reason} copper {width:g} mm on {layer} < the {need_w:g} mm {name} needs on {layer} "
+                    f"off its paths (on no Path: the net's own numbers, {_netreq_src(c)})"
                 )
     return sorted(set(fails))
+
+
+def _netreq_src(c) -> str:
+    return f"NetReq line {c.line}" if getattr(c, "line", 0) else f"class {c.class_name}"

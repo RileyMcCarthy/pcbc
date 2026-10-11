@@ -291,8 +291,8 @@ def uuid_check(value, who: str) -> str:
     if re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", s):
         return s
     if re.fullmatch(r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}", s):
-        raise ValueError(f"{who}: uuid {s!r} is not what KiCad keeps: its save writes it lowercase, {s.lower()!r}; write that")
-    raise ValueError(f"{who}: uuid {s!r} is not a uuid KiCad keeps (lowercase 8-4-4-4-12 hex); KiCad rewrites anything else on load, so the object could not be found again. Write one in that form, or leave uuid= out and one is derived from id=")
+        raise ValueError(f"{who}: uuid {s!r} is not what KiCad keeps: its save writes it lowercase, {s.lower()!r}")
+    raise ValueError(f"{who}: uuid {s!r} is not a uuid KiCad keeps (lowercase 8-4-4-4-12 hex); KiCad rewrites anything else on load, so the object could not be found again (with uuid= left out, one is derived from id=)")
 
 
 # ----------------------------------------------------------------------------------- shared parts

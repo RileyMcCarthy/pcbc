@@ -26,6 +26,9 @@ from .sexp import matching_paren
 from .stackup import via_amps, vias_per_change
 
 __all__ = [
+    "path_copper_failures",
+    "path_junctions",
+    "group_members",
     "CHAIN_BISECT",
     "COUPLING_CELL_MM",
     "POUR_CELL_MM",
@@ -305,7 +308,7 @@ def _via_rules(scene: Scene, cs: ConstraintSet, p: Piece, pieces_on_net: Sequenc
         out.append(f"{p.reason} {p.net}: a via on {tuple(p.layer)}; no example turns blind and buried vias on (B.0)")
     c = cs.by_net(p.net)
     if c is not None and not c.via.allowed:
-        out.append(f"{p.reason} {p.net}: a via on a net whose NetReq forbids vias")
+        out.append(f"{p.reason} {p.net}: a via on a net whose {'Pair' if c.pair is not None else 'NetReq'} forbids vias")
     if c is not None and c.reference:
         out.append(f"{p.reason} {p.net}: a via on a controlled-impedance net (reference {c.reference}); R2 never changes layers on one")
     if p.reason == "tap":
@@ -824,7 +827,7 @@ def same_net_slots(text: str, floor: float, layers: tuple[str, ...] = ("F.Cu", "
 #
 # One honest note on the citation. R-X4's own text scopes itself to a **high-speed** net ("a track
 # that branches to a third pad on a high-speed net is a chain order violation"), while this checks
-# every declared `Chain()` — including ds2's `VDDA`, which is Power class. That is deliberate and it
+# every declared `Path()` — including ds2's `VDDA`, which is Power class. That is deliberate and it
 # is wider than the line it is named after: B.2's rule is "the chain goes through its pads in order",
 # and a bypass cap fed as a spur is the same defect as a signal stub whatever the class. The widening
 # is recorded rather than smuggled, because it also means the old hard refusal was protecting an
@@ -848,7 +851,7 @@ the check report a spur rather than silently accept one."""
 
 @dataclass(frozen=True)
 class ChainVerdict:
-    """One declared `Chain()`, judged against the routed board.
+    """One declared `Path()`, judged against the routed board.
 
     `verdict` is one of:
 
@@ -860,7 +863,7 @@ class ChainVerdict:
       than pass.
     - `"poured"` — the net carries a filled zone, so every pad of it is connected through the plane
       and "the order" is not a question the copper can answer. Reported, never failed.
-    - `"unresolved"` — a `Chain()` member names no pad of that net on the board. `pcbc check` refuses
+    - `"unresolved"` — a `Path()` member names no pad of that net on the board. `pcbc check` refuses
       this before the board is drawn; it is reported here rather than silently skipped.
 
     `owner` is `"chain"` when pcbc's own chain pattern was allowed to route this net and `"R4"` when
@@ -868,7 +871,7 @@ class ChainVerdict:
     a violation — see `build._chain_gate`."""
 
     net: str
-    where: str  # "Chain line 97"
+    where: str  # "Path line 97"
     stations: tuple[str, ...]  # pad ids in the declared order: ("J2.1", "C4.1", "U1.12")
     verdict: str
     owner: str  # "chain" | "R4"
@@ -996,7 +999,7 @@ def _net_copper(text: str, net: str) -> tuple[tuple[str, frozenset[str], Shape, 
     return tuple(out)
 
 
-def _reaches(nodes: Sequence[tuple[str, frozenset[str], Shape, tuple]], src: Sequence[int], dst: Sequence[int]) -> bool:
+def _reaches(nodes: Sequence[tuple[str, frozenset[str], Shape, tuple]], src: Sequence[int], dst: Sequence[int], touch=None) -> bool:
     """Is any of `src` joined to any of `dst` through touching copper?
 
     Two pieces touch when `clears(a, b, 0.0)` is False — a gap under `EPS_MM`, which is pcbc's own
@@ -1018,7 +1021,7 @@ def _reaches(nodes: Sequence[tuple[str, frozenset[str], Shape, tuple]], src: Seq
             bj = boxes[j]
             if bi[0] > bj[2] or bj[0] > bi[2] or bi[1] > bj[3] or bj[1] > bi[3]:
                 continue
-            if clears(si, nodes[j][2], 0.0):
+            if (touch(i, j) is False) if touch is not None else clears(si, nodes[j][2], 0.0):
                 continue
             seen.add(j)
             if j in want:
@@ -1028,7 +1031,7 @@ def _reaches(nodes: Sequence[tuple[str, frozenset[str], Shape, tuple]], src: Seq
 
 
 def _station_pads(design, net: str, member: str, pads: dict) -> tuple[str, ...]:
-    """One `Chain()` member, `"REF.PIN"`, as the pad ids it names on this board.
+    """One `Path()` member, `"REF.PIN"`, as the pad ids it names on this board.
 
     `patterns.chain._members`' resolution, read off the routed file instead of off a scene: a member
     is a pin name as `Place(to=)` takes it, one pin may own several pads, and every pad it names is a
@@ -1058,9 +1061,9 @@ def _toward(dx: float, dy: float) -> str:
 
 
 def chain_order(text: str, design, cs: ConstraintSet, *, floor: float | None = None) -> tuple[ChainVerdict, ...]:
-    """R-X4's verify half: did every **declared** `Chain()`'s order survive in the finished copper?
+    """R-X4's verify half: did every **declared** `Path()`'s order survive in the finished copper?
 
-    One verdict per `Chain()` in board order. The question is asked of the routed board and of
+    One verdict per `Path()` in board order. The question is asked of the routed board and of
     nothing else — not of pcbc's own pieces, which `verify_copper` already judges, and not of the
     placement, which `route_checks.check_chains` already judges.
 
@@ -1110,8 +1113,8 @@ def chain_order(text: str, design, cs: ConstraintSet, *, floor: float | None = N
     for p in board_pad_geoms(text):
         by_net.setdefault(p.net, {})[p.id] = p
     out: list[ChainVerdict] = []
-    for ch in getattr(design, "chains", ()):
-        where = f"Chain line {ch.line}"
+    for ch in getattr(design, "paths", ()):
+        where = f"Path line {ch.line}"
         c = cs.by_net(ch.net)
         owner = "R4" if (c is not None and c.pair is not None) else "chain"
         pads = by_net.get(ch.net, {})
@@ -1161,46 +1164,502 @@ def _judge(text: str, ch, stations: tuple[str, ...], pads: dict, owner: str, whe
         if not _reaches(nodes, idx[stations[i]], idx[stations[i + 1]]):
             return ChainVerdict(
                 ch.net, where, stations, "open", owner,
-                f"no copper joins {stations[i]} to {stations[i + 1]}, so link {i + 1} of {n} of this chain is not on the board",
-                f'Route it or drop it: {_chain_call(ch)} declares a feed the router did not finish.',
+                f"no copper joins {stations[i]} to {stations[i + 1]}, so link {i + 1} of {n} of this path is not on the board",
+                "",
             )
     for i in range(1, len(stations) - 1):
         pid = stations[i]
         want = pads[pid]
         cut: list[tuple[str, frozenset[str], Shape, tuple]] = []
+        ends: list = []  # each cut piece's whole item, for `contact_outside`
         for kind, layers, shape, extra in cop:
             if not (layers & want.cu_layers):
                 cut.append((kind, layers, shape, extra))
+                ends.append(None)
                 continue
             if kind == "via":
                 at = extra[0]
                 if any(hull_dist2((at,), s.pts) <= (s.r + floor) ** 2 for s in want.copper):
                     continue
                 cut.append((kind, layers, shape, extra))
+                ends.append(("via", at, 2 * shape.r))
                 continue
             a, b, w = extra
             for p0, p1, ww in _outside(a, b, w, want.copper, floor):
                 cut.append(("seg", layers, track_shape(p0, p1, ww), (p0, p1, ww)))
+                ends.append(("track", a, b, w))
         graph_cut, cidx = graph(cut, without=pid)
-        if _reaches(graph_cut, cidx[stations[i - 1]], cidx[stations[i + 1]]):
+        from .route_geom import contact_outside
+
+        def touch(x: int, y: int, _n=len(cut), _ends=ends, _g=graph_cut, _want=want) -> bool:
+            # Two cut pieces that meet only inside the removed pad (a wide track's round end reaching
+            # back into it) are not a feed past it (`contact_outside`); a pad node is whole.
+            if x >= _n or y >= _n or _ends[x] is None or _ends[y] is None:
+                return not clears(_g[x][2], _g[y][2], 0.0)
+            return contact_outside(_g[x][2], _ends[x], _g[y][2], _ends[y], _want.copper, floor, 0.0)
+
+        if _reaches(graph_cut, cidx[stations[i - 1]], cidx[stations[i + 1]], touch):
             prev, nxt = stations[i - 1], stations[i + 1]
-            ref = pid.split(".")[0]
-            mid = ((pads[prev].at[0] + pads[nxt].at[0]) / 2.0, (pads[prev].at[1] + pads[nxt].at[1]) / 2.0)
-            toward = _toward(mid[0] - pads[pid].at[0], mid[1] - pads[pid].at[1])
             return ChainVerdict(
                 ch.net, where, stations, "spur", owner,
-                f"the copper joins {prev} to {nxt} without crossing {pid}'s pad, so {pid} hangs off the feed instead of sitting in it",
-                f'Place("{ref}", toward="{toward}") moves it into the corridor between {prev} and {nxt}; '
-                f"or {_chain_call(ch)} is asking for an order this copper does not take — drop {ref} from the chain and feed it locally instead.",
+                f"the copper joins {prev} to {nxt} without crossing {pid}'s pad, so {pid} hangs off the feed, not in it",
+                "",
             )
     return ChainVerdict(ch.net, where, stations, "held", owner, "", "")
 
 
-def _chain_call(ch) -> str:
-    """The `Chain(...)` line this chain is — the edit a gate's move ends in. `chain._chain_call`'s
-    answer, off the `ChainReq` rather than off a `ChainSpec`, so the gate quotes the author's own
-    spelling (`U1.VIN`) and not the pad it resolved to."""
-    return f'Chain("{ch.net}", ' + ", ".join(f'"{p}"' for p in ch.pads) + ")"
+# --- paths on the emitted board (docs/net-path-physics.md §4.6) ----------------------------------------
+
+
+def group_members(vias, landings) -> list[list[tuple[float, float]]]:
+    """The via groups among `vias` (points), joined **by their landings** (`landings`, segments as
+    point pairs), never by distance (§4.3): two barrels are one group when a landing segment of the
+    group's own role passes over both."""
+    from .route_geom import _pt_seg_d2
+
+    parent = list(range(len(vias)))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for a, b in landings:
+        on = [k for k, v in enumerate(vias) if _pt_seg_d2(v[0], v[1], a[0], a[1], b[0], b[1]) <= 1e-6]
+        for k in on[1:]:
+            x, y = find(on[0]), find(k)
+            if x != y:
+                parent[max(x, y)] = min(x, y)
+    out: dict[int, list] = {}
+    for k, v in enumerate(vias):
+        out.setdefault(find(k), []).append(tuple(v))
+    return [sorted(g) for _r, g in sorted(out.items())]
+
+
+def _blocks(adj: dict[int, set[int]]) -> list[set[int]]:
+    """The biconnected components (blocks) of an undirected graph, as vertex sets: Tarjan's edge-stack
+    algorithm, iterative. A bridge is a block of two vertices."""
+    index: dict[int, int] = {}
+    low: dict[int, int] = {}
+    out: list[set[int]] = []
+    counter = 0
+    for root in sorted(adj):
+        if root in index:
+            continue
+        index[root] = low[root] = counter
+        counter += 1
+        edges: list[tuple[int, int]] = []
+        stack = [(root, -1, iter(sorted(adj[root])))]
+        while stack:
+            v, parent, it = stack[-1]
+            nxt = next(it, None)
+            if nxt is None:
+                stack.pop()
+                if stack:
+                    u = stack[-1][0]
+                    low[u] = min(low[u], low[v])
+                    if low[v] >= index[u]:
+                        block: set[int] = set()
+                        while edges:
+                            a, b = edges.pop()
+                            block.update((a, b))
+                            if (a, b) == (u, v):
+                                break
+                        out.append(block)
+                continue
+            w = nxt
+            if w == parent:
+                continue
+            if w not in index:
+                edges.append((v, w))
+                index[w] = low[w] = counter
+                counter += 1
+                stack.append((w, v, iter(sorted(adj[w]))))
+            elif index[w] < index[v]:
+                edges.append((v, w))
+                low[v] = min(low[v], index[w])
+    return out
+
+
+def on_simple_paths(adj: dict[int, set[int]], src: Sequence[int], dst: Sequence[int]) -> set[int]:
+    """Every vertex that lies on some simple path from any of `src` to any of `dst`: the blocks on the
+    block-cut tree path between a virtual source joined to `src` and a virtual sink joined to `dst`
+    (a vertex of a 2-connected block lies on a simple path between any two others of it). Empty when
+    the two are not connected."""
+    if not src or not dst:
+        return set()
+    g = {k: set(v) for k, v in adj.items()}
+    S, T = -1, -2
+    g[S] = set(src)
+    g[T] = set(dst)
+    for x in src:
+        g.setdefault(x, set()).add(S)
+    for x in dst:
+        g.setdefault(x, set()).add(T)
+    blocks = _blocks(g)
+    # The block-cut tree: block nodes ("b", i) and vertex nodes ("v", x) joined when x is in block i.
+    member: dict[int, list[int]] = {}
+    for i, b in enumerate(blocks):
+        for x in b:
+            member.setdefault(x, []).append(i)
+    if S not in member or T not in member:
+        return set()
+    prev: dict[tuple, tuple | None] = {("v", S): None}
+    queue = [("v", S)]
+    while queue:
+        node = queue.pop(0)
+        if node == ("v", T):
+            break
+        kind, k = node
+        nbrs = [("b", i) for i in member.get(k, ())] if kind == "v" else [("v", x) for x in sorted(blocks[k])]
+        for n in nbrs:
+            if n not in prev:
+                prev[n] = node
+                queue.append(n)
+    if ("v", T) not in prev:
+        return set()
+    out: set[int] = set()
+    node = ("v", T)
+    while node is not None:
+        if node[0] == "b":
+            out |= blocks[node[1]]
+        node = prev[node]
+    return out - {S, T}
+
+
+def core_link_items(text: str, cs, owned_uuids=None) -> list[dict]:
+    """The copper of a net with paths that **no `pcbc:` role group owns** (a `layout.core.py` line's,
+    or any copper the board carries outside pcbc's groups), each piece given the path links it carries,
+    in `roles_doc`'s item shape with reason `core`, so every path gate judges it as it judges the
+    router's (refutation round 2, the blocker: width, vias, layers, the Kelvin junction and the
+    off-path width were checked on pcbc's own copper only, and a locked copy of the same board with a
+    narrowed link, a dropped barrel or a sense tap meeting the rail mid-trace built `ok`).
+
+    A piece carries a link when it lies on some simple path through the net's touching copper (every
+    track, arc, via and pad of the net) from one of the link's first station's pads to one of its last
+    station's (`on_simple_paths`); a join link's pieces are those between two pads of its station. A
+    piece on no link is the net's own (owner = the net): an off-path branch. One item per (piece,
+    link), so a piece two links share is judged against both."""
+    from .ampacity import ALL_CU, board_pad_geoms
+    from .gen import decompile
+    from .layout_job import roles_doc
+
+    if cs is None:
+        return []
+    nets = {c.net: c for c in cs.constraints if getattr(c, "paths", ())}
+    if not nets:
+        return []
+    if owned_uuids is None:
+        owned_uuids = {str(i["uuid"]) for i in roles_doc(text).items} if '(group "pcbc:' in text else set()
+    board = decompile(text)
+    pads_by: dict[str, list] = {}
+    for p in board_pad_geoms(text):
+        if p.net in nets:
+            pads_by.setdefault(p.net, []).append(p)
+    out: list[dict] = []
+    for net in sorted(nets):
+        c = nets[net]
+        cop = [x for x in board.copper if x.net == net and x.kind in ("seg", "arc", "via")]
+        if not any(x.uuid not in owned_uuids for x in cop):
+            continue
+        # vertices: the pieces, then the pads
+        verts: list[tuple[frozenset, list, object]] = []
+        for x in cop:
+            if x.kind == "via":
+                span = tuple(x.layers or ("F.Cu", "B.Cu"))
+                lays = ALL_CU if span == ("F.Cu", "B.Cu") else frozenset(span)
+                verts.append((lays, [via_shape(x.at, float(x.size or 0.0))], x))
+            elif x.kind == "arc":
+                verts.append((frozenset({x.layer}), [track_shape(x.a, x.mid, float(x.width or 0.0)), track_shape(x.mid, x.b, float(x.width or 0.0))], x))
+            else:
+                verts.append((frozenset({x.layer}), [track_shape(x.a, x.b, float(x.width or 0.0))], x))
+        pad_at: dict[str, int] = {}
+        for p in pads_by.get(net, ()):
+            pad_at[p.id] = len(verts)
+            verts.append((frozenset(p.cu_layers), list(p.copper), p))
+        boxes = []
+        for lays, shapes, _o in verts:
+            bs = [aabb(sh) for sh in shapes]
+            boxes.append((min(b[0] for b in bs), min(b[1] for b in bs), max(b[2] for b in bs), max(b[3] for b in bs)))
+        adj: dict[int, set[int]] = {i: set() for i in range(len(verts))}
+        touch: dict[tuple[int, int], tuple[float, float]] = {}
+        for i in range(len(verts)):
+            for j in range(i + 1, len(verts)):
+                if not (verts[i][0] & verts[j][0]):
+                    continue
+                bi, bj = boxes[i], boxes[j]
+                if bi[0] > bj[2] or bj[0] > bi[2] or bi[1] > bj[3] or bj[1] > bi[3]:
+                    continue
+                hit = next(((a, b) for a in verts[i][1] for b in verts[j][1] if not clears(a, b, 0.0)), None)
+                if hit is not None:
+                    adj[i].add(j)
+                    adj[j].add(i)
+                    pa, pb, _d = closest_points(*hit)
+                    touch[(i, j)] = ((pa[0] + pb[0]) / 2.0, (pa[1] + pb[1]) / 2.0)
+        # Two pieces that meet **inside a pad** they both touch are joined through that pad, not past
+        # it: the edge between them goes, so a pad is a cut where the copper really is one (two tracks
+        # ending at a station's centre do not make a bypass around it). A meeting outside every pad
+        # stays an edge: a tap joined to the rail mid-trace is a junction off the station.
+        npieces = len(cop)
+        for (i, j), at in touch.items():
+            if i >= npieces or j >= npieces:
+                continue
+            shared_l = verts[i][0] & verts[j][0]
+            for k in range(npieces, len(verts)):
+                if k in adj[i] and k in adj[j] and (verts[k][0] & shared_l) and any(_inside(sh, at) for sh in verts[k][1]):
+                    adj[i].discard(j)
+                    adj[j].discard(i)
+                    break
+        carries: dict[int, list[str]] = {}
+        for p in c.paths:
+            for lk in p.links:
+                if lk.join:
+                    pids = [pad_at[x] for x in lk.a if x in pad_at]
+                    on: set[int] = set()
+                    for k in range(len(pids)):
+                        for m in range(k + 1, len(pids)):
+                            on |= on_simple_paths(adj, [pids[k]], [pids[m]])
+                else:
+                    on = on_simple_paths(adj, [pad_at[x] for x in lk.a if x in pad_at], [pad_at[x] for x in lk.b if x in pad_at])
+                for v in on:
+                    if v < len(cop) and lk.key not in carries.setdefault(v, []):
+                        carries[v].append(lk.key)
+        for i, x in enumerate(cop):
+            if x.uuid in owned_uuids:
+                continue
+            if x.kind == "via":
+                key = ["via", [round(x.at[0], 4), round(x.at[1], 4)], list(x.layers or ("F.Cu", "B.Cu"))]
+                w, drill = float(x.size or 0.0), float(x.drill or 0.0)
+                pieces = [key]
+            elif x.kind == "arc":
+                w, drill = float(x.width or 0.0), 0.0
+                pieces = [
+                    ["seg", x.layer, [round(x.a[0], 4), round(x.a[1], 4)], [round(x.mid[0], 4), round(x.mid[1], 4)], round(w, 4)],
+                    ["seg", x.layer, [round(x.mid[0], 4), round(x.mid[1], 4)], [round(x.b[0], 4), round(x.b[1], 4)], round(w, 4)],
+                ]
+            else:
+                w, drill = float(x.width or 0.0), 0.0
+                pieces = [["seg", x.layer, [round(x.a[0], 4), round(x.a[1], 4)], [round(x.b[0], 4), round(x.b[1], 4)], round(w, 4)]]
+            for owner in carries.get(i) or [net]:
+                for key in pieces:
+                    out.append({"key": key, "uuid": x.uuid, "reason": "core", "net": net, "owner": owner, "w": round(w, 4), "drill": round(drill, 4), "where": x.where or ""})
+    return out
+
+
+def gate_roles(text: str, cs):
+    """`fab.board_roles`' answer with the copper no role group owns added (`core_link_items`): the
+    roles every path gate reads, so a `layout.core.py` line is judged like the router's copper."""
+    from .layout_job import roles_doc
+    from .route_emit import Sidecar
+
+    doc = roles_doc(text) if '(group "pcbc:' in text else Sidecar()
+    extra = core_link_items(text, cs, {str(i["uuid"]) for i in doc.items})
+    if not extra:
+        return doc
+    return Sidecar(items=list(doc.items) + extra, refusals=list(getattr(doc, "refusals", []) or []))
+
+
+def path_copper_failures(job, roles) -> list[str]:
+    """The fatal checks of §4.6 on pcbc's own copper, read off the emitted board's `pcbc:` roles:
+
+    - **vias and layers**: a via in a link's copper where the link has `vias=False`, copper on a layer
+      the link does not allow;
+    - **via groups**: every layer change on a link with a current (and on a current net's own links,
+      PR 9) is a group whose members are found by their `route_group` owner and joined by their
+      landings; its worst barrel is recomputed from the emitted count, pitch and landing width with
+      `stackup.via_group_shares` and must be within `via_amps`. A lone router via carrying a link's
+      (or a grouped net's) current is a group of one."""
+    from .stackup import via_group_shares
+
+    cs = job.constraints
+    if cs is None or not hasattr(cs, "link_by_key"):
+        return []
+    stack = cs.stackup
+    out: list[str] = []
+    items = list(roles.items)
+    by_owner: dict[tuple[str, str], list[dict]] = {}
+    for i in items:
+        by_owner.setdefault((str(i["net"]), str(i.get("owner", ""))), []).append(i)
+    for (net, owner), mine in sorted(by_owner.items()):
+        lk = cs.link_by_key(owner)
+        if lk is None:
+            continue  # a net carries no current of its own (docs/physics-subjects.md PR 3): only links have groups
+        if True:
+            who = f"{net} {lk.source}'s link {lk.key}"
+            if not lk.via.allowed:
+                for v in (i for i in mine if i["key"][0] == "via"):
+                    out.append(f"{who}: a via at ({v['key'][1][0]:g},{v['key'][1][1]:g}) on a link with no vias ({lk.vias_src or 'the link'})")
+            for sgm in (i for i in mine if i["key"][0] == "seg"):
+                if sgm["key"][1] not in lk.layers:
+                    out.append(f"{who}: copper on {sgm['key'][1]}, which the link does not allow (layers {', '.join(lk.layers)}, {lk.layers_src})")
+            amps = lk.current.amps if (lk.current is not None and lk.amps_written) else None
+            group = lk.group
+            dt = lk.current.temp_rise_c if lk.current is not None else 10.0
+        if amps is None:
+            continue
+        if group is None:
+            # Round 3 (refute-twooz fx06): the compiler planned one via for this layer change (one stackup barrel holds
+            # the current), so there is no group; each via on the board is still one barrel carrying all of it, rated
+            # by the drill it has. A 0.15 mm via (0.428 A) on a 0.6 A link passed every gate.
+            for v in (i for i in mine if i["key"][0] == "via"):
+                d = float(v.get("drill") or 0.0) or lk.via.drill_mm
+                one = via_amps(d, stack.via_plating_mm, dt)
+                if one + 1e-6 < amps:
+                    out.append(
+                        f"{who}: a lone via at ({v['key'][1][0]:g},{v['key'][1][1]:g}) ({d:g} mm drill) carries {amps:g} A, over the {one:.3f} A one "
+                        f"barrel holds ({stack.name}); the compiler planned one {lk.via.drill_mm:g} mm drill via for this layer change"
+                    )
+            continue
+        # Postfix B1 (refutation stackup r2): each barrel is rated by the drill on the board (the role item's
+        # "drill"), not the drill the compiler planned; four 0.15 mm barrels passed a gate that rated 0.3 mm.
+        drill_at = {tuple(i["key"][1]): float(i.get("drill") or 0.0) or group.drill_mm for i in mine if i["key"][0] == "via"}
+        rating = via_amps(group.drill_mm, stack.via_plating_mm, dt)
+        lone = [i for i in mine if i["key"][0] == "via" and i["reason"] == "route"]
+        for v in lone:
+            d = drill_at[tuple(v["key"][1])]
+            one = via_amps(d, stack.via_plating_mm, dt)
+            out.append(f"{who}: a lone via at ({v['key'][1][0]:g},{v['key'][1][1]:g}) ({d:g} mm drill) carries {amps:g} A, over the {one:.3f} A one barrel holds; the layer change needs a {group.count}-via group")
+        # A group's barrels and landings: the router's `route_group` pieces; and, separately, copper no
+        # role group owns (`core_link_items`, reason `core`): its vias grouped by the core tracks that
+        # pass over two or more of them and are no longer than the group the link needs
+        # (`count x pitch`), so a long run that ends on two groups does not make them one.
+        from .route_geom import _pt_seg_d2
+
+        gv = [tuple(i["key"][1]) for i in mine if i["key"][0] == "via" and i["reason"] == "route_group"]
+        gl = [i for i in mine if i["key"][0] == "seg" and i["reason"] == "route_group"]
+        cv = [tuple(i["key"][1]) for i in mine if i["key"][0] == "via" and i["reason"] == "core"]
+        reach = group.count * group.pitch_mm + 1e-3
+        cl = [
+            i for i in mine
+            if i["key"][0] == "seg" and i["reason"] == "core" and math.dist(tuple(i["key"][2]), tuple(i["key"][3])) <= reach
+            and sum(1 for v in cv if _pt_seg_d2(v[0], v[1], i["key"][2][0], i["key"][2][1], i["key"][3][0], i["key"][3][1]) <= 1e-6) >= 2
+        ]
+        sets = [(members, gl, False) for members in group_members(gv, [(tuple(i["key"][2]), tuple(i["key"][3])) for i in gl])] if gv else []
+        sets += [(members, cl, True) for members in group_members(cv, [(tuple(i["key"][2]), tuple(i["key"][3])) for i in cl])] if cv else []
+        for members, gl, core in sets:
+            n = len(members)
+            if core:
+                joined = [i for i in gl if any(_pt_seg_d2(m[0], m[1], i["key"][2][0], i["key"][2][1], i["key"][3][0], i["key"][3][1]) <= 1e-6 for m in members)]
+            else:
+                joined = [i for i in gl if any(math.dist(tuple(i["key"][2]), m) < 1e-3 or math.dist(tuple(i["key"][3]), m) < 1e-3 for m in members)]
+            landing = min((float(i["w"]) for i in joined), default=0.0)
+            layers = {i["key"][1] for i in joined}
+            if n > 1 and (len(layers) < 2 or landing <= 0.0):
+                out.append(f"{who}: the via group at ({members[0][0]:g},{members[0][1]:g}) has a landing on {', '.join(sorted(layers)) or 'no layer'} only; both layers' copper must run over every barrel")
+                continue
+            span = max(math.dist(a, b) for a in members for b in members) if n > 1 else 0.0
+            pitch = span / (n - 1) if n > 1 else 0.0
+            drill = min(drill_at.get(tuple(m), group.drill_mm) for m in members)
+            rating = via_amps(drill, stack.via_plating_mm, dt)
+            cu = stack.landing_oz(layers)
+            shares = via_group_shares(n, amps, drill, stack.via_plating_mm, stack.board_mm, pitch or group.pitch_mm, landing or group.landing_mm, cu)
+            worst = max(shares)
+            if worst > rating + 1e-6:
+                out.append(
+                    f"{who}: the via group at ({members[0][0]:g},{members[0][1]:g}) is {n} barrel{'s' if n != 1 else ''} of {drill:g} mm drill at {pitch:.3f} mm pitch with a "
+                    f"{landing:g} mm landing; its worst barrel carries {worst:.3f} A of {amps:g} A, over the {rating:.3f} A one holds "
+                    f"(lumped DC model, {stack.name}; the link needs {group.count})"
+                )
+    return sorted(set(out))
+
+
+def path_junctions(text: str, design, cs: ConstraintSet) -> list[dict]:
+    """The junction rules of §3.2 measured on the emitted board, at the net's clearance (the router's
+    number, `chain_order`'s `floor`): for a **sense** path, its copper beyond its first station's pad
+    may reach nothing of its net but its own stations; for a path that writes **amps=**, its copper
+    may touch no copper of another owner except inside its station pads. One row per finding:
+    `{net, path, station, touched, distance, rule}`; empty when every path holds. Read off
+    `gate_roles`, so copper no role group owns (a `layout.core.py` line) is judged with the router's.
+    A gate since refutation round 2 (`build.py`, `junction_lines`)."""
+    from .ampacity import board_pad_geoms
+    from .route_geom import clip_outside, contact_outside, gap
+
+    roles = gate_roles(text, cs)
+    by_owner: dict[str, list[dict]] = {}
+    for i in roles.items:
+        by_owner.setdefault(str(i.get("owner", "")), []).append(i)
+    pads_by: dict[str, dict] = {}
+    for p in board_pad_geoms(text):
+        pads_by.setdefault(p.net, {})[p.id] = p
+    out: list[dict] = []
+    for c in cs.constraints:
+        if not c.fielded():
+            continue
+        clr = c.clearance_mm.value
+        pads = pads_by.get(c.net, {})
+        mine_items = [i for i in roles.items if str(i["net"]) == c.net]
+        for p in c.paths:
+            if p.kind is None and p.amps is None:
+                continue
+            keys = {lk.key for lk in p.links}
+            rule = "sense" if p.kind is not None else "amps"
+            if p.kind is not None:
+                allowed_pads = set(p.stations[0])
+                stations = {x for st in p.stations for x in st}
+            else:
+                allowed_pads = {x for st in p.stations for x in st}
+                stations = allowed_pads
+            regions = [sh for pid in allowed_pads if pid in pads for sh in pads[pid].copper]
+
+            def parts(i):
+                if i["key"][0] == "seg":
+                    a, b, w = tuple(i["key"][2]), tuple(i["key"][3]), float(i["w"])
+                    return [(i["key"][1], track_shape(x, y, w), ("track", a, b, w)) for x, y in clip_outside(a, b, regions, clr)]
+                at = tuple(i["key"][1])
+                if any(clears(via_shape(at, 0.0), r, clr) is False for r in regions):
+                    return []
+                return [(L, via_shape(at, float(i["w"])), ("via", at, float(i["w"]))) for L in ("F.Cu", "B.Cu")]
+
+            own = [i for i in mine_items if str(i.get("owner", "")) in keys]
+            other = [i for i in mine_items if str(i.get("owner", "")) not in keys]
+            # A piece of copper no role group owns can carry this path and another link at once
+            # (`core_link_items` gives it one item per link): it is in `own` and in `other`, and touches itself.
+            foreign_pads = [(pid, pads[pid]) for pid in pads if pid not in stations]
+            for i in own:
+                for L, sh, ei in parts(i):
+                    for j in other:
+                        for L2, sh2, ej in parts(j):
+                            if L2 == L and contact_outside(sh, ei, sh2, ej, regions, clr, clr):
+                                out.append({"net": c.net, "path": f"Path line {p.line}", "station": p.written[0], "touched": f"{j['reason']} copper of {j.get('owner') or c.net} on {L}", "distance": round(gap(sh, sh2), 4), "rule": rule,
+                                            "mine": _piece_where(ei, i), "theirs": _piece_where(ej, j)})
+                    for pid, pg in foreign_pads:
+                        if L in pg.cu_layers and any(contact_outside(sh, ei, psh, None, regions, clr, clr) for psh in pg.copper):
+                            out.append({"net": c.net, "path": f"Path line {p.line}", "station": p.written[0], "touched": f"pad {pid}", "distance": round(min(gap(sh, psh) for psh in pg.copper), 4), "rule": rule,
+                                        "mine": _piece_where(ei, i), "theirs": f"pad {pid} at ({pg.at[0]:g},{pg.at[1]:g})" if getattr(pg, "at", None) else ""})
+    uniq = []
+    for r in out:
+        if r not in uniq:
+            uniq.append(r)
+    return uniq
+
+
+def _piece_where(e, item: dict) -> str:
+    """`its route_group track (18.808,11.73)-(20.538,10) 2.276 mm` / `route via at (19.35,9.952)`: one piece of copper
+    a junction row names, by kind, role and position (postfix B5: the fatal junction error named no copper and no place)."""
+    role = str(item.get("reason") or "")
+    if e[0] == "track":
+        _k, a, b, w = e
+        return f"{role} track ({a[0]:g},{a[1]:g})-({b[0]:g},{b[1]:g}) {w:g} mm"
+    _k, at, _w = e
+    return f"{role} via at ({at[0]:g},{at[1]:g})"
+
+
+def junction_lines(rows) -> list[str]:
+    """`path_junctions` rows as the build's error lines: facts only, the path, what its copper touches
+    and where (the two pieces, by kind and position)."""
+    out = []
+    for r in rows:
+        where = f"outside its first station {r['station']}'s pad" if r.get("rule") == "sense" else "outside its station pads"
+        d = float(r["distance"])
+        how = f"overlaps {r['touched']} by {-d:g} mm" if d < 0 else (f"touches {r['touched']}" if d == 0 else f"comes {d:g} mm from {r['touched']}, under its net's clearance")
+        pieces = ""
+        if r.get("mine"):
+            pieces = f": its {r['mine']}" + (f" meets the {r['theirs']}" if r.get("theirs") else "")
+        out.append(f"{r['net']}: {r['path']}'s copper {how}, {where}{pieces}")
+    return out
+
+
 
 
 # --- The two populations, counted before anything is designed around them --------------------------
@@ -1481,7 +1940,8 @@ class Parallel:
 
 
 def via_parallelism(text: str, cs: ConstraintSet) -> tuple[Parallel, ...]:
-    """Technique 1's population: every parallel via group on an unpoured power rail, rated.
+    """Technique 1's population: every parallel via group on an unpoured path link that carries a declared
+    current, rated against that link's current (`docs/physics-subjects.md` PR 3: a net declares none).
 
     A via is not a track and its current is a **count**, not a width. `stackup.vias_per_change` has
     compiled that count since R1 and `ViaSpec.per_change` appears nowhere outside `constraints.py` —
@@ -1524,29 +1984,54 @@ def via_parallelism(text: str, cs: ConstraintSet) -> tuple[Parallel, ...]:
     stack = cs.stackup
     vias = board_vias(text)
     out: list[Parallel] = []
-    for c in sorted(cs.constraints, key=lambda c: c.net):
-        if c.current is None or c.net in poured:
+    # The router's via groups (docs/net-path-physics.md §4.3) are found by their `route_group` role and
+    # joined by their landings, never by distance; each is rated by its worst barrel (lumped DC model).
+    from .layout_job import roles_doc
+    from .stackup import via_group_shares
+
+    # Per path link that carries a declared current (`docs/physics-subjects.md` PR 3: a net carries none
+    # of its own, so a via is rated against the current of the link whose copper it is).
+    try:
+        roles = roles_doc(text)
+    except ValueError:
+        roles = None
+    if roles is None:
+        return tuple(out)
+    by_owner: dict[tuple[str, str], tuple[list, list, list]] = {}
+    for i in roles.items:
+        owner = str(i.get("owner", ""))
+        lk = cs.link_by_key(owner)
+        if lk is None or lk.current is None or not lk.amps_written or str(i["net"]) in poured:
             continue
-        mine = sorted((v for v in vias if v["net"] == c.net), key=lambda v: v["at"])
-        if not mine:
-            continue
-        dt = c.current.temp_rise_c
-        for group in _clusters(mine):
+        v, sg, lone = by_owner.setdefault((str(i["net"]), owner), ([], [], []))
+        if i.get("reason") == "route_group":
+            (v if i["key"][0] == "via" else sg).append(i)
+        elif i["key"][0] == "via":
+            lone.append(i)
+    for (net, owner), (gv, gs, lone) in sorted(by_owner.items()):
+        lk = cs.link_by_key(owner)
+        amps, dt = float(lk.current.amps), lk.current.temp_rise_c
+        at_of = lambda m: tuple(round(x, 4) for x in m)  # noqa: E731
+        for members in group_members([tuple(x["key"][1]) for x in gv], [(tuple(x["key"][2]), tuple(x["key"][3])) for x in gs]):
+            joined = [x for x in gs if any(math.dist(tuple(x["key"][2]), m) < 1e-3 or math.dist(tuple(x["key"][3]), m) < 1e-3 for m in members)]
+            landing = min((float(x["w"]) for x in joined), default=0.0)
+            # Round 3: the landing copper is the thinnest layer the landings run on (`Stackup.landing_oz`), as the gate's.
+            cu = stack.landing_oz({x["key"][1] for x in joined} or lk.layers)
+            keys = {at_of(m) for m in members}
+            drill = min((v["drill"] for v in vias if v["net"] == net and at_of(v["at"]) in keys), default=lk.via.drill_mm)
+            n = len(members)
+            span = max(math.dist(a, b) for a in members for b in members) if n > 1 else 0.0
+            frac = max(via_group_shares(n, 1.0, drill, stack.via_plating_mm, stack.board_mm, span / (n - 1) if n > 1 else 1.0, landing or lk.widest(), cu))
+            one = via_amps(drill, stack.via_plating_mm, dt)
+            need = max(vias_per_change(amps, drill, stack.via_plating_mm, dt), lk.group.count if lk.group is not None else 1)
+            out.append(Parallel(net=net, amps=amps, at=tuple(members[0]), n=n, drill=drill, carries=round(one / frac, 3), need=need, add=max(0, need - n)))
+        spots = {at_of(x["key"][1]) for x in lone}
+        mine = sorted((v for v in vias if v["net"] == net and at_of(v["at"]) in spots), key=lambda v: v["at"])
+        for group in _clusters(mine) if mine else ():
             drill = min(mine[i]["drill"] for i in group)
             carries = round(len(group) * via_amps(drill, stack.via_plating_mm, dt), 3)
-            need = vias_per_change(c.current.amps, drill, stack.via_plating_mm, dt)
-            out.append(
-                Parallel(
-                    net=c.net,
-                    amps=float(c.current.amps),
-                    at=mine[group[0]]["at"],
-                    n=len(group),
-                    drill=drill,
-                    carries=carries,
-                    need=need,
-                    add=max(0, need - len(group)),
-                )
-            )
+            need = vias_per_change(amps, drill, stack.via_plating_mm, dt)
+            out.append(Parallel(net=net, amps=amps, at=mine[group[0]]["at"], n=len(group), drill=drill, carries=carries, need=need, add=max(0, need - len(group))))
     return tuple(out)
 
 
@@ -1554,12 +2039,12 @@ def parallel_lines(rows: Sequence[Parallel]) -> list[str]:
     """The under-rated groups, then a summary — or the sentence that says there are none."""
     short = [r for r in rows if r.add]
     if not rows:
-        return ["parallel: no via on any unpoured power net, so there is no group to rate"]
+        return ["parallel: no via on any unpoured path link that carries a declared current, so there is no group to rate"]
     if not short:
-        return [f"parallel: {len(rows)} via group(s) on unpoured power nets, every one rated for its declared current"]
+        return [f"parallel: {len(rows)} via group(s) on unpoured path links, every one rated for its link's declared current"]
     nets = ", ".join(sorted({r.net for r in short}))
     return [r.line() for r in short] + [
-        f"parallel: {len(short)} of {len(rows)} via group(s) under their rail's declared current ({nets}); "
+        f"parallel: {len(short)} of {len(rows)} via group(s) under their link's declared current ({nets}); "
         f"{sum(r.add for r in short)} more via(s) would carry it"
     ]
 
@@ -2203,6 +2688,10 @@ Halving it twice from 0.02 moves the answer by 0.0012 pF (0.2 %) and multiplies 
 fourteen. 0.05 is the one that is wrong — cell-centre sampling of a 0.25 mm track at 0.05 mm biases
 3 % high. The raster runs only for a pair of grounds with **no** on-board tie and only when one of
 them has a filled zone, so it costs nothing at all on every board in this repo but that one.
+
+The sweep is what chose the cell, on the board of that day. The routed board on disk 2026-10-10
+(the owner's file, dated 2026-09-27) measures 14.794 mm2 and 0.3938 pF at this same 0.02 mm cell.
+The dielectric did not move (1.53 mm, Dk 4.6); the copper did.
 """
 
 EPS0_F_PER_M = 8.8541878128e-12
@@ -2319,10 +2808,10 @@ def _closest_copper(text: str, a: str, b: str, by_net: dict) -> tuple[float, str
 
     Every track, via and pad, because the question is how close the two domains get anywhere — not
     how close two pads get, which is `route_checks._closest_cross_ref`'s question about where a part
-    could go. Measured on the DS2 Addon 2026-09-21: **0.2250 mm**, between the GND track on F.Cu from
-    (22.7,13.8) to (24,13.8) and the VSS via at (23.2,13.2) — neither of them a pad, which is why
-    the placement's own answer (0.3070 mm, `U1.4` to `U1.5`) is a different number about a different
-    thing.
+    could go. Measured on the DS2 Addon's routed board 2026-10-10: **0.239476 mm**, between the GND
+    via at (23.73,5.589) and the VSS track on B.Cu from (22.652,5.38) to (24.176,6.904) — neither
+    of them a pad. The 2026-09-21 pair (a GND track on F.Cu and a VSS via, 0.2250 mm) is not in the
+    board on disk.
     """
 
     def pieces(net: str) -> list[tuple[frozenset[str], Shape, str]]:
@@ -2383,7 +2872,7 @@ def _inside_spans(xs: Sequence[float], x: float) -> bool:
 def _facing_area(shapes: Sequence[Shape], zone: Zone, cell: float) -> float:
     """mm2 of `shapes`' union that lies over `zone`'s fill, rastered at `cell` — see `COUPLING_CELL_MM`.
 
-    Scanline, not point-in-polygon per cell: the DS2 Addon's GND pour is one 1392-vertex island and
+    Scanline, not point-in-polygon per cell: the DS2 Addon's GND pour is one 1665-vertex island and
     asking it about 150 000 cells one at a time is the whole cost. The crossings are computed once
     per row and the cell's answer is a binary search in them, which is what makes 0.02 mm affordable.
     """
@@ -2420,11 +2909,11 @@ def _coupling(text: str, cs: ConstraintSet, a: str, b: str, by_net: dict, zs: Se
     is an underestimate of the coupling, which is the right direction for a number whose job is to
     say "these two are not isolated, they are a capacitor".
 
-    Measured on the DS2 Addon 2026-09-21: **20.052 mm2 of VSS copper on F.Cu faces the 1012.099 mm2
-    GND pour on B.Cu across 1.53 mm of FR4 at Dk 4.6 — 0.5338 pF**, and no DC path at all.
-    `docs/stitch-plan.md` §6 row 6 recorded 21.600 mm2 and 0.575 pF from the panel; the area does not
-    reproduce (the 64.5 % it quotes is of *all* VSS copper, both layers, while only F.Cu faces the
-    pour) and these are the numbers this session measured.
+    Measured on the DS2 Addon's routed board 2026-10-10: **14.794 mm2 of VSS copper on F.Cu faces
+    the GND pour on B.Cu across 1.53 mm of FR4 at Dk 4.6 — 0.3938 pF**, and no DC path at all.
+    `docs/stitch-plan.md` §6 row 6 recorded 21.600 mm2 and 0.575 pF from the panel; neither
+    reproduces on this board. The 2026-09-21 board the cell was calibrated on measured 20.052 mm2
+    and 0.5338 pF (`COUPLING_CELL_MM`).
     """
     total = 0.0
     farads = 0.0
@@ -2470,9 +2959,10 @@ def bridge_ties(text: str, design, cs: ConstraintSet, *, coupling: bool = True) 
        (`_coupling`). A split with no DC tie is not an isolated domain; it is a capacitor with no
        defined DC potential across it, and that number is what says so.
 
-    Measured on the DS2 Addon 2026-09-21, which is the board the statement exists for: `GND`/`VSS`,
-    verdict **none**, closest approach **0.2250 mm**, **20.052 mm2** of VSS copper facing the GND
-    pour at **0.5338 pF**. Silent on all four example boards — each declares one `Ground()`.
+    Measured on the DS2 Addon's routed board 2026-10-10, which is the board the statement exists for:
+    `GND`/`VSS`, verdict **none**, closest approach **0.239476 mm**, **14.794 mm2** of VSS copper
+    facing the GND pour at **0.3938 pF**. Silent on all four example boards — each declares one
+    `Ground()`.
 
     **`netcheck.py` has a zero diff and that is the point of the slice.** `copper_nets` reads pad
     bindings inside footprint blocks and never a `(segment)` or a `(via)`, so a tie made of a part
@@ -2513,17 +3003,14 @@ def bridge_ties(text: str, design, cs: ConstraintSet, *, coupling: bool = True) 
             else:
                 facing, coupled = 0.0, 0.0
             why = f"nothing on this board joins {a} to {b}: no two-pin part has one pad on each"
-            move = (
-                f'A split with no DC tie is a capacitor with no defined potential across it. Resistor("R11", "0R", p1={a}, p2={b}) '
-                f'then Bridge("{a}", "{b}", at="R11"); or Bridge("{a}", "{b}", at=(...), kind="off_board", why="...") if the tie is made elsewhere.'
-            )
+            move = "A split with no DC tie is a capacitor with no defined potential across it, and no Bridge() declares a tie off this board."
             out.append(BridgeTie(a, b, "", (), kind, "none", (), closest, facing, coupled, why, move))
             continue
         if others:
             out.append(BridgeTie(
                 a, b, tie, spec.pads if spec is not None else (), kind, "multi", others, closest, 0.0, 0.0,
                 f"{', '.join(joined)} all join {a} to {b}, so the tie is {len(joined)} points and not one",
-                "Drop all but one, or drop the Bridge() line: a single-point tie that is not single is a ground loop with a part number.",
+                "A single-point tie that is not single is a ground loop.",
             ))
             continue
         pads = spec.pads if spec is not None and spec.pads else _tie_pads(design, tie, a, b)
@@ -2657,3 +3144,309 @@ def pair_coupling(text: str, cs: ConstraintSet) -> tuple[PairCoupling, ...]:
         lb, cb = _coupled_mm(sb, sa, thr)
         out.append(PairCoupling(a, b, la, lb, ca, cb, thr, c.pair.uncoupled_mm.value, c.pair.skew_mm.value))
     return tuple(out)
+
+
+SWITCH_AREA_CELL_MM = 0.02
+"""The raster pitch `switch_copper` measures a switch node's copper on: cell centres inside the union of
+its tracks and vias on a layer. At 0.02 mm the error is under a cell's width along the outline (about
+0.02 mm x the perimeter), well under the 0.1 mm2 the line prints."""
+
+
+def switch_copper(text: str, cs: ConstraintSet | None) -> list[dict]:
+    """The copper area of every `switch_node` net on the emitted board (decision 2, owner 2026-10-01: a
+    switch node may change layer through a via group, and its copper area stays measured and reported).
+
+    Per copper layer, the area of the union of the net's tracks, arcs and via lands on that layer (pads
+    excluded: they are the parts'), measured on a `SWITCH_AREA_CELL_MM` raster; plus the via count and
+    the routed track length. One row per switch-node net with copper; facts only."""
+    from .gen import decompile
+
+    if cs is None:
+        return []
+    nets = sorted(c.net for c in cs.constraints if c.kind == "switch_node")
+    if not nets:
+        return []
+    board = decompile(text)
+    rows: list[dict] = []
+    for net in nets:
+        cop = [x for x in board.copper if x.net == net and x.kind in ("seg", "arc", "via")]
+        if not cop:
+            continue
+        by_layer: dict[str, list[Shape]] = {}
+        length = 0.0
+        nvia = 0
+        for x in cop:
+            if x.kind == "via":
+                nvia += 1
+                for lay in tuple(x.layers or ("F.Cu", "B.Cu")):
+                    by_layer.setdefault(lay, []).append(via_shape(x.at, float(x.size or 0.0)))
+            elif x.kind == "arc":
+                w = float(x.width or 0.0)
+                by_layer.setdefault(x.layer, []).extend([track_shape(x.a, x.mid, w), track_shape(x.mid, x.b, w)])
+                length += math.dist(x.a, x.mid) + math.dist(x.mid, x.b)
+            else:
+                by_layer.setdefault(x.layer, []).append(track_shape(x.a, x.b, float(x.width or 0.0)))
+                length += math.dist(x.a, x.b)
+        areas: dict[str, float] = {}
+        cell = SWITCH_AREA_CELL_MM
+        for lay, shapes in sorted(by_layer.items()):
+            boxes = [aabb(sh) for sh in shapes]
+            x0, y0 = min(b[0] for b in boxes), min(b[1] for b in boxes)
+            x1, y1 = max(b[2] for b in boxes), max(b[3] for b in boxes)
+            nx, ny = int(math.ceil((x1 - x0) / cell)), int(math.ceil((y1 - y0) / cell))
+            hit = 0
+            for iy in range(ny):
+                y = y0 + (iy + 0.5) * cell
+                live = [(sh, b) for sh, b in zip(shapes, boxes) if b[1] <= y <= b[3]]
+                for ix in range(nx):
+                    x = x0 + (ix + 0.5) * cell
+                    if any(b[0] <= x <= b[2] and _inside(sh, (x, y)) for sh, b in live):
+                        hit += 1
+            areas[lay] = round(hit * cell * cell, 2)
+        rows.append({"net": net, "areas_mm2": areas, "total_mm2": round(sum(areas.values()), 2), "vias": nvia, "length_mm": round(length, 3)})
+    return rows
+
+
+def switch_copper_lines(rows: Sequence[dict]) -> list[str]:
+    """`SW: switch-node copper 7.4 mm2 (F.Cu 6.1 mm2, B.Cu 1.3 mm2), 3 vias, 9.812 mm of track; pads excluded`."""
+    out = []
+    for r in rows:
+        per = ", ".join(f"{lay} {a:.1f} mm2" for lay, a in r["areas_mm2"].items())
+        out.append(
+            f"{r['net']}: switch-node copper {r['total_mm2']:.1f} mm2 ({per}), {r['vias']} via{'s' if r['vias'] != 1 else ''}, "
+            f"{r['length_mm']:g} mm of track; pads excluded"
+        )
+    return out
+
+
+NECK_EXEMPT = ("guard", "route_group")
+"""Link copper the neck rule does not judge: a guard is not on the rail (`copper.PATTERN_NECK_OK`), and a via
+group's landing has its own rule (`copper.power_ampacity_failures`, the landing width)."""
+
+
+def _seg_dist(p: Pt, a: Pt, b: Pt) -> float:
+    from .route_geom import _pt_seg_d2
+
+    return math.sqrt(_pt_seg_d2(p[0], p[1], a[0], a[1], b[0], b[1]))
+
+
+def pad_necks(text: str, cs, roles) -> tuple[list[dict], list[dict]]:
+    """Decision 1 (owner, 2026-10-01): the pad neck, judged on the emitted board. Returns (necks, refused).
+
+    Every segment a path's link owns (`gate_roles`: pcbc's role groups and copper no group owns) that is
+    narrower than the link's width on its layer is a **neck** when all of these hold, and is refused with
+    the facts otherwise:
+
+    - one of its ends lies inside the copper of one of the link's station pads, on its layer;
+    - that pad's copper across the segment's direction is narrower than the link's width on that layer (a
+      neck exists only where the path meets a pad narrower than itself);
+    - it is no wider than that pad's copper across the segment's direction;
+    - its centreline runs at most `constraints.PAD_NECK_MAX_MM` past the pad's edge;
+    - its other end lies inside full-width copper of the same link on that layer, inside a via of the
+      link (the group's own sizing is `path_copper_failures`' check), or inside a pour of the net on that
+      layer.
+
+    A neck row: `{net, link, source, pad, layer, width_mm, across_mm, length_mm, into, at, key}`; a refused
+    row: `{net, link, source, layer, width_mm, need_mm, a, b, why, key}`. `key` is `copper_bar.bar_key`."""
+    from .ampacity import board_pad_geoms
+    from .constraints import PAD_NECK_MAX_MM
+    from .copper_bar import bar_key
+
+    if cs is None or not hasattr(cs, "link_by_key"):
+        return [], []
+    items = list(getattr(roles, "items", roles) or ())
+    cands = []
+    for i in items:
+        k = i.get("key") or [""]
+        if k[0] != "seg" or str(i.get("reason")) in NECK_EXEMPT:
+            continue
+        lk = cs.link_by_key(str(i.get("owner", "")))
+        if lk is None:
+            continue
+        need = float(lk.width_on(k[1]))
+        if float(i["w"]) + 1e-6 >= need:
+            continue
+        cands.append((i, lk, need))
+    if not cands:
+        return [], []
+    pads = {p.id: p for p in board_pad_geoms(text)}
+    zs = zones(text)
+    necks: list[dict] = []
+    refused: list[dict] = []
+    for i, lk, need in cands:
+        k = i["key"]
+        layer, a, b, w = k[1], tuple(k[2]), tuple(k[3]), float(i["w"])
+        net = str(i["net"])
+        key = bar_key("seg", layer, a, b, w)
+        stations = tuple(lk.a) + (() if lk.join else tuple(lk.b))
+        head = {"net": net, "link": lk.key, "source": lk.source, "layer": layer, "width_mm": round(w, 4), "key": key}
+
+        def refuse(why: str) -> None:
+            refused.append({**head, "need_mm": round(need, 4), "a": [round(a[0], 4), round(a[1], 4)], "b": [round(b[0], 4), round(b[1], 4)], "why": why})
+
+        found = None
+        for pid in stations:
+            p = pads.get(pid)
+            if p is None or layer not in p.cu_layers:
+                continue
+            for near, far in ((a, b), (b, a)):
+                if any(_inside(sh, near) for sh in p.copper):
+                    found = (pid, p, near, far)
+                    break
+            if found:
+                break
+        if found is None:
+            refuse(f"neither end lies in a station pad of the link ({', '.join(stations)}) on {layer}")
+            continue
+        pid, p, near, far = found
+        L = math.dist(near, far)
+        if L <= 0.0:
+            continue
+        ux, uy = (far[0] - near[0]) / L, (far[1] - near[1]) / L
+        nx, ny = -uy, ux
+        proj = [(q[0] * nx + q[1] * ny) for sh in p.copper for q in sh.pts]
+        rmax = max((sh.r for sh in p.copper), default=0.0)
+        across = round(max(proj) - min(proj) + 2.0 * rmax, 4)
+        if across >= need - 1e-6:
+            # Decision 1 allows a neck only where the path meets a pad narrower than its width.
+            refuse(f"{pid} is {across:g} mm across the segment, not narrower than the link's {need:g} mm on {layer}")
+            continue
+        if w > across + 1e-6:
+            refuse(f"{w:g} mm is wider than {pid}'s {across:g} mm of copper across the segment")
+            continue
+        inside = lambda t: any(_inside(sh, (near[0] + ux * L * t, near[1] + uy * L * t)) for sh in p.copper)
+        if inside(1.0):
+            out_len = 0.0
+        else:
+            lo, hi = 0.0, 1.0
+            for _ in range(40):
+                mid = (lo + hi) / 2.0
+                lo, hi = (mid, hi) if inside(mid) else (lo, mid)
+            out_len = round(L * (1.0 - lo), 4)
+        if out_len > PAD_NECK_MAX_MM + 1e-4:
+            refuse(f"it runs {out_len:g} mm past {pid}'s edge, over the {PAD_NECK_MAX_MM:g} mm a pad neck may (constraints.PAD_NECK_MAX_MM)")
+            continue
+        into = ""
+        for j in items:
+            kj = j.get("key") or [""]
+            if j is i or str(j.get("owner", "")) != lk.key:
+                continue
+            if kj[0] == "seg" and kj[1] == layer and float(j["w"]) + 1e-6 >= need and _seg_dist(far, tuple(kj[2]), tuple(kj[3])) <= float(j["w"]) / 2.0 + 1e-6:
+                into = "full-width copper"
+                break
+            if kj[0] == "via" and math.dist(far, tuple(kj[1])) <= float(j["w"]) / 2.0 + 1e-6:
+                into = "a via group" if str(j.get("reason")) == "route_group" or lk.group is not None else "a via"
+                break
+        if not into and any(z.net == net and z.layer == layer and in_zone(z, far) for z in zs):
+            into = f"the {net} pour"
+        if not into:
+            refuse(
+                f"its far end ({far[0]:g},{far[1]:g}) lies in no {need:g} mm copper of the link, no via of it and no {net} pour on {layer}"
+            )
+            continue
+        necks.append({**head, "pad": pid, "across_mm": across, "length_mm": out_len, "into": into, "at": [round(near[0], 4), round(near[1], 4)]})
+    return necks, refused
+
+
+def neck_lines(necks: Sequence[dict]) -> list[str]:
+    """`PWR: neck at R1.1 on F.Cu: 0.64 mm wide (R1.1 is 0.64 mm across) for 0.4 mm past its edge, into full-width
+    copper; Path line 12's link R1.1~R2.1 is 2.276 mm (limit 1 mm)` — every neck, for the report."""
+    from .constraints import PAD_NECK_MAX_MM
+
+    return [
+        f"{n['net']}: neck at {n['pad']} on {n['layer']}: {n['width_mm']:g} mm wide ({n['pad']} is {n['across_mm']:g} mm across) "
+        f"for {n['length_mm']:g} mm past its edge, into {n['into']}; {n['source']}'s link {n['link']} (limit {PAD_NECK_MAX_MM:g} mm)"
+        for n in sorted(necks, key=lambda n: (n["net"], n["link"], n["pad"], n["at"]))
+    ]
+
+
+def neck_refusal_lines(refused: Sequence[dict]) -> list[str]:
+    """Each narrow piece of a link that is not a pad neck, as a fact."""
+    return [
+        f"{r['net']} {r['source']}'s link {r['link']}: copper {r['width_mm']:g} mm on {r['layer']} from ({r['a'][0]:g},{r['a'][1]:g}) "
+        f"to ({r['b'][0]:g},{r['b'][1]:g}) < the {r['need_mm']:g} mm the link needs on {r['layer']}, and it is not a pad neck: {r['why']}"
+        for r in sorted(refused, key=lambda r: (r["net"], r["link"], r["a"], r["b"]))
+    ]
+
+
+# --- a path's length budget, measured on the emitted board (docs/physics-subjects.md PR 5) -----------------
+
+
+def path_lengths(text: str, cs: ConstraintSet | None) -> list[dict]:
+    """Every Path with a length budget (`Path(length_mm=)` or its kind's), and the copper its links own on the
+    emitted board: the routed length between its stations, which the placement's airwire only bounds from below.
+    The owners are the board's `pcbc:` role groups (a segment's chord, an arc's chord too: a lower bound)."""
+    if cs is None:
+        return []
+    from .layout_job import roles_doc
+
+    try:
+        roles = roles_doc(text)
+    except ValueError:
+        return []
+    mm: dict[str, float] = {}
+    for i in roles.items:
+        if i["key"][0] == "seg":
+            a, b = i["key"][2], i["key"][3]
+            mm[str(i.get("owner", ""))] = mm.get(str(i.get("owner", "")), 0.0) + math.dist(a, b)
+    out: list[dict] = []
+    for c in cs.constraints:
+        for p in c.paths:
+            if p.length_mm is None:
+                continue
+            keys = [lk.key for lk in p.links if not lk.join]
+            if not any(k in mm for k in keys):
+                continue  # nothing of it is on the board (an unfinished net ships none): the router's error says so
+            routed = round(sum(mm.get(k, 0.0) for k in keys), 3)
+            out.append({"net": c.net, "line": p.line, "written": tuple(p.written), "routed_mm": routed, "budget_mm": p.length_mm, "kind": p.kind,
+                        "src": p.length_src})
+    return out
+
+
+def path_length_lines(rows: Sequence[dict]) -> list[str]:
+    """The paths whose routed copper is longer than their length budget, each as a fact."""
+    return [
+        f"{r['net']} path {' -> '.join(r['written'])} (Path line {r['line']}): {r['routed_mm']:g} mm of routed copper between its stations, "
+        f"over its length_mm={r['budget_mm']:g}"
+        + (f" ({r['src']})" if r.get("src") and not r["src"].startswith("Path line") else (f" (kind {r['kind']}'s default)" if r["kind"] and not r.get("src") else ""))
+        for r in rows
+        if r["routed_mm"] > r["budget_mm"] + 1e-3
+    ]
+
+
+def pour_joints(text: str, cs: ConstraintSet | None) -> list[dict]:
+    """Every station joint of a Path on a pour (`docs/physics-subjects.md` PR 8) and the tap vias its pads have on the
+    emitted board: the board's `pcbc:tap:<pad>` role groups, counted per pad (a pad's joint is its own vias). A
+    through-hole station's joint is its barrel, judged at compile (E23) and not here."""
+    if cs is None:
+        return []
+    joints = [(c.net, p, j) for c in cs.constraints for p in c.paths for j in p.joints if j.barrel_mm is None]
+    if not joints:
+        return []
+    from .layout_job import roles_doc
+
+    try:
+        roles = roles_doc(text)
+    except ValueError:
+        return []
+    vias: dict[str, set] = {}
+    for i in roles.items:
+        if i["reason"] == "tap" and i["key"][0] == "via":
+            vias.setdefault(str(i["owner"]), set()).add(tuple(i["key"][1]))
+    from .paths import joint_pad_amps, joint_refusal
+
+    out: list[dict] = []
+    for net, p, j in joints:
+        got = min((len(vias.get(pad, ())) for pad in j.pads), default=0)
+        # Round 3 (refute-current f1c): the worst pad's share, not an even split, when Paths named overlapping pads.
+        ok = got * j.one_amps + 1e-9 >= joint_pad_amps(j)
+        out.append(
+            {"net": net, "line": p.line, "station": j.station, "amps": j.amps, "needed": j.vias, "vias": got, "carries": round(got * j.one_amps, 3),
+             "error": "" if ok else joint_refusal(net, p.line, p.pour or "", j, got, j.one_amps)}
+        )
+    return out
+
+
+def pour_joint_lines(rows: Sequence[dict]) -> list[str]:
+    """E23: the joints whose vias carry less than the station's draw (per pad), each as a fact."""
+    return [r["error"] for r in rows if r["error"]]

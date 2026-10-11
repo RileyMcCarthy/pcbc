@@ -19,12 +19,12 @@ from pathlib import Path
 
 import pytest
 
-from conftest import routed_result
+from conftest import put_core, routed_result, vehicle_examples, write_split
 from pcbc.build import build_job, non_layout_diff
 from pcbc.gen import decompile
 
 ROOT = Path(__file__).resolve().parent.parent
-EXAMPLES = ROOT / "examples"
+EXAMPLES = vehicle_examples()  # buck is the pre-migration board here: conftest.vehicle_examples
 
 
 def _copy(name: str, tmp: Path) -> Path:
@@ -58,10 +58,20 @@ def test_an_unrouted_net_has_no_generated_copper_in_layout_gen():
     # One move per missing link, not per pair of components (the refuters counted 3 moves for 2 links on node).
     route = _route(result)
     missing = sum(t - d for d, t in route["links"].values())
-    assert sum(1 for m in result["moves"] if "cannot reach" in m) == missing, (missing, result["moves"])
+    # A path link's failure says "did not route at" (docs/physics-subjects.md PR 3: VBUS is a Path).
+    assert sum(1 for m in result["moves"] if "cannot reach" in m or " did not route at " in m) == missing, (missing, result["moves"])
 
 
 # --- D2 ----------------------------------------------------------------------------------------------
+
+
+def _copy_example(name: str, tmp_path: Path) -> Path:
+    """The example board itself (not the pipeline vehicle), copied whole."""
+    import shutil as _sh
+
+    work = tmp_path / f"ex_{name}"
+    _sh.copytree(ROOT / "examples" / name, work, ignore=_sh.ignore_patterns("layout"))
+    return work / f"{name}.py"
 
 
 def _scene_and_cost(board: Path, net: str):
@@ -76,40 +86,35 @@ def _scene_and_cost(board: Path, net: str):
     return design, pl.job, scene, net_cost(pl.job.constraints, net)
 
 
-def test_the_via_move_names_the_netreq_line_the_net_is_on(tmp_path: Path):
-    """Refuted before: "allow vias with NetReq('SW', vias=True)" — SW already has its own NetReq at
-    board.py:56, so the move as printed is refused by `pcbc check` ("both name it"); and on a
-    one-layer preset a via alone cannot help. Now the move names the line, and offers layers= with
-    vias= when the net's layers leave one copper layer; the edit it describes passes `pcbc check`."""
-    from pcbc.route_native import _via_move
+def test_the_via_move_names_where_the_links_no_vias_comes_from(tmp_path: Path):
+    """Refuted before: "allow vias with NetReq('SW', vias=True)" named an edit `pcbc check` refused.
+    Since docs/direction.md §7b no edit is offered: the error states where the link's "no vias" comes
+    from. A net writes no vias= since docs/physics-subjects.md PR 5, so it is the link's: its path kind's
+    default (buck's feedback tap) or its Path's own line."""
+    from pcbc.route_cost import link_nc
+    from pcbc.route_native import _via_fact
 
-    board = _copy("buck", tmp_path)
-    design, job, scene, nc = _scene_and_cost(board, "SW")
-    line = next(i for i, ln in enumerate(board.read_text().splitlines(), 1) if ln.startswith('NetReq("SW"'))
-    move = _via_move(design, job, scene, "SW", nc)
-    assert f"its NetReq at board.py:{line}" in move and "layers=('F.Cu', 'B.Cu') and vias=True" in move, move
-    assert "NetReq('SW', vias=True)" not in move and "split" not in move, move
-    # The edit, applied as described, is a board `pcbc check` accepts.
-    lines = board.read_text().splitlines()
-    lines[line - 1] = lines[line - 1][:-1] + ', layers=("F.Cu", "B.Cu"), vias=True)'
-    board.write_text("\n".join(lines) + "\n")
-    assert build_job(board, upto="check", force=True).get("error") is None
+    design, job, scene, nc = _scene_and_cost(_copy_example("buck", tmp_path), "5V")
+    lk = job.constraints.link_by_key("C_OUT1.1~R_FB_TOP.1")
+    assert _via_fact(design, job, lk, "5V", link_nc(nc, lk)) == "vias are not allowed on this link (preset feedback)"
+    assert _via_fact(design, job, None, "5V", nc) == "", "the net itself allows vias"
+    del scene
 
 
-def test_the_via_move_says_to_split_a_net_out_of_a_shared_netreq(tmp_path: Path):
-    """A net on a multi-net NetReq: add vias=True there *after* splitting it out (adding a second line
-    naming the net is refused by `pcbc check`)."""
-    from pcbc.route_native import _via_move
+def test_the_via_move_names_the_path_line_that_writes_vias_false(tmp_path: Path):
+    """A Path that writes vias=False: the error names that line, and nothing about changing it (docs/direction.md §7b)."""
+    from pcbc.route_cost import link_nc
+    from pcbc.route_native import _via_fact
 
-    board = _copy("buck", tmp_path)
+    board = _copy_example("buck", tmp_path)
     text = board.read_text()
-    old = 'NetReq("VIN", "5V", "GND", kind="power", volts=12, amps=2)'
+    old = 'Path("VIN", "J_IN.1", "C_IN2.1", "C_IN1.1", "U1.VIN", amps=1.36)'
     assert old in text
-    board.write_text(text.replace(old, old[:-1] + ", vias=False)"))
+    write_split(board, text.replace(old, old[:-1] + ", vias=False)"))
     design, job, scene, nc = _scene_and_cost(board, "VIN")
-    line = next(i for i, ln in enumerate(board.read_text().splitlines(), 1) if ln.startswith('NetReq("VIN"'))
-    move = _via_move(design, job, scene, "VIN", nc)
-    assert move == f"or let VIN change layers: add vias=True to its NetReq at board.py:{line} (that line also names 5V, GND: split VIN out into a NetReq of its own first)", move
+    lk = job.constraints.link_by_key("J_IN.1~C_IN2.1")
+    del scene
+    assert _via_fact(design, job, lk, "VIN", link_nc(nc, lk)) == "vias are not allowed on this link (Path line 53)"
 
 
 # --- D3 ----------------------------------------------------------------------------------------------
@@ -119,20 +124,22 @@ def test_the_via_move_says_to_split_a_net_out_of_a_shared_netreq(tmp_path: Path)
 def test_a_no_via_power_netreq_ends_in_moves_not_an_internal_error(tmp_path: Path):
     """Refuted before: `vias=False` on buck's power NetReq ended in "internal router error ...
     pattern copper failed its own self-check: tap GND: a via on a net whose NetReq forbids vias".
-    Now the tap is not written, its refusal names the NetReq line, and the build stops on moves."""
+    Since docs/physics-subjects.md PR 5 `vias=` is a Path field (the copper between two pads), so the
+    line is refused at check with the facts (E4), and nothing reaches the router."""
     board = _copy("buck", tmp_path)
-    old = 'NetReq("VIN", "5V", "GND", kind="power", volts=12, amps=2)'
-    board.write_text(board.read_text().replace(old, old[:-1] + ", vias=False)"))
+    # The vehicle's three power NetReqs share line 55 (docs/physics-subjects.md O2 b); each writes vias=False here.
+    text = board.read_text()
+    for old in ('NetReq("VIN", kind="power", volts=12)', 'NetReq("5V", kind="power", volts=5)', 'NetReq("GND", kind="power")'):
+        assert old in text, old
+        text = text.replace(old, old[:-1] + ", vias=False)")
+    write_split(board, text)
     line = next(i for i, ln in enumerate(board.read_text().splitlines(), 1) if ln.startswith('NetReq("VIN"'))
     result = build_job(board, upto="route", force=True)
     err = str(result.get("error") or "")
     assert "internal" not in err and "pcbc bug" not in err, err
-    route = _route(result)
-    taps = [m for m in route["pattern_moves"] if m.startswith("tap GND: not written")]
-    assert taps and all(f"its NetReq at board.py:{line} forbids vias" in m for m in taps), route["pattern_moves"]
-    gen = (board.parent / "layout" / "buck" / "routed" / "layout.gen.py").read_text()
-    assert not re.search(r'^Via\("(VIN|5V|GND)"', gen, flags=re.M)
-    assert err.startswith("unrouted: ") or result.get("error") is None, err
+    assert err.startswith(f'NetReq("VIN") line {line}: vias= is about the copper between two pads (a via is a piece of that copper)'), err
+    assert err.endswith("vias= is a Path field"), err
+    assert not any(s["stage"] == "route" for s in result["steps"]), "nothing reaches the router"
 
 
 # --- D4 ----------------------------------------------------------------------------------------------
@@ -149,7 +156,7 @@ def test_a_hand_stub_from_a_pad_is_continued_by_the_router(tmp_path: Path):
     refused it as "joins nothing". Its free end is now a terminal: the build finishes and other 5V
     copper starts at the stub's end."""
     board = _copy("buck", tmp_path)
-    (board.parent / "layout.core.py").write_text('Seg("5V", (37.55, 13.025), (37.55, 11.0), width=0.781)\n')
+    put_core(board.parent / "layout.core.py", 'Seg("5V", (37.55, 13.025), (37.55, 11.0), width=0.781)\n')
     result = build_job(board, upto="fab", force=True)
     assert result.get("error") is None, result.get("error")
     got = decompile((board.parent / "layout" / "buck" / "routed" / "layout.kicad_pcb").read_text())
@@ -175,10 +182,19 @@ def test_a_gen_line_locked_verbatim_survives_a_placement_edit(tmp_path: Path):
     lock = next(c for c in got0.copper if c.net == "5V" and c.kind == "seg" and (on_pad(c.a) or on_pad(c.b)))
     line = next(ln for ln in gen if ln.startswith('Seg("5V"') and f'uuid="{lock.uuid}"' in ln)
     board = _copy("buck", tmp_path)
-    (board.parent / "layout.core.py").write_text(line + "\n")
+    put_core(board.parent / "layout.core.py", line + "\n")
     text = board.read_text()
-    assert "left=15, top=8, locked=True" in text
-    board.write_text(text.replace("left=15, top=8, locked=True", "left=15, top=10, locked=True"))
+    core = board.parent / "layout.core.py"
+    assert "left=15, top=8, locked=True" in core.read_text()
+    # SW held to F.Cu with no vias, as the switch_node preset held it when this was measured: decision 2
+    # (2026-10-01) lets a switch node change layer, and on this edited board SW then walls in EN, which is not the
+    # lock behaviour this test is about.
+    # docs/physics-subjects.md PR 5: a net writes no layers=/vias=; the switch path (the vehicle declares none) holds them,
+    # naming every pad of SW so it is the whole node, as the NetReq's net-wide fields were.
+    assert 'NetReq("SW", kind="switch_node", max_mm=6)' in text
+    text = text.replace('NetReq("SW", kind="switch_node", max_mm=6)', 'NetReq("SW", kind="switch_node", max_mm=6)\nPath("SW", "C_BOOT.2", "U1.SW", "L1.1", layers=["F.Cu"], vias=False)')
+    board.write_text(text)
+    core.write_text(core.read_text().replace("left=15, top=8, locked=True", "left=15, top=10, locked=True"))  # U1's Place is core's
     result = build_job(board, upto="fab", force=True)
     assert result.get("error") is None, result.get("error")
     route = _route(result)
@@ -204,7 +220,7 @@ def test_replay_routes_with_the_core_file_the_build_had(tmp_path: Path):
         f'Pour(None, layers=("F.Cu", "B.Cu"), name="ko{k}", keepout={ko}, points=[({x0}, {y0}), ({x1}, {y0}), ({x1}, {y1}), ({x0}, {y1})], id="ko{k}")'
         for k, (x0, y0, x1, y1) in enumerate(rects, 1)
     )
-    (board.parent / "layout.core.py").write_text(core + "\n")
+    put_core(board.parent / "layout.core.py", core + "\n")
     result = build_job(board, upto="route", force=True)
     assert str(result.get("error") or "").startswith("unrouted: "), result.get("error")
     files = sorted((board.parent / "layout" / "buck" / "routed" / "unrouted").glob("*.json"))
@@ -276,6 +292,6 @@ def test_board_net_order_is_refused(tmp_path: Path):
     text = board.read_text()
     m = re.search(r"^Board\((.*)\)\s*$", text, flags=re.M)
     assert m
-    board.write_text(text.replace(m.group(0), f"Board({m.group(1)}, net_order=['GND'])"))
+    write_split(board, text.replace(m.group(0), f"Board({m.group(1)}, net_order=['GND'])"))
     with pytest.raises(ValueError, match="net_order was the old router's flag"):
         load_board(board)

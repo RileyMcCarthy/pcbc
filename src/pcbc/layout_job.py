@@ -33,6 +33,8 @@ board and only that earns the word.
 
 from __future__ import annotations
 
+import re
+
 from dataclasses import replace
 from pathlib import Path
 
@@ -176,9 +178,9 @@ def board_uuids(text: str) -> dict[str, str]:
         head = str(n[0])
         if head == "footprint":
             ref = next((str(x[2]) for x in n[1:] if isinstance(x, list) and len(x) > 2 and x[0] == "property" and x[1] == Q("Reference")), "?")
-            owner = f"footprint {ref} (placed from board.py)"
+            owner = f"footprint {ref} (a fiducial the build places)" if re.fullmatch(r"FID\d+", ref) else f"footprint {ref} (placed from layout.core.py)"
         elif head == "gr_rect" and any(isinstance(x, list) and x[:1] == ["layer"] and len(x) > 1 and str(x[1]) == "Edge.Cuts" for x in n):
-            owner = "the board outline (Board() in board.py)"
+            owner = "the board outline (Outline() in layout.core.py, or derived)"
         else:
             owner = f"the board's ({head})"
         walk(n, owner)
@@ -256,7 +258,7 @@ def validate_core(design: Design, copper: list[Copper], graphics: list[Graphic],
             # A layer the board has, but not the kind this field takes: the reason is pcbc's rule, not
             # KiCad's (sixth review: a KiCad-saved zone on F.SilkS was refused as "an undefined layer",
             # which KiCad had just saved).
-            raise ValueError(f"{here(o)}: {what} names {la!r}, which is a layer of this board but not {kind}; in layout.core.py {what} is copper by design (docs/direction.md §2) — a zone or rule area on a non-copper layer is not a core primitive: leave the line out")
+            raise ValueError(f"{here(o)}: {what} names {la!r}, which is a layer of this board but not {kind}; in layout.core.py {what} is copper by design (docs/direction.md §2) — a zone or rule area on a non-copper layer is not a core primitive")
         if la not in pool:
             shown = ", ".join(pool) if len(pool) <= 12 else ", ".join(list(pool)[:30]) + ", User.1 .. User.45"
             raise ValueError(f"{here(o)}: {what} names {la!r}, which is not {kind} of this board ({shown}); KiCad refuses a board with an item on an undefined layer")
@@ -279,7 +281,7 @@ def validate_core(design: Design, copper: list[Copper], graphics: list[Graphic],
                     need(c, la, "padstack", cu, "a copper layer")
                 missing = sorted(set(want) - set(have))
                 if missing:
-                    raise ValueError(f"{here(c)}: a custom padstack gives a size for every copper layer below F.Cu, and KiCad's save fills in {', '.join(missing)} when it is left out; write them")
+                    raise ValueError(f"{here(c)}: a custom padstack gives a size for every copper layer below F.Cu, and KiCad's save fills in {', '.join(missing)} when it is left out; the line gives none for {', '.join(missing)}")
         if c.kind == "pour":
             if c.layers and any(la in ("*.Cu", "F&B.Cu") for la in c.layers):
                 _expand_layers(c, cu)
@@ -294,7 +296,7 @@ def validate_core(design: Design, copper: list[Copper], graphics: list[Graphic],
             lays = {by_id[m].layer for m in g.f.get("members", ()) if m in by_id and by_id[m].kind in ("seg", "arc")}
             if len(lays) == 1 and g.f.get("layer") not in lays:
                 (la,) = lays
-                raise ValueError(f"{here(g)}: a tuning pattern is on its members' layer, and KiCad's save moves this one from {g.f.get('layer')!r} to {la!r}: write layer={la!r}")
+                raise ValueError(f"{here(g)}: a tuning pattern is on its members' layer, and KiCad's save moves this one from {g.f.get('layer')!r} to {la!r}, its members' layer")
     # uuids: one object each, and never one the placed board already carries
     owner: dict[str, str] = {}
     for o in [*copper, *graphics]:
@@ -304,20 +306,30 @@ def validate_core(design: Design, copper: list[Copper], graphics: list[Graphic],
         for u in got:
             who = f"{here(o)} ({o.kind} {o.id!r})"
             if u in foreign:
-                raise ValueError(f"{who}: uuid {u} is {foreign[u]}'s; a uuid names one object and the build owns that one — drop uuid= from this line (one is derived from its id)")
+                raise ValueError(f"{who}: uuid {u} is {foreign[u]}'s; a uuid names one object and the build owns that one")
             if u in owner and owner[u] != who:
-                raise ValueError(f"{who}: uuid {u} is already {owner[u]}'s (derived from an id, or written); give one of them another uuid or id")
+                raise ValueError(f"{who}: uuid {u} is already {owner[u]}'s (derived from an id, or written), and a uuid names one object")
             owner[u] = who
 
 
+def _kind_word(kind: str) -> str:
+    """`Rect` for `gr_rect`: the constructor an author wrote."""
+    from .language import _LAYOUT_NAMES
+
+    bare = kind.removeprefix("gr_")
+    return next((n for n in _LAYOUT_NAMES if n.lower() == bare.replace("_", "")), kind)
+
+
 def load_core(design: Design, board: Path, placed_text=None, *, name: str | None = None) -> tuple[list[Copper], list[Graphic]]:
-    """Load `layout.core.py` into `design` and return its copper and drawings. Raises `ValueError`
-    naming `layout.core.py:<line>` on anything the file may not say."""
-    path = core_path(board)
-    before_cu, before_gr = len(design.copper), len(design.graphics)
-    load_layout(path, design, source="core")
-    copper = [c for c in design.copper[before_cu:] if c.source == "core"]
-    graphics = [g for g in design.graphics[before_gr:] if g.source == "core"]
+    """Validate the copper and drawings `layout.core.py` put into `design` and return them. The file is
+    executed once, by `language.load_board` (docs/board-outline.md A.2), because its `Place` lines are the
+    placement; what is checked here needs the placement (the KiCad round trip, the hard minimums, the
+    clearances, the parts' uuids). Raises `ValueError` naming `layout.core.py:<line>` on anything the file
+    may not say."""
+    if getattr(design, "core_loaded", None) is False:
+        raise ValueError(f"{CORE_NAME}: the design was loaded without it (load_board(core=False)), and the copper stages need it")
+    copper = [c for c in design.copper if c.source == "core"]
+    graphics = [g for g in design.graphics if g.source == "core"]
     ids = {o.id for o in [*copper, *graphics]}
     # Core copper names a net of board.py, or no net at all (`net=None`: KiCad's own no-net — `(net "")`
     # on a track or via, no token on a zone — for a floating spreader, a coupon, a rule area;
@@ -326,20 +338,24 @@ def load_core(design: Design, board: Path, placed_text=None, *, name: str | None
     # board; both built "verified" until the second review. Refused at load, naming the line.
     nets = set(design.nets)
     cu_layers = _copper_layers(design)
-    w, h = design.board.size_mm if design.board is not None else (0.0, 0.0)
+    keepouts = {ko.name: ko for ko in design.keepouts}
     for c in copper:
         if c.kind == "pour" and c.layers and any(la in ("*.Cu", "F&B.Cu") for la in c.layers):
             _expand_layers(c, cu_layers)
         if c.net and c.net not in nets:
             raise ValueError(f"{c.where or CORE_NAME}: {c.kind} on {c.net!r}, which is not a net of board.py ({', '.join(sorted(nets)) or 'none'}); copper names a net board.py declares, or net=None for copper on no net")
+        # The rule area gen draws from a `Keepout()` (`place_native.place_objects`) has one home, the
+        # `Keepout()`: placement reads it, and gen draws the area from it (docs/board-outline.md A.5). A
+        # pasted copy of that area is refused by name.
+        if c.kind == "pour" and c.keepout and c.name in keepouts:
+            ko = keepouts[c.name]
+            raise ValueError(f"{c.where or CORE_NAME}: Pour(None, keepout=...) {c.name!r} is the rule area gen draws from Keepout({c.name!r}) at {CORE_NAME}:{ko.line}")
         # Copper lives on a copper layer of the stackup. A `Pour(None, layer="Edge.Cuts")` built
-        # "verified" and put a filled region into the outline Gerber (third review T1): the outline has
-        # one home, Board(width, height) in board.py.
+        # "verified" and put a filled region into the outline Gerber (third review T1).
         on = [la for la in ((c.layers or ()) if c.kind in ("via", "pour") and c.layers else ()) if la] or ([c.layer] if c.layer else [])
         off = [la for la in on if la not in cu_layers]
         if off:
-            hint = f" The outline is Board({w:g}, {h:g}) in board.py, and a drawing goes on a Line/Rect/... line, not a copper one." if "Edge.Cuts" in off else ""
-            raise ValueError(f"{c.where or CORE_NAME}: {c.kind} on {off[0]!r}, which is not a copper layer of this stackup ({', '.join(cu_layers)}); copper is written on a copper layer only.{hint}")
+            raise ValueError(f"{c.where or CORE_NAME}: {c.kind} on {off[0]!r}, which is not a copper layer of this stackup ({', '.join(cu_layers)}); copper is written on a copper layer only")
         # A field the emitter needs and the build cannot fill: a via on no net has no class to take
         # its size and drill from (third review T3: this escaped as a traceback from `render_one`).
         if c.kind == "via" and not c.net and (c.size is None or c.drill is None):
@@ -350,17 +366,17 @@ def load_core(design: Design, board: Path, placed_text=None, *, name: str | None
         if g.f.get("net") and g.f["net"] not in nets:
             raise ValueError(f"{g.where or CORE_NAME}: {g.kind} on net {g.f['net']!r}, which is not a net of board.py")
         if g.f.get("layer") == "Edge.Cuts" or "Edge.Cuts" in (g.f.get("layers") or ()):
-            # Default chosen for this round, reversible: the outline has one home, Board(width, height)
-            # in board.py, which the place stage reads; a core Edge.Cuts drawing would give it a second
-            # one the placer never sees (a cutout under a part).
-            raise ValueError(f"{g.where or CORE_NAME}: {g.kind} on Edge.Cuts; the outline is Board(width, height) in board.py and the place stage reads only that. Move the outline change there")
+            # The outline has one home: `Outline()` in layout.core.py, which the place stage reads, or the
+            # one the build derives when there is none (docs/board-outline.md A.3); a core Edge.Cuts drawing
+            # would give it a second one the placer never sees (a cutout under a part).
+            raise ValueError(f"{g.where or CORE_NAME}: {_kind_word(g.kind)} on Edge.Cuts; the outline is Outline() in {CORE_NAME}, or derived when there is none")
     for g in graphics:
         # A core group names core objects: a gen id is build output and changes when the board does.
         stray = [m for m in g.f.get("members", ()) if m not in ids]
         if stray:
             raise ValueError(f"{g.where or CORE_NAME}: {g.kind} {g.id!r} names {stray[0]!r}, which is not an object of {CORE_NAME}; a core group may only hold core objects")
         if g.kind == "group" and str(g.f.get("name", "")).startswith(ROLE_PREFIX):
-            raise ValueError(f"{g.where or CORE_NAME}: group names starting {ROLE_PREFIX!r} are the build's own (a piece's role); name this group something else")
+            raise ValueError(f"{g.where or CORE_NAME}: group names starting {ROLE_PREFIX!r} are the build's own (a piece's role), and a core line's group is the author's")
     validate_core(
         design,
         copper,
@@ -373,7 +389,7 @@ def load_core(design: Design, board: Path, placed_text=None, *, name: str | None
     return copper, graphics
 
 
-def _clearance_clashes(design: Design, feet, core: list[Copper]) -> list[str]:
+def _clearance_clashes(design: Design, feet, core: list[Copper], job=None) -> list[str]:
     """A core segment, arc or via closer to a pad, hole, copper or the edge of another net than the
     compiled rules allow, judged in the scene pcbc's own patterns are judged in (`route_scene`). An
     overlap is a short; a near miss is refused too, with the air it has and the air it needs — a
@@ -393,7 +409,12 @@ def _clearance_clashes(design: Design, feet, core: list[Copper]) -> list[str]:
             pieces.append((c, [via_piece(c.net or "", "core", c.at, c.size, c.drill, layers=tuple(c.layers or ("F.Cu", "B.Cu")))]))
     if not pieces:
         return []
-    job = compile_design(design)
+    # A fresh compile (no fiducial masks: this check is the core lines' against the parts and the board), in the outline
+    # the placement set: the declared one or, on a derived board, R (docs/board-outline.md B.3).
+    fresh = compile_design(design)
+    if job is not None:
+        fresh.outline, fresh.derived = job.outline, job.derived
+    job = fresh
     if job.constraints is None:
         return []
     scene = build_scene(design, job, job.constraints, feet)
@@ -511,9 +532,9 @@ def diff_objects(want: list, got: list, *, what: str) -> list[str]:
                     # differs, so `filter_ratio` is blamed and not the nine-entry dict around it.
                     for sub in sorted(set(have) | set(want), key=str):
                         if have.get(sub) != want.get(sub):
-                            fields.append(f"{name}.{sub} (written {_short(have.get(sub))}, {what} has {_short(want.get(sub))}: write that)")
+                            fields.append(f"{name}.{sub} (written {_short(have.get(sub))}, {what} has {_short(want.get(sub))})")
                     continue
-                fields.append(f"{name} (written {_short(have)}, {what} has {_short(want)}: write that)")
+                fields.append(f"{name} (written {_short(have)}, {what} has {_short(want)})")
             out.append(f"{g[k].where or w[k].where or k}: {what} differs in {', '.join(fields)}")
     return out
 
@@ -595,6 +616,75 @@ def route_in_passes(design: Design, job, pl, *, name: str, core_cu: list[Copper]
         locked = list(core_cu) if len(passes) == LOCK_PASSES else [c for c in core_cu if c.id in want]
 
 
+def refit(design: Design, job, pl, rt, core_raw, core_cu, produced, *, name: str):
+    """docs/board-outline.md B.3 steps 4-5, on a derived board after routing: O, then everything drawn from it — the
+    `Edge.Cuts` rect, the slots and the isolation rule areas (`place_objects`), the plane pours (`plane_pours`) and a
+    point-less core Pour (filled again from O inset 0.5). Returns (the produced objects with those redrawn, a record:
+    the core copper as filled from O, `outline` for the result and the stamp, `notes`). Sets `job.outline` = O."""
+    from . import outline as ol
+    from .constraints import respan_rule_areas
+    from .layout import resolve_regions
+    from .pcb_place import _board_of
+    from .place_native import place_objects
+    from .route_native import plane_pours
+
+    d = job.derived
+    R = job.outline
+    routed = [c for c in produced if c.kind in ("seg", "arc", "via")]
+    core_box = [c for c in core_cu if c.kind in ("seg", "arc", "via")]
+    regions = resolve_regions(_board_of(job), job.regions)
+    extra = [(f"Keepout {k.name}", k.box) for k in job.keepouts if k.box is not None and not k.name.startswith("FID")]
+    extra += [(f"Region {n}", (r.x0, r.y0, r.x1, r.y1)) for n, r in regions.items()]
+    extra += [(f"{c.where or 'core rule area'}", _points_box(c.points)) for c in core_cu if c.kind == "pour" and c.keepout is not None and c.points]
+    copper = ol.copper_boxes([*routed, *core_box])
+    O, sides = ol.fit(d, [f for f in _feet_of(job, pl) if not f.ref.startswith("FID")], copper=copper, extra=extra)
+    notes = ol.routing_box_notes(d, R, copper)
+    # B.5-7: an isolation slot needs its webs inside O
+    short = ol.slot_refusal(design, job, O)
+    if short:
+        raise ValueError(short)
+    job.outline = O
+    if job.constraints is not None:
+        job.constraints = respan_rule_areas(job.constraints, O)
+    graphics, place_cu = place_objects(job, name, outline=O)
+    pl.graphics = graphics
+    pours = plane_pours(design, job, name) if rt.pours else []
+    old_place = {c.uuid for c in pl.copper} | {c.uuid for c in rt.pours}
+    gen_rest = [c for c in produced if c.uuid not in old_place]
+    pl.copper = place_cu
+    produced = stamp(design, [*place_cu, *pours, *gen_rest])
+    core_cu = stamp(design, core_raw, outline=O) if core_raw else []
+    # F.6 again on O (B.3 step 4): at place time the reference-plane check saw R, and a plane is O inset by the edge.
+    from .route_checks import build_ctx, check_reference
+
+    ref_moves, _ref_notes = check_reference(build_ctx(design, job, pl.feet))
+    record = {
+        "source": "derived",
+        "rect": list(O),
+        "R": list(R),
+        "sides": sides,
+        "line": ol.line(d, O, sides),
+        "A": d.A,
+        "m": d.m,
+        "reference_after_fit": ref_moves,
+    }
+    return produced, {"core_cu": core_cu, "outline": record, "notes": notes}
+
+
+def _points_box(points) -> tuple:
+    from .layout_prims import flat_points
+
+    pts = flat_points(points)
+    xs, ys = [p[0] for p in pts], [p[1] for p in pts]
+    return (min(xs), min(ys), max(xs), max(ys))
+
+
+def _feet_of(job, pl) -> list:
+    from .pcb_place import posed_feet_of
+
+    return list(posed_feet_of(job, pl.feet).values())
+
+
 def layout_job(design: Design, *, out: Path, board: Path, name: str | None = None, placement=None) -> dict:
     """Place, route, write `layout.gen.py`, emit `out`. See the module doc. Never raises for a board
     fact: every refusal is `result["error"]`; an unrouted net is `result["unrouted"]` with its moves
@@ -615,8 +705,8 @@ def layout_job(design: Design, *, out: Path, board: Path, name: str | None = Non
     # 1. place, in memory; the place-only board checked in memory before any routing
     pl = placement if placement is not None else place(design, name=name, base=work)
     result["place"] = {"layout": pl.report, "notes": pl.notes, "poses": {p.ref: {"at": list(p.at), "rot": p.rot} for p in pl.poses}}
-    if pl.error:
-        return {**result, "error": pl.error}
+    if pl.error or pl.orient_error:
+        return {**result, "error": pl.error or pl.orient_error}
     job = pl.job
     placed_text = emitted_text(design, pl, name=name)
     fails = check_text(job, placed_text)
@@ -631,9 +721,17 @@ def layout_job(design: Design, *, out: Path, board: Path, name: str | None = Non
         return {**result, "error": f"a core line is refused: {exc}"}
     result["core_objects"] = len(core_raw) + len(core_gr)
     try:
-        core_cu = stamp(design, core_raw) if core_raw else []
+        # A point-less core Pour fills the outline: the declared one, or R while routing (docs/board-outline.md B.3).
+        core_cu = stamp(design, core_raw, outline=job.outline) if core_raw else []
     except ValueError as exc:
         return {**result, "error": f"a core line is refused: {exc}"}
+    if job.derived is not None:
+        # B.5-5: core copper beyond a fixed side is outside the board; beyond a free side the side grows to it.
+        from .outline import fixed_side_breach
+
+        breach = fixed_side_breach(job, core_cu)
+        if breach:
+            return {**result, "error": f"a core line is refused: {breach}"}
     for c in core_cu:
         lack = _unfillable(c)
         if lack:
@@ -659,7 +757,7 @@ def layout_job(design: Design, *, out: Path, board: Path, name: str | None = Non
     if core_cu or core_gr:
         pads, layers = feet_pads(design, pl.feet)
         fails, notes = check_layout(design, pads, layers=layers)
-        fails += _clearance_clashes(design, pl.feet, core_cu)
+        fails += _clearance_clashes(design, pl.feet, core_cu, job=pl.job)
         result["core_check"] = {"fails": fails, "notes": notes}
         if fails:
             return {**result, "error": "a core line is refused: " + "; ".join(fails)}
@@ -676,6 +774,21 @@ def layout_job(design: Design, *, out: Path, board: Path, name: str | None = Non
         (work / UNROUTED_DIR).mkdir(parents=True, exist_ok=True)
         (work / UNROUTED_DIR / "internal-error.txt").write_text(traceback.format_exc())
         return {**result, "error": f"internal router error ({type(exc).__name__}: {exc}); this is a pcbc bug, not a board move. Problem file: {UNROUTED_DIR}/internal-error.txt"}
+    if job.derived is not None:
+        # B.3 step 4-5: the fit. O from the routed and core copper, the pads, the courtyards, the keepouts, the Regions and
+        # the fiducials; the outline, the slots, the rule areas and every pour drawn again from it.
+        try:
+            produced, fitted = refit(design, job, pl, rt, core_raw, core_cu, produced, name=name)
+        except ValueError as exc:
+            return {**result, "error": str(exc)}
+        core_cu = fitted["core_cu"]
+        design.copper = [c for c in design.copper if c.source != "core"] + core_cu
+        result["outline"] = fitted["outline"]
+        result["notes_outline"] = fitted["notes"]
+    else:
+        from .outline import line as _oline
+
+        result["outline"] = {"source": "declared", "rect": list(job.outline), "line": _oline(None, job.outline, {}, source="declared", decl_line=job.outline_line)}
     result["lock_passes"] = passes
     result["adopted"] = sorted(passes[-1]["reproduced"])
     result["locked"] = sorted(passes[-1]["locked"])
@@ -713,16 +826,16 @@ def layout_job(design: Design, *, out: Path, board: Path, name: str | None = Non
     clash = sorted(c.uuid for c in keep if c.uuid in core_uids)
     if clash:
         o = core_uids[clash[0]]
-        return {**result, "error": f"{o.where or o.id}: its uuid {clash[0]} is the uuid of different copper the build draws; a uuid names one object, so drop uuid= from that core line"}
+        return {**result, "error": f"{o.where or o.id}: its uuid {clash[0]} is the uuid of different copper the build draws, and a uuid names one object"}
     for g in groups:
         g.f["members"] = tuple(sorted({rename.get(m, m) for m in g.f["members"]}))
     gen_cu = keep
-    gen_gr = [*pl.graphics, *groups]
+    gen_gr = [*pl.graphics, *pl.marks, *groups]
     try:
         assign_ids(gen_cu, {o.id for o in [*core_cu, *core_gr]}, gen_gr, uuid_ids={u: o.id for u, o in core_uids.items()})
     except IdTaken as exc:
         owner = next((o for o in [*core_cu, *core_gr] if o.id == exc.id), None)
-        return {**result, "error": f"{(owner.where if owner else None) or CORE_NAME}: id {exc.id!r} is the id {GEN_NAME} gives to a different object ({exc.kind} {exc.uuid}); give this line another id"}
+        return {**result, "error": f"{(owner.where if owner else None) or CORE_NAME}: id {exc.id!r} is the id {GEN_NAME} gives to a different object ({exc.kind} {exc.uuid}); two objects cannot share an id"}
     # A core group names its members by id and a role group by uuid: one item, one group.
     member_owner: dict[str, str] = {}
     core_uuid_of = {o.id: uuid_of(o, name) for o in [*core_cu, *core_gr]}
@@ -733,12 +846,14 @@ def layout_job(design: Design, *, out: Path, board: Path, name: str | None = Non
             u = core_uuid_of.get(m) or gen_uuid_of.get(m, m)
             if u in member_owner and member_owner[u] != who:
                 what = "a piece pcbc's pattern wrote and grouped as " if str(member_owner[u]).startswith(ROLE_PREFIX) else "already in "
-                return {**result, "error": f"{g.where or who}: {m!r} is {what}{member_owner[u]!r}; KiCad keeps an item in one group, so a core group cannot take it — drop it from the group or delete the group"}
+                return {**result, "error": f"{g.where or who}: {m!r} is {what}{member_owner[u]!r}; KiCad keeps an item in one group, so a core group cannot take it"}
             member_owner[u] = who
 
     # 5. gen
     gp = gen_path(out)
-    write_gen(gp, pl.poses, gen_cu, board=name, graphics=gen_gr)
+    from .gen import outline_header
+
+    write_gen(gp, pl.poses, gen_cu, board=name, graphics=gen_gr, outline=outline_header(job.outline_source, job.outline_line))
     result["gen"] = str(gp)
     before_cu, before_gr, before_pose = len(design.copper), len(design.graphics), len(design.poses)
     try:

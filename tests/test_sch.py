@@ -2,7 +2,9 @@ from pathlib import Path
 
 from pcbc.language import load_board
 from pcbc.sch_emit import _fmt, _parts_from_design, _pin_world, emit_from_design
-from pcbc.sch_place import apply_sch_places, parse_refpin, pin_world
+from pcbc.sch_auto import resolve as apply_sch_places
+from pcbc.sch_place import parse_refpin, pin_world
+from conftest import copy_board, copy_board_file, write_split
 
 EXAMPLES = Path(__file__).resolve().parent.parent / "examples"
 BLINKY = EXAMPLES / "blinky" / "blinky.py"
@@ -187,15 +189,17 @@ def test_readability_report_is_empty_for_blinky():
 
 
 def test_wire_limit_per_net_and_sheet_default(tmp_path: Path):
-    src = BLINKY.read_text()
-    board = tmp_path / "blinky.py"
-    board.write_text(src.replace('LED = Net("LED")', 'LED = Net("LED", wire_mm=0)'))
+    """The wire limits are schematic.core.py's (docs/schematic-layout.md §3.1): SchNet(net, wire_mm=) and SchSheet(wire_mm=)."""
+    board = copy_board(BLINKY, tmp_path)
+    core = tmp_path / "schematic.core.py"
+    own = core.read_text() if core.exists() else ""
+    core.write_text(own + 'SchNet("LED", wire_mm=0)\n')
     sch = emit_from_design(load_board(board), title="b")
     assert sch.count('(label "LED"') == 2  # labels only, one per pin
-    board.write_text(src.replace('LED = Net("LED")', 'LED = Net("LED")\nSchStyle(wire_mm=0)'))
+    core.write_text(own + "SchSheet(wire_mm=0)\n")
     sch = emit_from_design(load_board(board), title="b")
     assert sch.count('(label "LED"') == 2
-    board.write_text(src)
+    core.write_text(own)
     assert emit_from_design(load_board(board), title="b").count('(label "LED"') == 1
 
 
@@ -226,20 +230,18 @@ def test_attached_pin_needs_no_symbol_room():
     assert "1" in c_hf.wired_pins and "1" in c_vbus.wired_pins
     node = pin_world(c_vbus, next(p for p in c_vbus.pins if p.number == "1"))
     top = pin_world(c_hf, next(p for p in c_hf.pins if p.number == "1"))
-    assert abs(top[1] - node[1]) < 0.01 and 2.54 <= abs(top[0] - node[0]) <= 12.7
+    assert abs(top[1] - node[1]) < 0.01 and 2.54 <= abs(top[0] - node[0]) <= 12.7 + 1e-6
 
 
 def test_align_lands_the_hanging_pin_on_another_pins_row(tmp_path: Path):
     import shutil
 
-    src = (EXAMPLES / "c3_usb" / "c3_usb.py").read_text()
-    board = tmp_path / "c3_usb.py"
     shutil.copytree(EXAMPLES / "c3_usb" / "components", tmp_path / "components")
     # C_EN continues below R_EN's EN pin; align= picks the gap so C_EN's own
     # EN pin lands on the row of U1.IO1, five pins further down.
-    old = 'SchPlace("C_EN", along="R_EN.2", side="bottom")'
-    assert old in src
-    board.write_text(src.replace(old, 'SchPlace("C_EN", along="R_EN.2", side="bottom", align="U1.IO1")'))
+    board = copy_board(EXAMPLES / "c3_usb" / "c3_usb.py", tmp_path)
+    core = tmp_path / "schematic.core.py"
+    core.write_text(core.read_text() + 'SchPlace("R_EN", to="U1.EN")\nSchPlace("C_EN", along="R_EN.2", side="bottom", align="U1.IO1")\n')
     by = _placed(board)
     io1 = pin_world(by["U1"], next(p for p in by["U1"].pins if p.name == "IO1"))
     top = pin_world(by["C_EN"], next(p for p in by["C_EN"].pins if p.net == "EN"))
@@ -249,18 +251,19 @@ def test_align_lands_the_hanging_pin_on_another_pins_row(tmp_path: Path):
 
 
 def test_wire_label_sits_mid_wire_not_at_the_pin():
-    import re
-
     from pcbc.sch_emit import _text_w
 
-    sch = emit_from_design(load_board(C3_USB), title="c3_usb")
-    m = re.search(r'\(label "CC1"\n\t\t\(at ([0-9.]+) ([0-9.]+) 0\)\n\t\t\(effects \(font \(size 1.27 1.27\)\) \(justify (left|right) (bottom|top)\)', sch)
-    assert m, "CC1 is a wire label"
-    x, y, just, vjust = float(m.group(1)), float(m.group(2)), m.group(3), m.group(4)
+    rep: dict = {}
+    sch = emit_from_design(load_board(C3_USB), title="c3_usb", report=rep)
+    from pcbc.sch_prims import decompile
+
+    m = next((lb for lb in decompile(sch)[1] if lb.kind == "label" and lb.text == "CC1" and int(lb.angle) in (0, 180)), None)
+    assert m, "CC1 is a wire label, along its horizontal wire"
+    (x, y), (just, vjust) = m.at, m.justify
     w = _text_w("CC1") + 0.4
     x0, x1 = (x, x + w) if just == "left" else (x - w, x)
-    # The name lies along the CC1 wire, on top of it, clear of the pin end.
-    by = _placed(C3_USB)
+    # The name lies along the CC1 wire, on top of it, clear of the pin end (the parts where the sheet drew them).
+    by = {p.ref: p for p in rep["_parts"]}
     cc1 = pin_world(by["J1"], next(p for p in by["J1"].pins if p.name == "CC1"))
     far = pin_world(by["R_CC1"], next(p for p in by["R_CC1"].pins if p.net == "CC1"))
     assert abs(y - cc1[1]) < 0.01 and vjust == "bottom"
@@ -297,10 +300,8 @@ def test_the_same_board_gives_the_same_file():
 def test_check_catches_a_schplace_on_a_missing_pin(tmp_path: Path):
     from pcbc.language import check_board
 
-    src = BLINKY.read_text()
-    assert 'to="R1.2"' in src
-    board = tmp_path / "blinky.py"
-    board.write_text(src.replace('to="R1.2"', 'to="R1.7"'))
+    board = copy_board(BLINKY, tmp_path)
+    (tmp_path / "schematic.core.py").write_text('SchPlace("D1", pin="A", to="R1.7")\n')
     fails = check_board(board)
     assert len(fails) == 1 and fails[0].startswith("schematic:") and "R1" in fails[0] and "'7'" in fails[0]
     assert check_board(BLINKY) == []
@@ -310,7 +311,7 @@ def test_pcbc_sch_prints_the_list(tmp_path: Path, capsys):
     from pcbc.cli import main
 
     board = tmp_path / "blinky.py"
-    board.write_text(BLINKY.read_text())
+    copy_board_file(board, BLINKY)
     rc = main(["sch", str(board)])
     out = capsys.readouterr().out
     assert rc == 0
@@ -321,12 +322,9 @@ def test_pcbc_sch_prints_the_list(tmp_path: Path, capsys):
 def test_report_says_how_to_share_a_node(tmp_path: Path):
     import shutil
 
-    src = (EXAMPLES / "c3_usb" / "c3_usb.py").read_text()
     old = 'SchPlace("C_MCU_HF", along="C_MCU.1", side="bottom")'
-    assert old in src
     shutil.copytree(EXAMPLES / "c3_usb" / "components", tmp_path / "components")
-    board = tmp_path / "c3_usb.py"
-    board.write_text(src.replace(old, 'SchPlace("C_MCU_HF", to="U1.3V3")'))
+    board = copy_board(EXAMPLES / "c3_usb" / "c3_usb.py", tmp_path, [(old, 'SchPlace("C_MCU_HF", to="U1.3V3")')])  # the example's core line
     report: dict = {}
     emit_from_design(load_board(board), title="c3", report=report)
     # Hung off U1.3V3 as well, it hangs from the same row one stagger out and
@@ -362,7 +360,7 @@ def test_multi_unit_symbols_are_refused(tmp_path: Path):
     text = text[:i] + unit1 + "\n    " + unit2 + text[i + len(block) :]
     sym.write_text(text)
     board = tmp_path / "node.py"
-    board.write_text((src / "node.py").read_text())
+    copy_board_file(board, src / "node.py")
     fails = [f for f in check_board(board, pcb=False) if "units" in f]
     assert fails and fails[0].startswith("U5:") and "2 units" in fails[0], fails
 
@@ -372,7 +370,8 @@ def test_a_series_resistor_lies_in_line_with_its_pin():
     end goes on to another part. It lies in line with the pin, not up off the top pin of a side
     (the free-side rule is for hangers). Caps between two signals still hang."""
     from pcbc.sch_emit import _parts_from_design
-    from pcbc.sch_place import apply_sch_places, pin_world
+    from pcbc.sch_auto import resolve as apply_sch_places
+    from pcbc.sch_place import pin_world
 
     design = load_board(EXAMPLES / "c3_usb" / "c3_usb.py")
     parts = _parts_from_design(design, {n.name: n.kind for n in design.nets.values()})

@@ -12,6 +12,8 @@ from pcbc.build import build_job
 from pcbc.language import load_board
 from pcbc.netcheck import check_copper, compare, copper_nets, expected_nets
 from pcbc.stackup import copper_layers
+from conftest import write_split
+from conftest import copy_board_file
 
 EXAMPLES = Path(__file__).resolve().parent.parent / "examples"
 BLINKY = EXAMPLES / "blinky" / "blinky.py"
@@ -45,7 +47,7 @@ def test_placed_board_fails_the_copper_gate_as_unconnected(tmp_path: Path):
     import shutil
 
     board = tmp_path / "c3_usb.py"
-    board.write_text(C3_USB.read_text())
+    copy_board_file(board, C3_USB)
     shutil.copytree(C3_USB.parent / "components", tmp_path / "components")
     result = build_job(board, upto="place", force=True)
     assert result.get("error") is None, result
@@ -62,7 +64,7 @@ def test_blinky_routes_clean_and_the_same_twice(tmp_path: Path):
     for i in (1, 2):
         board = tmp_path / f"b{i}" / "blinky.py"
         board.parent.mkdir()
-        board.write_text(BLINKY.read_text())
+        copy_board_file(board, BLINKY)
         result = build_job(board, upto="route", force=True)
         assert result.get("error") is None, result
         step = result["steps"][-1]
@@ -76,28 +78,29 @@ def test_blinky_routes_clean_and_the_same_twice(tmp_path: Path):
     assert copper_nets(text) == expected_nets(design)
 
 
-def test_pair_false_is_the_no_op_the_pair_refusal_warns_about(tmp_path: Path):
-    """The claim the move makes, asserted rather than believed: the preset wins, and only
-    `autoroute=` overrides it."""
+def test_a_pair_is_its_pair_line_and_pair_false_is_no_longer_a_net_field(tmp_path: Path):
+    """docs/physics-subjects.md PR 6: the pair is routed as one object because its Pair line says so;
+    `pair=` (once a NetReq field whose `False` was a silent no-op under kind usb_hs) is a Pair field, and
+    written on a NetReq it is refused with the facts (E5), never ignored."""
     import shutil
 
     from pcbc.compile import compile_design
-    from pcbc.language import load_board
+    from pcbc.language import check_board, load_board
 
     src = Path(__file__).resolve().parent.parent / "examples" / "c3_usb"
     shutil.copytree(src / "components", tmp_path / "components")
-    line = 'NetReq("USB_DP", "USB_DN", kind="usb_hs", z_diff_ohm=90, pair=True)'
+    line = 'Pair("USB_DP", "USB_DN", kind="usb_hs", z_diff_ohm=90)'
     text = (src / "c3_usb.py").read_text()
     assert text.count(line) == 1
-
-    def _auto(replacement: str):
-        board = tmp_path / "c3.py"
-        board.write_text(text.replace(line, replacement))
-        job = compile_design(load_board(board))
-        return next(cn.autoroute for cn in job.nets if "USB_DP" in cn.patterns)
-
-    assert _auto(line.replace("pair=True", "pair=False")) == "diff_pair"  # the no-op
-    assert _auto(line.replace("pair=True", "autoroute=True")) is True  # the edit that works
+    board = tmp_path / "c3.py"
+    write_split(board, text)
+    job = compile_design(load_board(board))
+    assert next(cn.autoroute for cn in job.nets if "USB_DP" in cn.patterns) == "diff_pair"
+    write_split(board, text.replace(line, 'NetReq("USB_DP", "USB_DN", kind="usb_hs", pair=False)'))
+    assert check_board(board) == [
+        'NetReq("USB_DP", "USB_DN") line 205: kind="usb_hs" is a Pair kind and pair= is a Pair field: it holds for two paths at once; '
+        "a NetReq takes kind generic, power, switch_node, analog, clock or i2c"
+    ]
 
 
 @pytest.mark.kicad
@@ -106,7 +109,7 @@ def test_the_route_stage_leaves_nothing_of_an_earlier_build(tmp_path: Path):
     build never leaves an older board behind): the gen file, the emitted board, its sidecars, and the
     unrouted problem files. What is left is exactly what this build wrote."""
     board = tmp_path / "blinky.py"
-    board.write_text(BLINKY.read_text())
+    copy_board_file(board, BLINKY)
     work = tmp_path / "layout" / "blinky" / "routed"
     (work / "unrouted").mkdir(parents=True)
     (work / "unrouted" / "LED-1.json").write_text("{}")
@@ -133,12 +136,13 @@ def test_an_unrouted_net_is_a_move_with_its_lines_and_a_problem_file():
     layout = out.parent.parent
     assert not (layout / "fab").exists() and not (layout / "inputs.json").exists()
     assert result["moves"], result
-    links = [m for m in result["moves"] if "cannot reach" in m]
+    # A path link's failure says "did not route at" (docs/physics-subjects.md PR 3: VBUS is a Path).
+    links = [m for m in result["moves"] if "cannot reach" in m or " did not route at " in m]
     closing = [m for m in result["moves"] if m not in links]
     assert links and [m.split(":")[0] for m in closing] == sorted(result["unrouted"]), closing
     assert all("unfinished, so none of its generated copper" in m for m in closing), closing
     for move in links:
-        assert "Move:" in move and "Problem file:" in move, move
+        assert "Move:" not in move and "Problem file:" in move, move
         assert "board.py" in move or "layout.core.py" in move, move
         name = move.split("Problem file: ")[1].split("/")[-1].strip()
         doc = json.loads((out.parent / "unrouted" / name).read_text())

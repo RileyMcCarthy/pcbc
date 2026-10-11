@@ -28,8 +28,9 @@ from pcbc.route_native import constrained_nets
 from pcbc.route_relax import RELAXABLE, _seg_closest, _straighten, chains_of, holds, orphan_copper, quality, relax_pieces
 from pcbc.route_scene import components
 from boardtext import scene_from_text, feet_of_text
+from conftest import declared_examples
 
-EXAMPLES = Path(__file__).resolve().parent.parent / "examples"
+EXAMPLES = declared_examples()  # the examples as shipped with a declared outline (vehicles): conftest.declared_examples
 
 
 def _blinky():
@@ -133,8 +134,10 @@ def test_the_relaxable_reasons_are_the_five_with_no_gate_reading_their_geometry(
 
 
 def test_a_constrained_netreq_s_nets_are_skipped_whatever_their_copper_is_labelled():
-    """buck declares `NetReq('SW', kind='switch_node')` and `NetReq('FB', kind='analog')`; both
-    route on one layer with no vias, and C4 keeps this pass off. One function names them
+    """buck declares `NetReq('SW', kind='switch_node')` and `NetReq('FB', kind='analog')`: both presets mark the net
+    `autoroute=False` (sensitive), so both route first and C4 keeps this pass off them. Since decision 2 (2026-10-01)
+    SW may change layer, and since docs/physics-subjects.md PR 5 FB may too (a net kind sets no layer or via), so it
+    is the `autoroute` clause, not "one layer, no vias", that keeps both here. One function names them
     (`route_native.constrained_nets`): the net order and this pass read it, so the two cannot drift."""
     design = load_board(EXAMPLES / "buck" / "buck.py")
     assert constrained_nets(compile_design(design), design) == frozenset({"SW", "FB"})

@@ -44,6 +44,7 @@ from .route_geom import (
     circle_shape,
     clears,
     gap,
+    hull_dist2,
     q,
     qp,
     rect_shape,
@@ -115,6 +116,9 @@ class Item:
     candidate loop would be a second reader of what a pad is — which is the drift `pads.py` exists
     to prevent. Empty is the honest answer for a track, a via, a lane or the edge, none of which
     KiCad gives properties to."""
+    link: str = ""
+    """`Piece.link` carried through: the path link this copper belongs to on a net whose paths carry a
+    field or kind (`docs/net-path-physics.md` §4.2); `""` for everything else."""
     block: int = 0
     """For a pad item, which `(pad ...)` of its footprint drew it (its index among the footprint's
     pads). Two items of one owner are **one pad** only when they share it: a custom pad's primitives
@@ -382,6 +386,150 @@ def antipad_clash(scene: "Scene", at: Pt, dia: float, net: str, *, ignore: froze
     return None
 
 
+# --- the junction rule (docs/net-path-physics.md §3.2) ---------------------------------------------
+
+
+@dataclass(frozen=True)
+class JunctionRule:
+    """When a same-net item is **foreign** to the copper being laid, on a net whose paths carry a field
+    or a kind. Same-net copper is never an obstacle anywhere else (`Slack.at`, `blocked`); version 1's
+    two legality rules make some of it one here:
+
+    1. a sense path touches the rest of its net only inside its first station's pad;
+    2. a path that writes `amps=` touches the rest of its net only inside its own station pads.
+
+    Contact inside an allowed pad (its copper dilated by the net's clearance, one number for the router
+    and the emitted-board check) is legal for both sides."""
+
+    net: str
+    link: str  # the candidate's link key; "" for the net's own (off-path) copper
+    foreign_links: frozenset[str]
+    foreign_off: bool  # the net's off-path copper is foreign to the candidate
+    foreign_pads: frozenset[str]
+    allowed: tuple[Shape, ...]  # pad copper where contact is legal
+    clearance: float
+
+    def foreign(self, it: "Item") -> bool:
+        if it.net != self.net:
+            return False
+        if it.kind == "pad":
+            return it.owner.split("@")[0] in self.foreign_pads
+        if it.kind not in ("track", "via"):
+            return False
+        lk = it.link
+        if lk and lk == self.link:
+            return False
+        if lk.startswith("@"):
+            return lk[1:] in self.foreign_pads
+        if lk:
+            return lk in self.foreign_links
+        return self.foreign_off
+
+    def in_allowed(self, p: Pt) -> bool:
+        """Is `p` within the clearance of a pad where contact is legal (the lattice's cheap test)."""
+        for sh in self.allowed:
+            if hull_dist2((p,), sh.pts) <= (sh.r + self.clearance) ** 2:
+                return True
+        return False
+
+    def _parts(self, kind: str, layers, shape: Shape, ends) -> list[Shape]:
+        """The copper of one item outside every allowed pad region: a track's centre line clipped
+        (`route_geom.clip_outside`), a via whole unless its centre is inside a region, a pad whole."""
+        from .route_geom import clip_outside
+
+        if kind == "track" and ends is not None:
+            a, b, w = ends
+            return [track_shape(x, y, w) for x, y in clip_outside(a, b, self.allowed, self.clearance)]
+        if kind == "via" and ends is not None:
+            return [] if self.in_allowed(ends) else [shape]
+        return [shape]
+
+    def clashes(self, scene: "Scene", pieces, ignore: frozenset[int] = frozenset()) -> int | None:
+        """The item id of the first foreign item a candidate's copper comes within the net's clearance
+        of, outside the allowed regions; None when it fits. `pieces` are `Piece`s of this net."""
+        from .route_geom import contact_outside
+
+        for pc in pieces:
+            if pc.kind == "seg":
+                layers = (pc.layer,)
+                mine = self._parts("track", layers, track_shape(pc.a, pc.b, pc.w), (pc.a, pc.b, pc.w))
+                e_mine = ("track", pc.a, pc.b, pc.w)
+            else:
+                layers = tuple(scene.layers)
+                mine = self._parts("via", layers, via_shape(pc.a, pc.w), pc.a)
+                e_mine = ("via", pc.a, pc.w)
+            for sh in mine:
+                box = aabb(sh)
+                for L in layers:
+                    for i in scene.query(L, box, self.clearance + _MAX_NEED):
+                        if i in ignore:
+                            continue
+                        it = scene.items[i]
+                        if L not in it.layers or it.copper is None or not self.foreign(it):
+                            continue
+                        t_ends = (it.copper.pts[0], it.copper.pts[-1], round(2 * it.copper.r, 6)) if it.kind == "track" and len(it.copper.pts) == 2 else (it.at() if it.kind == "via" else None)
+                        theirs = self._parts(it.kind, it.layers, it.copper, t_ends)
+                        e_theirs = ("track", *t_ends) if it.kind == "track" and t_ends is not None else (("via", t_ends, round(2 * it.copper.r, 6)) if it.kind == "via" and t_ends is not None else None)
+                        for th in theirs:
+                            if contact_outside(sh, e_mine, th, e_theirs, self.allowed, self.clearance, self.clearance):
+                                return it.id
+        return None
+
+
+def junction_rule(scene: "Scene", cs, net: str, lk, nc) -> JunctionRule | None:
+    """The rule for one link of `net` (`lk` a `constraints.Link`, or None for an off-path link), or None
+    when nothing on the net is foreign to it."""
+    c = cs.by_net(net)
+    if c is None or not c.fielded():
+        return None
+    sense = [p for p in c.paths if p.kind is not None]
+    amps = [p for p in c.paths if p.amps is not None]
+    all_keys = {x.key for p in c.paths for x in p.links}
+    pads = {it.owner.split("@")[0] for it in scene.items if it.kind == "pad" and it.net == net}
+    allowed: set[str] = set()
+    f_links: set[str] = set()
+    f_pads: set[str] = set()
+    f_off = False
+    mine = lk.key if lk is not None else ""
+    owner_sense = next((p for p in sense if any(x.key == mine for x in p.links)), None) if lk is not None else None
+    if owner_sense is not None:
+        f_off = True
+        own = {x.key for x in owner_sense.links}
+        f_links = all_keys - own
+        st = {x for s in owner_sense.stations for x in s}
+        f_pads = pads - st
+        allowed = set(owner_sense.stations[0])
+    elif lk is not None and lk.amps_written:
+        f_off = True
+        f_links = all_keys - {mine}
+        f_pads = pads - set(lk.a) - set(lk.b)
+        allowed = set(lk.a) | set(lk.b)
+    else:
+        for p in sense:
+            f_links |= {x.key for x in p.links}
+            for s in p.stations[1:]:
+                f_pads |= set(s)
+            allowed |= set(p.stations[0])
+        for p in amps:
+            for x in p.links:
+                if x.key != mine:
+                    f_links.add(x.key)
+                    allowed |= set(x.a) | set(x.b)
+        f_links.discard(mine)
+    if not f_links and not f_pads and not f_off:
+        return None
+    shapes = tuple(it.copper for it in scene.items if it.kind == "pad" and it.net == net and it.copper is not None and it.owner.split("@")[0] in allowed)
+    return JunctionRule(net, mine, frozenset(f_links), f_off, frozenset(f_pads), shapes, nc.clearance_mm)
+
+
+def link_clashes(scene: "Scene", pieces, net: str, rule: JunctionRule | None, ignore: frozenset[int] = frozenset()) -> int | None:
+    """`JunctionRule.clashes`, or None when the link has no rule: the judge every router, relaxer and
+    pattern site asks after `blocked` (§3.2)."""
+    if rule is None:
+        return None
+    return rule.clashes(scene, pieces, ignore)
+
+
 # --- the scene ------------------------------------------------------------------------------------
 
 
@@ -462,6 +610,7 @@ class Scene:
                 piece.owner or f"{piece.net or 'no net'} {piece.reason} on {piece.layer}",
                 reason=reason or piece.reason,
                 locked=True,
+                link=piece.link,
             )
         return Item(
             0,
@@ -474,6 +623,7 @@ class Scene:
             piece.owner or f"{piece.net or 'no net'} {piece.reason} via at ({piece.a[0]:g},{piece.a[1]:g})",
             reason=reason or piece.reason,
             locked=True,
+            link=piece.link,
         )
 
     # -- the questions -------------------------------------------------------------------------
@@ -527,14 +677,20 @@ def build_scene(design: Design, job: CompiledJob, cs: ConstraintSet, feet, *, ex
 
 
 def _finish(design, job, cs, stack, layers, table, items, feet, zones) -> Scene:
-    regions = resolve_regions(design.board, design.regions) if design.regions else {}
+    from .pcb_place import _board_of
+
+    if getattr(job, "outline", None) is None:
+        # A derived board's outline is set by placement (R) and the fit (O); a scene over no outline would span the frame.
+        raise ValueError("the board has no Outline() and this job was not placed: a derived outline is set by the place stage (docs/board-outline.md B.3)")
+    frame = _board_of(job)  # the job's outline (docs/board-outline.md PR 2); a keepout's numbers are frame coordinates
+    regions = resolve_regions(frame, design.regions) if design.regions else {}
     for ko in sorted(job.keepouts, key=lambda k: k.name):
-        x0, y0, x1, y1 = resolve_keepout(ko, design.board, regions)
+        x0, y0, x1, y1 = resolve_keepout(ko, frame, regions)
         items.append(Item(0, "keepout", "", frozenset(layers), rect_shape((x0 + x1) / 2.0, (y0 + y1) / 2.0, x1 - x0, y1 - y0), None, None, f"keepout {ko.name}"))
     for area in cs.rule_areas:
         x0, y0, x1, y1 = area.box
         items.append(Item(0, "keepout", "", frozenset(layers), rect_shape((x0 + x1) / 2.0, (y0 + y1) / 2.0, x1 - x0, y1 - y0), None, None, f"rule area {area.name}"))
-    content = content_rect(design.board)
+    content = content_rect(frame)  # the job's outline: declared, or R while routing (docs/board-outline.md B.3)
     e = stack.edge_clearance
     outline = (q(content.x0 + e), q(content.y0 + e), q(content.x1 - e), q(content.y1 - e))
     items.append(Item(0, "edge", "", frozenset(layers), rect_shape((outline[0] + outline[2]) / 2.0, (outline[1] + outline[3]) / 2.0, outline[2] - outline[0], outline[3] - outline[1]), None, None, "board edge"))

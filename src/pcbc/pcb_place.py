@@ -17,7 +17,7 @@ from dataclasses import dataclass, field, replace
 from .copper import _rotate
 from .css import Rect, rotate_local_bounds
 from .geom import _iter_tagged, footprint_box_local
-from .layout import content_rect, resolve_keepout, resolve_place, resolve_regions
+from .layout import board_rect, content_rect, resolve_keepout, resolve_place, resolve_regions
 from .model import BoardSpec, Design, PlaceSpec
 from .stackup import Stackup, fanout_lane, get_stackup, pass_mm
 
@@ -28,7 +28,13 @@ _PAD_NET = re.compile(r'\(net\s+(?:\d+\s+)?"([^"]*)"\)')
 _FOOT_AT = re.compile(r"\n\t\t\(at [0-9.+-]+ [0-9.+-]+(?: ([0-9.+-]+))?\)")
 
 GAP = 0.2  # courtyard to courtyard, mm
-EDGE_CLEAR = 0.3  # copper to board edge (JLC asks 0.2; routing wants a lane)
+EDGE_CLEAR = 0.3  # copper to board edge: the default; a board reads its stackup's `edge_clearance` (`edge_clear`)
+
+
+def edge_clear(job) -> float:
+    """Copper to the board edge: the stackup's `edge_clearance`, the one home of that number (docs/board-outline.md
+    B.3: `EDGE_CLEAR` and the stackup were two homes for one number; every stackup has 0.3)."""
+    return float(get_stackup(job.stackup).edge_clearance)
 DECAP_MM = 2.5  # the first decoupling cap on a pin belongs this close to it
 DECAP_NEXT_MM = 5.0  # the bulk cap behind it, this close
 EDGE_MM = 1.0  # a connector this far from every edge is not on one
@@ -48,6 +54,7 @@ class Pad:
     w: float
     h: float
     net: str
+    through: bool = False  # a drilled pad: copper on every layer, not only its footprint's side
 
 
 @dataclass
@@ -173,7 +180,7 @@ def parse_foot(ref: str, block: str) -> Foot:
             w, h = max(w, cw), max(h, ch)
         if round(float(at.group(3) or 0) - frot) % 180 == 90:
             w, h = h, w
-        pads.append(Pad(num.group(1), float(at.group(1)), float(at.group(2)), w, h, net.group(1) if net else ""))
+        pads.append(Pad(num.group(1), float(at.group(1)), float(at.group(2)), w, h, net.group(1) if net else "", through=bool(re.match(r'\(pad\s+"[^"]*"\s+(np_)?thru_hole', pad))))
     crt = footprint_box_local(block, "courtyard")
     pb = footprint_box_local(block, "pads")
     box = (min(crt[0], pb[0]), min(crt[1], pb[1]), max(crt[2], pb[2]), max(crt[3], pb[3]))
@@ -203,7 +210,7 @@ def _custom_size(pad: str) -> tuple[float | None, float | None]:
 
 def parse_refpin(spec: str) -> tuple[str, str]:
     if "." not in spec:
-        raise ValueError(f"{spec!r}: write REF.PIN, e.g. U1.VIN")
+        raise ValueError(f"{spec!r} is not REF.PIN (a part reference, a dot, a pin name or pad number)")
     ref, pin = spec.split(".", 1)
     return ref.strip(), pin.strip()
 
@@ -239,34 +246,51 @@ def validate(design: Design) -> list[str]:
     fails: list[str] = []
     for p in design.places:
         if p.to:
+            at = f"layout.core.py:{p.line}" if p.line else f"Place({p.ref!r})"
             try:
                 tref, tpin = parse_refpin(p.to)
             except ValueError as e:
-                fails.append(f"Place({p.ref!r}): {e}")
+                fails.append(f"{at}: the to= of Place({p.ref!r}) is {p.to!r}: {e}")
                 continue
             if tref not in refs:
-                fails.append(f"Place({p.ref!r}, to={p.to!r}): no part {tref}")
+                fails.append(f"{at}: the to= of Place({p.ref!r}) names {p.to}, and there is no part {tref} on the board")
                 continue
-            if tpin not in parts[tref].part.pins:
-                fails.append(f"Place({p.ref!r}, to={p.to!r}): {tref} has no pin {tpin} (pins: {', '.join(parts[tref].part.pins)})")
+            pins = parts[tref].part.pins
+            if tpin not in pins and tpin not in parts[tref].pins:
+                fails.append(f"{at}: the to= of Place({p.ref!r}) names {p.to}, and {tref} has no pin {tpin} (its pins: {', '.join(pins)})")
                 continue
             net = _pin_net(design, tref, tpin)
+            if not net:
+                fails.append(f"{at}: the to= of Place({p.ref!r}) names {p.to}, which is on no net")
+                continue
             if p.ref in parts and net not in parts[p.ref].pins.values():
-                fails.append(f"Place({p.ref!r}, to={p.to!r}): {p.ref} has no pin on net {net}")
+                fails.append(f"{at}: the to= of Place({p.ref!r}) names {p.to}, on net {net}, and {p.ref} has no pin on net {net}")
             if p.toward and p.toward not in _DIRS:
                 fails.append(f"Place({p.ref!r}): toward must be one of {', '.join(_DIRS)}")
         if p.edge and p.edge not in _EDGE_OUT:
             fails.append(f"Place({p.ref!r}): edge must be one of {', '.join(_EDGE_OUT)}")
         if p.side != "F" and (p.to or p.edge):
-            fails.append(f"Place({p.ref!r}): side='B' is not placed by relation yet; use CSS")
+            fails.append(f"Place({p.ref!r}): side='B' is placed by CSS position only; relation placement (to=, edge=) is front side only")
+    from .layout import declared_outline
+
+    if declared_outline(design)[0] is None and getattr(design, "core_loaded", None) is not False:
+        # B.5-1: with no Outline() an anchor is written in frame coordinates (docs/board-outline.md B.1).
+        from .outline import unframed_places
+
+        fails += unframed_places(design.places)
     return fails
 
 
 # ---------------------------------------------------------------- engine
 
 
-def _board_of(job) -> BoardSpec:
-    return BoardSpec(size_mm=job.board_size_mm, padding=job.padding, layers=job.layers, stackup=job.stackup, pcb=job.pcb, planes=job.planes)
+def _board_of(job, rect=None) -> BoardSpec:
+    """The board CSS resolves against: the job's outline (`job.outline`: declared, or R/O in derived mode), or `rect`;
+    the derived frame before placement has set one (docs/board-outline.md PR 2)."""
+    from .layout import frame_board
+
+    base = BoardSpec(size_mm=None, layers=job.layers, stackup=job.stackup, pcb=job.pcb, planes=job.planes)
+    return frame_board(base, rect if rect is not None else getattr(job, "outline", None))
 
 
 def lane_rules(job) -> tuple[Stackup, float]:
@@ -307,8 +331,10 @@ def _rot_for_face(face: tuple[float, float], out: tuple[float, float]) -> float:
     return 0.0
 
 
-def _edge_css(spec: PlaceSpec, foot: Foot) -> PlaceSpec:
-    """`edge=` as CSS: flush with that edge (minus overhang), centred along it unless told."""
+def _edge_css(spec: PlaceSpec, foot: Foot, clear: float = EDGE_CLEAR, origin=(0.0, 0.0)) -> PlaceSpec:
+    """`edge=` as CSS: flush with that edge (minus overhang), centred along it unless told. `left`/`top` are frame
+    coordinates (`layout._frame` takes them back to the board's corner), so the inset from a left or top edge and the
+    centring are written from `origin`, the outline's corner: Outline(at=(5, 7)) put an edge="left" part 5 mm off it."""
     out = _EDGE_OUT[spec.edge]
     face = _face(foot)
     rot = spec.rot if spec.rot_set else _rot_for_face(face, out)
@@ -320,16 +346,17 @@ def _edge_css(spec: PlaceSpec, foot: Foot) -> PlaceSpec:
     crt_face = x1 if face == (1.0, 0.0) else -x0 if face == (-1.0, 0.0) else y1 if face == (0.0, 1.0) else -y0
     reach = max(
         (p.x * face[0] + p.y * face[1] + (p.w / 2 if face[0] else p.h / 2) for p in foot.pads if p.num),
-        default=crt_face - EDGE_CLEAR,
+        default=crt_face - clear,
     )
-    inset = round(max(-float(spec.overhang), EDGE_CLEAR - (crt_face - reach)), 3)
-    css[spec.edge] = inset
+    inset = round(max(-float(spec.overhang), clear - (crt_face - reach)), 3)
+    ox, oy = origin
+    css[spec.edge] = round(inset + (ox if spec.edge == "left" else oy if spec.edge == "top" else 0.0), 6)
     if spec.edge in ("top", "bottom"):
         if not along_set:
-            css.update(left=0, right=0, margin_left="auto", margin_right="auto")
+            css.update(left=ox, right=0, margin_left="auto", margin_right="auto")
     else:
         if not along_set:
-            css.update(top=0, bottom=0, margin_top="auto", margin_bottom="auto")
+            css.update(top=oy, bottom=0, margin_top="auto", margin_bottom="auto")
     return replace(spec, **css)
 
 
@@ -337,11 +364,15 @@ FID_INSET = 4.0
 FID_HALF = 1.25  # Fiducial_1mm_Mask2mm courtyard
 
 
-def fiducial_spots(size_mm: tuple[float, float], taken: list[Foot], want: int = 3) -> list[tuple[str, float, float]]:
-    """Three fiducials, corners first then edge middles, wherever no anchor sits. The AI never places these."""
-    w, h = size_mm
+def fiducial_spots(rect, taken: list[Foot], want: int = 3) -> list[tuple[str, float, float]]:
+    """Three fiducials, corners first then edge middles, wherever no anchor sits, `FID_INSET` inside `rect`
+    ((x0, y0, x1, y1), or a declared (w, h) from (0, 0)). The AI never places these."""
+    if isinstance(rect, Rect):
+        rect = (rect.x0, rect.y0, rect.x1, rect.y1)
+    x0, y0, x1, y1 = rect if len(rect) == 4 else (0.0, 0.0, *rect)
     i = FID_INSET
-    candidates = [(w - i, i), (w - i, h - i), (i, h - i), (i, i), (w / 2, i), (w / 2, h - i), (i, h / 2), (w - i, h / 2)]
+    mx, my = (x0 + x1) / 2, (y0 + y1) / 2
+    candidates = [(x1 - i, y0 + i), (x1 - i, y1 - i), (x0 + i, y1 - i), (x0 + i, y0 + i), (mx, y0 + i), (mx, y1 - i), (x0 + i, my), (x1 - i, my)]
     spots: list[tuple[str, float, float]] = []
     for x, y in candidates:
         box = (x - FID_HALF, y - FID_HALF, x + FID_HALF, y + FID_HALF)
@@ -351,6 +382,276 @@ def fiducial_spots(size_mm: tuple[float, float], taken: list[Foot], want: int = 
         if len(spots) == want:
             break
     return spots
+
+
+# ---------------------------------------------------------------- a path's exit corridor (decision 4)
+
+
+@dataclass(frozen=True)
+class Corridor:
+    """The room one exit of a declared path's end pad needs, in world mm (decision 4, owner 2026-10-01): the
+    path's width (or, at a pad narrower than the path, the pad neck's width for `PAD_NECK_MAX_MM`, then the
+    path's) plus twice its clearance, from the pad's edge outward along that exit.
+
+    It runs `reach` mm past the pad's edge: to the point where the path can first turn (the end of the neck, or
+    the stub past the part's own other-net neighbours' clearance, whichever is farther) plus half the path's
+    width and its clearance — the room the turn itself takes. The owner's text gives no length; this one is
+    pcbc's (refuter round, 2026-10-02: running it to the board edge called a pad 6 mm from any copper blocked).
+    It ends sooner at a station pad of the same path (the path has arrived), and at the part's own other-net
+    copper or the board's content edge, which leave the path no room to leave this way (`dead`)."""
+
+    pad: str  # "U1.2"
+    side: str  # "right" | "left" | "down" | "up"
+    rects: tuple[tuple[float, float, float, float], ...]  # the neck's rect (when there is one), then the full width's
+    source: str  # "Path line 60"
+    net: str
+    width: float  # the path's width on the pad's layer
+    neck: float | None  # the neck's width at the pad, when the pad is narrower than the path
+    clearance: float
+    stations: frozenset[str]  # the path's own pads: never an intrusion
+    layers: frozenset[str] = frozenset({"F.Cu"})  # the copper layers the path leaves this pad on
+    reach: float = 0.0  # mm past the pad's edge the corridor needs
+    length: float = 0.0  # mm past the pad's edge it runs (shorter than `reach` when `end` stops it)
+    end: str = ""  # what stops it short of `reach`
+    dead: bool = False  # stopped by the part's own other-net copper or the board edge: no room to leave this way
+    closed: str = ""  # no stub leaves this side at all: the part's own pad in the way
+
+
+_SIDES = (("right", (1.0, 0.0)), ("left", (-1.0, 0.0)), ("down", (0.0, 1.0)), ("up", (0.0, -1.0)))
+_ALL_CU = frozenset({"F.Cu", "In1.Cu", "In2.Cu", "B.Cu"})
+
+
+def _pad_rect(foot: Foot, pad: Pad, at=None, rot=None) -> tuple[float, float, float, float]:
+    cx, cy = foot.pad_world(pad, at=at, rot=rot)
+    x0, y0, x1, y1 = rotate_local_bounds(-pad.w / 2.0, -pad.h / 2.0, pad.w / 2.0, pad.h / 2.0, foot.rot if rot is None else rot)
+    return (cx + x0, cy + y0, cx + x1, cy + y1)
+
+
+def _pad_layers(foot: Foot, pad: Pad) -> frozenset[str]:
+    """The copper layers a pad is on: every one for a drilled pad, its footprint's side for a surface pad."""
+    return _ALL_CU if pad.through else frozenset({foot.layer})
+
+
+def _rect_gap(a, b) -> float:
+    dx = max(a[0] - b[2], b[0] - a[2], 0.0)
+    dy = max(a[1] - b[3], b[1] - a[3], 0.0)
+    return math.hypot(dx, dy)
+
+
+def _rects_overlap(a, b) -> bool:
+    return a[0] < b[2] - 1e-9 and b[0] < a[2] - 1e-9 and a[1] < b[3] - 1e-9 and b[1] < a[3] - 1e-9
+
+
+def path_ends(job) -> dict[str, list[tuple[str, object, object]]]:
+    """{ref: [(pad number, PathSpec, the Link at that end)]} for every pad a declared `Path()` starts or ends on."""
+    cs = getattr(job, "constraints", None)
+    out: dict[str, list] = {}
+    if cs is None:
+        return out
+    for c in sorted(cs.constraints, key=lambda c: c.net):
+        for p in c.paths:
+            links = [lk for lk in p.links if not lk.join]
+            if not links or len(p.stations) < 2:
+                continue
+            for st, lk in ((p.stations[0], links[0]), (p.stations[-1], links[-1])):
+                for pid in st:
+                    ref, _dot, num = pid.partition(".")
+                    if (num, p, lk) not in out.setdefault(ref, []):
+                        out[ref].append((num, p, lk))
+    return out
+
+
+def pad_corridors(job, foot: Foot, num: str, path, lk, limit: Rect, feet: dict[str, Foot] | None = None) -> list[Corridor]:
+    """The exit corridors of `foot`'s pad `num`, the end of `path` at `lk`, one per side. A side whose stub at the
+    neck's width from the pad's centre, out past its other-net neighbours' clearance, meets an other-net pad of
+    the footprint (`route_scene.pad_exits`' rule) is `closed`. `feet` (the parts placed so far) supplies the
+    path's other station pads, where a corridor ends."""
+    from .constraints import PAD_NECK_MAX_MM, clearance_table
+
+    cs = job.constraints
+    pad = next((q for q in foot.pads if q.num == num), None)
+    if pad is None or foot.at is None:
+        return []
+    c = cs.by_net(path.net)
+    clear = float(c.clearance_mm.value) if c is not None else 0.2
+    table = clearance_table(cs)
+    others = [q for q in foot.pads if q.num != num and q.net and q.net != path.net]
+    worst = max([clear] + [table.between(path.net, q.net)[0] for q in others])
+    w = float(lk.width_on(foot.layer))
+    layers = ((frozenset(lk.layers) & _ALL_CU) or frozenset({foot.layer})) if pad.through else frozenset({foot.layer})
+    stations = frozenset(x for st in path.stations for x in st)
+    arrive = []
+    for oref, of in sorted((feet or {}).items()):
+        if oref == foot.ref or of.at is None:
+            continue
+        for q in of.pads:
+            if f"{oref}.{q.num}" in stations and _pad_layers(of, q) & layers:
+                arrive.append((f"{oref}.{q.num}", _pad_rect(of, q)))
+    r = _pad_rect(foot, pad)
+    cx, cy = (r[0] + r[2]) / 2.0, (r[1] + r[3]) / 2.0
+    out: list[Corridor] = []
+    for side, (dx, dy) in _SIDES:
+        s = dx or dy
+        across = (r[3] - r[1]) if dx else (r[2] - r[0])
+        half = (r[2] - r[0]) / 2.0 if dx else (r[3] - r[1]) / 2.0
+        wn = min(across, w)
+        d = half + worst + wn / 2.0 + 1e-4
+        ex, ey = cx + dx * d, cy + dy * d
+        stub = (min(cx, ex) - (wn / 2.0 if dy else 0.0), min(cy, ey) - (wn / 2.0 if dx else 0.0), max(cx, ex) + (wn / 2.0 if dy else 0.0), max(cy, ey) + (wn / 2.0 if dx else 0.0))
+        neck = wn if wn < w - 1e-9 else None
+        head = dict(pad=f"{foot.ref}.{num}", side=side, source=lk.source.split(" (")[0], net=path.net, width=w, neck=neck, clearance=clear, stations=stations, layers=layers)
+        shut = next((q for q in others if _rect_gap(stub, _pad_rect(foot, q)) < table.between(path.net, q.net)[0]), None)
+        if shut is not None:
+            out.append(Corridor(rects=(), dead=True, closed=f"{foot.ref}.{shut.num} [{shut.net}]", **head))
+            continue
+        edge = (r[2] if dx > 0 else r[0]) if dx else (r[3] if dy > 0 else r[1])
+        turn = max(PAD_NECK_MAX_MM if neck is not None else 0.0, worst + wn / 2.0)
+        reach = turn + w / 2.0 + clear
+        far, end, dead = edge + s * reach, "", False
+        bound = (limit.x1 if dx > 0 else limit.x0) if dx else (limit.y1 if dy > 0 else limit.y0)
+        if (far - bound) * s > 0:
+            far, end, dead = bound, "the board's content edge", True
+        hw = w / 2.0 + clear
+        mid = cy if dx else cx
+
+        def ahead(qr):
+            lat = (qr[1], qr[3]) if dx else (qr[0], qr[2])
+            if lat[1] <= mid - hw or lat[0] >= mid + hw:
+                return None
+            near = (qr[0] if dx > 0 else qr[2]) if dx else (qr[1] if dy > 0 else qr[3])
+            return None if (near - edge) * s < 0 else near
+
+        # The part's own other-net copper ahead (buck's U1.2 "up" exit meets U1.5 under the body): no room.
+        for q in others:
+            near = ahead(_pad_rect(foot, q))
+            if near is None:
+                continue
+            stop = near - s * table.between(path.net, q.net)[0]
+            if (far - stop) * s > 0:
+                far, end, dead = stop, f"{foot.ref}.{q.num} [{q.net}]", True
+        # A station pad of the same path ahead: the path has arrived, and needs no room past it.
+        for name, qr in arrive:
+            near = ahead(qr)
+            if near is not None and (far - near) * s > 0:
+                far, end, dead = near, f"{name}, a station of this path", False
+        start_full = edge + s * (PAD_NECK_MAX_MM if neck is not None else 0.0)
+
+        def band(a: float, b: float, hw: float):
+            lo, hi = min(a, b), max(a, b)
+            return (lo, cy - hw, hi, cy + hw) if dx else (cx - hw, lo, cx + hw, hi)
+
+        rects = []
+        if neck is not None:
+            stop_neck = start_full if (far - start_full) * s > 0 else far
+            if (stop_neck - edge) * s > 0:
+                rects.append(band(edge, stop_neck, neck / 2.0 + clear))
+        if (far - start_full) * s > 0:
+            rects.append(band(start_full, far, w / 2.0 + clear))
+        out.append(Corridor(rects=tuple(tuple(round(v, 4) for v in x) for x in rects), reach=round(reach, 4), length=round(max((far - edge) * s, 0.0), 4), end=end, dead=dead, **head))
+    return out
+
+
+def _past_edge(cor: Corridor, foot: Foot, rect) -> float:
+    """How far past the end pad's edge, along the exit, a rect's near side lies (0 when it overlaps the edge)."""
+    ref, _dot, num = cor.pad.partition(".")
+    pad = next(q for q in foot.pads if q.num == num)
+    r = _pad_rect(foot, pad)
+    if cor.side == "right":
+        d = rect[0] - r[2]
+    elif cor.side == "left":
+        d = r[0] - rect[2]
+    elif cor.side == "down":
+        d = rect[1] - r[3]
+    else:
+        d = r[1] - rect[3]
+    return round(max(d, 0.0), 3)
+
+
+def _shape(cor: Corridor) -> str:
+    """`0.532 mm neck + 2 x 0.2 mm for 1 mm, then 0.781 mm + 2 x 0.2 mm to 1.59 mm past U1.2's edge`."""
+    from .constraints import PAD_NECK_MAX_MM
+
+    full = f"{cor.width:g} mm + 2 x {cor.clearance:g} mm to {cor.length:g} mm past {cor.pad}'s edge"
+    if cor.neck is None:
+        return full
+    if cor.length <= PAD_NECK_MAX_MM + 1e-9:
+        return f"{cor.neck:g} mm neck + 2 x {cor.clearance:g} mm to {cor.length:g} mm past {cor.pad}'s edge"
+    return f"{cor.neck:g} mm neck + 2 x {cor.clearance:g} mm for {PAD_NECK_MAX_MM:g} mm, then {full}"
+
+
+def corridor_hits(part: Foot, at, rot, corridors) -> list[str]:
+    """`part`'s pads at (`at`, `rot`) inside any live corridor (not `dead`) on one of its layers, one fact per corridor:
+    `U1.2's down exit corridor (SW, Path line 60)`. A pad that is a station of that path is the path's own, never an
+    intrusion."""
+    hits = []
+    for cor in corridors:
+        if cor.dead:
+            continue
+        for q in part.pads:
+            if not q.num or f"{part.ref}.{q.num}" in cor.stations or not (_pad_layers(part, q) & cor.layers):
+                continue
+            pr = _pad_rect(part, q, at=at, rot=rot)
+            if any(_rects_overlap(pr, x) for x in cor.rects):
+                hits.append(f"{cor.pad}'s {cor.side} exit corridor ({cor.net}, {cor.source})")
+                break
+    return hits
+
+
+def corridor_errors(job, feet: dict[str, Foot]) -> list[str]:
+    """Decision 4, the declared placement's half: every pad a `Path()` starts or ends on, on a part that is placed,
+    none of whose exits is open, at least one of them held on each of its layers by copper of a part a declared
+    CSS/absolute/edge `Place()` put there (those are never moved; a `Place(to=)` part is placed around corridors
+    and never counts). An exit is also not open when it is `closed` or `dead` (the part's own copper, or the board's
+    edge). One error per such pad, facts only, before routing."""
+    ends = path_ends(job)
+    if not ends:
+        return []
+    declared = {s.ref: s for s in job.places if not s.to}
+    board = _board_of(job)
+    content = content_rect(board)
+    out: list[str] = []
+    for ref in sorted(ends):
+        foot = feet.get(ref)
+        if foot is None or foot.at is None:
+            continue
+        for num, path, lk in ends[ref]:
+            cors = pad_corridors(job, foot, num, path, lk, content, feet=feet)
+            if not cors:
+                continue
+            lines: list[str] = []
+            placed_by = False
+            for cor in cors:
+                if cor.closed:
+                    lines.append(f"{cor.side}: no stub leaves past {cor.closed}, {ref}'s own pad")
+                    continue
+                if cor.dead:
+                    lines.append(f"{cor.side}: it stops at {cor.end} {cor.length:g} mm past {cor.pad}'s edge, short of the {cor.reach:g} mm the corridor needs")
+                    continue
+                held: dict[str, list[str]] = {}
+                for oref in sorted(declared):
+                    other = feet.get(oref)
+                    if other is None or other.at is None or oref == ref:
+                        continue
+                    for q in other.pads:
+                        if not q.num or f"{oref}.{q.num}" in cor.stations:
+                            continue
+                        on = _pad_layers(other, q) & cor.layers
+                        rect = _pad_rect(other, q)
+                        if not on or not any(_rects_overlap(rect, x) for x in cor.rects):
+                            continue
+                        fact = f"{oref}.{q.num} [{q.net or 'no net'}] (layout.core.py:{declared[oref].line}) {_past_edge(cor, foot, rect):g} mm past {cor.pad}'s edge"
+                        for L in sorted(on):
+                            held.setdefault(L, []).append(fact)
+                if set(held) != set(cor.layers):
+                    break
+                who = list(dict.fromkeys(f for L in sorted(held) for f in held[L]))
+                on_layers = f" on {', '.join(sorted(cor.layers))}" if len(cor.layers) > 1 else ""
+                lines.append(f"{cor.side}: {', '.join(who)}{on_layers}, inside its {_shape(cor)}")
+                placed_by = True
+            else:
+                if placed_by:
+                    out.append(f"{path.net}: every exit of {ref}.{num}, where {lk.source.split(' (')[0]} {'starts' if f'{ref}.{num}' in path.stations[0] else 'ends'}, is closed: " + "; ".join(lines))
+    return out
 
 
 def resolve_places(design: Design, job, seeds) -> tuple[list[PlaceSpec], list[str], list[tuple[str, float, float]]]:
@@ -386,12 +687,18 @@ def resolve_places(design: Design, job, seeds) -> tuple[list[PlaceSpec], list[st
         foot = feet[spec.ref]
         foot.at, foot.rot = (round(at[0], 4), round(at[1], 4)), rot % 360
         placed.append(foot)
+        # The settled pose is a frame coordinate: `parent=None`, or every later resolve of it (`poses_of_places`, apply,
+        # check) measured it from the Region's corner a second time (C_IN1 in a Region at top=12 landed at y=26.98, not
+        # 14.98). Which Region a part is in is read from `design.places`, which keep their parent.
         done = replace(spec, at=foot.at, rot=foot.rot, position="absolute", from_box="origin", left=foot.at[0], top=foot.at[1], right=None, bottom=None,
-                       margin_left=0, margin_right=0, margin_top=0, margin_bottom=0, translate_x=None, translate_y=None)
+                       margin_left=0, margin_right=0, margin_top=0, margin_bottom=0, translate_x=None, translate_y=None, parent=None)
         resolved[spec.ref] = done
         return done
 
     specced = {p.ref for p in job.places}
+    if getattr(job, "outline", None) is None:
+        # No Outline() in layout.core.py: the outline is derived from the placement (docs/board-outline.md B.2).
+        return _resolve_derived(design, job, board, regions, feet, libs, keepouts, order, moves, resolved, placed, settle)
     for ref, foot in sorted(feet.items()):
         if ref in specced:
             continue
@@ -405,20 +712,21 @@ def resolve_places(design: Design, job, seeds) -> tuple[list[PlaceSpec], list[st
         if spec.to:
             pending.append(spec)
             continue
-        s = _edge_css(spec, feet[spec.ref]) if spec.edge else spec
+        s = _edge_css(spec, feet[spec.ref], edge_clear(job), origin=getattr(board, "origin", None) or (0.0, 0.0)) if spec.edge else spec
         rp = resolve_place(s, board, libs[spec.ref], regions)
         if rp.at is None:
             continue
         settle(rp, rp.at, rp.rot)
 
     # Fiducials take the free corners once the anchors are down; relations keep off them.
-    spots = fiducial_spots(board.size_mm, placed) if not any(r.startswith("FID") for r in feet) else []
+    spots = fiducial_spots(board_rect(board), placed) if not any(r.startswith("FID") for r in feet) else []
     for ref, x, y in spots:
         placed.append(Foot(ref, (-FID_HALF, -FID_HALF, FID_HALF, FID_HALF), [Pad("", 0.0, 0.0, 1.0, 1.0, "")], at=(x, y), rot=0.0))
     if 0 < len(spots) < 3:
         moves.append(f"only {len(spots)} fiducial spot(s) are free: the anchors cover the other corners and edge middles; JLC wants 3")
 
     # Relations in dependency order: a part attached to a pending part waits for it.
+    ends = path_ends(job)
     guard = 0
     while pending:
         guard += 1
@@ -431,13 +739,171 @@ def resolve_places(design: Design, job, seeds) -> tuple[list[PlaceSpec], list[st
         pending.remove(spec)
         tref, tpin = parse_refpin(spec.to)
         if tref not in feet or feet[tref].at is None:
-            moves.append(f"{spec.ref}: its target {tref} has no place (Place(to=) needs the target placed by CSS or by relation)")
+            what = "is no part of the board" if tref not in feet else "has no position (no Place() put it down)"
+            moves.append(f"{spec.ref}: {'layout.core.py:' + str(spec.line) if spec.line else 'its Place()'} attaches it to {tref}, which {what}")
             continue
-        at, rot, note = _attach(spec, feet[spec.ref], feet[tref], _pin_net(design, tref, tpin) or "", placed, keepouts, content, regions)
+        # Decision 4: the exit corridors of the target's other pads a declared Path() starts or ends on.
+        cors = {num: pad_corridors(job, feet[tref], num, path, lk, content, feet=feet) for num, path, lk in ends.get(tref, ())}
+        # Postfix B11 (refutation placement r2): the pads the to= names are the ones whose corridors the part may sit
+        # in; every other pad of the target keeps its corridors, whichever same-net pad the search anchors on (R4,
+        # to=U1.- (pin 3), landed in U1.OUT's (pin 4) exit when the search anchored on pin 4).
+        from .paths import station_pads
+
+        anet = _pin_net(design, tref, tpin) or ""
+        named = {x.split(".", 1)[1] for x in station_pads(design, anet, spec.to)} if anet else set()
+        at, rot, note = _attach(spec, feet[spec.ref], feet[tref], anet, placed, keepouts, content, regions, corridors=cors, named=named, clear=edge_clear(job))
         settle(spec, at, rot)
         if note:
             moves.append(note)
     return [resolved.get(p.ref, p) for p in job.places], moves, spots
+
+
+def _relate(design, job, feet, placed, keepouts, regions, resolved, order, moves, settle, specs, limits) -> None:
+    """Place the relations `specs` in dependency and file order, each searched within `limits` in turn (the first with
+    a clear spot wins; the last one's note stands when none has one). `_attach` insets each limit by the edge
+    clearance, so a caller wanting an exact box hands it grown by that much."""
+    from .paths import station_pads
+
+    ends = path_ends(job)
+    pending = list(specs)
+    names = {q.ref for q in pending}
+    guard = 0
+    while pending:
+        guard += 1
+        ready = [p for p in pending if parse_refpin(p.to)[0] in resolved or parse_refpin(p.to)[0] not in {q.ref for q in pending}]
+        if not ready or guard > 64 + len(names):
+            raise ValueError(f"Place(to=...) cycle or missing target among {', '.join(sorted(p.ref for p in pending))}")
+        ready.sort(key=lambda p: order[p.ref])
+        spec = ready[0]
+        pending.remove(spec)
+        tref, tpin = parse_refpin(spec.to)
+        if tref not in feet or feet[tref].at is None:
+            what = "is no part of the board" if tref not in feet else "has no position (no Place() put it down)"
+            moves.append(f"{spec.ref}: {'layout.core.py:' + str(spec.line) if spec.line else 'its Place()'} attaches it to {tref}, which {what}")
+            continue
+        anet = _pin_net(design, tref, tpin) or ""
+        named = {x.split(".", 1)[1] for x in station_pads(design, anet, spec.to)} if anet else set()
+        # A clear spot in an earlier limit wins while it is beside the pin (within DECAP_NEXT_MM, the decoupling rule's
+        # reach); farther than that, the later limits are searched too and a spot nearer by more than DECAP_MM takes it
+        # (c3_usb: I0 left U1's caps a clear spot 8.9 mm from U1.3V3, and the open board had one 1.6 mm away).
+        tpads = [feet[tref].pad_world(p) for p in feet[tref].pads if p.net == anet] or [feet[tref].center()]
+
+        def reach(g):
+            f = feet[spec.ref]
+            own = [f.pad_world(p, at=g[0], rot=g[1]) for p in f.pads if p.net == anet] or [g[0]]
+            return min(math.hypot(a[0] - b[0], a[1] - b[1]) for a in own for b in tpads)
+
+        # The first decoupling cap on an IC pin is held to DECAP_MM (the rule `_issues` checks): a clear spot within it
+        # wins in whichever limit has it, so an in-limit spot 3.4 mm away no longer beats an open one 1.57 mm away (buck
+        # with R_FB_BOT anchored: C_IN1 3.40 and C_IN2 4.34 mm from U1.VIN, refute:placement 2026-10-07).
+        first = _first_decap_limit(design, job, feet, spec, tref, tpin, anet, resolved, reach_of=lambda r: _reach_now(feet, r, anet, tpads))
+        got = None
+        for lim in limits:
+            cors = {num: pad_corridors(job, feet[tref], num, path, lk, lim, feet=feet) for num, path, lk in ends.get(tref, ())}
+            g = _attach(spec, feet[spec.ref], feet[tref], anet, placed, keepouts, lim, regions, corridors=cors, named=named, clear=edge_clear(job))
+            if first is not None and g[2] is None and reach(g) <= first:
+                if got is None or got[2] is not None or reach(got) > first:
+                    got = g
+                break
+            if got is None or (g[2] is None and (got[2] is not None or reach(g) < reach(got) - DECAP_MM)):
+                got = g
+            if first is None and got[2] is None and reach(got) <= DECAP_NEXT_MM:
+                break
+        at, rot, note = got
+        settle(spec, at, rot)
+        if note:
+            moves.append(note)
+
+
+def _reach_now(feet, ref: str, net: str, tpads) -> float:
+    """How far a placed part's pads on `net` are from the target pads `tpads`."""
+    f = feet[ref]
+    own = [f.pad_world(p) for p in f.pads if p.net == net] or [f.center()]
+    return min(math.hypot(a[0] - b[0], a[1] - b[1]) for a in own for b in tpads)
+
+
+def _first_decap_limit(design, job, feet, spec, tref: str, tpin: str, anet: str, resolved, reach_of) -> float | None:
+    """DECAP_MM (plus a closed pad row's fanout lane) when `spec` puts the first decoupling cap on an IC's supply pin: a
+    two-pad C on a power net and a ground net, attached to a part with more than two pads, and no cap already settled on
+    that pin within the limit. None for any other relation (it keeps the DECAP_NEXT_MM reach)."""
+    if not spec.ref.startswith("C") or anet not in design.nets or getattr(design.nets[anet], "kind", "") != "power":
+        return None
+    f = feet[spec.ref]
+    if len(f.pads) != 2 or len([p for p in feet[tref].pads if p.num]) <= 2:
+        return None
+    ground = {n for n, net in design.nets.items() if getattr(net, "kind", "") == "ground"}
+    if not ({p.net for p in f.pads} & ground):
+        return None
+    cs = getattr(job, "constraints", None)
+    if spec.ref in {r for lp in (getattr(cs, "loops", ()) if cs is not None else ()) for r in lp.parts}:
+        return None
+    pads = {p.num for p in feet[tref].pads if p.net == anet}
+    extra = feet[tref].lane_mm if pads & set(getattr(feet[tref], "closed", ()) or ()) else 0.0
+    limit = DECAP_MM + extra
+    for r, other in resolved.items():
+        if r == spec.ref or not r.startswith("C") or str(getattr(other, "to", "") or "").split(".", 1)[0] != tref:
+            continue
+        if feet.get(r) is not None and feet[r].at is not None and any(p.net == anet for p in feet[r].pads) and reach_of(r) <= limit:
+            return None
+    return limit
+
+
+def _resolve_derived(design, job, board, regions, feet, libs, keepouts, order, moves, resolved, placed, settle):
+    """B.2 (docs/board-outline.md): anchors in the frame, relations limited to the anchors' box, edge groups shaped
+    alone and docked, fixed sides, fiducials last; then R (the routing box) and the placement-only fit, set on the job
+    (`job.outline` = R, `job.derived`). Raises `outline.OutlineError` with a B.5 fact."""
+    from types import SimpleNamespace
+
+    from . import outline as ol
+
+    unplaced = sorted(r for r in feet if r not in {p.ref for p in job.places} and not r.startswith("FID"))
+    if unplaced:
+        raise ol.OutlineError(
+            f"{', '.join(unplaced)} {'has' if len(unplaced) == 1 else 'have'} no Place() in layout.core.py; with no Outline() the outline is "
+            f"derived from where the parts are, and {'this has' if len(unplaced) == 1 else 'these have'} no position"
+        )
+    def anchor(spec):
+        rp = resolve_place(spec, board, libs[spec.ref], regions)
+        if rp.at is None:
+            raise ol.OutlineError(f"{'layout.core.py:' + str(spec.line) + ': ' if spec.line else ''}Place({spec.ref!r}) has no left= or at=: with no Outline() there is no width to centre it in")
+        settle(rp, rp.at, rp.rot)
+
+    def relations(specs, limits):
+        _relate(design, job, feet, placed, keepouts, regions, resolved, order, moves, settle, specs, limits)
+
+    # A core rule area (`Pour(None, keepout=...)`) counts toward the derived outline as a Keepout does (docs/board-outline.md
+    # A.5, B.1): it is in I, an edge group docks outside it, its face may fix a side, and the fit holds it. It reached only
+    # the post-route fit before, so one past a side an edge part fixes was left wholly outside Edge.Cuts with no word
+    # (refute:outline 2026-10-07).
+    rules = ol.rule_areas(design)
+    ctx = SimpleNamespace(
+        job=job, feet=feet, placed=placed, resolved=resolved, keepouts=keepouts + [b for _k, b in rules],
+        keepout_specs=list(job.keepouts) + [k for k, _b in rules],
+        region_boxes=[(r.x0, r.y0, r.x1, r.y1) for r in regions.values()], regions=regions, region_specs=list(job.regions),
+        edge_clear=edge_clear(job),
+        anchor=anchor, relations=relations, settle=lambda spec, at, rot: settle(spec, at, rot),
+    )
+    d = ol.place_derived(ctx)
+    for name, x, y in d.fids:
+        placed.append(Foot(name, (-FID_HALF, -FID_HALF, FID_HALF, FID_HALF), [Pad("", 0.0, 0.0, 1.0, 1.0, "")], at=(x, y), rot=0.0))
+    if 0 < len(d.fids) < 3:
+        moves.append(f"only {len(d.fids)} fiducial spot(s) are free: the anchors cover the other corners and edge middles; JLC wants 3")
+    d.A, d.pitch = ol.allowance_of(job)
+    d.m = ol.margin_of(job, poured=ol.has_pour(job, design))
+    extra = [(f"Keepout {k.name}", b) for k, b in zip(job.keepouts, keepouts)] + [(f"Region {n}", (r.x0, r.y0, r.x1, r.y1)) for n, r in regions.items()]
+    extra += [(k.label, b) for k, b in rules]
+    # Core copper beyond a free side is design: the side grows to hold it (B.5-5), at placement already, so R holds it.
+    core_cu = ol.copper_boxes([c for c in getattr(design, "copper", ()) if c.source == "core"])
+    d.fit, d.sides = ol.fit(d, [f for f in placed if not f.ref.startswith("FID")], copper=core_cu, extra=extra)
+    d.R = ol.routing_box(d)
+    job.outline = d.R
+    job.derived = d
+    # The relations of the edge groups moved with them after `settle` wrote their poses: the feet are the truth.
+    for ref, spec in list(resolved.items()):
+        f = feet.get(ref)
+        if f is not None and f.at is not None and spec.at != f.at:
+            resolved[ref] = replace(spec, at=f.at, left=f.at[0], top=f.at[1])
+    return [resolved.get(p.ref, p) for p in job.places], moves, d.fids
 
 
 def _area(box) -> float:
@@ -456,14 +922,16 @@ def _farads(value: str) -> float:
     return float(m.group(1)) * _SCALE.get(m.group(2).lower() if m.group(2) != "µ" else "µ", 1.0)
 
 
-def _attach(spec: PlaceSpec, part: Foot, target: Foot, net: str, placed: list[Foot], keepouts, content: Rect, regions) -> tuple[tuple[float, float], float, str | None]:
+def _attach(spec: PlaceSpec, part: Foot, target: Foot, net: str, placed: list[Foot], keepouts, content: Rect, regions, corridors=None, named=None, clear: float = EDGE_CLEAR) -> tuple[tuple[float, float], float, str | None]:
     tpads = [p for p in target.pads if p.net == net]
     apads = [p for p in part.pads if p.net == net]
     if not tpads or not apads:
-        raise ValueError(f"Place({spec.ref!r}, to={spec.to!r}): no pad on net {net!r} on both parts")
+        at = f"layout.core.py:{spec.line}: " if spec.line else ""
+        lacks = " and ".join(f.ref for f, pads in ((target, tpads), (part, apads)) if not pads)
+        raise ValueError(f"{at}the to= of Place({spec.ref!r}) names {spec.to}, on net {net!r}, and {lacks} has no pad on it" if net else f"{at}the to= of Place({spec.ref!r}) names {spec.to}, which is on no net")
     gap = GAP if spec.gap is None else float(spec.gap)
     tc = target.center()
-    limit = regions[spec.parent] if spec.parent else Rect(content.x0 + EDGE_CLEAR, content.y0 + EDGE_CLEAR, content.x1 - EDGE_CLEAR, content.y1 - EDGE_CLEAR)
+    limit = regions[spec.parent] if spec.parent else Rect(content.x0 + clear, content.y0 + clear, content.x1 - clear, content.y1 - clear)
     others = [f for f in placed if f.ref != part.ref]
     # World pads of everything placed, by net, for the "lean toward your other nets" score.
     known: dict[str, list[tuple[float, float]]] = {}
@@ -476,6 +944,10 @@ def _attach(spec: PlaceSpec, part: Foot, target: Foot, net: str, placed: list[Fo
     rots = (spec.rot % 360,) if spec.rot_set else _ROTS
     for tp in tpads:
         tw = target.pad_world(tp)
+        # Every corridor but those of the pads the to= names: "another pad of that part" (decision 4). Without a
+        # named set (a caller that resolved none), the anchor pad's own.
+        own = named if named else {tp.num}
+        cors = [c for num, cs_ in sorted((corridors or {}).items()) if num not in own for c in cs_]
         if spec.toward:
             dirs = [_DIRS[spec.toward]]
         elif tp.num in target.escape:
@@ -516,6 +988,8 @@ def _attach(spec: PlaceSpec, part: Foot, target: Foot, net: str, placed: list[Fo
                             box = (at[0] + cb[0], at[1] + cb[1], at[0] + cb[2], at[1] + cb[3])
                             keep = (at[0] + ck[0], at[1] + ck[1], at[0] + ck[2], at[1] + ck[3])
                             clash = _clashes(box, keep, others, keepouts, limit, gap)
+                            if not clash and cors:
+                                clash = corridor_hits(part, at, rot, cors)
                             if not clash:
                                 found = (at, math.hypot(d, lat))
                                 break
@@ -545,10 +1019,15 @@ def _attach(spec: PlaceSpec, part: Foot, target: Foot, net: str, placed: list[Fo
     if stuck_best is None:
         raise ValueError(f"Place({spec.ref!r}, to={spec.to!r}): nowhere to stand")
     d, at, rot, clash = stuck_best
-    what = ", ".join(sorted(clash))
+    # Postfix B12 (refutation placement r2): the fallback pose was never tested against the corridors (they are tested
+    # only where nothing else clashes), so a part left in a live exit corridor was reported with its keepouts alone.
+    own = named if named else set()
+    every = [c for num, cs_ in sorted((corridors or {}).items()) if num not in own for c in cs_]
+    clash = sorted(set(clash) | set(corridor_hits(part, at, rot, every)))
+    what = ", ".join(clash)
     return at, rot, (
-        f"{spec.ref}: no clear spot next to {spec.to} within {_REACH:g} mm: {what} in the way; "
-        f"Place({spec.ref!r}, to={spec.to!r}, toward=...) picks another side, or move {what}"
+        f"{spec.ref}: no clear spot next to {spec.to} within {_REACH:g} mm: {what} in the way; it stands at "
+        f"({at[0]:g},{at[1]:g}) rotated {rot:g}"
     )
 
 
@@ -604,13 +1083,13 @@ def layout_report(design: Design, job, posed) -> list[str]:
     for i, a in enumerate(refs):
         for b in refs[i + 1 :]:
             if _overlap(feet[a].world_box(), feet[b].world_box()):
-                issues.append(f"{a} and {b} overlap (courtyards): give one of them its own spot or Place(to=) the other")
+                issues.append(f"{a} and {b} overlap (courtyards)")
                 continue
             for ic, part in ((a, b), (b, a)):
                 if feet[ic].closed and _overlap(feet[ic].world_keep(), feet[part].world_box()):
                     issues.append(
                         f"{part} sits in {ic}'s fanout lane: nothing passes between {ic}'s pads, so each row needs "
-                        f"{feet[ic].lane_mm:g} mm outside it for its escape vias; move {part} out, or Place({part!r}, to=\"{ic}.<pin>\") and the tool keeps the lane"
+                        f"{feet[ic].lane_mm:g} mm outside it for its escape vias"
                     )
     for ref in refs:
         box = feet[ref].world_box()
@@ -622,10 +1101,17 @@ def layout_report(design: Design, job, posed) -> list[str]:
     power = {n for n, net in design.nets.items() if getattr(net, "kind", "") == "power"}
     ics = {ref for ref, f in feet.items() if len([p for p in f.pads if p.num]) > 2}
     by_pin: dict[tuple[str, str], list[tuple[float, str]]] = {}
+    # docs/net-path-physics.md §4.5, §6: a cap a declared Loop() names is that loop's, and a cap whose
+    # Place(to=) names a pin of a part with more than two pads on the cap's power net is measured to
+    # that pin, not to the nearest guess.
+    cs = getattr(job, "constraints", None)
+    in_loop = {r for lp in (getattr(cs, "loops", ()) if cs is not None else ()) for r in lp.parts}
+    place_of = {pl.ref: pl for pl in design.places}
+    attached: dict[str, int] = {}
     for ref in refs:
         f = feet[ref]
         inst = inst_by.get(ref)
-        if inst is None or not ref.startswith("C") or len(f.pads) != 2:
+        if inst is None or not ref.startswith("C") or len(f.pads) != 2 or ref in in_loop:
             continue
         nets = {p.net for p in f.pads}
         pnet = next((n for n in nets if n in power), None)
@@ -634,7 +1120,21 @@ def layout_report(design: Design, job, posed) -> list[str]:
         cpad = next(p for p in f.pads if p.net == pnet)
         cw = f.pad_world(cpad)
         nearest = None
-        for ic in sorted(ics):
+        spec = place_of.get(ref)
+        to = str(getattr(spec, "to", "") or "")
+        if "." in to:
+            tref, tpin = to.split(".", 1)
+            tinst = inst_by.get(tref)
+            if tref in feet and tref in ics and tinst is not None and tpin in tinst.part.pins and tinst.pins.get(tpin) == pnet:
+                for p in feet[tref].pads:
+                    if p.num in tinst.part.pins[tpin].pads:
+                        pw = feet[tref].pad_world(p)
+                        dmm = math.hypot(pw[0] - cw[0], pw[1] - cw[1])
+                        if nearest is None or dmm < nearest[0]:
+                            nearest = (dmm, tref, p.num)
+                if nearest is not None:
+                    attached[ref] = getattr(spec, "line", 0)
+        for ic in sorted(ics) if nearest is None else ():
             for p in feet[ic].pads:
                 if p.net != pnet:
                     continue
@@ -671,9 +1171,15 @@ def layout_report(design: Design, job, posed) -> list[str]:
             if dmm > limit:
                 what = "a decoupling cap" if i == 0 else "the next cap on that pin row"
                 why = f" ({limit - extra:g} + the {extra:g} mm fanout lane of a closed pad row)" if extra else ""
-                issues.append(
-                    f"{ref} is {dmm:.1f} mm from {ic}.{pin}: {what} belongs within {limit:g} mm{why}; Place({ref!r}, to=\"{ic}.{pin}\")"
-                )
+                if ref in attached:
+                    # The attachment is already written: say so and name its line, never repeat it.
+                    line = attached[ref]
+                    where = f"layout.core.py:{line}" if line else "its Place()"
+                    issues.append(f"{ref} is {dmm:.1f} mm from {ic}.{pin}, the pin {where} attaches it to: {what} belongs within {limit:g} mm{why}")
+                else:
+                    issues.append(
+                        f"{ref} is {dmm:.1f} mm from {ic}.{pin}: {what} belongs within {limit:g} mm{why}; no Place(to=) attaches {ref} to {ic}"
+                    )
     from fnmatch import fnmatch
 
     pads_on: dict[str, list[tuple[str, str, float, float]]] = {}
@@ -699,8 +1205,11 @@ def layout_report(design: Design, job, posed) -> list[str]:
                 dmm, ref, num, r2, n2 = worst
                 pin = _pin_name(inst_by[ref], num) if ref in inst_by else num
                 pin2 = _pin_name(inst_by[r2], n2) if r2 in inst_by else n2
-                issues.append(f"{net}: {ref}.{pin} is {dmm:.1f} mm from {r2}.{pin2}, its nearest pad on the net; NetReq max_mm={cn.max_length_mm:g}: Place({ref!r}, to=\"{r2}.{pin2}\") or bring them together")
-    w, h = board.size_mm
+                issues.append(f"{net}: {ref}.{pin} is {dmm:.1f} mm from {r2}.{pin2}, its nearest pad on the net, over NetReq max_mm={cn.max_length_mm:g}")
+    # Derived mode: the edges are the placement's own fit (docs/board-outline.md B.3, `pcbc pcb`'s outline).
+    fit = (getattr(job, "derived", None) or {}).get("fit")
+    ex0, ey0, ex1, ey1 = fit if fit is not None else (lambda r: (r.x0, r.y0, r.x1, r.y1))(board_rect(board))
+    ec = edge_clear(job)
     for ref in refs:
         if _placed_on_edge(ref, job):
             continue
@@ -711,17 +1220,19 @@ def layout_report(design: Design, job, posed) -> list[str]:
                 continue
             px, py = f.pad_world(p)
             hw, hh = (p.h, p.w) if f.rot % 180 == 90 else (p.w, p.h)
-            over = max(EDGE_CLEAR - (px - hw / 2), EDGE_CLEAR - (py - hh / 2), (px + hw / 2) - (w - EDGE_CLEAR), (py + hh / 2) - (h - EDGE_CLEAR), 0.0)
+            over = max(ex0 + ec - (px - hw / 2), ey0 + ec - (py - hh / 2), (px + hw / 2) - (ex1 - ec), (py + hh / 2) - (ey1 - ec), 0.0)
             near = max(near, over)
-        if near > 1e-3:
-            issues.append(f"{ref}'s pads come within {EDGE_CLEAR:g} mm of the board edge: copper needs {EDGE_CLEAR:g} mm; move it in, or Place({ref!r}, edge=...) if it is a connector")
+        if near > ec + 1e-3:
+            issues.append(f"{ref}'s pads cross the board edge by {near - ec:.2f} mm: copper needs {ec:g} mm inside it")
+        elif near > 1e-3:
+            issues.append(f"{ref}'s pads come within {ec:g} mm of the board edge: copper needs {ec:g} mm")
     for ref in refs:
         if not ref.startswith("J"):
             continue
         box = feet[ref].world_box()
-        dist = min(box[0], box[1], w - box[2], h - box[3])
+        dist = min(box[0] - ex0, box[1] - ey0, ex1 - box[2], ey1 - box[3])
         if dist > EDGE_MM:
-            issues.append(f"{ref} is {dist:.1f} mm from the nearest board edge: Place({ref!r}, edge=\"bottom\") puts a connector on one")
+            issues.append(f"{ref} is {dist:.1f} mm from the nearest board edge, and a connector is reached from an edge")
     return issues
 
 

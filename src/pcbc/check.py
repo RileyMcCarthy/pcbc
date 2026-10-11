@@ -6,6 +6,7 @@ from pathlib import Path
 
 from dataclasses import replace
 
+from .pcb_place import _board_of
 from .compile import CompiledJob
 from .layout import footprints_by_ref, resolve_place, resolve_regions
 from .model import BoardSpec
@@ -42,14 +43,7 @@ def check_text(job: CompiledJob, text: str, tol_mm: float = 0.05) -> list[str]:
         if ref:
             by_ref[ref] = block
 
-    board = BoardSpec(
-        size_mm=job.board_size_mm,
-        padding=job.padding,
-        layers=job.layers,
-        stackup=job.stackup,
-        pcb=job.pcb,
-        planes=job.planes,
-    )
+    board = _board_of(job)  # the job's outline (docs/board-outline.md PR 2)
     regions = resolve_regions(board, job.regions)
     fps = footprints_by_ref(text)
     aliases = build_alias_index(text)

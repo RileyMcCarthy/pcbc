@@ -3,29 +3,57 @@
   "images": [
     {
       "id": "blinky",
-      "title": "Blinky",
+      "title": "Blinky — with schematic.core.py",
       "path": "tests/benchmarks/schematics/blinky.png",
       "kind": "schematic",
       "board": "blinky"
     },
     {
+      "id": "blinky-auto",
+      "title": "Blinky — auto, no core",
+      "path": "tests/benchmarks/schematics/blinky.auto.png",
+      "kind": "schematic",
+      "board": "blinky"
+    },
+    {
       "id": "buck",
-      "title": "Buck",
+      "title": "Buck — with schematic.core.py",
       "path": "tests/benchmarks/schematics/buck.png",
       "kind": "schematic",
       "board": "buck"
     },
     {
+      "id": "buck-auto",
+      "title": "Buck — auto, no core",
+      "path": "tests/benchmarks/schematics/buck.auto.png",
+      "kind": "schematic",
+      "board": "buck"
+    },
+    {
       "id": "c3_usb",
-      "title": "C3 USB",
+      "title": "C3 USB — with schematic.core.py",
       "path": "tests/benchmarks/schematics/c3_usb.png",
       "kind": "schematic",
       "board": "c3_usb"
     },
     {
+      "id": "c3_usb-auto",
+      "title": "C3 USB — auto, no core",
+      "path": "tests/benchmarks/schematics/c3_usb.auto.png",
+      "kind": "schematic",
+      "board": "c3_usb"
+    },
+    {
       "id": "node",
-      "title": "Node",
+      "title": "Node — with schematic.core.py",
       "path": "tests/benchmarks/schematics/node.png",
+      "kind": "schematic",
+      "board": "node"
+    },
+    {
+      "id": "node-auto",
+      "title": "Node — auto, no core",
+      "path": "tests/benchmarks/schematics/node.auto.png",
       "kind": "schematic",
       "board": "node"
     }

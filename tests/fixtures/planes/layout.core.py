@@ -1,0 +1,8 @@
+Outline(width=40, height=30)
+Place("R1", position="absolute", left=5, top=5, locked=True, reason="CLK, the net that declares the edge")
+Place("R2", position="absolute", left=11, top=5, locked=True, reason="CLK's other end")
+Place("R3", position="absolute", left=5, top=24, locked=True, reason="SIG, a second net for the pours to flow around")
+Place("R4", position="absolute", left=11, top=24, locked=True, reason="SIG's other end")
+Place("C1", position="absolute", left=30, top=5, locked=True, reason="decoupling, north-east")
+Place("C2", position="absolute", left=30, top=24, locked=True, reason="decoupling, south-east")
+Place("C3", position="absolute", left=22.74, top=14.02, locked=True, reason="its 3V3 pad sits on the interior lattice site at (23.4945, 15.0), so one site is refused by copper and the note has a blocker to name")

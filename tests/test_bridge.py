@@ -26,11 +26,13 @@ from pcbc.language import load_board
 from boardtext import feet_of_text
 from pcbc.route_checks import build_ctx, check_bridge
 from pcbc.route_verify import bridge_ties
+from conftest import copy_board, ds2_dir, write_split
+from conftest import copy_board_file
 
 ROOT = Path(__file__).resolve().parent.parent
 EXAMPLES = ROOT / "examples"
 FIXTURE = ROOT / "tests" / "fixtures" / "bridge" / "bridge.py"
-DS2 = Path.home() / "Documents" / "MaD" / "Hardware" / "DS2Addon" / "pcbc"
+DS2 = ds2_dir()
 HAS_DS2 = (DS2 / "ds2_addon.py").exists()
 DS2_ROUTED = DS2 / "layout" / "ds2_addon" / "routed" / "layout.kicad_pcb"
 
@@ -51,7 +53,7 @@ def _placed(name: str) -> Path:
 
 def _write(tmp_path: Path, name: str, body: str) -> Path:
     p = tmp_path / f"{name}.py"
-    p.write_text(body)
+    write_split(p, body)
     return p
 
 
@@ -64,7 +66,7 @@ c = dict(package="0805", manufacturer="Yageo", mpn="CC0805KRX7R9BB104", lcsc="C4
 r = dict(package="0805", manufacturer="UniOhm", mpn="0805W8F0000T5E", lcsc="C17888")
 '''
 TAIL = '''Board(width=40, height=25, layers=2, stackup="jlcpcb_2l_1oz")
-NetReq("3V3", "GND", "VDDA", "VSS", kind="power", volts=3.3, amps=0.1)
+NetReq("3V3", "VDDA", kind="power", volts=3.3); NetReq("GND", "VSS", kind="power")
 '''
 
 
@@ -87,7 +89,7 @@ NetReq("3V3", "GND", "VDDA", "VSS", kind="power", volts=3.3, amps=0.1)
 def test_load_refuses_a_bridge_that_is_wrong_about_itself(tmp_path: Path, call: str, says: str):
     """Everything that is a property of the **call** is refused at load, before any net exists.
 
-    Not the net names: `Chain()`, `Bus()` and `Guard()` all defer those to `compile_constraints`, and
+    Not the net names: `Path()`, `Bus()` and `Guard()` all defer those to `compile_constraints`, and
     a board is free to write its `Bridge()` line above its `Ground()` lines. Refusing an undeclared
     net at load would turn that ordering into an error about the wrong thing.
     """
@@ -102,7 +104,7 @@ def test_load_refuses_a_bridge_that_is_wrong_about_itself(tmp_path: Path, call: 
     "call,says",
     [
         ('Bridge("GND", "NOPE", at="R11")', "no net 'NOPE'"),
-        ('Bridge("GND", "3V3", at="R11")', 'write Ground("3V3")'),
+        ('Bridge("GND", "3V3", at="R11")', "a bridge ties two grounds, and 3V3 is not declared with Ground()"),
     ],
 )
 def test_compile_refuses_a_bridge_that_is_wrong_about_the_netlist(tmp_path: Path, call: str, says: str):
@@ -192,8 +194,8 @@ def test_ds2_prints_the_untied_grounds_move_and_does_not_fail():
     assert move.startswith("GND/VSS: VSS cannot reach GND.")
     assert "U1 binds both on 16 pins (AVSS on VSS, DGND on GND), which is not a tie" in move
     assert "(GND: C5, C6; VSS: C1, C10, C12, C3, C4, C7, C9)" in move
-    assert 'Resistor("R11", "0R", p1=GND, p2=VSS)' in move
-    assert 'Bridge("GND", "VSS", at=("J1.2", "J2.2"), kind="off_board"' in move
+    # docs/direction.md §7b: the facts, and no part or Bridge() line to paste.
+    assert "Resistor(" not in move and "Bridge(" not in move, move
 
 
 @pytest.mark.parametrize("name", ["blinky", "buck", "c3_usb", "node"])
@@ -204,7 +206,9 @@ def test_the_example_boards_say_nothing_about_bridges(name: str):
     grounds = [n.name for n in design.nets.values() if n.kind == "ground"]
     assert len(grounds) == 1, grounds
     assert _untied_grounds(design) == []
-    job = compile_design(design)
+    from boardtext import with_outline
+
+    job = with_outline(design, compile_design(design))
     ctx = build_ctx(design, job, feet_of_text(design, _placed(name).read_text()))
     assert check_bridge(ctx) == []
     assert job.constraints.bridges == ()
@@ -228,6 +232,7 @@ def test_the_example_boards_say_nothing_about_bridges(name: str):
 # cut (`docs/stitch-plan.md` §8 item 5).
 DS2_AXES = (
     ("x", (13.270, 37.750), (1.520, 41.928), 24.480),
+    # (2026-10-02: the 2026-10-01 re-record for decision 4's moves is undone; ds2 is placed as at the checkpoint.)
     ("y", (4.916, 24.130), (3.200, 20.360), 15.444),
     ("u", (21.058, 43.756), (13.470, 41.668), 20.610),
     ("v", (-2.291, 14.506), (-13.322, 20.195), 16.797),
@@ -250,7 +255,7 @@ def test_ds2_has_no_axis_that_separates_its_two_grounds():
     # pitch — a distance that names why the two grounds have to be tied somewhere, not a place to
     # tie them, because no part goes between two pins of one package.
     assert "J1.2 and C7.2 come closest, 2.6675 mm apart" in move
-    assert 'Resistor("R11", "0R", p1=GND, p2=VSS) with Place("R11", to="J1.2")' in move
+    assert "no Bridge() names a part that ties them" in move and "Resistor(" not in move and "Place(\"" not in move, move
 
 
 def test_the_fixture_board_says_nothing_because_its_tie_is_already_at_the_closest_approach():
@@ -269,11 +274,10 @@ def test_the_fixture_board_says_nothing_because_its_tie_is_already_at_the_closes
 def test_a_tie_away_from_the_closest_approach_is_a_place_move(tmp_path: Path):
     """The same fixture with `R11` pushed into a corner: the two domains still meet in the middle,
     and a single-point tie in the corner makes every return current go round to reach it."""
-    body = FIXTURE.read_text().replace(
+    board = copy_board(FIXTURE, tmp_path, [(
         'Place("R11", position="absolute", left=18.5, top=10.5, locked=True, reason="the one tie, between the domains")',
         'Place("R11", position="absolute", left=1, top=1, locked=True, reason="deliberately not at the meeting point")',
-    )
-    board = _write(tmp_path, "bridge_corner", body)
+    )], name="bridge_corner.py")
     design = load_board(board)
     job = compile_design(design)
     from conftest import placed_board
@@ -283,7 +287,7 @@ def test_a_tie_away_from_the_closest_approach_is_a_place_move(tmp_path: Path):
     assert moves, moves
     assert all(m.startswith("GND/VSS: R11 ties them at ") for m in moves), moves
     assert all("left out of the measurement on both sides" in m for m in moves), moves
-    assert all('Place("R11", to=' in m for m in moves), moves
+    assert all(m.endswith("(layout.core.py:4 places R11).") and 'Place("R11", to=' not in m for m in moves), moves
 
 
 def test_two_ties_read_as_multi_before_any_copper_exists(tmp_path: Path):
@@ -293,19 +297,13 @@ def test_two_ties_read_as_multi_before_any_copper_exists(tmp_path: Path):
     It is fatal because it is the only thing here KiCad cannot see: two declared nets joined by two
     separate 0R parts are, to KiCad, two nets and two parts and no violation at all.
     """
-    body = FIXTURE.read_text().replace(
-        'Bridge("GND", "VSS", at="R11", why="the analog return meets the digital one under the ADC")', ""
-    ).replace(
-        'Capacitor("C1", "100nF", p1=VDDA, p2=VSS, **c)',
-        'Capacitor("C1", "100nF", p1=VDDA, p2=VSS, **c)\nResistor("R12", "0R", package="0805", manufacturer="UniOhm", mpn="0805W8F0000T5E", lcsc="C17888", p1=VSS, p2=GND)',
-    ).replace(
-        'SchPlace("R11", left=60, top=40)',
-        'SchPlace("R11", left=60, top=40)\nSchPlace("R12", left=60, top=80)',
-    ).replace(
-        'Place("C3", position="absolute", right=6, top=6, locked=True, reason="digital decoupling, east")',
-        'Place("R12", position="absolute", left=18.5, top=20, locked=True, reason="the second tie this test exists for")\nPlace("C3", position="absolute", right=6, top=6, locked=True, reason="digital decoupling, east")',
-    )
-    board = _write(tmp_path, "bridge_multi", body)
+    board = copy_board(FIXTURE, tmp_path, [
+        ('Bridge("GND", "VSS", at="R11", why="the analog return meets the digital one under the ADC")', ""),
+        ('Capacitor("C1", "100nF", p1=VDDA, p2=VSS, **c)',
+         'Capacitor("C1", "100nF", p1=VDDA, p2=VSS, **c)\nResistor("R12", "0R", package="0805", manufacturer="UniOhm", mpn="0805W8F0000T5E", lcsc="C17888", p1=VSS, p2=GND)'),
+        ('Place("C3", position="absolute", right=6, top=6, locked=True, reason="digital decoupling, east")',
+         'Place("R12", position="absolute", left=18.5, top=20, locked=True, reason="the second tie this test exists for")\nPlace("C3", position="absolute", right=6, top=6, locked=True, reason="digital decoupling, east")'),
+    ], name="bridge_multi.py")
     design = load_board(board)
     from conftest import placed_board
 
@@ -320,19 +318,21 @@ def test_two_ties_read_as_multi_before_any_copper_exists(tmp_path: Path):
 # What the finished copper says
 # ---------------------------------------------------------------------------------------------
 
-# The DS2 Addon's two grounds, read off its checked-in routed board 2026-09-21.
+# The DS2 Addon's two grounds, read off the routed board beside `ds2_addon.py` on 2026-10-10.
+# That file is the owner's, dated 2026-09-27. The 2026-09-21 copper this pin used to name — a GND
+# track on F.Cu from (22.7,13.8) to (24,13.8), a VSS via at (23.2,13.2), 20.052 mm2, 0.5338 pF —
+# is not in it.
 #
-# `closest` is over **copper**, not pads: the nearest approach is a GND track and a VSS via, neither
-# of them a pad, which is why the placement's own answer (0.3070 mm, `U1.4` to `U1.5`) is a different
-# number about a different question. `facing`/`pf` are `route_verify._coupling` at
-# `COUPLING_CELL_MM` — 20.052 mm2 of VSS copper on F.Cu over the 1012.099 mm2 GND pour on B.Cu,
-# across 1.53 mm of FR4 at Dk 4.6.
+# `closest` is over **copper**, not pads: the nearest approach is a GND via (size 0.5 at
+# (23.73,5.589)) and a VSS track on B.Cu (width 0.25, (22.652,5.38) to (24.176,6.904)). The gap
+# is the centre-line distance minus both radii, 0.239476 mm. `facing`/`pf` are
+# `route_verify._coupling` at `COUPLING_CELL_MM` — 14.794 mm2 of VSS copper on F.Cu over the GND
+# pour on B.Cu, across 1.53 mm of FR4 at Dk 4.6, which is 0.3938 pF. The dielectric is the same
+# one the 2026-09-21 measurement used; the copper is what moved.
 #
-# `docs/stitch-plan.md` §6 row 6 recorded **21.600 mm2 (64.5 %) and 0.575 pF** from the panel and
-# neither reproduces. The percentage does, against the wrong denominator: 20.052 mm2 is 64.5 % of
-# *all* VSS copper on both layers and 76.3 % of the F.Cu half, and only the F.Cu half can face a
-# B.Cu pour. These are the numbers this session measured.
-DS2_TIE = {"verdict": "none", "closest": 0.2250, "facing_mm2": 20.052, "pf": 0.5338}
+# `docs/stitch-plan.md` §6 row 6 recorded **21.600 mm2 and 0.575 pF** from the panel, and neither
+# reproduces on this board.
+DS2_TIE = {"verdict": "none", "closest": 0.239476, "facing_mm2": 14.794, "pf": 0.3938}
 
 @pytest.mark.kicad
 @pytest.mark.skipif(not DS2_ROUTED.exists(), reason="needs the DS2 Addon's routed board")
@@ -345,8 +345,8 @@ def test_ds2_routed_board_has_two_grounds_and_nothing_joining_them():
     assert (row.a, row.b, row.verdict, row.tie) == ("GND", "VSS", DS2_TIE["verdict"], "")
     assert row.closest is not None
     assert row.closest[0] == pytest.approx(DS2_TIE["closest"], abs=1e-4)
-    assert row.closest[1] == "GND track on F.Cu (22.7,13.8)-(24,13.8)"
-    assert row.closest[2] == "VSS via at (23.2,13.2)"
+    assert row.closest[1] == "GND via at (23.73,5.589)"
+    assert row.closest[2] == "VSS track on B.Cu (22.652,5.38)-(24.176,6.904)"
     assert row.facing_mm2 == pytest.approx(DS2_TIE["facing_mm2"], abs=0.02)
     assert row.coupling_pf == pytest.approx(DS2_TIE["pf"], abs=0.001)
     # Never fatal: the board it fires on ships and builds green.
@@ -361,7 +361,7 @@ def test_the_fixture_builds_to_fab_with_the_gate_verified(tmp_path: Path):
     placement, routing, KiCad's own DRC and fab, with `netcheck.check_copper` passing it and **no
     gate change at all**."""
     board = tmp_path / "bridge.py"
-    board.write_text(FIXTURE.read_text())
+    copy_board_file(board, FIXTURE)
     result = build_job(board, upto="fab", force=True)
     assert result["error"] is None, result["error"]
     assert result["ok"] is True

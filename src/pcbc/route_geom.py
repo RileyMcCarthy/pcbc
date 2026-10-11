@@ -540,6 +540,144 @@ def gap(a: Shape, b: Shape) -> float:
     return round(math.sqrt(hull_dist2(a.pts, b.pts)) - math.fsum((a.r, b.r)), 4) + 0.0
 
 
+# --- the junction clip (docs/net-path-physics.md §3.2) --------------------------------------------
+
+CLIP_BISECT = 64
+"""Bisection steps for `clip_outside`, as `route_verify.CHAIN_BISECT`: the distance from a point to a
+convex shape is convex along a straight line, so the part of a centre line within `d` of one shape is a
+single interval, found by a ternary search and two bisections to (2/3)**64 of the true crossing."""
+
+
+def _within(a: Pt, b: Pt, shape: Shape, d: float) -> tuple[float, float] | None:
+    lim = (shape.r + d) ** 2
+    box = aabb(shape)
+    if min(a[0], b[0]) > box[2] + d or max(a[0], b[0]) < box[0] - d:
+        return None
+    if min(a[1], b[1]) > box[3] + d or max(a[1], b[1]) < box[1] - d:
+        return None
+
+    def at(t: float) -> Pt:
+        return (a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t)
+
+    def f(t: float) -> float:
+        return hull_dist2((at(t),), shape.pts) - lim
+
+    lo, hi = 0.0, 1.0
+    for _ in range(CLIP_BISECT):
+        m1 = lo + (hi - lo) / 3.0
+        m2 = hi - (hi - lo) / 3.0
+        if f(m1) <= f(m2):
+            hi = m2
+        else:
+            lo = m1
+    inner = (lo + hi) / 2.0
+    if f(inner) > 0.0:
+        if f(0.0) <= 0.0:
+            inner = 0.0
+        elif f(1.0) <= 0.0:
+            inner = 1.0
+        else:
+            return None
+
+    def edge(good: float, bad: float) -> float:
+        for _ in range(CLIP_BISECT):
+            mid = (good + bad) / 2.0
+            if f(mid) <= 0.0:
+                good = mid
+            else:
+                bad = mid
+        return good
+
+    t0 = 0.0 if f(0.0) <= 0.0 else edge(inner, 0.0)
+    t1 = 1.0 if f(1.0) <= 0.0 else edge(inner, 1.0)
+    return (t0, t1)
+
+
+def clip_outside(a: Pt, b: Pt, shapes, d: float) -> tuple[tuple[Pt, Pt], ...]:
+    """The parts of the centre line `a -> b` farther than `d` from every one of `shapes` (a segment
+    clipped against convex hulls plus radius), in centre-line order. The router's junction predicate
+    and the emitted-board junction check both call it, at one number: the net's clearance."""
+    spans = sorted(s for s in (_within(a, b, sh, d) for sh in shapes) if s is not None)
+    if not spans:
+        return ((a, b),)
+    merged: list[list[float]] = [list(spans[0])]
+    for t0, t1 in spans[1:]:
+        if t0 <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], t1)
+        else:
+            merged.append([t0, t1])
+    out = []
+    cur = 0.0
+    for t0, t1 in merged:
+        if t0 > cur + 1e-12:
+            out.append((cur, t0))
+        cur = max(cur, t1)
+    if cur < 1.0 - 1e-12:
+        out.append((cur, 1.0))
+
+    def at(t: float) -> Pt:
+        return qp((a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t))
+
+    return tuple((at(t0), at(t1)) for t0, t1 in out if at(t0) != at(t1))
+
+
+def _witness(a: Shape, b: Shape) -> Pt:
+    """The middle of the two facing points of `a` and `b` (`route_verify.closest_points`' answer)."""
+    best = (float("inf"), a.pts[0], b.pts[0])
+    for pts_p, pts_q, flip in ((a.pts, b.pts, False), (b.pts, a.pts, True)):
+        for p in pts_p:
+            for i in range(len(pts_q)):
+                s, e = pts_q[i], pts_q[(i + 1) % len(pts_q)]
+                dx, dy = e[0] - s[0], e[1] - s[1]
+                L = dx * dx + dy * dy
+                t = 0.0 if L == 0 else max(0.0, min(1.0, ((p[0] - s[0]) * dx + (p[1] - s[1]) * dy) / L))
+                w = (s[0] + t * dx, s[1] + t * dy)
+                d = math.dist(p, w)
+                if d < best[0]:
+                    best = (d, w, p) if flip else (d, p, w)
+    d, pa, pb = best
+    if d > 1e-12:
+        ux, uy = (pb[0] - pa[0]) / d, (pb[1] - pa[1]) / d
+        pa = (pa[0] + ux * a.r, pa[1] + uy * a.r)
+        pb = (pb[0] - ux * b.r, pb[1] - uy * b.r)
+    return ((pa[0] + pb[0]) / 2.0, (pa[1] + pb[1]) / 2.0)
+
+
+def _deep_parts(ends, shape: Shape, regions, d: float) -> list[Shape]:
+    """The copper of one item lying **wholly** farther than `d` from every region: a track's centre line
+    clipped at `d` plus its own half width, a via dropped when its disc comes within `d` of a region, a
+    pad (`ends` None) whole."""
+    if ends is None:
+        return [shape]
+    if ends[0] == "track":
+        _k, a, b, w = ends
+        return [track_shape(x, y, w) for x, y in clip_outside(a, b, regions, d + w / 2.0)]
+    _k, at, dia = ends
+    return [] if any(hull_dist2((at,), r.pts) <= (r.r + d + dia / 2.0) ** 2 for r in regions) else [shape]
+
+
+def contact_outside(s1: Shape, e1, s2: Shape, e2, regions, d: float, need: float) -> bool:
+    """Do two pieces of copper, each already clipped to its part outside `regions` dilated by `d`
+    (`clip_outside` at `d`), come within `need` of each other **outside** those regions?
+
+    The clip cuts a track's centre line, so a clipped track keeps its round end, which reaches back
+    into the region by half its width: two wide tracks that meet only inside a pad touch through those
+    ends. Refutation round 2 found the router refusing a straight, via-free 3 A link for exactly that
+    (a 1.367 mm track leaving a pad its 1.367 mm feed enters at a right angle). So a contact whose
+    witness (`_witness`) lies inside a region counts only when the two pieces also touch with their
+    whole copper outside it (`_deep_parts`). `e1`/`e2`: `("track", a, b, w)`, `("via", at, dia)`, or
+    None for a pad. The router's junction rule and the emitted-board junction and order checks all ask
+    this one predicate."""
+    if clears(s1, s2, need):
+        return False
+    if not regions:
+        return True
+    w = _witness(s1, s2)
+    if not any(hull_dist2((w,), r.pts) <= (r.r + d) ** 2 for r in regions):
+        return True
+    return any(not clears(x, y, need) for x in _deep_parts(e1, s1, regions, d) for y in _deep_parts(e2, s2, regions, d))
+
+
 # --- paths ----------------------------------------------------------------------------------------
 
 

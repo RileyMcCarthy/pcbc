@@ -159,6 +159,7 @@ class StitchSpec:
     bound: int  # the declared candidate bound: len(sites), stated so a test can pin it
     at: Pt = (0.0, 0.0)  # the anchor: where the links start (carrier "parallel")
     width: float = 0.0  # the link width: the class, never narrowed (§5)
+    link: str = ""  # carrier "parallel": the path link whose current the rungs carry (docs/physics-subjects.md PR 3)
     budget: "ThermalSpec | None" = None
     """The compiled `Thermal()` a `thermal` spec is placing, `None` for every other carrier.
 
@@ -1175,21 +1176,39 @@ def _parallel_specs(ctx: PatternCtx) -> tuple[StitchSpec, ...]:
     cs = ctx.cs
     stack = scene.stack
     out: list[StitchSpec] = []
+    # The population is per path link that carries a declared current (`docs/physics-subjects.md` PR 3):
+    # a net carries none of its own, so only a link's vias have a current to be rated against, each at
+    # its own link's current. A net with no such link is not in the population.
     for c in sorted(cs.constraints, key=lambda c: c.net):
-        if c.current is None or c.net in scene.plane_of:
+        if c.net in scene.plane_of:
             continue
-        mine = _vias_of(scene, c.net)
+        for lk in sorted({x.key: x for p in c.paths for x in p.links if x.current is not None and x.amps_written}.values(), key=lambda x: x.key):
+            out.extend(_parallel_link(ctx, c, lk))
+    return tuple(out)
+
+
+def _parallel_link(ctx: PatternCtx, c, lk) -> list[StitchSpec]:
+    """The parallel rungs one current-carrying link's lone vias need (see `_parallel_specs`)."""
+    scene = ctx.scene
+    stack = scene.stack
+    out: list[StitchSpec] = []
+    for _once in (0,):
+        # A router via group already carries its current through its own landing (docs/net-path-physics.md
+        # §4.3): its barrels are not lone vias to add twins to.
+        grouped = {it.at() for it in scene.items if it.kind == "via" and it.net == c.net and it.reason == "route_group"}
+        on_link = {it.at() for it in scene.items if it.kind == "via" and it.net == c.net and it.link == lk.key}
+        mine = [v for v in _vias_of(scene, c.net) if v["at"] not in grouped and v["at"] in on_link]
         if not mine:
-            continue
-        dt = c.current.temp_rise_c
-        width = round(float(c.width_mm.value), 4)
+            return out
+        dt = lk.current.temp_rise_c
+        width = round(float(lk.widest()), 4)
         for group in _clusters_of(mine):
             # The **weakest** barrel rates the group, which is `route_verify.Parallel.drill`'s
             # reading of the same cluster: a group is only as good as its thinnest plating. The
             # **anchor's** size is what a new via copies (§2f); the two are the same number on every
             # group in this repo, because every group here is single-drilled.
             drill = min(mine[i]["drill"] for i in group)
-            need = vias_per_change(c.current.amps, drill, stack.via_plating_mm, dt)
+            need = vias_per_change(lk.current.amps, drill, stack.via_plating_mm, dt)
             add = need - len(group)
             if add <= 0:
                 continue
@@ -1209,15 +1228,16 @@ def _parallel_specs(ctx: PatternCtx) -> tuple[StitchSpec, ...]:
                     joins=("F.Cu", "B.Cu"),
                     owner=f"{c.net} via at ({at[0]:g},{at[1]:g})",
                     why=(
-                        f"{len(group)} x {drill:g} mm barrel carries {one * len(group):g} A of {c.net}'s "
-                        f"{c.current.amps:g} A at {dt:g} C, and vias_per_change asks {need}"
+                        f"{len(group)} x {drill:g} mm barrel carries {one * len(group):g} A of {lk.source}'s link {lk.key}'s "
+                        f"{lk.current.amps:g} A at {dt:g} C, and vias_per_change asks {need}"
                     ),
                     bound=len(sites),
                     at=at,
                     width=width,
+                    link=lk.key,
                 )
             )
-    return tuple(out)
+    return out
 
 
 def _owned_runs(ctx: PatternCtx, net: str) -> tuple[tuple[Pt, ...], ...]:
@@ -1386,7 +1406,6 @@ def _plane_refusal(ctx: PatternCtx, spec: StitchSpec) -> Refusal | None:
     if spec.carrier != "plane" or ctx.cs.fastest_edge() is not None:
         return None
     fast = sorted({c.net for c in ctx.cs.constraints if c.kind in ("usb_hs", "clock", "spi", "pair")})
-    hint = f'NetReq("{fast[0]}", ..., rise_ps=...)' if fast else "the NetReq of the fastest net on this board"
     return Refusal(
         pattern=PLANE_REASON,
         net=spec.net,
@@ -1399,9 +1418,8 @@ def _plane_refusal(ctx: PatternCtx, spec: StitchSpec) -> Refusal | None:
             spec.net,
             f"{spec.owner}, two pours of one net facing each other across {spec.joins[0]}/{spec.joins[1]}",
             f"a stitch lattice at lambda/{PITCH_FRACTION:g} of the board's fastest edge (R-E1)",
-            spec.why,
-            f"Moves: add rise_ps= to {hint} — the fastest edge rate this board's parts really produce, "
-            f"in picoseconds, off their datasheets; pcbc has no default for it and will not invent one",
+            f"{spec.why}; no NetReq on this board gives rise_ps=, and pcbc has no default edge rate"
+            + (f" (nets of a fast kind: {', '.join(fast)})" if fast else ""),
             sep="\n  ",
         ),
     )
@@ -1984,8 +2002,6 @@ def _guard_refuse_pour(ctx: PatternCtx, spec: StitchSpec) -> Refusal:
             f"{ground} has no plane or pour on this board, so every stitch via would weld to nothing "
             f"and the two tracks would be islands on a named net that KiCad's pad-to-pad unconnected "
             f"check cannot see (rule: no_pour)",
-            f'Moves: NetReq("{ground}", kind="power") gives a two-layer board its back pour; or '
-            f'Board(planes=[("{ground}", "In1.Cu")]) on four layers; or drop the Guard("{spec.owner}") line',
             sep="\n  ",
         ),
     )
@@ -2078,7 +2094,6 @@ def _thermal_refuse(ctx: PatternCtx, spec: StitchSpec, blockers: str, rule: str)
     b = spec.budget
     assert b is not None
     heats = sorted({it.owner for it in ctx.scene.items if it.kind == "pad" and "pad_prop_heatsink" in it.prop and it.owner.startswith(f"{b.ref}.")})
-    did_you = f'; did you mean Thermal("{heats[0]}")?' if heats else f"; {b.ref} declares no pad_prop_heatsink pad at all"
     return Refusal(
         pattern=THERMAL_REASON,
         net=spec.net,
@@ -2091,8 +2106,7 @@ def _thermal_refuse(ctx: PatternCtx, spec: StitchSpec, blockers: str, rule: str)
             spec.net,
             f"{spec.owner}, declared on Thermal line {b.req.line}",
             f"{b.need} x {b.via[0]:g}/{b.via[1]:g} barrel(s) under it ({spec.why})",
-            blockers,
-            f'Moves: drop the Thermal("{spec.owner}") line{did_you}',
+            blockers + (f"; {b.ref}'s pad_prop_heatsink pad is {heats[0]}" if heats else f"; {b.ref} declares no pad_prop_heatsink pad"),
             sep="\n  ",
         ),
     )
@@ -2123,26 +2137,8 @@ def _bare_notes(ctx: PatternCtx, spec: StitchSpec, per_block: dict) -> tuple[str
             why = f"no {spec.via[0]:g} mm ring fits inside it"
         else:
             why = f"{tried} of its {n} site(s) tried and none cleared"
-        out.append(f"thermal {spec.owner}: {BARE} at ({at[0]:g},{at[1]:g}) (pad {k + 1} of the land's {len(spec.blocks)}) has no barrel: {why}. {_bare_moves(ctx, spec, clash)}")
+        out.append(f"thermal {spec.owner}: {BARE} at ({at[0]:g},{at[1]:g}) (pad {k + 1} of the land's {len(spec.blocks)}) has no barrel: {why}")
     return tuple(out)
-
-
-def _bare_moves(ctx: PatternCtx, spec: StitchSpec, clash: Clash | None) -> str:
-    """The edits that give a bare pad of a thermal land its barrel, each ending in a `board.py` line:
-    take the blocker off its layer (it is another net's copper; a `NetReq(layers=)` routes it on the
-    other side), or turn or move the land's part so the land clears it."""
-    ref = spec.owner.split(".")[0]
-    edits = []
-    if clash is not None and clash.item.reason == "core":
-        edits.append(f"move {clash.item.owner} off the land or delete it (it is a lock, so pcbc routes around it and never moves it)")
-    elif clash is not None and clash.item.kind in ("track", "via") and clash.item.net and clash.item.net != spec.net:
-        layer = sorted(clash.item.layers)[0] if len(clash.item.layers) == 1 else "this layer"
-        other = "F.Cu" if layer == "B.Cu" else _other(ctx)
-        edits.append(f'NetReq("{clash.item.net}", layers=["{other}"]) takes {clash.item.owner} off {layer} under the land')
-    elif clash is not None and clash.item.kind == "pad" and "." in clash.item.owner:
-        edits.append(f'move {clash.item.owner.split(".")[0]} (its Place()) off the land')
-    edits.append(f'turn or move {ref} (its Place(), e.g. rotate=) so the land clears it')
-    return "Moves: " + "; or ".join(edits) + "."
 
 
 def _shortfall(spec: StitchSpec, tried: int, clash: Clash | None, unreached: int, lane: str, crowded: int = 0) -> str:
@@ -2198,9 +2194,11 @@ def _cover(ctx: PatternCtx, spec: StitchSpec, got: int, blocked_why: str = "", p
         # arithmetic wrong. `floor_ok` is `<=` here and `>=` for a rail — see `Coverage.line`.
         rise = b.rise_of(got)
         return Coverage(want=spec.need, got=got, measure=rise, target=round(b.rise_c, 3), unit="C", floor_ok=rise <= b.rise_c + 1e-9, why=spec.owner, blocked=blocked_why)
-    c = ctx.cs.by_net(spec.net)
-    dt = c.current.temp_rise_c if (c is not None and c.current is not None) else 10.0
-    amps = float(c.current.amps) if (c is not None and c.current is not None) else 0.0
+    # The rung's link (its owner names the via it twins; `_parallel_link` sized it at that link's current).
+    lk = ctx.cs.link_by_key(spec.link) if spec.link else None
+    lk = lk if (lk is not None and lk.current is not None) else None
+    dt = lk.current.temp_rise_c if lk is not None else 10.0
+    amps = float(lk.current.amps) if lk is not None else 0.0
     one = via_amps(spec.via[1], ctx.scene.stack.via_plating_mm, dt)
     have = round(one * (got + 1), 3)  # the anchor plus the rungs that fitted
     return Coverage(want=spec.need, got=got, measure=have, target=round(amps, 3), unit="A", floor_ok=have + 1e-9 >= amps, why=spec.owner, blocked=blocked_why)
@@ -2348,48 +2346,6 @@ def antipad_pitch(scene: Scene, net: str, dia: float) -> tuple[float, str]:
     return best
 
 
-def _moves(ctx: PatternCtx, spec: StitchSpec, clash: Clash | None) -> str:
-    """The edits, in the order an author should consider them. Every one ends in a `board.py` line.
-
-    A tap's refusal moves the pad's **own** footprint, because a tap is one pad's business. A rung
-    has no footprint: its anchor is a via the router placed, and the only parts that can move are the
-    ones in the way. So the first edit names the blocker's owner, and where the blocker carries no
-    footprint — a track — the edit is the one `tap._moves` uses for the same case, a `NetReq` that
-    takes it off this layer.
-
-    The last edit is always `amps=`, and it is the only one that changes the *requirement* rather
-    than the room: `vias_per_change` is `ceil(amps / via_amps(drill))`, so a rail declared for a
-    connector's rating rather than for its load asks for barrels it does not need. It is offered last
-    because it is the edit that can be wrong for the right reason.
-    """
-    edits: list[str] = []
-    pitch, why = antipad_pitch(ctx.scene, spec.net, spec.via[0])
-    if pitch >= VIA_PARALLEL_MM - 1e-9:
-        edits.append(
-            f'Board(layers=4) is the only edit that opens a window at all: {why} needs {pitch:g} mm between '
-            f"two {spec.via[0]:g} mm rings and a parallel via is one the measurement counts only within "
-            f"{VIA_PARALLEL_MM:g} mm, so on this stackup there is no distance that is both"
-        )
-    if clash is not None:
-        ref = clash.item.owner.split(".")[0]
-        dx, dy = spec.at[0] - clash.at[0], spec.at[1] - clash.at[1]
-        toward = ("right" if dx >= 0 else "left") if abs(dx) >= abs(dy) else ("down" if dy >= 0 else "up")
-        if "." in clash.item.owner and clash.item.kind == "pad":
-            edits.append(f'Place("{ref}", toward="{toward}") takes {clash.item.owner} off the ring')
-        elif clash.item.net:
-            edits.append(f'NetReq("{clash.item.net}", layers=["{_other(ctx)}"]) takes {clash.item.owner} off this layer')
-        else:
-            edits.append(f"move {clash.item.owner} itself, which carries no net and so cannot be routed away")
-    c = ctx.cs.by_net(spec.net)
-    amps = float(c.current.amps) if (c is not None and c.current is not None) else 0.0
-    one = via_amps(spec.via[1], ctx.scene.stack.via_plating_mm, c.current.temp_rise_c if (c is not None and c.current is not None) else 10.0)
-    edits.append(
-        f'change amps= on the NetReq that already declares "{spec.net}": {amps:g} A over one '
-        f"{spec.via[1]:g} mm barrel's {one:g} A is what asks for the second via"
-    )
-    return "Moves: " + "; or ".join(edits) + "."
-
-
 def _other(ctx: PatternCtx) -> str:
     """The far outer layer, for a `NetReq(layers=...)` edit — `tap._other`'s answer."""
     layers = [L for L in ctx.scene.layers if L != "F.Cu"]
@@ -2451,7 +2407,6 @@ def _refuse(ctx: PatternCtx, spec: StitchSpec, got: int, clash: Clash | None, se
             spec.owner,
             f"{spec.need} more {spec.via[0]:g}/{spec.via[1]:g} barrel(s) within {VIA_PARALLEL_MM:g} mm of it ({spec.why})",
             blockers,
-            _moves(ctx, spec, clash),
             sep="\n  ",
         ),
     )

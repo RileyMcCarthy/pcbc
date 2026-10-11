@@ -1,0 +1,29 @@
+{
+ "ambiguous_names": 0,
+ "body_overlaps": 0,
+ "extent_area": 697.2,
+ "extent_mm": [
+  24.9,
+  28.0
+ ],
+ "fill_pct": 6.1,
+ "hard": 0,
+ "label_partner_mm": 0.0,
+ "labels": 1,
+ "lint_issues": 0,
+ "min_gap_mm": 6.35,
+ "paper": "A4",
+ "parts_off_paper": 0,
+ "power_symbols": 4,
+ "region_frames": 0,
+ "text_collisions": 0,
+ "text_crowding": 0,
+ "text_source": "kicad-svg",
+ "tight_pairs": 0,
+ "upside_down_power": 0,
+ "wire_mm": 21.6,
+ "wire_over_pin": 0,
+ "wire_overlaps": 0,
+ "wire_through_text": 0,
+ "wrong_way_up": 0
+}

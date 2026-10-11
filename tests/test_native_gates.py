@@ -11,20 +11,24 @@ from pathlib import Path
 
 import pytest
 
+from conftest import edit_board, put_core
 from pcbc.build import build_job
 
 ROOT = Path(__file__).resolve().parent.parent
-EXAMPLES = ROOT / "examples"
+from conftest import vehicle_examples  # noqa: E402
+
+EXAMPLES = vehicle_examples()  # buck is the pre-migration board here: conftest.vehicle_examples
 FIXTURES = ROOT / "tests" / "fixtures"
 
 
 def _copy(tmp_path: Path, src: Path, edits=()) -> Path:
-    text = src.read_text()
-    for old, new in edits:
-        assert old in text, old
-        text = text.replace(old, new)
     out = tmp_path / src.name
-    out.write_text(text)
+    out.write_text(src.read_text())
+    for cname in ("layout.core.py", "schematic.core.py"):
+        core = src.parent / cname
+        if core.exists():
+            (tmp_path / cname).write_text(core.read_text())
+    edit_board(out, edits, every=True)
     return out
 
 
@@ -105,7 +109,7 @@ def test_a_lock_whose_two_free_ends_the_router_joins_to_one_pad_builds(tmp_path:
     src = EXAMPLES / "buck"
     board = _copy(tmp_path, src / "buck.py")
     shutil.copytree(src / "components", tmp_path / "components")
-    (tmp_path / "layout.core.py").write_text('Seg("GND", (24.0, 2.0), (24.0, 6.5), width=0.3, layer="F.Cu")\n')
+    put_core(tmp_path / "layout.core.py", 'Seg("GND", (24.0, 2.0), (24.0, 6.5), width=0.3, layer="F.Cu")\n')
     result = build_job(board, upto="fab", force=True)
     assert result["error"] is None and result.get("ok"), result["error"]
     route = _route(result)

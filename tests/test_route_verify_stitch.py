@@ -53,10 +53,11 @@ from pcbc.stackup import via_amps, vias_per_change
 
 from test_examples_fab import PARALLEL, RETURNS
 from test_return_rules import RULES
+from conftest import ds2_dir, vehicle_examples
 
 ROOT = Path(__file__).resolve().parent.parent
-EXAMPLES = ROOT / "examples"
-DS2 = Path.home() / "Documents" / "MaD" / "Hardware" / "DS2Addon" / "pcbc"
+EXAMPLES = vehicle_examples()  # buck is the pre-migration board here: conftest.vehicle_examples
+DS2 = ds2_dir()
 HAS_DS2 = (DS2 / "ds2_addon.py").exists()
 
 
@@ -220,6 +221,7 @@ def test_the_nearest_reference_net_via_on_either_board_is_2_2472_mm_away():
     near = []
     for name in ("c3_usb", "node"):
         near += [r.near[2] for r in return_vias(_text(name), _cs(name)) if r.near]
+    # (2.0732 on 2026-10-01 only, while decision 4's corridor ran to the board edge and moved U3.)
     assert len(near) == 2 and round(min(near), 4) == 1.96, sorted(near)
     assert min(near) > RETURN_MM, "not one of them has a reference-net via inside the threshold"
     for name, pitch in (("c3_usb", 0.8), ("node", 0.7)):
@@ -244,7 +246,7 @@ def test_the_threshold_decides_nothing_on_any_board_in_this_repo(monkeypatch):
     # 2.2472 is the nearest reference-net via on any board, re-measured 2026-09-21 (it was 1.6279 on
     # the stale artifacts). The sweep steps over it and past it by 4x and nothing moves.
     # Re-recorded 2026-09-25: 1.96 is the nearest on the native router's copper, and is swept too.
-    for tol in (0.0, 0.5, 0.7, 0.8, 1.0, 1.96, 2.2472, 3.0, 5.0, 10.0):
+    for tol in (0.0, 0.5, 0.7, 0.8, 1.0, 1.96, 2.0732, 2.2472, 3.0, 5.0, 10.0):
         monkeypatch.setattr(rv, "RETURN_MM", tol)
         for name in BOARDS:
             got = tuple(r.verdict for r in return_vias(_text(name), _cs(name)))
@@ -409,23 +411,26 @@ def test_technique_one_fires_on_exactly_one_net_on_exactly_one_board():
     # single-via changes (6 more vias). Re-recorded again the same day for the refuters' D1: node's
     # `VBUS` is unrouted, an unfinished net ships no generated copper, so node has no `VBUS` via and
     # owes nothing (it read two single-via groups of copper that is now dropped). pcbc writes no rung.
+    # Re-recorded 2026-09-30 for docs/net-path-physics.md PR 9: buck's VIN changes layer through two
+    # flow-through 3-via groups now (joined by their landings, rated at their worst barrel), so it owes
+    # nothing; before, three lone 0.4 mm vias owed two rungs each. The population is empty on every board.
+    # Re-measured 2026-10-02 (docs/physics-subjects.md PR 3, O2 (b)): a net carries no current, so only a current
+    # Path's links are rated, and the vehicle buck declares none: its population is empty too.
     short = {name: [r for r in via_parallelism(_text(name), _cs(name)) if r.add] for name in BOARDS}
-    assert [name for name, rows in short.items() if rows] == ["buck"], {k: len(v) for k, v in short.items()}
-    buck = short["buck"]
-    assert {r.net for r in buck} == {"VIN"} and len(buck) == 3, buck
-    assert {(r.n, r.drill, r.carries, r.need, r.add) for r in buck} == {(1, 0.4, 0.871, 3, 2)}, buck
+    assert [name for name, rows in short.items() if rows] == [], {k: len(v) for k, v in short.items()}
+    assert not via_parallelism(_text("buck"), _cs("buck")), "the vehicle declares no current"
     assert not [v for v in board_vias(_text("node")) if v["net"] == "VBUS"], "node's VBUS is unrouted: no VBUS via on its board"
     assert via_amps(0.2, 0.018, 10.0) == 0.527 and vias_per_change(1.0, 0.2, 0.018, 10.0) == 2
     assert via_amps(0.4, 0.018, 10.0) == 0.871 and vias_per_change(1.0, 0.4, 0.018, 10.0) == 2
-    assert sum(r.add for r in buck) == 6, "two rungs per short buck cluster"
     # No group anywhere is already answered: the native build places no stitch rung.
     rated = [r for r in via_parallelism(_text("node"), _cs("node")) if not r.add]
     assert rated == [], rated
     if HAS_DS2:
         ds2 = via_parallelism(_text("ds2"), _cs("ds2"))
         # Re-recorded 2026-09-25: 13 groups on the native router's copper (was 14 on KRT's), every one
-        # `need` 1; the barrels are 0.3 and 0.4 mm drill, both rated over 0.1 A.
-        assert len(ds2) == 13 and {r.need for r in ds2} == {1}, ds2
+        # `need` 1. Since docs/physics-subjects.md PR 3 the DS2 Addon declares no current (its `amps=0.1` left the
+        # NetReq), so no group is rated at all.
+        assert not ds2, ds2
         assert vias_per_change(0.1, 0.3, 0.018, 10.0) == 1, "0.1 A under one 0.707 A barrel: no rung can ever be owed"
 
 
@@ -449,7 +454,11 @@ def test_a_poured_rail_is_exempt_and_the_exemption_is_what_keeps_the_count_hones
     # Re-recorded 2026-09-25 for the native router: buck's `GND` reads 6 clusters (was 7 on KRT's
     # copper); node's `GND` 42 / largest 10 and `3V3` 15 / largest 2 are unchanged, because those
     # are tap fields and the tap pattern is the same code under either router.
-    for name, net, amps, groups, biggest in (("buck", "GND", 2.0, 6, 1), ("node", "GND", 1.0, 42, 10), ("node", "3V3", 1.0, 15, 2)):
+    # Re-measured 2026-10-02 (docs/physics-subjects.md PR 3, PR 8): node's GND 41 clusters (was 42) and 3V3 16 (was 15;
+    # U2.VOUT's joint is two tap vias now). The amps are the arithmetic's, not a declaration (no net carries one).
+    # Re-measured 2026-10-03: node's 3V3 17 clusters (was 16), largest 2, since the silkscreen no longer re-places a part whose
+    # reference has no room (node's C_EN, R_EN and R_LED went 0.6 mm further out before); GND 41 / 10 unchanged.
+    for name, net, amps, groups, biggest in (("buck", "GND", 2.0, 6, 1), ("node", "GND", 1.0, 41, 10), ("node", "3V3", 1.0, 17, 2)):
         text = _text(name)
         cs = _cs(name)
         assert net in {n for n, _lay in poured_planes(text)}, (name, net)
@@ -498,7 +507,12 @@ def test_the_two_cluster_walks_agree_on_every_via_of_every_board():
     # Re-recorded the same day for the refuters' D1 (an unfinished net ships no copper): node 84 -> 82,
     # its two `VBUS` router vias dropped with the rest of `VBUS`; c3_usb's three `VBUS` vias were already
     # removed as dangling, so it holds at 53; ds2's `REFN_F` had none. 171 vias.
-    want = {n: c for n, c in (("blinky", 1), ("buck", 11), ("c3_usb", 53), ("node", 82), ("ds2", 24)) if n in BOARDS}
+    # Re-recorded 2026-09-30 (docs/net-path-physics.md PR 9): buck 11 -> 14, VIN's three lone vias became two
+    # 3-via groups.
+    # ds2 26 on 2026-10-01 only, while decision 4's corridor ran to the board edge and moved C4-C6; 24 again since 2026-10-02.
+    # Re-measured 2026-10-02 (docs/physics-subjects.md): buck 14 -> 11 (the vehicle declares no current: no groups),
+    # node 82 -> 83 (U2.VOUT's second tap via, PR 8), ds2 24 -> 28 (PR 5: the analog pins fan out and change layer).
+    want = {n: c for n, c in (("blinky", 1), ("buck", 11), ("c3_usb", 53), ("node", 83), ("ds2", 28)) if n in BOARDS}
     assert seen == want, (seen, want, "every via on every board, and blinky has one now")
 
 
@@ -526,29 +540,22 @@ def test_this_is_not_the_same_question_as_the_bottlenecks_kind():
     # Re-recorded 2026-09-25 for the native router. node's `VBUS` is unrouted at N0 (the path walk
     # reads `open`), so the illustration moved to buck's `VIN`: the walk names one via, 0.871 A at
     # (18.588,5.38), `under current`, and the census finds **three** short groups on that net.
-    node = power_bottlenecks(compile_design(load_board(_board("node"))), _text("node"))["VBUS"]
-    assert (node["kind"], node["verdict"]) == ("open", "open"), node
-    job = compile_design(load_board(_board("buck")))
-    text = _text("buck")
-    row = power_bottlenecks(job, text)["VIN"]
-    assert (row["kind"], row["carries"], row["width_mm"], row["verdict"]) == ("via", 0.871, 0.0, "under current"), row
-    assert row["at_mm"].startswith("18.588,5.38 on "), row["at_mm"]
-    short = [r for r in via_parallelism(text, job.constraints) if r.add]
-    assert len(short) == 3 and (18.588, 5.38) in {r.at for r in short}, "the walk names one of the three the census finds"
-    # A via bottleneck is not an under-rated via: ds2's three are every one of them rated (0.871 A
-    # on `3V3` and `VSS`, 0.707 A on `VDDA`, re-recorded 2026-09-25; KRT's were all 0.707).
-    if HAS_DS2:
-        rows = power_bottlenecks(compile_design(load_board(_board("ds2"))), _text("ds2"))
-        vias = {n: r["carries"] for n, r in rows.items() if r["kind"] == "via"}
-        assert vias == {"3V3": 0.871, "VDDA": 0.707, "VSS": 0.871}, vias
-        assert all(r["verdict"] == "ok" for n, r in rows.items() if r["kind"] == "via"), rows
-        assert [r for r in via_parallelism(_text("ds2"), _cs("ds2")) if r.add] == [], "and none of them owes a rung"
-    # c3_usb: `VBUS` is unrouted at N0 (was a 0.127 mm track on KRT's copper) and its `3V3` via
-    # bottleneck is rated, so c3_usb still owes no rung.
+    # Re-measured 2026-10-02 (docs/physics-subjects.md PR 3): the rows are a current Path's, keyed by its line. node's
+    # VBUS (Path line 66) is unrouted (the walk reads `open`); its LOAD (Path line 69, 1 A) is a 0.4 mm track that carries
+    # 1.231 A. c3_usb's 3V3 (Path line 210, 0.5 A) is a via bottleneck, 0.871 A, `ok`, and the census owes no rung.
+    node = power_bottlenecks(compile_design(load_board(_board("node"))), _text("node"))
+    assert (node["VBUS (Path line 66)"]["kind"], node["VBUS (Path line 66)"]["verdict"]) == ("open", "open"), node
+    assert (node["LOAD (Path line 69)"]["kind"], node["LOAD (Path line 69)"]["carries"], node["LOAD (Path line 69)"]["verdict"]) == ("track", 1.231, "ok"), node
     c3 = power_bottlenecks(compile_design(load_board(_board("c3_usb"))), _text("c3_usb"))
-    assert (c3["VBUS"]["kind"], c3["VBUS"]["verdict"]) == ("open", "open"), c3["VBUS"]
-    assert (c3["3V3"]["kind"], c3["3V3"]["carries"], c3["3V3"]["verdict"]) == ("via", 0.871, "ok"), c3["3V3"]
-    assert [r for r in via_parallelism(_text("c3_usb"), _cs("c3_usb")) if r.add] == [], "c3_usb owes no rung either"
+    assert (c3["VBUS (Path line 209)"]["kind"], c3["VBUS (Path line 209)"]["verdict"]) == ("open", "open"), c3
+    row = c3["3V3 (Path line 210)"]
+    assert (row["kind"], row["carries"], row["verdict"]) == ("via", 0.871, "ok"), row
+    # A via bottleneck is not an under-rated via: the census finds the same two 0.4 mm barrels and owes nothing.
+    assert [r for r in via_parallelism(_text("c3_usb"), _cs("c3_usb")) if r.add] == [], "c3_usb owes no rung"
+    # The vehicle buck and the DS2 Addon declare no current, so the walk has no row to give.
+    assert power_bottlenecks(compile_design(load_board(_board("buck"))), _text("buck")) == {}
+    if HAS_DS2:
+        assert power_bottlenecks(compile_design(load_board(_board("ds2"))), _text("ds2")) == {}
 
 
 # --- the reports, and where they run ---------------------------------------------------------------
@@ -557,24 +564,20 @@ def test_this_is_not_the_same_question_as_the_bottlenecks_kind():
 def test_the_lines_say_what_is_there_including_when_nothing_is():
     """A report nobody can act on is still a report somebody has to read, so the empty case is a
     sentence and not a blank."""
-    assert parallel_lines(via_parallelism(_text("blinky"), _cs("blinky"))) == [
-        "parallel: no via on any unpoured power net, so there is no group to rate"
-    ]
+    empty = ["parallel: no via on any unpoured path link that carries a declared current, so there is no group to rate"]
+    assert parallel_lines(via_parallelism(_text("blinky"), _cs("blinky"))) == empty
     # Re-recorded 2026-09-25 for the native router: c3_usb has two rated groups (was four), and
     # node's `VBUS` has two groups of one 0.4 mm barrel each (0.871 A of 1 A; KRT's were 0.2 mm).
     assert parallel_lines(via_parallelism(_text("c3_usb"), _cs("c3_usb"))) == [
-        "parallel: 2 via group(s) on unpoured power nets, every one rated for its declared current"
+        "parallel: 2 via group(s) on unpoured path links, every one rated for its link's declared current"
     ]
     # Re-recorded 2026-09-25 for the refuters' D1: node's `VBUS` is unrouted and ships no copper, so node
     # is the empty case too (it read two short `VBUS` groups of copper that is now dropped).
-    assert parallel_lines(via_parallelism(_text("node"), _cs("node"))) == [
-        "parallel: no via on any unpoured power net, so there is no group to rate"
-    ]
+    assert parallel_lines(via_parallelism(_text("node"), _cs("node"))) == empty
+    # Re-recorded 2026-09-30 (docs/net-path-physics.md PR 9): VIN's groups are rated.
+    # The vehicle buck declares no current (docs/physics-subjects.md O2 (b)): the empty case.
     buck = parallel_lines(via_parallelism(_text("buck"), _cs("buck")))
-    assert buck[0] == "VIN via group at (18.588,5.38): 1 x 0.4 mm drill carries 0.871 A of 2 A [needs 3, so 2 more]", buck[0]
-    assert buck[-1] == (
-        "parallel: 3 of 3 via group(s) under their rail's declared current (VIN); 6 more via(s) would carry it"
-    ), buck[-1]
+    assert buck == empty, buck
     # node's return line is the **other** empty case and the sentence has to say which: two nets are
     # watched and neither carries a via, which is not the same as nothing being watched.
     assert return_lines(return_vias(_text("node"), _cs("node")), referenced_nets(_cs("node"))) == [
@@ -626,8 +629,9 @@ def test_both_counts_run_in_the_build_and_the_census_half_can_stop_nothing(name:
     assert ret["verdicts"] == ({} if not RETURNS[name] else {RETURNS[name][0][2]: len(RETURNS[name])}), (name, ret["verdicts"])
     # Re-recorded 2026-09-25 for the native router: buck's `VIN` is short; node's `VBUS` was too until
     # the refuters' D1 fix dropped the copper of an unfinished net (node's `VBUS` is unrouted).
+    # Re-recorded 2026-09-30: buck's VIN is no longer short (docs/net-path-physics.md PR 9, 3-via groups).
     short_nets = sorted({g["net"] for g in par["short"]})
-    assert short_nets == {"buck": ["VIN"]}.get(name, []), (name, short_nets)
+    assert short_nets == [], (name, short_nets)
 
 
 @pytest.mark.parametrize("name", BOARDS)
@@ -656,7 +660,8 @@ def test_the_recorded_dicts_cover_every_board_and_are_internally_consistent():
     for name in BOARDS:
         stack = _cs(name).stackup
         for net, rows in PARALLEL[name].items():
-            amps = _cs(name).by_net(net).current.amps
+            # A net carries no current (docs/physics-subjects.md PR 3): the rows' current is their Path links'.
+            amps = max(lk.current.amps for p in _cs(name).by_net(net).paths for lk in p.links if lk.current is not None)
             drill = stack.via_drill
             assert {need for _at, _n, need in rows} == {vias_per_change(amps, drill, stack.via_plating_mm, 10.0)}, (name, net, rows)
             assert all(math.dist(a, b) > RETURN_MM for i, (a, _, _) in enumerate(rows) for b, _, _ in rows[i + 1 :]), (name, net, "every recorded group is a singleton, so no two anchors are within a group's reach")

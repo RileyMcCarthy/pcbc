@@ -3,6 +3,7 @@ from pathlib import Path
 from pcbc.circuit import check_design, load_part
 from pcbc.language import check_board, load_board, reset
 from pcbc.symbol import parse_symbol_pins
+from conftest import write_split
 
 ROOT = Path(__file__).resolve().parent
 FIX = ROOT / "fixtures"
@@ -29,22 +30,21 @@ def test_blinky_check_ok():
     d = load_board(BLINKY)
     assert {i.ref for i in d.instances} == {"R1", "D1"}
     assert d.board is not None
-    assert d.board.size_mm == (40.0, 25.0)
+    # docs/board-outline.md PR 4: blinky declares no Outline(); its outline is derived (was size_mm == (40.0, 25.0))
+    assert d.board.size_mm is None and d.outline is None
 
 
 def test_unbound_required_pin(tmp_path: Path):
     board = tmp_path / "board.py"
     ldo = FIX / "ldo"
-    board.write_text(
-        f"""
+    write_split(board, f"""
 from pcbc import Board, Ground, Power, load
 U = load({str(ldo)!r})
 VCC = Power("VCC")
 GND = Ground("GND")
 U("U1", VIN=VCC, VOUT=VCC, GND=GND)
 Board(width=20, height=10, layers=2, stackup="jlcpcb_2l_1oz")
-"""
-    )
+""")
     fails = check_board(board)
     assert any("U1.EN unbound" in f for f in fails)
 
@@ -52,16 +52,14 @@ Board(width=20, height=10, layers=2, stackup="jlcpcb_2l_1oz")
 def test_unknown_pin_name(tmp_path: Path):
     board = tmp_path / "board.py"
     ldo = FIX / "ldo"
-    board.write_text(
-        f"""
+    write_split(board, f"""
 from pcbc import Board, Ground, Power, load
 U = load({str(ldo)!r})
 VCC = Power("VCC")
 GND = Ground("GND")
 U("U1", VIN=VCC, VOUT=VCC, GND=GND, EN=VCC, FOO=VCC)
 Board(width=20, height=10, layers=2, stackup="jlcpcb_2l_1oz")
-"""
-    )
+""")
     fails = check_board(board)
     assert any("U1.FOO" in f for f in fails)
 
@@ -69,8 +67,7 @@ Board(width=20, height=10, layers=2, stackup="jlcpcb_2l_1oz")
 def test_nc_may_float(tmp_path: Path):
     board = tmp_path / "board.py"
     ldo = FIX / "ldo"
-    board.write_text(
-        f"""
+    write_split(board, f"""
 from pcbc import Board, Ground, Place, Power, SchPlace, load
 U = load({str(ldo)!r})
 VCC = Power("VCC")
@@ -78,9 +75,7 @@ GND = Ground("GND")
 U("U1", VIN=VCC, VOUT=VCC, GND=GND, EN=VCC)
 Board(width=20, height=10, layers=2, stackup="jlcpcb_2l_1oz")
 Place("U1", at=(5, 5))
-SchPlace("U1", left=10, top=10)
-"""
-    )
+""")
     assert check_board(board) == []
 
 
@@ -98,48 +93,41 @@ def test_missing_board():
 
 def test_missing_place(tmp_path: Path):
     board = tmp_path / "board.py"
-    board.write_text(
-        """
+    write_split(board, """
 from pcbc import Board, Ground, Power, Resistor
 VCC = Power("VCC")
 GND = Ground("GND")
 Resistor("R1", "1k", package="0402", mpn="X", lcsc="C1", p1=VCC, p2=GND)
 Board(width=10, height=10, layers=2, stackup="jlcpcb_2l_1oz")
-"""
-    )
+""")
     fails = check_board(board)
     assert any("R1: no Place()" in f for f in fails)
 
 
-def test_missing_schplace(tmp_path: Path):
+def test_a_part_with_no_schplace_is_laid_out_by_the_tool(tmp_path: Path):
+    """docs/schematic-layout.md §2 / PR 4: SchPlace() is optional; "no SchPlace()" is no longer a failure."""
     board = tmp_path / "board.py"
-    board.write_text(
-        """
+    write_split(board, """
 from pcbc import Board, Ground, Place, Power, Resistor
 VCC = Power("VCC")
 GND = Ground("GND")
 Resistor("R1", "1k", package="0402", mpn="X", lcsc="C1", p1=VCC, p2=GND)
 Board(width=10, height=10, layers=2, stackup="jlcpcb_2l_1oz")
 Place("R1", at=(5, 5))
-"""
-    )
-    fails = check_board(board)
-    assert any("R1: no SchPlace()" in f for f in fails)
+""")
+    assert check_board(board) == []
 
 
 def test_missing_lcsc(tmp_path: Path):
     board = tmp_path / "board.py"
-    board.write_text(
-        """
+    write_split(board, """
 from pcbc import Board, Ground, Place, Power, Resistor, SchPlace
 VCC = Power("VCC")
 GND = Ground("GND")
 Resistor("R1", "1k", package="0402", mpn="X", p1=VCC, p2=GND)
 Board(width=10, height=10, layers=2, stackup="jlcpcb_2l_1oz")
 Place("R1", at=(5, 5))
-SchPlace("R1", left=10, top=10)
-"""
-    )
+""")
     fails = check_board(board)
     assert any("R1 missing lcsc" in f for f in fails)
 

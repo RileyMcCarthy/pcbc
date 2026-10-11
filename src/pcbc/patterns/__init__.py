@@ -33,10 +33,8 @@ __all__ = [
     "ALL_SHAPES",
     "MAX_LINKS",
     "PRE",
-    "MID",
     "POST",
     "FINAL",
-    "merge_plans",
     "PatternCtx",
     "PatternPlan",
     "PatternResult",
@@ -140,7 +138,7 @@ class PatternCtx:
     cs: ConstraintSet
     board: str  # for stable_uuid
     stage: str
-    """Which of `_STAGES`' keys is running: `"pre"` | `"mid"` | `"post"` | `"final"`.
+    """Which of `_STAGES`' keys is running: `"pre"` | `"post"` | `"final"`.
 
     The four are not interchangeable and a pattern may read this to say so. `pre` and `mid` see a
     board with no router copper on it; `post` sees the planes' fields (`route_native.plane_pours`)
@@ -529,24 +527,13 @@ PRE = ("hop",)
 step (`route_native.route_stage`), run **after** the hops so `fanout._excluded` can drop the nets the hops claimed — a closed
 row's lane is better spent on the hop that needed it than on a via the hop then has to start from."""
 
-MID = ("spine",)
-"""The rest of C.1's pre stage, the half that runs **after** the fanout.
-
-C.1 puts the fanout at step 2 and the spine at step 5, and the order is the whole argument of the
-stage: least free first. A closed row's escape has exactly one direction it can leave in, and a
-spine is the **widest** copper pcbc writes — buck's `VIN` trunk is 0.781 mm, wider than anything else
-on that board — so a spine placed first can stand across a lane that a fanout via then has no second
-answer for. Running it after means the spine sees every escape as an obstacle and steps round it,
-which is the direction the dependency actually runs.
-
-It costs one extra stage name and one merge (`merge_plans`), and it is measured rather than assumed:
-`docs/r2-measurements.md` S7 records both orders on the two boards that have a fanout at all.
-
-**`chain` is written and is deliberately NOT in this tuple.** `patterns/chain.py` exists, its unit
-tests run against it directly, and `route_verify.chain_order` — the finished-board half S6 was really
-for — is wired into the build. The pattern itself does not run, because a real build says it must not
-yet. On ds2, a board that builds today, every configuration tried breaks it, and never where the
-copper is:
+CHAIN_NOT_STAGED = None
+"""**`chain` is written and is deliberately in no stage tuple.** (The `mid` stage that held the spine
+pattern is gone: `docs/physics-subjects.md` PR 3 deleted the spine (KD 14, O4), whose population was
+empty once no net carried a current of its own.) `patterns/chain.py` exists, its unit tests run against
+it directly, and `route_verify.chain_order` — the finished-board half S6 was really for — is wired into
+the build. The pattern itself does not run, because a real build says it must not yet. On ds2, a board
+that builds today, every configuration tried breaks it, and never where the copper is:
 
 | what the chain wrote on ds2 | outcome |
 |---|---|
@@ -558,19 +545,11 @@ copper is:
 The last row is the one that decided it: 16.4 mm of short, local, legal copper on the far side of a
 47 x 25.4 mm board, none of it within 3.4 mm of the tap that fails and none of it on the layer of the
 plane that splits. Copper written before the router changes every route after it.
-The other four boards agree in the smaller way: with the chain registered, `test_examples_fab`
-fails on buck, c3_usb and node (node's `angles` 102 against a ceiling of 100), and only blinky is
-untouched.
-
-There is precedent for the shape of this, and it is `spine.WIDE_MM`: S7 measured that ds2's 0.25 mm
-power nets could not take a spine either, because locked copper takes the corridors its constrained
-nets structurally need, and excluded them on the measurement rather than tuning until it passed.
-This is the same board saying the same thing one pattern later.
 
 What would change it is a router that can search, not a bound that can be tuned: four bounds were
-tried and the failure moved rather than went away. R3's maze router is where this belongs, and
-`chain.py` is kept whole — not deleted and not behind a runtime flag — so that slice starts from the
-pattern, its 17 tests and this table rather than from scratch.
+tried and the failure moved rather than went away. `chain.py` is kept whole — not deleted and not
+behind a runtime flag — so that slice starts from the pattern, its tests and this table rather than
+from scratch.
 """
 
 
@@ -608,15 +587,15 @@ paragraph that could be moved to make ds2 place a stitch. `docs/stitch-plan.md` 
 """
 
 
-_STAGES = {"pre": PRE, "mid": MID, "post": POST, "final": FINAL}
-"""Which patterns each stage runs, in `route_native.route_stage`'s order: `pre`, the fanout, `mid`,
-the pours' fields, `post`, the router, `final`. A stage exists here or it does not run."""
+_STAGES = {"pre": PRE, "post": POST, "final": FINAL}
+"""Which patterns each stage runs, in `route_native.route_stage`'s order: `pre`, the fanout, the pours'
+fields, `post`, the router, `final`. A stage exists here or it does not run."""
 
 
 def _modules() -> dict:
-    from . import chain, hop, spine, stitch, tap
+    from . import chain, hop, stitch, tap
 
-    return {"chain": chain, "hop": hop, "spine": spine, "stitch": stitch, "tap": tap}
+    return {"chain": chain, "hop": hop, "stitch": stitch, "tap": tap}
 
 
 def pattern_copper(
@@ -710,44 +689,16 @@ def _no_banned_vias(ctx: PatternCtx, reason: str, res: PatternResult) -> Pattern
         return res
     parts = []
     for net, n in sorted(bad.items()):
+        c = ctx.cs.by_net(net)
         r = next((r for r in ctx.design.netreqs if any(fnmatch.fnmatch(net, x) for x in r.nets)), None)
-        where = f"its NetReq at board.py:{r.line}" if r is not None and getattr(r, "line", 0) else "its NetReq"
-        others = [x for x in (r.nets if r is not None else ()) if x != net]
-        split = f" (split {net} out of that line first: it also names {', '.join(others)})" if others else ""
-        parts.append(f"{n} via(s) on {net}, and {where} forbids vias: add vias=True there{split} if this {reason} copper is wanted")
+        if c is not None and c.pair is not None:
+            where = f"its Pair at board.py:{c.line}"  # Pair(vias=False) (refutation one-home r1, defect 2)
+        else:
+            where = f"its NetReq at board.py:{r.line}" if r is not None and getattr(r, "line", 0) else "its NetReq"
+        parts.append(f"{n} via(s) on {net}, and {where} forbids vias")
     what = res.net
-    move = f"{reason} {res.net}: not written — it needs " + "; ".join(parts) + f". Without it the router joins {', '.join(sorted(bad))} on one layer or reports the link."
+    move = f"{reason} {res.net}: not written — it needs " + "; ".join(parts) + f". The router joins {', '.join(sorted(bad))} on one layer or reports the link."
     return replace(res, pieces=(), joins=(), links=(0, res.links[1]), coverage=0.0, refusal=Refusal(reason, res.net, what, None, "vias forbidden", False, move))
-
-
-def merge_plans(first: PatternPlan, second: PatternPlan) -> PatternPlan:
-    """The two halves of C.1's pre stage, with the fanout between them, as one plan.
-
-    `second` ran on `first`'s own scene, so the scene is already shared and `done` is recomputed over
-    both stages' claims against it: a net the hops half-claimed and the spine finished is `done`, and
-    asking each half on its own would call it `partial` twice.
-    """
-    scene = second.scene if second.scene is not None else first.scene
-    pieces = first.pieces + second.pieces
-    claimed = first.claimed | second.claimed
-    done = frozenset(n for n in sorted(claimed) if scene is not None and not net_open(scene, n))
-    refused: dict = {n: tuple(rs) for n, rs in first.refused.items()}
-    for n, rs in second.refused.items():
-        refused[n] = tuple(refused.get(n, ())) + tuple(rs)
-    return PatternPlan(
-        pieces=pieces,
-        ids=first.ids + second.ids,
-        census=_census(pieces),
-        moves=first.moves + second.moves,
-        notes=first.notes + second.notes,
-        done=done,
-        partial=frozenset(sorted(claimed - done)),
-        refused={n: refused[n] for n in sorted(refused)},
-        claimed=claimed,
-        links={r: dict(sorted({**first.links.get(r, {}), **second.links.get(r, {})}.items())) for r in sorted({*first.links, *second.links})},
-        wall_ms=first.wall_ms + second.wall_ms,
-        scene=scene,
-    )
 
 
 def hard_refusals(plan: PatternPlan) -> tuple[Refusal, ...]:

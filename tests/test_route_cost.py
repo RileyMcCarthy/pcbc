@@ -18,7 +18,7 @@ from pcbc.route_native import ORDER, constrained_nets, net_order, route_stage
 from pcbc.route_pair import offset
 
 ROOT = Path(__file__).resolve().parent.parent
-BUCK = ROOT / "examples" / "buck" / "buck.py"
+BUCK = ROOT / "tests" / "fixtures" / "declared" / "buck" / "buck.py"  # buck as shipped with a declared outline: conftest.declared_examples
 
 
 def _nc(width=0.2, clearance=0.15, via_dia=0.6, per_change=1, via_allowed=True) -> NetCost:
@@ -85,15 +85,32 @@ def test_the_order_is_constrained_nets_first_then_widest_then_by_name():
     firsts = [n for n in got if n in con]
     assert got[: len(firsts)] == firsts, (got, con)
     for group in (firsts, got[len(firsts):]):
-        keys = [(-net_cost(cs, n).width_mm, n) for n in group]
+        # widest first by the widest copper the net carries on any layer, its paths' links included
+        # (docs/net-path-physics.md §4.2: `ConstraintSet.widest`)
+        keys = [(-(cs.widest(n) if cs.by_net(n) is not None else net_cost(cs, n).width_mm), n) for n in group]
         assert keys == sorted(keys), group
 
 
 def test_buck_routes_every_link_in_memory_and_the_same_twice():
-    """Measured 2026-09-25: the router makes all 11 of buck's router links (5V 1, BOOT 1, EN 1, FB 2,
-    GND 2, SW 2, VIN 2) without KiCad and without a board file, and a second run in the same process
-    gives the same pieces in the same order. BUDGET is an expansion count (200000), so this cannot
-    depend on how fast the machine is."""
+    """Measured 2026-09-25: the router made all 11 of buck's router links without KiCad and without a
+    board file, and a second run in the same process gives the same pieces in the same order. BUDGET is
+    an expansion count (200000), so this cannot depend on how fast the machine is.
+
+    Re-measured 2026-09-30 on the migrated buck (docs/net-path-physics.md §5): 13 of 14 links (5V 4,
+    BOOT 1, EN 1, FB 2, GND 2, SW 1, VIN 2) and two 3-via groups on VIN. The one left is the switch
+    path's `U1.SW -> L1.1` at 0.781 mm on F.Cu with no vias: C_IN1 pinches its channel to 0.46 mm as
+    placed (the placement warning names it), and the net stays open rather than be bypassed through
+    C_BOOT.2 at 0.3 mm.
+
+    Re-measured 2026-10-01 after the owner's decisions: 12 of 13 links (VIN is one link now that the spine
+    joins more of it, 1 of 1) and two 2-via groups on VIN (1.36 A, decision 5). SW is still the one left: C_IN1
+    now sits right of U1 (decision 4) and SW may change layer (decision 2), but VIN's 0.459 mm spine crosses
+    under U1.2 and no layer change has room for SW's 4-via group.
+
+    Re-measured 2026-10-02 (docs/physics-subjects.md PR 3): VIN's current is its Path (line 69, through both input
+    caps), the spine is deleted, and every net's own copper is the class floor. SW now routes; VIN's link
+    C_IN2.1 -> C_IN1.1 does not (15 of 16 links; one 2-via group on VIN's J_IN.1 -> C_IN2.1). §10.1 of the design
+    predicted this (junction rule 2 holds the cells), and O5 keeps the rule and lets the failure stand."""
     from pcbc.place_native import place
 
     assert BUDGET == 200000
@@ -104,6 +121,7 @@ def test_buck_routes_every_link_in_memory_and_the_same_twice():
         out = route_stage(design, pl.job, pl, name="buck")
         runs.append(out)
     a, b = runs
-    assert a.failed == [] and a.unrouted == [], [(f.net, f.a, f.b) for f in a.failed]
-    assert sum(t for _d, t in a.links.values()) == sum(d for d, _t in a.links.values()) == 11, a.links
+    assert [(f.net, f.a, f.b) for f in a.failed] == [("VIN", "C_IN2.1", "C_IN1.1")] and a.unrouted == ["VIN"], [(f.net, f.a, f.b) for f in a.failed]
+    assert (sum(d for d, _t in a.links.values()), sum(t for _d, t in a.links.values())) == (15, 16), a.links
+    assert [(g["net"], g["link"], g["count"]) for g in a.stats["groups"]] == [("VIN", "J_IN.1~C_IN2.1", 2)], a.stats.get("groups")
     assert [repr(p) for p in a.pieces] == [repr(p) for p in b.pieces]

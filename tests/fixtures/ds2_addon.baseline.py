@@ -12,7 +12,7 @@ Assumed values, to be checked against the DS2 gauge's bridge: 1 kΩ series with 
 each input and reference (1.6 kHz), 1 µF across each pair (TI's 10:1 differential-to-common).
 """
 
-from pcbc import Board, Capacitor, Chain, Ground, Net, NetReq, Place, Power, Resistor, SchPlace, SchRegion, load
+from pcbc import Board, Capacitor, Path, Ground, Net, NetReq, Place, Power, Resistor, SchPlace, SchRegion, load
 
 # Digital domain: from the EdgeBoard through J1.
 V33 = Power("3V3")
@@ -92,9 +92,9 @@ Capacitor("C2", "1uF", mpn="CGA0805X7R105K250KT", lcsc="C45359957", manufacturer
 
 # Rev 1's outline: 47 x 25.4 mm, two layers, the headers on the edges they were on.
 Board(width=47, height=25.4, layers=2, stackup="jlcpcb_2l_1oz")
-NetReq("3V3", "GND", "VDDA", "VSS", kind="power", volts=3.3, amps=0.1)
+NetReq("3V3", "VDDA", kind="power", volts=3.3); NetReq("GND", "VSS", kind="power")
 NetReq("AIN0", "AIN1", "AIN2", "AIN3", "REFP_F", "REFN_F", kind="analog", max_mm=30)  # filters at the connectors, ADC in the middle of 47 mm
-Chain("VDDA", "J2.1", "C4.1", "U1.12")  # the analog rail feeds through its cap before the pin
+Path("VDDA", "J2.1", "C4.1", "U1.12")  # the analog rail feeds through its cap before the pin
 
 # Schematic: the gauge's wires come in on the left, the ADC in the middle, the EdgeBoard on the right.
 SchRegion("inputs", title="Inputs", left=12, top=12, width=150, height=190)

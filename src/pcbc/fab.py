@@ -23,6 +23,7 @@ from .stackup import copper_layers
 from .geom import footprint_box_local
 from .sexp import (
     board_footprint_spans,
+    edge_outline,
     footprint_at,
     footprint_reference,
     stable_uuid,
@@ -156,6 +157,13 @@ def footprint_side(block: str) -> str:
     layer = m.group(1) if m else "F.Cu"
     if layer.startswith("B.") or layer in ("B.Cu", "Bottom"):
         return "Bottom"
+    return "Top"
+
+
+def footprint_side_of(pcb_text: str, ref: str) -> str:
+    for start, end in board_footprint_spans(pcb_text):
+        if footprint_reference(pcb_text[start:end]) == ref:
+            return footprint_side(pcb_text[start:end])
     return "Top"
 
 
@@ -401,6 +409,33 @@ def _fid_hits_courtyard(text: str, x: float, y: float, radius: float = 1.35) -> 
     return False
 
 
+FID_MASK_R = 1.0  # `_fiducial_sexp`: a 2 mm mask opening around the 1 mm dot
+
+
+def _fid_hits_copper(text: str, x: float, y: float, gap: float = 0.2) -> str:
+    """The copper on F.Cu a fiducial's 2 mm mask opening at (x, y) would take in (a track, a via or a pour fill
+    within `gap` of the opening), as a fact; "" when there is none. A fiducial on routed copper is a short to a net
+    KiCad's DRC reports as `shorting_items` (refuter round, 2026-10-02: the 16 x 7 mm probe board)."""
+    from .gen import decompile
+    from .route_verify import in_zone, zones
+
+    reach = FID_MASK_R + gap
+    for c in decompile(text, unique=False).copper:
+        if c.kind == "via" and c.at is not None:
+            if math.hypot(c.at[0] - x, c.at[1] - y) < reach + float(c.size or 0.0) / 2.0:
+                return f"the {c.net or 'no-net'} via at ({c.at[0]:g},{c.at[1]:g})"
+        elif c.kind == "seg" and c.layer == "F.Cu" and c.a is not None and c.b is not None:
+            (ax, ay), (bx, by) = c.a, c.b
+            L2 = (bx - ax) ** 2 + (by - ay) ** 2
+            t = 0.0 if L2 <= 0.0 else max(0.0, min(1.0, ((x - ax) * (bx - ax) + (y - ay) * (by - ay)) / L2))
+            if math.hypot(ax + t * (bx - ax) - x, ay + t * (by - ay) - y) < reach + float(c.width or 0.0) / 2.0:
+                return f"the {c.net or 'no-net'} track ({ax:g},{ay:g})->({bx:g},{by:g}) on F.Cu"
+    for z in zones(text):
+        if z.layer == "F.Cu" and z.polys and in_zone(z, (x, y)):
+            return f"the {z.net or 'no-net'} pour on F.Cu"
+    return ""
+
+
 def existing_fiducials(text: str) -> list[tuple[str, float, float]]:
     """The `FIDn` footprints a board already carries, `(ref, x, y)` each."""
     placed = []
@@ -414,37 +449,37 @@ def existing_fiducials(text: str) -> list[tuple[str, float, float]]:
 
 
 def insert_fiducials(
-    text: str, size_mm: tuple[float, float], inset: float = 4.0, spots: list[tuple[str, float, float]] | None = None
+    text: str, rect, inset: float = 4.0, spots: list[tuple[str, float, float]] | None = None, refused: list[str] | None = None
 ) -> tuple[str, list[tuple[str, float, float]]]:
     """(the board with three fiducials appended, **the ones appended**). A board that already carries
     any `FIDn` is returned unchanged with an empty list: fab's allowlist admits only a fiducial this
     call wrote (fifth review: the existing ones were returned as if inserted, and a second FID1
-    stacked on the first was excused by them)."""
+    stacked on the first was excused by them). `rect` is the outline (x0, y0, x1, y1): the board's Edge.Cuts, which in
+    derived mode is not at (0, 0) (docs/board-outline.md B.4)."""
     if existing_fiducials(text):
         return text, []
-    w, h = size_mm
+    x0, y0, x1, y1 = rect
     if spots is not None:
         return _append_fiducials(text, list(spots)), list(spots)
-    # Prefer NE/SE/SW; fall back to NW if a courtyard eats a corner.
+    # Prefer NE/SE/SW; fall back to NW if a courtyard eats a corner. A spot on a courtyard or on copper is never
+    # taken: until the refuter round of 2026-10-02 fewer than three free spots put all three at the first three
+    # corners anyway, on routed copper, and fab then failed on its own fiducials' shorts.
     candidates = [
-        (w - inset, inset),
-        (w - inset, h - inset),
-        (inset, h - inset),
-        (inset, inset),
+        (x1 - inset, y0 + inset),
+        (x1 - inset, y1 - inset),
+        (x0 + inset, y1 - inset),
+        (x0 + inset, y0 + inset),
     ]
     spots: list[tuple[str, float, float]] = []
     for x, y in candidates:
-        if not _fid_hits_courtyard(text, x, y):
+        why = "off the board" if not (x0 < x < x1 and y0 < y < y1) else ("a courtyard" if _fid_hits_courtyard(text, x, y) else _fid_hits_copper(text, x, y))
+        if not why:
             spots.append((f"FID{len(spots) + 1}", x, y))
+        elif refused is not None:
+            refused.append(f"({x:g},{y:g}): its 2 mm mask opening takes in {why}")
         if len(spots) == 3:
             break
-    if len(spots) < 3:
-        spots = [
-            ("FID1", w - inset, inset),
-            ("FID2", w - inset, h - inset),
-            ("FID3", inset, h - inset),
-        ]
-    return _append_fiducials(text, spots), spots
+    return (_append_fiducials(text, spots) if spots else text), spots
 
 
 def _append_fiducials(text: str, spots: list[tuple[str, float, float]]) -> str:
@@ -472,11 +507,12 @@ def _run(cmd: list[str]) -> dict:
 # KiCad AABB false short on rotated modules — DRC owns those. Nothing else is exempt: the router's
 # exemptions (dangling tracks and vias, the pair gap it rewrote, clearance errors above the fab floor)
 # went with it (docs/native-plan.md, critique #1). A KiCad error is an error.
-_IGNORE_DRC = {
-    "silk_overlap",
-    "silk_over_copper",
-    "silk_edge_clearance",
-    "silk_mask_clearance",
+#
+# Silkscreen is not exempt either (2026-10-03): the `.kicad_pro` carries the fab's silk minimums as KiCad
+# rules, errors (`stackup.silk_rules`, `SILK_SEVERITIES`), and the place stage plans every reference and
+# trims every library drawing to them (`silk.silk_plan`). Until then the four silk types were dropped here
+# and KiCad's own severity for them is a warning: 162 silk warnings on the five examples, none gated.
+_IGNORE_DRC: set[str] = {
     # length_out_of_range is not ignored: NetReq max_mm is an airwire budget and never becomes a
     # length rule, the canary is a warning and never reaches the error gate, and an explicit
     # length_mm= (or an i2c bus) must gate.
@@ -512,6 +548,31 @@ def copper_drc_errors(drc: dict, floor_mm: float = 0.10) -> list[dict]:
         if sev == "error":
             out.append(v)
     return out
+
+
+def drc_error_lines(violations: list[dict], inserted: list[str] = ()) -> str:
+    """KiCad's DRC errors as facts, by type: `shorting_items x6: Track [PWR] on F.Cu, length 2.3702 mm at (9.8615,1.824)
+    with Pad [<no net>] of FID1 on F.Cu at (12,4) (FID1: a fiducial fab inserted); ...`. Every item of every violation
+    is named with its position; `inserted` are the `FIDn` refs this fab run appended to the board."""
+    by: dict[str, list[dict]] = {}
+    for v in violations:
+        by.setdefault(str(v.get("type") or v.get("Type") or "?"), []).append(v)
+    fid = re.compile(r"\bof (FID\d+)\b")
+    out = []
+    for typ in sorted(by, key=lambda k: (-len(by[k]), k)):
+        vs = by[typ]
+        shown = []
+        for v in vs:
+            items = []
+            for it in v.get("items") or []:
+                pos = it.get("pos") or {}
+                desc = str(it.get("description", ""))
+                m = fid.search(desc)
+                tag = f" ({m.group(1)}: a fiducial fab inserted)" if m and m.group(1) in inserted else ""
+                items.append(f"{desc} at ({float(pos.get('x', 0.0)):g},{float(pos.get('y', 0.0)):g}){tag}")
+            shown.append(" with ".join(items) if items else str(v.get("description", "")))
+        out.append(f"{typ} x{len(vs)}: " + "; ".join(shown))
+    return " | ".join(out)
 
 
 def bom_refs(rows: list[dict]) -> set[str]:
@@ -553,9 +614,63 @@ def board_roles(text: str):
     return roles_doc(text)
 
 
-def _owned_copper(doc) -> tuple[tuple[str, str, float], ...]:
-    """`(net, reason, width_mm)` for every segment pcbc wrote, with the width **the board has**."""
-    return tuple((str(i["net"]), str(i["reason"]), float(i["w"])) for i in doc.items if i.get("key", ("",))[0] == "seg" and i.get("net"))
+def _owned_copper(doc) -> tuple[tuple[str, str, float, str, str], ...]:
+    """`(net, reason, width_mm, owner, layer)` for every segment pcbc wrote, with the width **the board
+    has**: the role owner (a path link's key, or the net) and the layer are what the per-link, per-layer
+    gate judges by (`docs/net-path-physics.md` §4.4)."""
+    from .copper_bar import bar_key
+
+    return tuple(
+        (str(i["net"]), str(i["reason"]), float(i["w"]), str(i.get("owner", "")), str(i["key"][1]), bar_key("seg", i["key"][1], tuple(i["key"][2]), tuple(i["key"][3]), float(i["w"])))
+        for i in doc.items
+        if i.get("key", ("",))[0] == "seg" and i.get("net")
+    )
+
+
+def _sense_copper(doc, job) -> frozenset:
+    """`copper_bar.bar_key`s of every piece a sense path's link owns (`docs/net-path-physics.md` §4.6):
+    on a net whose paths are only sense paths, the all-pairs ampacity walk runs over the net's copper
+    with the sense copper beyond its junction removed."""
+    from .copper_bar import bar_key
+
+    cs = job.constraints
+    if cs is None or not hasattr(cs, "link_by_key"):
+        return frozenset()
+    out = set()
+    for i in doc.items:
+        lk = cs.link_by_key(str(i.get("owner", "")))
+        if lk is None or not lk.sense:
+            continue
+        key = i.get("key") or [""]
+        if key[0] == "seg":
+            out.add(bar_key("seg", key[1], tuple(key[2]), tuple(key[3]), float(i.get("w") or 0.0)))
+        elif key[0] == "via":
+            out.add(bar_key("via", tuple(key[1])))
+    return frozenset(out)
+
+
+def _via_groups(doc) -> dict[tuple, tuple]:
+    """`{(x, y): (members, landing_mm, landing layers)}` for every via the board's `pcbc:route_group:` roles name: a via group is
+    joined by its own landings, never by distance (`docs/net-path-physics.md` §4.3), so the ampacity
+    walk rates each barrel as one of its group's members."""
+    by_owner: dict[tuple[str, str], list] = {}
+    for i in doc.items:
+        if i.get("reason") != "route_group" or i.get("key", ("",))[0] != "via":
+            continue
+        by_owner.setdefault((str(i["net"]), str(i.get("owner", ""))), []).append(i)
+    out: dict[tuple, int] = {}
+    segs = [i for i in doc.items if i.get("reason") == "route_group" and i.get("key", ("",))[0] == "seg"]
+    for (net, owner), vias in by_owner.items():
+        from .route_verify import group_members
+
+        mine = [s for s in segs if s["net"] == net and str(s.get("owner", "")) == owner]
+        for members in group_members([tuple(v["key"][1]) for v in vias], [(tuple(s["key"][2]), tuple(s["key"][3])) for s in mine]):
+            joined = [s for s in mine if any(abs(tuple(s["key"][2])[0] - m[0]) < 1e-3 and abs(tuple(s["key"][2])[1] - m[1]) < 1e-3 for m in members) or any(abs(tuple(s["key"][3])[0] - m[0]) < 1e-3 and abs(tuple(s["key"][3])[1] - m[1]) < 1e-3 for m in members)]
+            landing = min((float(s["w"]) for s in joined), default=0.0)
+            layers = tuple(sorted({str(s["key"][1]) for s in joined}))
+            for at in members:
+                out[(round(at[0], 4), round(at[1], 4))] = (tuple(members), landing or 0.5, layers)
+    return out
 
 
 def _shield_copper(doc) -> frozenset:
@@ -619,16 +734,40 @@ def fab_job(
         copy_with_siblings(pcb, work)
         write_dru(job, work)
     text = work.read_text()
+    # The outline is the emitted board's Edge.Cuts (docs/board-outline.md B.4): a fresh compile cannot know a derived one.
+    board_outline = edge_outline(text)
+    if board_outline is not None and (job.outline is None or job.outline_source == "derived"):
+        job.outline = board_outline
     fids: list[tuple[str, float, float]] = []
+    fid_refused: list[str] = []
     if insert_fids:
-        text, fids = insert_fiducials(text, job.board_size_mm)
+        text, fids = insert_fiducials(text, board_outline or job.outline, refused=fid_refused)
         work.write_text(text)
     # Fab writes nothing else onto the board. The silkscreen references were placed by the place
-    # stage (`place_native.place`'s `silk.legalize_silk`, with the decoupling caps it may hide) and are
-    # on the routed board the gates judged; until the fifth review fab ran the silk pass again, without that
-    # list and in another footprint order, moved three of buck's references, and needed an allowlist
-    # that admitted any reference position and any text size.
-    silk_rep = {"silk": {"moved": [], "hidden": [], "sized": [], "issues": [], "notes": ["fab writes no silk: the references are the place stage's, on the routed board"]}}
+    # stage (`place_native.place`'s `silk.silk_plan`) and are on the routed board the gates judged; until
+    # the fifth review fab ran the silk pass again, in another footprint order, moved three of buck's
+    # references, and needed an allowlist that admitted any reference position and any text size. What
+    # fab says about the silk is read off the board: the references it does not print.
+    from .silk import hidden_line, hidden_references
+    from .stackup import get_stackup, silk_limits
+
+    limits = silk_limits(get_stackup(job.stackup))
+    silk_rep = {"silk": {"hidden": [hidden_line(r, limits) for r in hidden_references(text)], "marks": []}}
+    if design is not None:
+        # A library pin-1 or polarity mark the board does not carry, moved or not (refute:silk 2026-10-07: they were
+        # dropped and nothing said so). Read off the board against each part's own `.kicad_mod`.
+        from .place_native import seed_feet
+        from .silk import unprinted_marks
+
+        from .orient import check_text as orient_check, library_mark_reason
+
+        feet = seed_feet(design)
+        silk_rep["silk"]["marks"] = unprinted_marks(text, {pf.ref: pf.lib.silk_shapes for pf in feet}, limits, reason=library_mark_reason(design, feet, limits, text))
+        # docs/direction.md §4c, read off the fab board: what marks each part's orientation, and what does not.
+        orient = orient_check(text, design, limits)
+        silk_rep["silk"]["orientation"] = orient["lines"]
+        silk_rep["silk"]["orientation_fails"] = orient["fails"]
+        silk_rep["silk"]["silk_mask"] = orient["silk_mask"]
 
     comp_root = Path(components) if components else None
     if comp_root is None:
@@ -657,6 +796,9 @@ def fab_job(
         "fab": str(out_dir),
         "pcb": str(work),
         "kicad_cli": str(cli),
+        "fiducial_spots_refused": fid_refused,
+        "outline_rect": list(board_outline) if board_outline is not None else None,
+        "outline_source": job.outline_source,
         "fiducials": [{"ref": n, "at": [x, y], "by": "fab"} for n, x, y in fids] + [{"ref": n, "at": [x, y], "by": "place"} for n, x, y in (existing_fiducials(text) if not fids else [])],
         "bom_rows": len(bom_rows),
         "missing_lcsc": missing_lcsc,
@@ -786,7 +928,14 @@ def fab_job(
     # CPL from the board file. kicad-cli pos is provenance only — Ubuntu's
     # KiCad 7 cannot load a KiCad 10 board and writes an empty POS.
     text = work.read_text()
-    (out_dir / "cpl.csv").write_text(jlc_cpl_from_board(text))
+    # docs/direction.md §4c: each part's rotation and centre in JLC's own footprint's frame, registered against that
+    # footprint (`cpl.py`); KiCad's `(at)` copied verbatim put KiCad's SOT-23-5 180 degrees off JLC's.
+    from .cpl import board_rows, cpl_csv, library_roots, note_lines
+
+    cpl_rows = board_rows(text, design, roots=library_roots(comp_root))
+    result["cpl"] = note_lines(cpl_rows)
+    result["cpl_fails"] = [r["fact"] for r in cpl_rows if r["fails"]]
+    (out_dir / "cpl.csv").write_text(cpl_csv(cpl_rows, {r["ref"]: footprint_side_of(text, r["ref"]) for r in cpl_rows}))
     pos_raw = out_dir / "pos_kicad.csv"
     steps.append(
         _run(
@@ -813,18 +962,26 @@ def fab_job(
     result["bom_not_in_cpl"] = missing_cpl
 
     if copper_err:
-        result["error"] = f"kicad-cli DRC {len(copper_err)} copper error(s)"
+        result["error"] = f"kicad-cli DRC {len(copper_err)} copper error(s): " + drc_error_lines(copper_err, [n for n, _x, _y in fids])
         _write_notes(out_dir, job, result)
         return result
     if blockers:
-        result["error"] = (
-            f"{len(blockers)} via-in-pad on passives/mounting pegs; "
-            "re-route with --same-net-pad-clearance (dog-bone, not VIP)"
-        )
+        shown = "; ".join(f"{b['pad']} [{b.get('net') or 'no net'}] via at ({b['via'][0]:g},{b['via'][1]:g}){' inside the pad' if b.get('inside') else ' over its edge'}" for b in blockers)
+        result["error"] = f"{len(blockers)} via-in-pad on passives/mounting pegs, which JLC Standard assembly cannot take: {shown}"
         _write_notes(out_dir, job, result)
         return result
     if missing_cpl:
         result["error"] = f"BOM refs missing from CPL: {', '.join(missing_cpl)}"
+        _write_notes(out_dir, job, result)
+        return result
+    smask = (result.get("silk") or {}).get("silk_mask") or []
+    if smask:
+        # The fab board is the routed board plus fiducials: an inserted fiducial's opening is measured here too.
+        result["error"] = "the silkscreen is nearer a pad's mask opening than the fab prints: " + "; ".join(smask)
+        _write_notes(out_dir, job, result)
+        return result
+    if result["cpl_fails"]:
+        result["error"] = "the placement file cannot give JLC's rotation: " + "; ".join(result["cpl_fails"])
         _write_notes(out_dir, job, result)
         return result
 
@@ -847,10 +1004,29 @@ def fab_job(
     # between its pads, printed as a power move when a rail is short (`ampacity.power_moves`). It is
     # recorded in `report.json` and in `FAB_NOTES.md`, and pinned per board in
     # `test_examples_fab.py`, so it is a ledger that must not get worse rather than a boolean already true.
-    roles = board_roles(text)
-    amp = power_ampacity_failures(job, text, owned=_owned_copper(roles))
+    # pcbc's role groups and the copper none of them owns (a `layout.core.py` line's), each piece
+    # given the path links it carries (`route_verify.gate_roles`): every path gate judges both.
+    from .route_verify import gate_roles
+
+    roles = gate_roles(text, job.constraints)
+    # Decision 1: the pad necks on the emitted board — each listed, each refused one a failure below.
+    from .route_verify import neck_lines, pad_necks
+
+    necks = pad_necks(text, job.constraints, roles)
+    result["necks"] = neck_lines(necks[0])
+    amp = power_ampacity_failures(job, text, owned=_owned_copper(roles), necks=necks)
+    # The paths' own copper (docs/net-path-physics.md §4.6): a via or a layer a link does not allow,
+    # and every via group's worst barrel recomputed from the copper the board has. Fatal: the router
+    # laid it, so a short group or a stray via is pcbc's own defect.
+    from .route_verify import path_copper_failures
+
+    paths = path_copper_failures(job, roles)
+    result["path_copper"] = paths
+    amp = sorted(set(amp + paths))
     result["ampacity"] = amp
-    result["ampacity_bottleneck"] = power_bottlenecks(job, text, redundant=_shield_copper(roles))
+    result["ampacity_bottleneck"] = power_bottlenecks(
+        job, text, redundant=_shield_copper(roles), groups=_via_groups(roles), sense_copper=_sense_copper(roles, job), necks=frozenset(n["key"] for n in necks[0])
+    )
     # The measurement only counted while it sat in `FAB_NOTES.md`: the build printed
     # `copper: verified`, `error: null`, exit 0, and an AI reading that shipped buck with 1.21 A of
     # copper on a 2 A rail. `power_moves` carries the non-`ok` rows out as moves, `build.py` puts
@@ -1307,8 +1483,7 @@ def _thermal_notes(job: CompiledJob, rows=()) -> list[str]:
         if r["verdict"] == "short" or got < t.need:
             head += (
                 f" **Short:** the budget asks for {t.need} barrel(s) ({t.rise_of(t.need):g} C) and the land had room for {got}, "
-                f"so this land runs {r['rise_c'] - t.rise_c:+.2f} C over its budget: give it room (clear the tracks under it, "
-                f"or move the part) or accept the rise with `Thermal(rise_c=)`."
+                f"so this land runs {r['rise_c'] - t.rise_c:+.2f} C over its budget."
             )
         if r.get("bare"):
             head += f" {len(r['bare'])} of its {r.get('blocks')} pads carry no barrel."
@@ -1402,6 +1577,33 @@ def _clear_refused(out_dir: Path) -> None:
             f.replace(out_dir / f"refused{ext}")
 
 
+def _copper_order(job: CompiledJob) -> list[str]:
+    """The copper the order must state (round 3, refute-twooz): every width and via rating on this board is sized for
+    the stackup's copper, and a fab given no weight builds 1 oz. The same numbers are the board's `(stackup)`
+    (`seed._stackup`), which the Gerber job file carries."""
+    from .stackup import Copper, get_stackup
+
+    stack = get_stackup(job.stackup)
+    cu = [c for c in stack.stack if isinstance(c, Copper)]
+    outer = [c for c in cu if c.layer in ("F.Cu", "B.Cu")]
+    inner = [c for c in cu if c.layer not in ("F.Cu", "B.Cu")]
+    text = f"- Order outer copper {stack.copper_oz:g} oz ({outer[0].thickness_mm:g} mm finished on F.Cu and B.Cu)"
+    if inner:
+        text += f", inner {', '.join(c.layer for c in inner)} {inner[0].thickness_mm:g} mm"
+    text += f", board {stack.board_mm:g} mm. Every track width and via rating here is sized for this copper."
+    return ["## Copper", "", text]
+
+
+def _outline_words(result: dict, job: CompiledJob) -> str:
+    """`40×25 mm (declared)` or `26.81×18 mm (derived)`: the outline fab was handed (its Edge.Cuts), and where it came
+    from (docs/board-outline.md B.4)."""
+    rect = result.get("outline_rect") or job.outline
+    if rect is None:
+        return "with no outline"
+    w, h = round(rect[2] - rect[0], 4), round(rect[3] - rect[1], 4)
+    return f"{w:g}×{h:g} mm ({getattr(job, 'outline_source', 'declared')})"
+
+
 def _write_notes(out_dir: Path, job: CompiledJob, result: dict) -> None:
     if result.get("error"):
         _clear_refused(out_dir)
@@ -1412,7 +1614,9 @@ def _write_notes(out_dir: Path, job: CompiledJob, result: dict) -> None:
     lines = [
         "# Fab notes",
         "",
-        f"Board {job.board_size_mm[0]:g}×{job.board_size_mm[1]:g} mm, {job.layers} layer, stackup `{job.stackup}`.",
+        f"Board {_outline_words(result, job)}, {job.layers} layer, stackup `{job.stackup}`.",
+        "",
+        *_copper_order(job),
         "",
         "## Fiducials",
         "",
@@ -1422,7 +1626,9 @@ def _write_notes(out_dir: Path, job: CompiledJob, result: dict) -> None:
             lines.append(f"- {f['ref']} at ({f['at'][0]:g}, {f['at'][1]:g}) — 1 mm Cu, 2 mm mask, F.Cu")
         lines.append("- JLCPCB Standard SMT wants 3–4 fiducials ≥ 3.35 mm from the edge. Rails (5 mm) can be added at order time.")
     else:
-        lines.append("- None in the file. Ask JLCPCB to add rails + fiducials, or re-run with insert.")
+        lines.append("- None in the file.")
+        for r in result.get("fiducial_spots_refused") or []:
+            lines.append(f"- spot {r}")
     lines += ["", "## Via-in-pad", ""]
     blockers = result.get("via_in_pad_blockers") or []
     if vip:
@@ -1451,6 +1657,26 @@ def _write_notes(out_dir: Path, job: CompiledJob, result: dict) -> None:
     else:
         lines.append("- None detected.")
     lines += _thermal_notes(job, result.get("thermal") or ())
+    hidden = (result.get("silk") or {}).get("hidden") or []
+    marks = (result.get("silk") or {}).get("marks") or []
+    lines += ["", "## Silkscreen", ""]
+    lines += [f"- {h}" for h in hidden] if hidden else ["- Every reference is printed (a fiducial carries none)."]
+    lines += [f"- {m}" for m in marks] if marks else ["- Every pin-1 and polarity mark of the libraries is printed."]
+    smask = (result.get("silk") or {}).get("silk_mask")
+    if smask is not None:
+        lines += [f"- **{m}**" for m in smask] if smask else ["- All silkscreen ink, marks and text, is the fab's clearance or more from every mask opening (measured: KiCad's DRC flags only an overlap)."]
+    orient = (result.get("silk") or {}).get("orientation") or []
+    ofails = (result.get("silk") or {}).get("orientation_fails") or []
+    if orient or ofails:
+        lines += ["", "### Orientation marks", ""]
+        lines += [f"- **{f}**" for f in ofails]
+        lines += [f"- {o}" for o in orient]
+    cpl = result.get("cpl") or []
+    if cpl:
+        # docs/direction.md §4c: the CPL's rotation is JLC's, registered per part against JLC's own footprint.
+        lines += ["", "## Placement (CPL)", ""]
+        lines += [f"- **{f}**" for f in result.get("cpl_fails") or []]
+        lines += [f"- {c}" for c in cpl if c not in (result.get("cpl_fails") or [])]
     lines += ["", "## BOM LCSC", ""]
     if miss:
         lines.append("Missing LCSC on footprint property: " + ", ".join(miss))
@@ -1487,6 +1713,11 @@ def _write_notes(out_dir: Path, job: CompiledJob, result: dict) -> None:
         # copper on each rail's worst pad-to-pad path can carry, vias included.
         lines += ["## Power, end to end", ""]
         lines += [f"- {line}" for line in bottleneck_lines(rows)]
+        lines += [""]
+    if result.get("necks"):
+        # Decision 1: every pad neck the board carries (pad, width, length past the pad's edge, what it runs into).
+        lines += ["## Pad necks", ""]
+        lines += [f"- {line}" for line in result["necks"]]
         lines += [""]
     if result.get("error"):
         lines += ["## Error", "", result["error"], ""]

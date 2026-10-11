@@ -30,7 +30,11 @@ from pcbc.compile import compile_design
 from pcbc.language import load_board
 from pcbc.netcheck import check_copper
 
-EXAMPLES = Path(__file__).resolve().parent.parent / "examples"
+from conftest import vehicle_examples  # noqa: E402
+from conftest import write_split
+from conftest import copy_board_file
+
+EXAMPLES = vehicle_examples()  # buck is the pre-migration board here: conftest.vehicle_examples
 COMPLETE = ("blinky", "buck")
 UNFINISHED = ("c3_usb", "node")
 
@@ -48,8 +52,19 @@ BAR = {
     # `detour` 2.51 -> **2.59** (`EN`, see DETOURS). `vias` 1 -> 0, `micro` 7 -> 1 and `angles`
     # 20 -> 4 fell. Measured by `scratchpad/native/record.py` (a native build of a copy of each board).
     "blinky": {"vias": 0, "off45": 0, "micro": 0, "detour": 1.03, "angles": 0},
-    "buck": {"vias": 0, "off45": 3, "micro": 1, "detour": 2.59, "angles": 4},
+    "buck": {"vias": 0, "off45": 3, "micro": 1, "detour": 2.84, "angles": 8},
 }
+# **Re-recorded 2026-10-02 for docs/physics-subjects.md O2 (b)**: the vehicle buck declares no current (three plain
+# NetReqs), so no net has a via group, no spine and no power row. `detour` 2.59 -> **2.84** (`EN`, measured by
+# `scratchpad/subjects-build/kfix/fab_metrics.py buck`; the ceiling rose and is said here); the others fell or held.
+# **Re-recorded 2026-09-30 for docs/net-path-physics.md PR 9 on the vehicle buck** (the board as it shipped,
+# `conftest.vehicle_examples`): VIN's own links now change layer through flow-through 3-via groups (the
+# count from `via_barrel`, judged at the worst barrel) and run 1.09 mm on B.Cu, where they were three lone
+# 0.4 mm vias (0.871 A each) at 0.781 mm. VIN's worst path rises 0.871 -> 1.999 A (no longer under its
+# 2 A) and the stitch carrier stops looking for rungs (group barrels are not lone vias). The price,
+# recorded rather than hidden: VIN's routed length 32.489 -> 53.765 mm (detour 1.53 -> 2.53), the
+# `track_angle` count 4 -> 8, one more pcbc via under a courtyard (2 -> 3), the GND pour 903.64 -> 914.46 mm2.
+
 """`detour` is the worst per-net ratio of routed length to the shortest possible (`copper_bar`); buck's
 2.59 is `EN`, which leaves `U1` round the `FB` and `SW` copper routed before it on F.Cu."""
 
@@ -59,20 +74,20 @@ PLANES = {
     # (`route_native.plane_pours`). buck's is 31.95 mm2 smaller: the router takes B.Cu for its layer
     # changes where the old router kept to F.Cu.
     "blinky": {("GND", "B.Cu"): 942.54},
-    "buck": {("GND", "B.Cu"): 903.64},
+    "buck": {("GND", "B.Cu"): 921.86},  # docs/physics-subjects.md O2 (b), re-measured 2026-10-02: the vehicle declares no current
 }
 
-TAP_NECKED = {"blinky": 0, "buck": 1}
+TAP_NECKED = {"blinky": 0, "buck": 0}  # docs/physics-subjects.md O2 (b), re-measured 2026-10-02: the vehicle declares no current
 """Tap stubs the tap pattern necks to a pad's across dimension (a `track_width` hit each), unchanged."""
 
-COURTYARD = {"blinky": 0, "buck": 2}
+COURTYARD = {"blinky": 0, "buck": 1}  # docs/physics-subjects.md O2 (b), re-measured 2026-10-02: the vehicle declares no current
 """pcbc's own vias inside another part's courtyard (`copper_bar.vias_in_courtyard`): buck's two are
 router vias (`route`) under `U1`'s courtyard, where the old router placed none. A warning-grade census,
 not a rule: the courtyard is an assembly keep-out and KiCad's DRC checks copper, not this."""
 
 DETOURS = {
     "blinky": {"LED": 1.03},
-    "buck": {"5V": 1.13, "BOOT": 1.0, "EN": 2.59, "FB": 1.02, "GND": 0.49, "SW": 1.6, "VIN": 1.53},
+    "buck": {"5V": 1.05, "BOOT": 1.0, "EN": 2.84, "FB": 1.0, "GND": 0.49, "SW": 1.56, "VIN": 1.21},  # docs/physics-subjects.md O2 (b), re-measured 2026-10-02: the vehicle declares no current
 }
 
 PASSIVE_PADS = {"blinky": 4, "buck": 18}
@@ -80,7 +95,7 @@ PASSIVE_PADS = {"blinky": 4, "buck": 18}
 VIAS_PATTERN = {
     # Exact per reason. `route` is the native router's own layer changes.
     "blinky": {"tap": 1},
-    "buck": {"route": 5, "tap": 6},
+    "buck": {"route": 5, "tap": 6},  # docs/physics-subjects.md O2 (b), re-measured 2026-10-02: the vehicle declares no current
 }
 
 REFUSED = {
@@ -88,19 +103,19 @@ REFUSED = {
     # `stitch: 3` is new: the router puts `VIN`'s layer changes on single 0.4 mm-drill vias (the old router
     # kept VIN on F.Cu), a 2 A rail needs three barrels per change, and the parallel carrier finds no
     # site for a rung at any of the three (two would sit in a pad, one against copper).
-    "buck": {"hop": 2, "spine": 2, "stitch": 3},
+    "buck": {"hop": 2},  # docs/physics-subjects.md O2 (b), re-measured 2026-10-02: the vehicle declares no current; the spine is deleted (O4)
 }
 
 SPINE_REFUSED = {
     "blinky": [],
-    "buck": [("C_OUT2.1->J_OUT.1", "copper"), ("J_IN.1->C_IN1.1", "copper")],
+    "buck": [],  # the spine pattern is deleted (docs/physics-subjects.md O4)
 }
 
 TAP_REFUSED = {"blinky": [], "buck": []}
 
 STITCH_REFUSED = {
     "blinky": [],
-    "buck": [("VIN via at (18.588,5.38)", "via_in_pad"), ("VIN via at (18.842,10.714)", "via_in_pad"), ("VIN via at (20.112,11.476)", "copper")],
+    "buck": [],
 }
 
 RUNGS = {"blinky": [], "buck": []}
@@ -108,24 +123,24 @@ RUNGS = {"blinky": [], "buck": []}
 OWNS = {
     # (segments, vias) per `pcbc:` role on the emitted board.
     "blinky": {"hop": (3, 0), "tap": (1, 1)},
-    "buck": {"route": (33, 5), "spine": (10, 0), "tap": (6, 6)},
+    "buck": {"route": (39, 5), "tap": (6, 6)},  # docs/physics-subjects.md O2 (b), re-measured 2026-10-02: the vehicle declares no current
 }
 
 SOFT = {
     "blinky": {"width_power": 0},
     # buck 8 -> 1: the router draws every net at its class width; the one hit is the tap stub
     # `TAP_NECKED` names.
-    "buck": {"width_power": 1},
+    "buck": {"width_power": 0},  # docs/physics-subjects.md O2 (b), re-measured 2026-10-02: the vehicle declares no current (no per-layer class rule since PR 3)
 }
 
 SPINE_LINKS = {
     "blinky": {},
-    "buck": {"5V": (3, 4, 0.6386), "VIN": (2, 4, 0.1593)},
+    "buck": {},  # the spine is deleted (O4)
 }
 
 SPINE_NETS = {
     "blinky": {},
-    "buck": {"5V": (7, 14.6184), "VIN": (3, 3.3831)},
+    "buck": {},  # the spine is deleted (O4)
 }
 
 BOTTLENECK = {
@@ -133,9 +148,12 @@ BOTTLENECK = {
     # necked track on the old router's board; natively 0.871 A through one 0.4 mm-drill via (every track at
     # class width, 0 mm under it). Still short of its declared 2 A either way: `UNDER`.
     "blinky": {},
-    "buck": {"5V": (1.999, 0.0), "VIN": (0.871, 0.0)},
+    "buck": {},  # O2 (b): the vehicle declares no current, so no Path has an ampacity row
 }
-UNDER = {"blinky": [], "buck": ["VIN"]}
+UNDER = {"blinky": [], "buck": []}
+"""Re-recorded 2026-10-01 (refutation round 1, defect 1): buck's `GND` declares 2 A and is poured; its pads
+reach the pour through single vias rated under 2 A, which version 1 does not size, so its row says
+`not rated: pour` (never `ok`) and the build prints it with the power moves."""
 
 SAME_NET = {"blinky": 0, "buck": 1}
 """Re-recorded 2026-09-25 for the native router: buck 0 -> **1**, a new same-net clearance slot (two
@@ -147,7 +165,7 @@ LEFTOVER = {
     # (the spine's millimetres, the rest's) on each spined net; natively the rest is the router's own
     # `route` copper, which the bar counts as pattern copper, so the second number is 0.
     "blinky": {},
-    "buck": {"5V": (25.76, 0.0), "VIN": (32.489, 0.0)},
+    "buck": {"5V": (24.125, 0.0), "VIN": (25.69, 0.0)},  # docs/physics-subjects.md O2 (b), re-measured 2026-10-02: the vehicle declares no current (the spine is gone, so the router's copper)
 }
 
 RETURNS = {
@@ -165,27 +183,15 @@ RETURNS = {
 }
 
 PARALLEL = {
-    # Every parallel-via group on an unpoured rail, (anchor, barrels, barrels needed), five boards.
+    # Every parallel-via group on an unpoured path link that carries a declared current, (anchor, barrels, barrels
+    # needed), five boards. Re-measured 2026-10-02 (docs/physics-subjects.md PR 3): a net carries no current, so only a
+    # current Path's links are counted. The vehicle buck, blinky and ds2 declare none; node's VBUS is unrouted and
+    # its LOAD changes no layer; c3_usb's 3V3 (0.5 A, Path line 268) changes layer twice through one 0.4 mm barrel.
     "blinky": {},
-    "buck": {"VIN": (((18.588, 5.38), 1, 3), ((18.842, 10.714), 1, 3), ((20.112, 11.476), 1, 3))},
-    "c3_usb": {"3V3": (((13.0, 16.302), 1, 1), ((18.588, 8.936), 1, 1))},
-    # node: `VBUS` is unrouted at N0 and an unfinished net ships no copper, so it has no via to group
-    # (re-recorded 2026-09-25 for the D1 fix; it had two single 0.4 mm-drill groups of the dropped copper).
+    "buck": {},
+    "c3_usb": {"3V3": (((9.952, 12.746), 1, 1), ((34.082, 11.476), 1, 1))},
     "node": {},
-    "ds2": {
-        "3V3": (((18.588, 18.08), 1, 1), ((19.35, 15.54), 1, 1), ((23.922, 7.666), 1, 1)),
-        "VDDA": (((21.128, 5.634), 1, 1), ((22.83, 8.05), 1, 1)),
-        "VSS": (
-            ((3.094, 18.588), 1, 1),
-            ((8.682, 16.556), 1, 1),
-            ((10.46, 14.778), 1, 1),
-            ((17.572, 6.396), 1, 1),
-            ((22.652, 5.38), 1, 1),
-            ((23.414, 13.508), 1, 1),
-            ((36.368, 11.73), 1, 1),
-            ((40.686, 16.556), 1, 1),
-        ),
-    },
+    "ds2": {},
 }
 
 THERMAL = {
@@ -200,8 +206,8 @@ UNFINISHED_PLANES = {
     # four-layer pours in this repo: the plane gate (`build._plane_gate`) is asked of them on every
     # build even though the board stops at `VBUS`, and this is the only place that answer is held
     # (the second refutation round, major 4: inner-layer island blindness passed the suite).
-    "c3_usb": {"GND B.Cu": (1, 1070.36)},
-    "node": {"3V3 In2.Cu": (1, 2517.18), "GND In1.Cu": (1, 2545.0)},
+    "c3_usb": {"GND B.Cu": (1, 1053.82)},  # 1070.36 before VBUS and 3V3 became Paths (physics-subjects PR 3), re-measured 2026-10-02
+    "node": {"3V3 In2.Cu": (1, 2517.18), "GND In1.Cu": (1, 2544.56)},  # GND 2545.0 before physics-subjects PR 3-8 (re-measured 2026-10-02)
 }
 
 OVERLAPS = {
@@ -210,7 +216,7 @@ OVERLAPS = {
     # itself and USB_DN's 0.926 mm fold (its turn is joined by other copper, so no tail is cut) are
     # dropped. node: USB_DP's fold at (32.232,32.665) is dropped with the container's tail (nothing else
     # is at the turn), and GND's second tap stub is cut back to the first tap's via.
-    "c3_usb": [("USB_DN", "dropped"), ("USB_DP", "dropped")],
+    "c3_usb": [("EN", "dropped"), ("USB_DN", "dropped"), ("USB_DP", "dropped")],  # EN's since physics-subjects PR 3 (re-measured 2026-10-02)
     "node": [("GND", "trimmed"), ("USB_DP", "folded")],
 }
 
@@ -228,7 +234,7 @@ UNFINISHED_THERMAL = {
 def test_example_builds_to_fab(tmp_path: Path, name: str):
     src = EXAMPLES / name
     board = tmp_path / f"{name}.py"
-    board.write_text((src / f"{name}.py").read_text())
+    copy_board_file(board, src / f"{name}.py")
     if (src / "components").exists():
         shutil.copytree(src / "components", tmp_path / "components")  # blinky's two parts carry no 3D models
     result = build_job(board, upto="fab", force=True)
@@ -298,8 +304,10 @@ def test_example_builds_to_fab(tmp_path: Path, name: str):
     assert power_ampacity_failures(job, routed, owned=owned_cu) == [], name
     # And the honest whole-net number beside it: what the worst pad-to-pad path carries, vias
     # included. A ledger — `carries` must not fall and `under_mm` must not rise.
-    bottleneck = power_bottlenecks(job, routed)
-    necked = [(n, r, 0.1) for n, r, _w in owned_cu if r not in ("tap", "fanout") and n in bottleneck]
+    from pcbc.fab import _via_groups
+
+    bottleneck = power_bottlenecks(job, routed, groups=_via_groups(board_roles(routed)))  # the router's via groups, as fab reads them
+    necked = [(n, r, 0.1) for n, r, _w, *_rest in owned_cu if r not in ("tap", "fanout") and n in bottleneck]
     assert bool(power_ampacity_failures(job, routed, owned=necked)) == bool(necked), (name, necked[:2], "a gate that cannot fail is not a gate")
     got = {n: (r["carries"], r["under_mm"]) for n, r in bottleneck.items() if not r["zoned"]}
     assert sorted(got) == sorted(BOTTLENECK[name]), (name, sorted(got), "a power net that appears or disappears here is a change nobody recorded")
@@ -313,7 +321,7 @@ def test_example_builds_to_fab(tmp_path: Path, name: str):
     fab_step = next(s for s in result["steps"] if s.get("stage") == "fab")
     assert [m.split(":")[0] for m in fab_step["power"]] == UNDER[name], (name, fab_step["power"])
     assert result.get("power", []) == fab_step["power"], (name, result.get("power"))
-    assert (name == "blinky") == ("power" not in result), (name, "a board with nothing to say says nothing")
+    assert ("power" in result) == bool(UNDER[name]), (name, "a board with nothing to say says nothing")
     if name == "buck":
         # And the author who wants the stop gets it, on the same board and the same copper:
         # `--strict-power` (`PCBC_STRICT_POWER=1`) turns every one of those moves into the fab
@@ -328,8 +336,12 @@ def test_example_builds_to_fab(tmp_path: Path, name: str):
             strict = fab_job(job, routed_pcb, out_dir=tmp_path / "strict", design=load_board(board))
         finally:
             os.environ.pop("PCBC_STRICT_POWER", None) if was is None else os.environ.update({"PCBC_STRICT_POWER": was})
-        assert strict["error"] == "power: " + "; ".join(fab_step["power"]), strict["error"]
-        assert "## Power, end to end" in (tmp_path / "strict" / "FAB_NOTES.md").read_text(), "a stopped build still writes the ledger it stopped on"
+        if fab_step["power"]:
+            assert strict["error"] == "power: " + "; ".join(fab_step["power"]), strict["error"]
+        else:
+            assert strict["error"] is None, strict["error"]
+        # The ledger is written whenever a Path declares a current (docs/physics-subjects.md O2 (b): the vehicle declares none).
+        assert ("## Power, end to end" in (tmp_path / "strict" / "FAB_NOTES.md").read_text()) == bool(BOTTLENECK[name]), "the ledger is the Paths' rows"
         # Verbatim, because every clause of it was wrong once. The **coordinate** and not the pad
         # pair: `C_IN1.1->R_EN.1` is an alphabetical tie member — `R_EN` is a 100 k enable pull-up
         # drawing 0.12 mA — while the 2 A path is `J_IN.1->U1.3`, so "move those two parts closer"
@@ -348,9 +360,11 @@ def test_example_builds_to_fab(tmp_path: Path, name: str):
         # Natively the rail is short by its **vias**, not its width: every VIN track is at its 0.781 mm
         # class, and the router's layer changes are single 0.4 mm-drill barrels (0.871 A each) where 2 A
         # needs three (`vias_per_change`); the stitch carrier found no site for a rung (`STITCH_REFUSED`).
-        assert len(fab_step["power"]) == 1 and fab_step["power"][0].startswith(
-            "VIN: declared 2 A, carries 0.871 A through its narrowest single via at 18.588,5.38"
-        ), fab_step["power"]
+        # Re-recorded 2026-09-30 (docs/net-path-physics.md PR 9): VIN's layer changes are 3-via flow-through
+        # groups now, so the rail carries 1.999 A of its 2 A on the curve and no power move is printed.
+        # Re-recorded 2026-10-01 (refutation round 1, defect 1): the one line is GND's pour vias, not rated.
+        # Re-recorded 2026-10-02 (docs/physics-subjects.md O2 (b)): the vehicle declares no current, so nothing is printed.
+        assert fab_step["power"] == [], fab_step["power"]
     # `docs/stitch-plan.md` S6 and section 6 row 4: the array measured where it was placed, and the
     # two things the gate is allowed to fail on. `via_in_pad` **grows** by exactly the array — that is
     # the point of the technique — and `via_in_pad_blockers` does not grow at all, which is the half
@@ -423,7 +437,13 @@ def test_example_builds_to_fab(tmp_path: Path, name: str):
     assert fab_text.count("\n\t(group") == final.count("\n\t(group")
     back = decompile(fab_text)
     assign_ids(back.copper, set(), back.graphics)
-    assert gen_source(back.poses, back.copper, board=name, graphics=back.graphics) == (tmp_path / "layout" / name / "routed" / "layout.gen.py").read_text()
+    from pcbc.compile import compile_design as _compile
+    from pcbc.gen import outline_header
+    from pcbc.language import load_board as _load
+
+    job = _compile(_load(board))  # the header's outline line is the board's (docs/board-outline.md B.4)
+    head = outline_header(job.outline_source, job.outline_line)
+    assert gen_source(back.poses, back.copper, board=name, graphics=back.graphics, outline=head) == (tmp_path / "layout" / name / "routed" / "layout.gen.py").read_text()
     place = next(s for s in result["steps"] if s.get("stage") == "place")
     # F.1's `usb_hs` budget line, the same carve-out `test_pcb_place._relations` makes and for the
     # same reason: `PRESETS` gives a fast kind no `airwire_mm`, so a board declaring `usb_hs` with
@@ -452,10 +472,10 @@ def test_example_builds_to_fab(tmp_path: Path, name: str):
     # And the same two questions asked inside `pcbc build`, so they run on a user's board and not
     # only here (finding 11).
     assert route["planes"]["fails"] == [] and route["planes"]["islands"] == {f"{n} {L}": 1 for n, L in PLANES[name]}, (name, route["planes"])
-    # R-X4's **V** half, same wiring: every declared `Chain()` on this board read off the emitted copper
+    # R-X4's **V** half, same wiring: every declared `Path()` on this board read off the emitted copper
     # (`route_verify.chain_order` via `build._chain_gate`); the verdicts are pinned in
     # `test_route_verify_chains.py`. Neither complete board declares one.
-    declared = {ch.net for ch in load_board(board).chains}
+    declared = {ch.net for ch in load_board(board).paths}
     assert set(route["chains"]["checked"]) == declared, (name, route["chains"], declared)
     assert route["chains"]["fails"] == [], (name, route["chains"]["fails"], "R-X4: a declared order pcbc routes must be in the copper")
     # `docs/stitch-plan.md` S1's two counts, asked inside `pcbc build` and not only in the suite —
@@ -535,7 +555,7 @@ def test_an_unfinished_example_is_a_move_and_never_a_package(tmp_path: Path, nam
 
     src = EXAMPLES / name
     board = tmp_path / f"{name}.py"
-    board.write_text((src / f"{name}.py").read_text())
+    copy_board_file(board, src / f"{name}.py")
     shutil.copytree(src / "components", tmp_path / "components")
     result = build_job(board, upto="fab", force=True)
     err = str(result.get("error"))
@@ -550,7 +570,8 @@ def test_an_unfinished_example_is_a_move_and_never_a_package(tmp_path: Path, nam
     assert result["plan"][-1] == "fab" and [s["stage"] for s in result["steps"]][-1] == "route", "fab never ran"
     # Every generated piece of an unfinished net is left out, and one closing line says so (the
     # refuters' D1: 13 `Seg`s of VBUS stood in c3_usb's layout.gen.py while VBUS was "unrouted").
-    links = [m for m in result["moves"] if "cannot reach" in m]
+    # A path link's failure says "did not route at <width>" (docs/physics-subjects.md PR 3: VBUS is a Path now).
+    links = [m for m in result["moves"] if "cannot reach" in m or " did not route at " in m]
     tail = [m for m in result["moves"] if m not in links]
     assert tail == [m for m in tail if m.startswith("VBUS: unfinished, so none of its generated copper")] and len(tail) == 1, tail
     gen = (layout / "routed" / "layout.gen.py").read_text()
@@ -563,7 +584,8 @@ def test_an_unfinished_example_is_a_move_and_never_a_package(tmp_path: Path, nam
         # never "has no Place()" for a part that has one (the refuters: "J1 pad at 32.9,38.7" was
         # read as ref "J1 pad at 32").
         for blocker in way.split(":", 1)[1].split(";"):
-            assert re.search(r"(board|layout\.core)\.py:\d+|a net with no NetReq line", blocker), (blocker, move)
+            # ... or the net's own path copper the router laid earlier (the junction rule holds it: no line wrote it).
+            assert re.search(r"(board|layout\.core)\.py:\d+|a net with no NetReq line|laid earlier|a path's copper meets the rest of its net|board edge \[no net\]", blocker), (blocker, move)
         assert "has no Place()" not in way, way
         f = move.split("Problem file: ")[1].split("/")[-1].strip()
         doc = json.loads((layout / "routed" / "unrouted" / f).read_text())
@@ -612,3 +634,62 @@ def test_an_unfinished_example_is_a_move_and_never_a_package(tmp_path: Path, nam
         kicad_drc(cut, refill=True)  # refills and saves
         gate = _plane_gate(cut.read_text(), None)
         assert gate["islands"]["GND In1.Cu"] >= 2 and any(f.startswith("the GND plane on In1.Cu is ") for f in gate["fails"]), gate
+
+
+# ---------------------------------------------------------------------------------------------
+# The migrated example (docs/net-path-physics.md §5, PR 10). `examples/buck` carries its sense/load
+# split on Paths now; the rest of this file measures the pipeline on the board as it shipped
+# (`conftest.vehicle_examples`). What the migrated board's emitted copper actually carries is held
+# here, against what §5 says it should.
+# ---------------------------------------------------------------------------------------------
+
+
+@pytest.mark.kicad
+def test_migrated_buck_carries_its_paths_and_names_the_switch_pinch():
+    """Measured 2026-09-30. §5 says: the trunk `L1.2 -> C_OUT1.1 -> J_OUT.1` at 0.781 mm on F.Cu (1.09 on
+    B.Cu) with a 3-via group at any change; the feedback tap at 0.2 mm on F.Cu, no vias, leaving the rail
+    inside C_OUT1.1; SW's `U1.SW -> L1.1` at 0.781 mm on F.Cu.
+
+    Re-measured 2026-10-02 after docs/physics-subjects.md PR 3 (the net carries no current; VIN's 1.36 A is its Path's,
+    and junction rule 2 holds VIN's copper apart, O5): SW now routes (on F.Cu at 0.781 mm), an off-path branch is the
+    0.16 mm class floor, and VIN is the net left open, with the error that says so (§10.1's prediction). An
+    unfinished net ships none of its generated copper."""
+    from conftest import routed_result
+    from pcbc.fab import board_roles
+    from pcbc.layout_job import roles_doc
+    from pcbc.route_verify import path_copper_failures, path_junctions
+
+    # The migrated buck with the placement it was measured on: its declared outline (tests/fixtures/declared/buck, PR 4 of
+    # docs/board-outline.md). The example itself derives its outline now; its routed board is the build's, reported.
+    board = Path(__file__).resolve().parent / "fixtures" / "declared" / "buck" / "buck.py"
+    out, result = routed_result("buck_declared", board)
+    err = result.get("error") or ""
+    assert err.startswith(
+        "unrouted: VIN\nVIN: C_IN2.1 (18.87,9.46) -> C_IN1.1 (17.91,11.446) (Path line 53) did not route at 0.459 mm on F.Cu, 0.541 mm on B.Cu + 0.2 mm clearance: "
+        "no layer change has room for its 2-via group (flow-through, 1.3 mm pitch, 1.3 mm landing at 0.541 mm on both layers) and no single-layer route was found."
+    ), err
+    # Postfix B6: U1.3 is U1.VIN, the last station of the same Path, not off-path copper.
+    assert "U1.3 [VIN, station U1.VIN of Path line 53, not an end of this link]" in err and "U1.3 [VIN, off-path copper]" not in err, err
+    # Postfix B7: VIN's copper is withheld (unfinished net), so R-X4 would blame link 1 (J_IN.1 -> C_IN2.1), which the
+    # router laid; the link that failed is C_IN2.1 -> C_IN1.1, and the unrouted line says so.
+    assert "not fed in its order" not in err, err
+    text = out.read_text()
+    design = load_board(board)
+    cs = compile_design(design).constraints
+    route = next(st for st in result["steps"] if st["stage"] == "route")
+    assert route["junctions"] == [] and path_junctions(text, design, cs) == [], "both junction rules hold on the emitted copper"
+    roles = roles_doc(text)
+    by_owner: dict[str, list] = {}
+    for i in roles.items:
+        by_owner.setdefault(str(i["owner"]), []).append(i)
+    tap = by_owner["C_OUT1.1~R_FB_TOP.1"]
+    assert {(i["key"][0], i["w"]) for i in tap} == {("seg", 0.2)} and {i["key"][1] for i in tap} == {"F.Cu"}, tap
+    c_out1 = next(p for p in __import__("pcbc.ampacity", fromlist=["board_pad_geoms"]).board_pad_geoms(text) if p.id == "C_OUT1.1")
+    ends = [tuple(i["key"][k]) for i in tap for k in (2, 3)]
+    assert any(abs(e[0] - c_out1.at[0]) < 1e-3 and abs(e[1] - c_out1.at[1]) < 1e-3 for e in ends), "the tap leaves the rail inside C_OUT1.1"
+    for key in ("L1.2~C_OUT1.1", "C_OUT1.1~J_OUT.1", "U1.2~L1.1"):
+        for i in by_owner[key]:
+            assert i["key"][0] == "seg" and i["w"] == {"F.Cu": 0.781, "B.Cu": 1.09}[i["key"][1]], (key, i)
+    assert {i["w"] for i in by_owner["5V"] if i["key"][0] == "seg"} == {0.16}, "C_OUT2.1's off-path branch at the class floor (PR 3)"
+    assert path_copper_failures(compile_design(design), board_roles(text)) == [], "every path's width, vias, layers and groups hold"
+    assert not any(i["net"] == "VIN" for i in roles.items), "VIN is unfinished: none of its generated copper ships (docs/direction.md §5)"

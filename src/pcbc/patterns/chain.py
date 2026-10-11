@@ -1,14 +1,14 @@
 """`chain` — pads in a declared feed order (`docs/r2-design.md` B.2).
 
 A chain is the one pattern whose shape is not derived from the geometry: it is an **order**, and the
-order is the author's. `Chain("VDDA", "J2.1", "C4.1", "U1.12")` says the rail leaves the connector,
+order is the author's. `Path("VDDA", "J2.1", "C4.1", "U1.12")` says the rail leaves the connector,
 goes *through* the bypass cap and only then reaches the pin — the cap is in the path, not hanging off
 it — and that is a sentence no router infers from a netlist, because every one of the six orders over
 three pads connects the same three pads. So the chain is linked consecutively in the order it was
 given, and it is never re-ordered to close the net.
 
 **This pattern is not in any stage** (`patterns._STAGES`; the table under `patterns.MID` is why). A
-declared `Chain()` is linked by the router, station to station before any other link of its net
+declared `Path()` is linked by the router, station to station before any other link of its net
 (`route_native.net_links`), and `build._chain_gate` fails the build when the emitted copper does not
 feed the stations in order (`route_verify.chain_order`). The module is kept whole, with its tests, as
 the starting point for a pattern-level chain.
@@ -19,7 +19,7 @@ for the author who wants one.
 
 Two populations, and B.2's own split:
 
-- **declared** — every `GroupSpec(kind="chain")`, in board order, at the order the `Chain()` wrote.
+- **declared** — every `GroupSpec(kind="chain")`, in board order, at the order the `Path()` wrote.
   Soft refusal, and `route_verify.chain_order` reads the routed board afterwards.
 - **implicit** — any net with three or more pads that no other pattern owns, ordered by
   `route_checks._principal_order`: the *same* function `check_chains` measures an undeclared chain
@@ -63,7 +63,7 @@ and recorded here so they are not re-decided silently:
 - **`ELBOWS`** — the two right-angled shapes B.0 names and `link_candidates` drops one step before
   `mitre` repairs them, offered again at the end of this pattern's candidate list. Two nets finished
   and three refusals given a blocker to name; the measured table is in that constant's docstring.
-- **A `Chain()` member is a pin name, not a pad.** `U1.VIN` may be one pad or four, and `_members`
+- **A `Path()` member is a pin name, not a pad.** `U1.VIN` may be one pad or four, and `_members`
   resolves a member to **every** pad that pin names, in `patterns._pad_key` order, making each of
   them a station — the chain feeds all of them, in the one order that is a function of the
   footprint. No member of the five declared chains in this repo maps to more than one pad, so the
@@ -99,7 +99,7 @@ from ..moves import move_line
 from ..copper_bar import airwire_mm
 from ..route_checks import CHAIN_HOP_MM, _principal_order
 from ..route_emit import Piece
-from ..route_geom import Pt, Shape, clears, gap, qp, track_shape
+from ..route_geom import Pt, Shape, clears, gap, octile_path, qp, track_shape
 from ..route_scene import Clash, Exit, Item, blocked, pad_exits
 from . import (
     MAX_LINKS,
@@ -110,14 +110,16 @@ from . import (
     lane_ok,
     legs_of,
     legs_ok,
+    link_candidates,
     mitre,
     pieces_of,
     shape_ok,
     terminals,
     toward_first,
 )
-from . import spine as _spine
-from .spine import WIDE_MM, anchor
+
+# `WIDE_MM`, `anchor`, `crowded` and `link_shapes` lived in the spine pattern, which
+# `docs/physics-subjects.md` PR 3 (KD 14, O4) deleted; they are kept here, the one pattern that reads them.
 
 REASON = "chain"
 
@@ -154,7 +156,7 @@ on and a dead end. The elbow's corner comes out of `mitre` as a 0.2828 mm chord,
 copper every other corner pcbc writes and `pcbc_geometry_angles` sees nothing new.
 
 **It does not rescue the one declared chain, and this paragraph is the corrected version of the
-claim that it made the refusal actionable.** ds2's `Chain("VDDA", "J2.1", "C4.1", "U1.12")` still
+claim that it made the refusal actionable.** ds2's `Path("VDDA", "J2.1", "C4.1", "U1.12")` still
 refuses on link 2. The elbow does add a candidate that misses by a number an author could move `C5`
 by — an `L-h*` over the top at `y` 5.641 descending at `x` 22.83, which leaves **0.075 mm of air
 where the Power class needs 0.200** — but **that number is never printed**, and S6's review caught it
@@ -227,14 +229,14 @@ class ChainSpec:
     is not, because there is no declaration to disobey. It is carried on the spec rather than
     re-derived in the refusal, where it would be a second opinion about the same fact.
 
-    `labels` is parallel to `stations` and is what a message calls each stop: the `Chain()`'s own
+    `labels` is parallel to `stations` and is what a message calls each stop: the `Path()`'s own
     `REF.PIN` spelling for a declared chain, so the refusal quotes the line the author wrote, and the
     `REF.PADNUM` owner for an implicit one, because there is no line to quote.
     """
 
     net: str
     declared: bool
-    where: str  # "Chain line 97" | "3 pads on their own principal axis"
+    where: str  # "Path line 97" | "3 pads on their own principal axis"
     stations: tuple[Terminal, ...]
     labels: tuple[str, ...]
     width: float
@@ -252,7 +254,7 @@ def _width(ctx: PatternCtx, net: str) -> float:
     floor (S6 decision 5).
 
     `constraints.compile_constraints.synthesised` is the function that would give this net a
-    `Constraint` if anything had asked for one — a `Bus()`, a `Chain()`, a `Guard()` — and it
+    `Constraint` if anything had asked for one — a `Bus()`, a `Path()`, a `Guard()` — and it
     compiles a `generic` request, whose preset carries `width_mm=None`, which `_compile_req` reads as
     `floor_w`: the exact number `classes["Default"].track_width_mm` is built from, one line above it.
     So reading the Default class here is not an approximation of `synthesised`; it is the same
@@ -285,7 +287,7 @@ def _layer(ctx: PatternCtx, net: str, stations: tuple[Terminal, ...]) -> str:
 
 
 def _members(ctx: PatternCtx, net: str, spec: str) -> tuple[tuple[Terminal, str], ...]:
-    """One `Chain()` member, `"REF.PIN"`, as the terminals it names — `route_checks._refpin_pad`'s
+    """One `Path()` member, `"REF.PIN"`, as the terminals it names — `route_checks._refpin_pad`'s
     resolution, over a whole net's terminals rather than over one `Foot`.
 
     A member is a **pin name** as `Place(to=)` takes it (`U1.VIN`), falling back to a pad number when
@@ -306,7 +308,7 @@ def _skip(net: str, where: str, why: str) -> ChainSpec:
 
 
 def specs(ctx: PatternCtx) -> tuple[ChainSpec, ...]:
-    """B.2's population: every declared `Chain()` in **board order**, then the implicit chains in
+    """B.2's population: every declared `Path()` in **board order**, then the implicit chains in
     `sorted(net)` — B.0's order for a net-driven pattern.
 
     Declared first because a declared order is the author's and an implicit one is pcbc's reading of
@@ -323,14 +325,26 @@ def specs(ctx: PatternCtx) -> tuple[ChainSpec, ...]:
     scene = ctx.scene
     out: list[ChainSpec] = []
     declared: set[str] = set()
-    for ch in ctx.design.chains:
-        where = f"Chain line {ch.line}"
+    for ch in ctx.design.paths:
+        where = f"Path line {ch.line}"
         declared.add(ch.net)
         c = ctx.cs.by_net(ch.net)
         if c is not None and c.pair is not None:
             # B.2: "Chains on nets carrying a `PairSpec` are skipped with a printed note, not
             # silently: pairs are R4's." Four of the five declared chains in this repo are here.
             out.append(_skip(ch.net, where, f"carries a Pair, and R2 routes no pairs at all — {', '.join(ch.pads)} is R4's"))
+            continue
+        spec_of = next((ps for ps in (c.paths if c is not None else ()) if ps.line == ch.line), None)
+        if spec_of is not None and spec_of.fielded:
+            # A Path with a field or a kind is the router's: each link has its own width, vias and junction rule, and a
+            # chain writes at the class width with no link of its own (docs/physics-subjects.md PR 3: a 1 A link drawn
+            # at the 0.16 mm floor, measured 2026-10-02).
+            out.append(_skip(ch.net, where, "carries a field, so the router lays its links at their own widths"))
+            continue
+        if ch.amps is not None and ch.net in scene.plane_of:
+            # docs/physics-subjects.md PR 8: on a poured rail the pour is the copper between the stations; the
+            # joints are `tap`'s, sized for each station's draw.
+            out.append(_skip(ch.net, where, f"is on the {ch.net} pour ({scene.plane_of[ch.net]}), which is the copper between its stations; its joints are tap's"))
             continue
         pairs: list[tuple[Terminal, str]] = []
         for member in ch.pads:
@@ -484,14 +498,14 @@ def elbows(ea: Exit, eb: Exit) -> tuple[tuple[str, tuple[Pt, ...]], ...]:
 
 
 def link_shapes(a: Terminal, b: Terminal, exits_a, exits_b) -> tuple[tuple[str, tuple[Pt, ...]], ...]:
-    """Every shape this pattern offers one link, in order: `spine.link_shapes` unchanged, then the
+    """Every shape this pattern offers one link, in order: `shared_link_shapes` unchanged, then the
     `ELBOWS` for every exit pair.
 
     Appended rather than interleaved, so the prefix of this list is byte-identical to what a spine
     backbone link would try and the elbows can only answer a link that had no answer at all. Order is
     the answer here as everywhere: there is no score, and the first candidate that clears wins.
     """
-    out = list(_spine.link_shapes(a, b, exits_a, exits_b))
+    out = list(shared_link_shapes(a, b, exits_a, exits_b))
     for ea in exits_a:
         for eb in exits_b:
             for name, pts in elbows(ea, eb):
@@ -697,11 +711,6 @@ def _toward(dx: float, dy: float) -> str:
     return "down" if dy >= 0 else "up"
 
 
-def _chain_call(spec: ChainSpec) -> str:
-    """The `Chain(...)` line this chain is, or would be — the edit the move ends in."""
-    return f'Chain("{spec.net}", ' + ", ".join(f'"{label}"' for label in spec.labels) + ")"
-
-
 def _refuse_layer(ctx: PatternCtx, spec: ChainSpec) -> Refusal:
     """The stations share no copper layer, and R2 puts no via on a chain (B.2: a chain is a feed
     order on one layer).
@@ -723,7 +732,6 @@ def _refuse_layer(ctx: PatternCtx, spec: ChainSpec) -> Refusal:
             f"{len(spec.stations)} stops in feed order",
             "one run on one copper layer",
             f"its stops share no copper layer ({where}), and R2 puts no via on a chain — a chain is a feed order on one layer (rule: no layer)",
-            f'Moves: NetReq("{spec.net}", layers=["{ctx.scene.layers[0]}"]) names the layer the feed runs on.',
             sep="\n  ",
         ),
     )
@@ -758,70 +766,6 @@ def _blocker(spec: ChainSpec, clash: Clash | None, why: str, i: int) -> str:
     )
 
 
-def _reordered(spec: ChainSpec, i: int, who: str) -> str:
-    """The `Chain()` line with `who`'s stop moved to just after stop `i` — the edit an R-X4 refusal
-    ends in, because what is wrong there is the order and not the placement."""
-    labels = list(spec.labels)
-    k = next((n for n, label in enumerate(labels) if label.split(".")[0] == who), -1)
-    if k < 0:
-        return _chain_call(spec)
-    labels.insert(i + 1, labels.pop(k))
-    return f'Chain("{spec.net}", ' + ", ".join(f'"{label}"' for label in labels) + ")"
-
-
-def _moves(ctx: PatternCtx, spec: ChainSpec, i: int, a: Terminal, b: Terminal, clash: Clash | None) -> str:
-    """Two edits, both real, and which two depends on what stopped the link.
-
-    - **R-X4** — the thing in the way is one of the chain's **own later stops**, so the placement is
-      not the fault and moving a part is the wrong advice: the order is. The move is the `Chain()`
-      line with that stop put where the placement already has it, which is an edit the author can
-      paste. For an implicit chain it is the same line, offered as the `Chain()` to write — pcbc read
-      the order off `_principal_order` and the geometry disagrees, and saying so is more use than
-      saying the pads are badly placed.
-    - **anything else** — the thing in the way is a third part sitting in the corridor between two
-      pads the author named, so **that** is what moves. `hop._moves` moves a terminal instead,
-      because a hop chooses its own corridor and either end can step aside; a chain's corridor is
-      given. `route_checks.check_chains` already says exactly this for the placement-time version of
-      the same finding — "`{who}` lies in the corridor between ... ; move `{who}`" — so the router's
-      move and the checker's name the same part. The direction is computed: away from the line
-      between the two stops, which is the way out of the corridor rather than away from one end of it.
-    - **no blocker at all** — there is no third part to name, so the move is the near stop pointed at
-      the far one: an exit facing the wrong way is what "no candidate" means.
-
-    The second edit is always the chain itself, because a chain is the one refusal where "this cannot
-    be done" may be the right answer: the author asked for a feed through a pad the placement cannot
-    feed through, and dropping that stop and decoupling it locally is a real board change. That is
-    B.2's own second move, and it names a stop of the chain — never the blocker, which is not in it.
-    """
-    drop = a.ref if a.ref != spec.labels[0].split(".")[0] else b.ref
-    if clash is not None and clash.rule == "no_stub":
-        who = clash.item.owner.split(".")[0]
-        line = _reordered(spec, i, who)
-        if spec.declared:
-            return f"Moves: {line} puts {clash.item.owner} where the placement already has it, which is the order this chain can be fed in."
-        return (
-            f"Moves: {line} declares the order the placement gives, in place of the one pcbc read "
-            f"off the pads' own principal axis."
-        )
-    if clash is not None and clash.item.owner:
-        who = clash.item.owner.split(".")[0]
-        mid = ((anchor(a)[0] + anchor(b)[0]) / 2.0, (anchor(a)[1] + anchor(b)[1]) / 2.0)
-        toward = _toward(clash.at[0] - mid[0], clash.at[1] - mid[1])
-        first = f'Place("{who}", toward="{toward}") takes it out of the corridor between {spec.labels[i]} and {spec.labels[i + 1]}'
-    else:
-        toward = _toward(anchor(b)[0] - anchor(a)[0], anchor(b)[1] - anchor(a)[1])
-        first = f'Place("{a.ref}", toward="{toward}") turns its exit toward {spec.labels[i + 1]}'
-    if spec.declared:
-        return (
-            f"Moves: {first}; or {_chain_call(spec)} is asking for an order this placement cannot give "
-            f"— drop {drop} from the chain and feed it locally instead."
-        )
-    return (
-        f"Moves: {first}; or {_chain_call(spec)} declares the order you want, in place of the one the pads' own line "
-        f'gives; or NetReq("{spec.net}", layers=["{_other(ctx, spec.layer)}"]) takes the feed to the other side.'
-    )
-
-
 def _refuse(ctx: PatternCtx, spec: ChainSpec, failed: tuple, tried: int) -> Refusal:
     """B.2's refusal: the failing link named by its number and its two stops, a real blocker with its
     own number, what was emitted before it, and a `board.py` edit.
@@ -853,7 +797,6 @@ def _refuse(ctx: PatternCtx, spec: ChainSpec, failed: tuple, tried: int) -> Refu
             f"link {i + 1} of {n}, {la} at ({anchor(a)[0]:g},{anchor(a)[1]:g})",
             f"{lb} at ({anchor(b)[0]:g},{anchor(b)[1]:g}) on {spec.layer} at {spec.width:g} mm ({spec.where})",
             head,
-            _moves(ctx, spec, i, a, b, clash),
             sep="\n  ",
         ),
     )
@@ -871,3 +814,102 @@ __all__ = [
     "stub_clash",
     "stub_need",
 ]
+
+
+# --- moved from the deleted spine pattern -------------------------------------------------------
+
+WIDE_MM = 0.4
+"""How wide a net's class has to be before it gets a spine at all.
+
+B.4 uses this number one way — a net with three or more pads that is *not* `power` is a spine when
+it is at least this wide — and S7 applies it to every spine, which is a **deviation from B.4** with
+a measurement behind it.
+
+A spine is copper written before the router runs, and it costs the corridor it takes. What it buys
+is the difference between the class width and what a maze router would have necked to, so on a net
+whose class is 0.25 mm against a fab floor of 0.127 the pattern is spending a corridor to save
+0.123 mm of copper width. ds2 is that board — two layers, a dense TSSOP, and **six** `vias=False`
+single-layer analog nets whose only corridors are the ones a spine would take — and it is the board
+where the trade was measured: at every locality cap tried (6, 8, 12 mm and none) ds2's 0.25 mm spines
+broke the gate outright, `AIN0` or `AIN1` losing its path to `U1` entirely or `3V3`, `GND` and `VSS`
+finding no path on any layer. The order predicts it — the constrained nets are routed by the router
+after every pattern stage (`route_native.route_stage`), so a spine takes their corridors first — and
+the number that separates a board where a spine pays from one where it does not is the width it is
+protecting. `docs/r2-measurements.md` S7, and it is S7's first open issue.
+
+It is also the Power class's own width on c3_usb, node and the DS2 Addon's 4-layer sibling, so
+"wide enough that a maze router necking it is a warning" and "wide enough to be worth a corridor" are
+the same number rather than two."""
+
+
+def anchor(t: Terminal) -> Pt:
+    """Where a rib or a link meets this station: the centre of the **primitive**, not of everything
+    the pad draws. `tap.anchor`'s rule and `tap.anchor`'s reason — a USB-C shield pad and node's QFN
+    thermal pad draw several shapes, and the centre of all of them is a point that may sit between
+    them, so a rib from there is neither axis-aligned nor necessarily on copper."""
+    return t.item.at()
+
+
+# --- the axis frame, exactly ----------------------------------------------------------------------
+
+
+def crowded(a: Terminal, b: Terminal, exits_a, exits_b) -> bool:
+    """Are these two pads closer together than their own two exits are from their centres?
+
+    A.7 puts an exit `half + the widest clearance this net owes on the footprint + width/2` out, and
+    that distance grows with the width — so on the widest copper pcbc writes, two neighbouring pads
+    of the same net routinely sit **inside** each other's exits. Measured at 0.781 mm on buck, and
+    re-taken from a build for the S7 review, which found three of these numbers invented (finding
+    22): `C_IN1.1 -> U1.3` are 1.7160 mm apart with their widest exits **1.3156 and 1.1266** mm out,
+    `U1.3 -> C_IN2.1` 1.5432 mm with 1.1266 and 1.3156, and on `5V` `L1.2 -> C_OUT1.1` 2.1620 mm with
+    2.4006 and 1.3156. Every exit-to-exit candidate for those links doubles back on itself, `mitre`
+    refuses the hairpin, and three quarters of buck's `VIN` and `5V` went to the router for a reason
+    that is about the exits and not about the board.
+
+    `C_IN2.1 -> R_EN.1` (3.0093 mm against 1.3156 + 0.9106) used to be listed here as a fourth case
+    and is **not** one: it measures roomy, gets six candidates rather than 112, and still fails with
+    `no candidate`. It is a link this change did not help, which is worth saying and is not evidence
+    for it. `docs/r2-measurements.md` S7.
+
+    The **widest** exit on each pad, not the nearest: the question is whether any exit pair can
+    cross, and it is the pair facing each other that does. On buck's `C_OUT1.1 -> C_OUT2.1` the two
+    pads are 2.2500 mm apart, their nearest exits 1.0906 mm out and the two facing ones 1.3156 mm, so
+    the nearest-exit reading calls them roomy (2.1812 < 2.25) and every exit-to-exit candidate then
+    doubles back, while the widest reading (2.6312 > 2.25) calls them crowded, which they are.
+    """
+    if not exits_a or not exits_b:
+        return True
+    da = max(math.dist(anchor(a), e.at) for e in exits_a)
+    db = max(math.dist(anchor(b), e.at) for e in exits_b)
+    return math.dist(anchor(a), anchor(b)) < da + db
+
+
+def shared_link_shapes(a: Terminal, b: Terminal, exits_a, exits_b) -> tuple[tuple[str, tuple[Pt, ...]], ...]:
+    """B.0's `exits(a) x exits(b) x link_candidates`, with **three** more in front of it: the straight
+    line between the two pad centres and the two octile paths between them, offered only where the
+    two pads are `crowded`.
+
+    `pad_exits` says a pattern never starts a track at a pad centre and aims at another pad centre,
+    and the reason it gives is real — buck's straight `EN` centre line passes 0.0892 mm from
+    `U1.4 [FB]`. But that reason is a *clearance*, and a clearance is what `blocked` judges, on this
+    candidate exactly as on every other: the centre line is not exempt from anything, it is simply
+    the one shape the exit enumeration cannot express when the exits cross. It is tried **first**
+    there, because when it clears it is also the shortest copper that could join the two pads, and
+    it is not offered at all when the exits do not cross, so no link that the exits can express is
+    decided by it.
+
+    The bound is 4 x 4 x 7 + 3 = **115** per link, and it is declared here and nowhere else.
+    """
+    out: list[tuple[str, tuple[Pt, ...]]] = []
+    if crowded(a, b, exits_a, exits_b) and anchor(a) != anchor(b):
+        # Three shapes, because two crowded pads are not usually axis-aligned: the straight line
+        # when it happens to be 0/45/90 (`shape_ok` drops it otherwise), then the two octile paths
+        # `route_geom` already builds — the 45 taken first, and the axis taken first.
+        out.append(("centre", (anchor(a), anchor(b))))
+        out.append(("centre-Z", octile_path(anchor(a), anchor(b), diagonal_first=True)))
+        out.append(("centre-L", octile_path(anchor(a), anchor(b), diagonal_first=False)))
+    for ea in exits_a:
+        for eb in exits_b:
+            for name, pts in link_candidates(ea, eb):
+                out.append((name, (anchor(a), ea.at) + pts[1:-1] + (eb.at, anchor(b))))
+    return tuple(out)

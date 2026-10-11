@@ -32,10 +32,11 @@ from boardtext import scene_from_text
 from pcbc.language import load_board
 from pcbc.place_native import emitted_text, place
 from pcbc.route_scene import build_scene
+from conftest import ds2_dir
 
 ROOT = Path(__file__).resolve().parent.parent
 EXAMPLES = ROOT / "examples"
-DS2 = Path.home() / "Documents/MaD/Hardware/DS2Addon/pcbc"
+DS2 = ds2_dir()
 BOARDS = {n: EXAMPLES / n / f"{n}.py" for n in ("blinky", "buck", "c3_usb", "node")}
 if (DS2 / "ds2_addon.py").exists():
     BOARDS["ds2"] = DS2 / "ds2_addon.py"
@@ -106,4 +107,6 @@ def test_the_route_stage_reads_no_board_text(monkeypatch):
                 monkeypatch.setattr(m, attr, f)
     monkeypatch.setattr(type(pl), "text", property(lambda self: (_ for _ in ()).throw(AssertionError("Placement.text read by the route stage"))), raising=False)
     rt = route_native.route_stage(design, pl.job, pl, name=board.stem)
-    assert hits == [] and not rt.failed and rt.links, (hits, rt.unrouted)
+    # The migrated buck leaves VIN's C_IN2.1 -> C_IN1.1 link open as placed (docs/physics-subjects.md §10.1, O5):
+    # the subject here is that no board text was read, which the stage still shows to the end.
+    assert hits == [] and [f.net for f in rt.failed] == ["VIN"] and rt.links, (hits, rt.unrouted)

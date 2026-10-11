@@ -23,7 +23,7 @@ branch this fixture exists to exercise would never run — the blinky trap of
 `docs/stitch-plan.md` §7.1, which has no `(zone ...)` block on its routed board at all.
 """
 
-from pcbc import Board, Bridge, Capacitor, Ground, NetReq, Place, Power, Resistor, SchPlace
+from pcbc import Board, Bridge, Capacitor, Ground, NetReq, Power, Resistor, SchPlace
 
 # Digital domain, east.
 V33 = Power("3V3")
@@ -41,20 +41,20 @@ Capacitor("C2", "100nF", p1=VDDA, p2=VSS, **c)
 Capacitor("C3", "100nF", p1=V33, p2=GND, **c)
 Capacitor("C4", "100nF", p1=V33, p2=GND, **c)
 
-Board(width=40, height=25, layers=2, stackup="jlcpcb_2l_1oz")
-NetReq("3V3", "GND", "VDDA", "VSS", kind="power", volts=3.3, amps=0.1)
+Board(layers=2, stackup="jlcpcb_2l_1oz")
+NetReq("3V3", "VDDA", kind="power", volts=3.3); NetReq("GND", "VSS", kind="power")
 Bridge("GND", "VSS", at="R11", why="the analog return meets the digital one under the ADC")
 
 # The analog pair west, the digital pair east, the tie in the middle: R11 is the two domains' own
 # closest approach, which is what `route_checks.check_bridge` asks of a declared tie.
-Place("C1", position="absolute", left=6, top=6, locked=True, reason="analog decoupling, west")
-Place("C2", position="absolute", left=6, top=15, locked=True, reason="analog decoupling, west")
-Place("R11", position="absolute", left=18.5, top=10.5, locked=True, reason="the one tie, between the domains")
-Place("C3", position="absolute", right=6, top=6, locked=True, reason="digital decoupling, east")
-Place("C4", position="absolute", right=6, top=15, locked=True, reason="digital decoupling, east")
 
-SchPlace("R11", left=60, top=40)
-SchPlace("C1", left=20, top=20)
-SchPlace("C2", left=20, top=60)
-SchPlace("C3", left=110, top=20)
-SchPlace("C4", left=110, top=60)
+
+
+
+
+
+
+
+
+
+

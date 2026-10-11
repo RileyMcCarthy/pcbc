@@ -31,9 +31,13 @@ def _excluded(design: Design, job: CompiledJob, claimed: frozenset[str] = frozen
     pattern. The last is C.1's order: hops run before the fanout, and a closed row's lane is better
     spent on the hop that needed it than on a via the hop then has to start from."""
     out: set[str] = set(claimed)
-    for cn in job.nets:
-        if cn.autoroute == "diff_pair" or cn.vias is False or len(cn.layers) == 1:
-            out.update(n for n in design.nets if any(fnmatch(n, p) for p in cn.patterns))
+    cs = job.constraints
+    for c in cs.constraints if cs is not None else ():
+        # A pair, or a net whose one Path is the whole node and keeps it to one layer or off vias
+        # (docs/physics-subjects.md PR 5: a net writes no vias=/layers=; `Constraint.structural` less `autoroute`).
+        whole = c.whole_node_path()
+        if c.net in design.nets and (c.pair is not None or c.autoroute == "diff_pair" or (whole is not None and any((not lk.via.allowed) or len(lk.layers) == 1 for lk in whole.links))):
+            out.add(c.net)
     return out
 
 
@@ -65,6 +69,7 @@ def fanout_pieces(design: Design, job: CompiledJob, board: str, scene: Scene, cl
         for net in pins.values():
             count[net] = count.get(net, 0) + 1
     excluded = _excluded(design, job, claimed)
+    bare = _bare_pads(job.constraints)
     default = next((c.track_width_mm for c in job.classes if c.name == "Default"), stack.track_min)
     pieces: list[Piece] = []
     notes: list[dict] = []
@@ -91,7 +96,7 @@ def fanout_pieces(design: Design, job: CompiledJob, board: str, scene: Scene, cl
             wx, wy = _rotate(nx, ny, foot.rot)  # the escape direction on the board
             for i, p in enumerate(row):  # i over the whole row: neighbours alternate even with bare pads between
                 net = p.net
-                if not net or count.get(net, 0) < 2 or net in excluded:
+                if not net or count.get(net, 0) < 2 or net in excluded or f"{ref}.{p.num}" in bare:
                     continue
                 half_out = p.h / 2.0 if side in ("top", "bottom") else p.w / 2.0
                 across = p.w if side in ("top", "bottom") else p.h
@@ -123,6 +128,24 @@ def fanout_pieces(design: Design, job: CompiledJob, board: str, scene: Scene, cl
                 pieces.append(via_piece(net, "fanout", (vx, vy), stack.via_diameter, stack.via_drill, owner=owner, uuid=stable_uuid(board, "fanout", ref, p.num, "via")))
                 notes.append({"ref": ref, "pad": p.num, "net": net, "via": (vx, vy)})
     return (pieces, notes)
+
+
+def _bare_pads(cs) -> frozenset[str]:
+    """Pads (and nets) that get no escape via (`docs/net-path-physics.md` §4.3, by current): a station
+    pad of a path link with a current or a sense kind, whose escape would be a lone via its current (or
+    its measurement) crosses. The router leaves such a pad directly. (A net whose own links change layer
+    through a via group keeps its escapes; `route_native.net_links` never starts one of its links on a
+    lone via, so an unused escape is pruned as dangling.)"""
+    if cs is None or not hasattr(cs, "constraints"):
+        return frozenset()
+    out: set[str] = set()
+    for c in cs.constraints:
+        for p in c.paths:
+            if p.amps is None and p.kind is None:
+                continue
+            for st in p.stations:
+                out.update(st)
+    return frozenset(out)
 
 
 def _lane_clearance(job: CompiledJob) -> float:

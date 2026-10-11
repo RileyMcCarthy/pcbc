@@ -10,7 +10,7 @@ from .compile import compile_design
 from .dru import netclass_patterns, project_classes
 from .footprints import footprint_path
 from .model import Design, Instance
-from .stackup import board_rules, get_stackup
+from .stackup import SILK_SEVERITIES, board_rules, get_stackup, silk_rules
 from .sexp import matching_paren, stable_uuid
 
 _PROP_VAL = re.compile(r'(\(property "([^"]+)" )"[^"]*"')
@@ -225,11 +225,21 @@ def _nets(design: Design) -> str:
     return "".join(lines)
 
 
-def _outline(w: float, h: float, board: str) -> str:
+def _seed_outline(design: Design, board: str) -> str:
+    """The seed board's Edge.Cuts: the declared outline, or none in derived mode (the place stage draws the derived
+    one; docs/board-outline.md B.4). `emit_base` strips it either way: gen's `Rect` is the outline the board gets."""
+    from .layout import declared_outline
+
+    rect = declared_outline(design)[0]
+    return _outline(rect, board) if rect is not None else ""
+
+
+def _outline(rect, board: str) -> str:
+    x0, y0, x1, y1 = rect
     return (
         f"\t(gr_rect\n"
-        f"\t\t(start 0 0)\n"
-        f"\t\t(end {w:g} {h:g})\n"
+        f"\t\t(start {x0:g} {y0:g})\n"
+        f"\t\t(end {x1:g} {y1:g})\n"
         f"\t\t(stroke (width 0.05) (type default))\n"
         f"\t\t(fill none)\n"
         f'\t\t(layer "Edge.Cuts")\n'
@@ -252,14 +262,50 @@ def _tenting(design: Design) -> str:
     return "\t\t(tenting\n\t\t\t(front yes)\n\t\t\t(back yes)\n\t\t)\n"
 
 
+def _stackup(design: Design) -> str:
+    """The board's `(stackup)` in `(setup)`, from pcbc's Stackup: every copper and dielectric thickness pcbc sized the
+    board with. Round 3 (refute-twooz): no stackup was written, so KiCad's default (35 um copper, 1.51 mm core) went
+    into the Gerber job file of a `jlcpcb_2l_2oz` board whose widths all assume 70 um."""
+    from .stackup import Copper, get_stackup
+
+    if design.board is None:
+        return ""
+    stack = get_stackup(design.board.stackup)
+    rows = ['\t\t\t(layer "F.SilkS"\n\t\t\t\t(type "Top Silk Screen")\n\t\t\t)\n',
+            '\t\t\t(layer "F.Paste"\n\t\t\t\t(type "Top Solder Paste")\n\t\t\t)\n',
+            '\t\t\t(layer "F.Mask"\n\t\t\t\t(type "Top Solder Mask")\n\t\t\t\t(thickness 0)\n\t\t\t)\n']
+    n = 0
+    for item in stack.stack:
+        if isinstance(item, Copper):
+            rows.append(f'\t\t\t(layer "{item.layer}"\n\t\t\t\t(type "copper")\n\t\t\t\t(thickness {item.thickness_mm:g})\n\t\t\t)\n')
+        else:
+            n += 1
+            rows.append(
+                f'\t\t\t(layer "dielectric {n}"\n\t\t\t\t(type "{item.kind}")\n\t\t\t\t(thickness {item.thickness_mm:g})\n'
+                f'\t\t\t\t(material "{"FR4" if item.material == "core" else item.material}")\n\t\t\t\t(epsilon_r {item.dk:g})\n'
+                '\t\t\t\t(loss_tangent 0.02)\n\t\t\t)\n'
+            )
+    rows += ['\t\t\t(layer "B.Mask"\n\t\t\t\t(type "Bottom Solder Mask")\n\t\t\t\t(thickness 0)\n\t\t\t)\n',
+             '\t\t\t(layer "B.Paste"\n\t\t\t\t(type "Bottom Solder Paste")\n\t\t\t)\n',
+             '\t\t\t(layer "B.SilkS"\n\t\t\t\t(type "Bottom Silk Screen")\n\t\t\t)\n']
+    return "\t\t(stackup\n" + "".join(rows) + '\t\t\t(copper_finish "None")\n\t\t\t(dielectric_constraints no)\n\t\t)\n'
+
+
+def _thickness(design: Design) -> float:
+    from .stackup import get_stackup
+
+    return round(get_stackup(design.board.stackup).board_mm, 4) if design.board is not None else 1.6
+
+
 def emit_pcb(design: Design, *, name: str, base: Path | None = None) -> str:
     """The seed board. `base` is the directory it will be written to: model paths are then relative
     to it (`_absolute_models`)."""
     if design.board is None:
         raise ValueError("no Board()")
-    w, h = design.board.size_mm
+    from .place_native import seed_columns
+
     fps: list[str] = []
-    cols = max(int(w // 8), 1)
+    cols = seed_columns(design)
     for i, inst in enumerate(design.instances):
         gx = 5.0 + (i % cols) * 8.0
         gy = 5.0 + (i // cols) * 8.0
@@ -271,7 +317,7 @@ def emit_pcb(design: Design, *, name: str, base: Path | None = None) -> str:
         '\t(generator "pcbc")\n'
         '\t(generator_version "0.1")\n'
         "\t(general\n"
-        "\t\t(thickness 1.6)\n"
+        f"\t\t(thickness {_thickness(design):g})\n"
         "\t)\n"
         '\t(paper "A4")\n'
         "\t(title_block\n"
@@ -279,13 +325,14 @@ def emit_pcb(design: Design, *, name: str, base: Path | None = None) -> str:
         "\t)\n"
         + _layers(layers_n)
         + "\t(setup\n"
-        "\t\t(pad_to_mask_clearance 0)\n"
+        + _stackup(design)
+        + "\t\t(pad_to_mask_clearance 0)\n"
         "\t\t(allow_soldermask_bridges_in_footprints no)\n"
         + _tenting(design)
         + "\t)\n"
         + _nets(design)
         + "".join(fps)
-        + _outline(w, h, name)
+        + _seed_outline(design, name)
         + ")\n"
     )
 
@@ -300,9 +347,10 @@ def emit_pro(design: Design, *, name: str) -> str:
         "board": {
             "design_settings": {
                 "defaults": {},
-                "rules": board_rules(get_stackup(job.stackup)),
+                "rules": {**board_rules(get_stackup(job.stackup)), **silk_rules(get_stackup(job.stackup))},
                 # KiCad warns about two holes too close; the fab drills through the web. An error.
-                "rule_severities": {"hole_to_hole": "error"},
+                # Silk under the fab's minimums is not printed as drawn: errors too.
+                "rule_severities": {"hole_to_hole": "error", **SILK_SEVERITIES},
             }
         },
         "meta": {"filename": f"{name}.kicad_pcb", "version": 1},

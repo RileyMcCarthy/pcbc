@@ -7,7 +7,7 @@ same deterministic input `test_patterns.py::_mid` uses, and not a build, so a dr
 rule it left rather than the router that moved under it.
 
 **Three of S6's own sentences do not survive contact with the boards, and the tests that show why are
-here rather than in a comment.** The acceptance asks for ds2's `Chain("VDDA", "J2.1", "C4.1",
+here rather than in a comment.** The acceptance asks for ds2's `Path("VDDA", "J2.1", "C4.1",
 "U1.12")` to be *carried* in feed order; `C5` sits across `U1.12`'s only corridor and the chain
 refuses its second link. `route_checks.check_chains` reports nothing about it, because the check
 measures a straight centre-line corridor and the router has to leave pads through `pad_exits` and
@@ -27,7 +27,7 @@ import pytest
 
 from pcbc.compile import compile_design
 from pcbc.language import load_board
-from pcbc.patterns import MID, PatternCtx, pattern_copper, terminals
+from pcbc.patterns import PatternCtx, pattern_copper, terminals
 from pcbc.patterns.chain import (
     ELBOWS,
     MAX_PER_LINK,
@@ -40,22 +40,32 @@ from pcbc.patterns.chain import (
     stub_clash,
     stub_need,
 )
-from pcbc.patterns.spine import WIDE_MM, anchor
+from pcbc.patterns.chain import WIDE_MM, anchor  # moved here with the spine's deletion (docs/physics-subjects.md KD 14)
 from pcbc.route_checks import _principal_order, build_ctx, check_chains
 from pcbc.route_emit import piece_key
 from pcbc.route_geom import clears, gap, track_shape
 from pcbc.route_scene import blocked, pad_exits
 from pcbc.route_verify import verify_copper
 from boardtext import scene_from_text
+from conftest import declared_examples, ds2_dir, edit_board, write_split
 
 ROOT = Path(__file__).resolve().parent.parent
-EXAMPLES = ROOT / "examples"
-DS2 = Path.home() / "Documents" / "MaD" / "Hardware" / "DS2Addon" / "pcbc"
+EXAMPLES = declared_examples()  # the examples as shipped with a declared outline (vehicles): conftest.declared_examples
+DS2 = ds2_dir()
 NAMES = ("blinky", "buck", "c3_usb", "node", "ds2")
 ALL = tuple(n for n in NAMES if n != "ds2" or (DS2 / "ds2_addon.py").exists())
 
 
+BUCK_NETREQ = ROOT / "tests" / "fixtures" / "buck_netreq" / "buck.py"
+"""buck as it shipped before docs/net-path-physics.md PR 10 (one NetReq for VIN, 5V and GND, no Path):
+the board every pattern measurement in this file was taken on. The example itself migrated to Paths,
+and a spine never runs on a net whose paths carry their own numbers, so the pattern pins keep their
+board here rather than lose it."""
+
+
 def _board(name: str) -> Path:
+    if name == "buck":
+        return BUCK_NETREQ
     return DS2 / "ds2_addon.py" if name == "ds2" else EXAMPLES / name / f"{name}.py"
 
 
@@ -66,7 +76,7 @@ def _placed(name: str) -> Path:
     # (`conftest.placed_board`). Placing is pure Python: check + seed + place, no KiCad.
     from conftest import placed_board
 
-    return placed_board(name, _board(name))
+    return placed_board("buck_netreq" if name == "buck" else name, _board(name))
 
 
 def _uuid_name(name: str) -> str:
@@ -83,6 +93,46 @@ def _ctx(name: str) -> PatternCtx:
     job = compile_design(design)
     scene = scene_from_text(design, job, job.constraints, _placed(name).read_text())
     return PatternCtx(scene=scene, design=design, job=job, cs=job.constraints, board=_uuid_name(name), stage="mid")
+
+
+_C3_PRE_D4 = (
+    ('\nPlace("U3", to="J1.DP1"', '\nPlace("U3", at=(19.6125, 18.6385), rot=180'),
+    ('\nPlace("R_CC1", to="J1.CC1"', '\nPlace("R_CC1", at=(15.99, 19.8685), rot=180'),
+    ('\nPlace("R_CC2", to="J1.CC2"', '\nPlace("R_CC2", at=(22.75, 19.4085), rot=90'),
+    ('\nPlace("C_VBUS_HF", to="U2.VIN"', '\nPlace("C_VBUS_HF", at=(30.863, 12.17), rot=90'),
+    ('\nPlace("C_VBUS", to="U2.VIN"', '\nPlace("C_VBUS", at=(29.843, 10.25), rot=180'),
+    ('\nPlace("C_3V3_HF", to="U2.VOUT"', '\nPlace("C_3V3_HF", at=(36.66, 11.23), rot=270'),
+    ('\nPlace("C_3V3", to="U2.VOUT"', '\nPlace("C_3V3", at=(35.8625, 9.07), rot=0'),
+    ('\nPlace("C_MCU_HF", to="U1.3V3"', '\nPlace("C_MCU_HF", at=(9.37, 15.36), rot=180'),
+    ('\nPlace("C_MCU", to="U1.3V3"', '\nPlace("C_MCU", at=(11.35, 16.38), rot=270'),
+    ('\nPlace("R_EN", to="U1.EN"', '\nPlace("R_EN", at=(13.34, 15.37), rot=0'),
+    ('\nPlace("C_EN", to="U1.EN"', '\nPlace("C_EN", at=(15.58, 15.36), rot=0'),
+    ('\nPlace("SW_RST", to="U1.EN"', '\nPlace("SW_RST", at=(13.1, 20.55), rot=270'),
+    ('\nPlace("R_BOOT", to="U1.IO9"', '\nPlace("R_BOOT", at=(18.77, 4.36), rot=90'),
+    ('\nPlace("SW_BOOT", to="U1.IO9"', '\nPlace("SW_BOOT", at=(19.95, 8.05), rot=270'),
+    ('\nPlace("R_LED", to="U1.IO10"', '\nPlace("R_LED", at=(19.23, 11.2), rot=0'),
+    ('\nPlace("D1", to="R_LED.2"', '\nPlace("D1", at=(21.84, 11.45), rot=180'),
+)
+"""Every part c3_usb attaches with Place(to=), declared where the relation placer put it before decision 4
+(2026-10-01; placement now keeps the USB pair's exit corridors at J1 and U1 clear and moved four of them), so the
+elbow comparison keeps measuring the board it was written for. All of them, because a declared part is placed
+before every relation and declaring only the four that moved re-orders the rest."""
+
+
+def _c3_usb_pre_d4_ctx() -> PatternCtx:
+    import shutil
+    import tempfile
+
+    from conftest import placed_board
+
+    root = Path(tempfile.mkdtemp(prefix="pcbc-c3-pre-d4-")) / "c3_usb"
+    shutil.copytree(EXAMPLES / "c3_usb", root, ignore=shutil.ignore_patterns("layout"))
+    board = root / "c3_usb.py"
+    edit_board(board, _C3_PRE_D4)
+    design = load_board(board)
+    job = compile_design(design)
+    scene = scene_from_text(design, job, job.constraints, placed_board("c3_usb_pre_d4", board).read_text())
+    return PatternCtx(scene=scene, design=design, job=job, cs=job.constraints, board="c3_usb", stage="mid")
 
 
 class _Plan:
@@ -139,13 +189,16 @@ def _chain(plan):
 # --- B.2's population and its order ---------------------------------------------------------------
 
 CHAINS = {
+    # Re-measured 2026-10-02 (docs/physics-subjects.md PR 3/4): the currents are declared Paths now (buck VIN,
+    # c3_usb VBUS and 3V3, node VBUS and LOAD), so they are declared chains first, in board order; and with the
+    # spine deleted and every net at the class floor, buck's 5V is under `WIDE_MM` and in the population.
     "blinky": (),
-    "buck": ("FB", "SW"),
-    "c3_usb": ("USB_DP", "USB_DN", "BOOT", "EN"),
-    "node": ("USB_DP", "USB_DN", "BOOT", "EN", "GATE", "SCL", "SDA", "T_DIV", "T_OUT"),
+    "buck": ("5V", "FB", "SW", "VIN"),
+    "c3_usb": ("VBUS", "3V3", "USB_DP", "USB_DN", "BOOT", "EN"),
+    "node": ("VBUS", "LOAD", "USB_DP", "USB_DN", "3V3", "BOOT", "EN", "GATE", "SCL", "SDA", "T_DIV", "T_OUT"),  # 3V3: PR 8's Path line 160
     "ds2": ("VDDA", "3V3", "AIN0", "AIN1", "AIN2", "AIN3", "REFN_F", "REFP_F", "VSS"),
 }
-"""B.2's population per board, in `specs`' own order: the declared `Chain()`s in **board order**
+"""B.2's population per board, in `specs`' own order: the declared `Path()`s in **board order**
 first, then every unowned three-or-more-pad net `sorted(net)`.
 
 Measured 2026-09-20. blinky has none — its only multi-pad net is `GND`, which is a plane and the
@@ -153,29 +206,34 @@ tap's. Four of the five declared chains in the repo are the two USB pairs, which
 fifth is ds2's `VDDA`. Everything else here is implicit."""
 
 SKIPPED = {
-    "c3_usb": ("USB_DP", "USB_DN"),
-    "node": ("USB_DP", "USB_DN"),
+    "c3_usb": ("VBUS", "3V3", "USB_DP", "USB_DN"),
+    "node": ("VBUS", "LOAD", "USB_DP", "USB_DN", "3V3"),
 }
 """The declared chains that carry a `PairSpec`. B.2: "Chains on nets carrying a `PairSpec` are
-**skipped with a printed note**, not silently: pairs are R4's.\""""
+**skipped with a printed note**, not silently: pairs are R4's.\"" And (docs/physics-subjects.md PR 8) a Path with
+a current on a pour, node's 3V3: the pour is the copper between its stations, and its joints are tap's. And a Path with a
+field (a current here: c3_usb's VBUS and 3V3, node's VBUS and LOAD) is the router's, whose links have their own widths:
+a chain writes at the class width (node's 1 A LOAD was drawn at the 0.16 mm floor, measured 2026-10-02)."""
 
-CHAIN_OWNS = {"blinky": (0, 0.0), "buck": (1, 1.13), "c3_usb": (16, 14.646), "node": (28, 17.759), "ds2": (13, 16.373)}
+CHAIN_OWNS = {"blinky": (0, 0.0), "buck": (9, 3.237), "c3_usb": (16, 14.646), "node": (35, 19.692), "ds2": (13, 16.373)}  # node (28, 17.759) until 2026-10-03: the silkscreen no longer re-places a part whose reference has no room (node's C_EN, R_EN and R_LED went 0.6 mm further out before)  # node (29, 20.909) while the chain drew LOAD's 1 A link at the class floor (2026-10-02, fixed the same day)  # c3_usb (18, 15.024), node (26, 17.493) while decision 4's corridor ran to the board edge (2026-10-01); checkpoint placement again since 2026-10-02
 """`(segments, mm)` this pattern writes on each placed board, exact. A chain that stops claiming a net
 shows up here before it shows up anywhere else."""
 
 CHAIN_LINKS = {
     "blinky": {},
-    "buck": {"FB": (1, 2, 0.3824), "SW": (0, 2, 0.0)},
-    "c3_usb": {"BOOT": (2, 2, 1.1046), "EN": (3, 3, 1.5245)},
+    "buck": {"5V": (0, 4, 0.0), "FB": (2, 2, 1.0955), "SW": (0, 2, 0.0), "VIN": (0, 4, 0.0)},  # 5V, VIN since 2026-10-02 (physics-subjects PR 3); FB 2 of 2 since PR 5
+    "c3_usb": {"BOOT": (2, 2, 1.1046), "EN": (3, 3, 1.5245)},  # VBUS and 3V3 carry a current: the router's  # EN 1.3702 on 2026-10-01 only (decision 4's corridor to the board edge moved C_EN)
     "node": {
-        "BOOT": (2, 2, 1.1046), "EN": (3, 3, 1.5648), "GATE": (1, 2, 0.9063), "SCL": (0, 2, 0.0),
-        "SDA": (0, 2, 0.0), "T_DIV": (2, 2, 0.951), "T_OUT": (0, 2, 0.0),
+        # VBUS and LOAD carry a current: the router's (skipped since 2026-10-02)
+        "BOOT": (2, 2, 1.1046), "EN": (2, 3, 0.8531), "GATE": (1, 2, 0.9063), "SCL": (0, 2, 0.0),  # EN 1.532 on 2026-10-01 only
+        "SDA": (0, 2, 0.0), "T_DIV": (2, 2, 1.3633), "T_OUT": (2, 2, 1.2975),
+        # EN (3, 3, 1.5648), T_DIV (2, 2, 0.951), T_OUT (0, 2, 0.0) until 2026-10-03: the silkscreen no longer re-places a part whose reference has no room (node's C_EN, R_EN and R_LED went 0.6 mm further out before)
     },
     # Every ds2 number here is a zero or a fragment, and that is the slice's finding rather than a
     # disappointment: `CHAIN_HOP_MM` bounds a link to the 8 mm a placed chain hop reaches, and ds2's
     # parts are further apart than that. `VDDA` is 0 of 2 because its own first link is 13.04 mm.
     "ds2": {
-        "VDDA": (0, 2, 0.0), "3V3": (1, 4, 0.355), "AIN0": (2, 3, 0.1819), "AIN1": (2, 3, 0.1673),
+        "VDDA": (0, 2, 0.0), "3V3": (1, 4, 0.355), "AIN0": (2, 3, 0.1819), "AIN1": (2, 3, 0.1673),  # 3V3 0.3548 on 2026-10-01 only
         "AIN2": (0, 3, 0.0), "AIN3": (0, 3, 0.0), "REFN_F": (0, 3, 0.0), "REFP_F": (0, 3, 0.0),
         "VSS": (0, 8, 0.0),
     },
@@ -186,16 +244,22 @@ counted off the pieces by `PatternResult.links`, and how much of the net's airwi
 
 CHAIN_REFUSED = {
     "blinky": [],
-    "buck": [("R_FB_TOP.2->R_FB_BOT.1", "copper", False), ("C_BOOT.2->U1.2", "no candidate", False)],
+    # 2026-10-02 (physics-subjects PR 3): buck's 5V and VIN, c3_usb's VBUS and 3V3 and node's VBUS are declared
+    # chains now; a multi-pad station (J1.VBUS) reads as two pads with no candidate between them.
+    # PR 5: FB's chain is at the class floor (0.16 mm, no longer analog's 0.2) and closes; C_BOOT.2 -> U1.2 is now refused on copper.
+    "buck": [("R_FB_TOP.1->L1.2", "not local", False), ("C_BOOT.2->U1.2", "copper", False), ("J_IN.1->C_IN1.1", "not local", False)],
+    # c3_usb's VBUS and 3V3 and node's VBUS carry a current and are skipped (the router's), so they refuse nothing here.
     "c3_usb": [],
+    # node's C_EN.1->SW_RST.1 refuses and U1.12->U5.4 closes since 2026-10-03: the silkscreen no longer re-places a part whose reference has no room (node's C_EN, R_EN and R_LED went 0.6 mm further out before).
     "node": [
-        ("R_G.2->Q1.1", "no candidate", False), ("U1.19->U4.4", "not local", False),
-        ("U1.18->U4.3", "not local", False), ("U1.12->U5.4", "copper", False),
+        ("C_EN.1->SW_RST.1", "no candidate", False), ("R_G.2->Q1.1", "no candidate", False),
+        ("U1.19->U4.4", "not local", False), ("U1.18->U4.3", "not local", False),
     ],
     # Eight of ds2's nine are `not local`, including the declared `VDDA`: its first link is 13.04 mm
     # centre to centre, past the 8 mm `CHAIN_HOP_MM` bounds a chain hop to. That is what the bound
     # was for — see `test_the_chain_is_written_and_deliberately_not_registered` for the builds.
     "ds2": [
+        # ("J1.1->U1.13" on 2026-10-01 only, while decision 4's corridor ran to the board edge and moved C4-C6.)
         ("J2.1->C4.1", "not local", False), ("R10.1->U1.13", "not local", False),
         ("C7.1->U1.11", "not local", False), ("C8.2->U1.10", "not local", False),
         ("U1.7->C10.1", "not local", False), ("U1.6->C11.2", "not local", False),
@@ -221,10 +285,10 @@ def test_a_chain_is_a_declared_order_first_then_every_unowned_three_pad_net():
     for name in ALL:
         ctx = _ctx(name)
         assert tuple(s.net for s in chain_specs(ctx)) == CHAINS[name], (name, [s.net for s in chain_specs(ctx)])
-        declared = [ch.net for ch in ctx.design.chains]
+        declared = [ch.net for ch in ctx.design.paths]
         for i, s in enumerate(chain_specs(ctx)):
             if s.declared:
-                assert s.net == declared[i] and s.where.startswith("Chain line "), (name, s.net, s.where)
+                assert s.net == declared[i] and s.where.startswith("Path line "), (name, s.net, s.where)
                 continue
             assert s.net not in ctx.scene.plane_of, (name, s.net, "a plane net is the tap's: a plane IS its spine")
             assert len(terminals(ctx.scene, s.net)) >= 3, (name, s.net, "two terminals is a hop's (B.1)")
@@ -250,22 +314,24 @@ def test_a_pair_net_chain_is_skipped_with_a_printed_note_and_never_in_silence():
         for s in skipped:
             res = chain_run(ctx, s)
             assert res.pieces == () and res.refusal is None, (name, s.net, "a skip writes nothing and refuses nothing")
-            assert len(res.notes) == 1 and res.notes[0].startswith(f"style: chain {s.net}: skipped, carries a Pair"), res.notes
+            # PR 8: node's 3V3 Path is its joints; a Path with a current is the router's (its links have their own widths)
+            why = "is on the 3V3 pour" if (name, s.net) == ("node", "3V3") else "carries a Pair" if s.net.startswith("USB_") else "carries a field"
+            assert len(res.notes) == 1 and res.notes[0].startswith(f"style: chain {s.net}: skipped, {why}"), res.notes
     ctx = _ctx("c3_usb")
     dp = next(s for s in chain_specs(ctx) if s.net == "USB_DP")
     assert chain_run(ctx, dp).notes == (
         "style: chain USB_DP: skipped, carries a Pair, and R2 routes no pairs at all — J1.A6, U3.1, U1.27 is R4's "
-        "(Chain line 268)",  # c3_usb's Chain moved one line when S6's `Thermal` joined its import block
+        "(Path line 214)",  # c3_usb's Path lines moved 4 down when its currents became Paths (docs/physics-subjects.md PR 3/4)
     ), chain_run(ctx, dp).notes
     plan, _d, _j, _t = _mid("c3_usb")
-    assert len([n for n in plan.notes if n.startswith("style: chain")]) == 2, plan.notes
+    assert len([n for n in plan.notes if n.startswith("style: chain")]) == len(SKIPPED["c3_usb"]), plan.notes  # the pairs and the current Paths
     assert "USB_DP" not in plan.claimed and "USB_DN" not in plan.claimed, plan.claimed
 
 
 def test_every_chain_refusal_is_soft_declared_or_not_and_nothing_in_the_repo_is_hard():
     """C.6's hardness rule after S6's review, which for R2 is now "nothing sets it".
 
-    The slice shipped a declared `Chain()` as a **hard** refusal — an abort of the whole build before
+    The slice shipped a declared `Path()` as a **hard** refusal — an abort of the whole build before
     KRT runs — on the premise that KRT would connect the same pads by branching and the branch is
     exactly what the order was written to forbid. Two measurements retired it, and both are pinned
     below and in `test_route_verify_chains.py`:
@@ -292,7 +358,7 @@ def test_every_chain_refusal_is_soft_declared_or_not_and_nothing_in_the_repo_is_
             spec = next(s for s in chain_specs(_ctx(name)) if s.net == r.net)
             assert not r.hard, (name, r.net, spec.declared, "a declared chain is no longer a hard refusal")
             assert r.move.startswith(f"chain {r.net}: "), r.move
-            assert "Moves: " in r.move and r.move.rstrip().endswith("."), r.move
+            assert "Moves: " not in r.move and r.move.rstrip().endswith((".", ")")), r.move
     assert not any(r.hard for name in ALL for r in _mid(name)[0].refusals()), (
         "test_examples_fab.py asserts this on the four it builds; after S6's review it holds on ds2 too"
     )
@@ -316,7 +382,7 @@ def test_every_chain_refusal_is_soft_declared_or_not_and_nothing_in_the_repo_is_
 def test_the_ds2_addon_declared_chain_refuses_on_distance_and_the_order_is_checked_on_the_board():
     """The one declared chain R2 would route, the sentence S6 ended up with, and why it is honest.
 
-    `Chain("VDDA", "J2.1", "C4.1", "U1.12")` refuses at **link 1**, on distance: `J2.1 -> C4.1` is
+    `Path("VDDA", "J2.1", "C4.1", "U1.12")` refuses at **link 1**, on distance: `J2.1 -> C4.1` is
     13.04 mm centre to centre against `CHAIN_HOP_MM`'s 8 mm. Nothing is written.
 
     That bound is S6's own finding and not a tidy round number. Without it the chain wrote 14.4 mm
@@ -341,25 +407,23 @@ def test_the_ds2_addon_declared_chain_refuses_on_distance_and_the_order_is_check
     """
     ctx = _ctx("ds2")
     spec = next(s for s in chain_specs(ctx) if s.net == "VDDA")
-    assert spec.declared and spec.where == "Chain line 97" and spec.labels == ("J2.1", "C4.1", "U1.12"), spec
-    assert tuple(t.owner for t in spec.stations) == ("J2.1", "C4.1", "U1.12"), "the Chain()'s order, verbatim"
+    assert spec.declared and spec.where == "Path line 97" and spec.labels == ("J2.1", "C4.1", "U1.12"), spec
+    assert tuple(t.owner for t in spec.stations) == ("J2.1", "C4.1", "U1.12"), "the Path()'s order, verbatim"
+    # 15.9678 and 2.9847 on 2026-10-01 only, while decision 4's corridor ran to the board edge (C4.1 at 23.58,6.4411).
     assert spec.spans == (13.0402, 3.8204), spec.spans
     res = chain_run(ctx, spec)
     assert res.pieces == () and res.joins == () and res.links == (0, 2), (res.pieces, res.joins, res.links)
     assert res.refusal is not None and not res.refusal.hard and res.refusal.what == "J2.1->C4.1", res.refusal
     assert res.refusal.rule == "not local" and res.refusal.clash is None, res.refusal
     assert res.refusal.move.splitlines() == [
-        "chain VDDA: link 1 of 2, J2.1 at (8.89,12.7) cannot reach C4.1 at (20.33,6.4411) on F.Cu at 0.25 mm "
-        "(Chain line 97).",
+        "chain VDDA: link 1 of 2, J2.1 at (8.89,12.7) cannot reach C4.1 at (20.33,6.4411) on F.Cu at 0.16 mm "  # the class floor since physics-subjects PR 3
+        "(Path line 97).",
         "  In the way: J2.1 and C4.1 are 13.04 mm apart, past the 8 mm a chain hop the placement made reaches — "
         "this pattern draws a short local link well and a long one badly, so the run is the router's and the order "
         "is read back off the finished board instead (rule: not local)",
         "  Nothing of this chain is down: link 1 of 2 is its first, and a chain is an order pcbc does not re-order "
         "to close",
         f"  Tried 0 candidates of at most 2 x {MAX_PER_LINK}.",
-        '  Moves: Place("J2", toward="right") turns its exit toward C4.1; or '
-        'Chain("VDDA", "J2.1", "C4.1", "U1.12") is asking for an order this placement cannot give — drop C4 from the '
-        "chain and feed it locally instead.",
     ], res.refusal.move
 
 
@@ -378,7 +442,7 @@ def test_the_no_stub_rule_fires_on_a_later_stop_and_leaves_the_order_the_pads_gi
     against the 0.207 mm `stackup.clearance_min + w/2` this rule keeps, and the pattern writes nothing.
 
     The move is the part that makes this rule worth having: what is wrong is the **order**, not the
-    placement, so the refusal hands back the `Chain()` line with `R_EN.2` put where the placement
+    placement, so the refusal hands back the `Path()` line with `R_EN.2` put where the placement
     already has it rather than telling the author to move a part that is exactly where it belongs.
     """
     ctx = _ctx("c3_usb")
@@ -404,8 +468,6 @@ def test_the_no_stub_rule_fires_on_a_later_stop_and_leaves_the_order_the_pads_gi
         "  Nothing of this chain is down: link 1 of 3 is its first, and a chain is an order pcbc does not re-order "
         "to close",
         f"  Tried 13 candidates of at most 3 x {MAX_PER_LINK}.",
-        '  Moves: Chain("EN", "SW_RST.1", "R_EN.2", "U1.8", "C_EN.1") declares the order the placement gives, in '
-        "place of the one pcbc read off the pads' own principal axis.",
     ], res.refusal.move
 
 
@@ -500,7 +562,7 @@ def test_r_x4_fires_on_no_board_in_this_repo_and_that_is_recorded_rather_than_as
 def test_a_chain_is_never_re_ordered_to_close_it():
     """B.2: "It never re-orders to close the net: the order is the AI's intent."
 
-    A declared chain's stations are the `Chain()`'s members resolved to pads, in the order written,
+    A declared chain's stations are the `Path()`'s members resolved to pads, in the order written,
     and an implicit chain's are `route_checks._principal_order` over the pad anchors — the *same*
     function `check_chains` measures an undeclared chain against, so the placement check and the
     router cannot disagree about what the order is. Nothing anywhere in this pattern sorts them
@@ -512,8 +574,9 @@ def test_a_chain_is_never_re_ordered_to_close_it():
             if s.skip:
                 continue
             if s.declared:
-                ch = next(c for c in ctx.design.chains if c.net == s.net)
-                assert s.labels == ch.pads, (name, s.net, s.labels, ch.pads, "the Chain() line, verbatim")
+                ch = next(c for c in ctx.design.paths if c.net == s.net)
+                # A multi-pad station (J1.VBUS) is two pads with one label: the order is the line's, verbatim.
+                assert tuple(dict.fromkeys(s.labels)) == ch.pads, (name, s.net, s.labels, ch.pads, "the Path() line, verbatim")
                 continue
             pads = terminals(ctx.scene, s.net)
             want = tuple(pads[i].owner for i in _principal_order([anchor(t) for t in pads]))
@@ -645,15 +708,17 @@ def test_the_chain_is_written_and_deliberately_not_registered():
     What S6 ships instead is the half that needed no pattern: `route_verify.chain_order` reads a
     declared order off the finished board (`test_route_verify_chains.py`).
     """
-    from pcbc.patterns import MID, PRE, POST
+    from pcbc.patterns import _STAGES, POST, PRE
 
-    assert PRE == ("hop",) and MID == ("spine",) and POST == ("tap",), (PRE, MID, POST)
+    # The `mid` stage went with the spine (docs/physics-subjects.md PR 3); chain is in no stage either.
+    assert PRE == ("hop",) and POST == ("tap",) and sorted(_STAGES) == ["final", "post", "pre"], (PRE, POST, sorted(_STAGES))
+    assert not any(REASON in mods for mods in _STAGES.values())
     # The **stage** writes no chain copper on any board: that is what "not registered" means.
     for name in ALL:
         design = load_board(_board(name))
         job = compile_design(design)
-        stage = pattern_copper(design, job, job.constraints, _uuid_name(name), stage="mid", scene=scene_from_text(design, job, job.constraints, _placed(name).read_text()))
-        assert not [p for p in stage.pieces if p.reason == REASON], (name, "the mid stage must write no chain copper")
+        stage = pattern_copper(design, job, job.constraints, _uuid_name(name), stage="pre", scene=scene_from_text(design, job, job.constraints, _placed(name).read_text()))
+        assert not [p for p in stage.pieces if p.reason == REASON], (name, "no stage writes chain copper")
     # And the pattern is still whole: asked directly it still has a population and still writes.
     plan, _d, _j, _t = _mid("c3_usb")
     assert [p for p in plan.pieces if p.reason == REASON], "driven directly it still writes"
@@ -673,7 +738,7 @@ def test_the_elbows_are_offered_after_every_shape_the_shared_builder_has():
     so the prefix of its candidate list is byte-identical to a backbone link's: an elbow can only
     answer a link that had no answer, and it reorders nothing.
     """
-    from pcbc.patterns.spine import link_shapes as spine_link_shapes
+    from pcbc.patterns.chain import shared_link_shapes as spine_link_shapes
 
     ctx = _ctx("ds2")
     spec = next(s for s in chain_specs(ctx) if s.net == "VDDA")
@@ -706,9 +771,9 @@ def test_an_elbow_finishes_a_chain_the_shared_shapes_cannot():
     copper rather than on a remembered number.
     """
     import pcbc.patterns.chain as chain_mod
-    from pcbc.patterns.spine import link_shapes as spine_link_shapes
+    from pcbc.patterns.chain import shared_link_shapes as spine_link_shapes
 
-    ctx = _ctx("c3_usb")
+    ctx = _c3_usb_pre_d4_ctx()
     spec = next(s for s in chain_specs(ctx) if s.net == "EN")
     with_elbows = chain_run(ctx, spec)
     assert with_elbows.links == (3, 3) and with_elbows.refusal is None, with_elbows
@@ -731,15 +796,36 @@ def test_a_chain_spec_is_frozen_and_carries_where_its_order_came_from():
     the same fact. After S6's review it no longer decides how hard the refusal is — nothing does —
     but it still decides **where the order is checked**: only a declared chain is read back off the
     routed board by `route_verify.chain_order`, because only a declared order can be disobeyed.
-    `where` is what the refusal quotes: the `Chain()`'s own line number, or how many pads the
+    `where` is what the refusal quotes: the `Path()`'s own line number, or how many pads the
     implicit sweep found and what ordered them."""
     ctx = _ctx("ds2")
     vdda = next(s for s in chain_specs(ctx) if s.net == "VDDA")
     vss = next(s for s in chain_specs(ctx) if s.net == "VSS")
-    assert isinstance(vdda, ChainSpec) and vdda.declared and vdda.where == "Chain line 97"
+    assert isinstance(vdda, ChainSpec) and vdda.declared and vdda.where == "Path line 97"
     assert not vss.declared and vss.where == "9 pads on their own principal axis"
     with pytest.raises(Exception):
         vdda.net = "nope"  # type: ignore[misc]
     assert len(vss.labels) == len(vss.stations) == 9, vss.labels
     assert all(label == t.owner for label, t in zip(vss.labels, vss.stations)), "an implicit stop is named by its pad"
-    assert vdda.labels == ("J2.1", "C4.1", "U1.12"), "a declared stop is named the way the Chain() named it"
+    assert vdda.labels == ("J2.1", "C4.1", "U1.12"), "a declared stop is named the way the Path() named it"
+
+
+def test_a_current_path_on_a_pour_asks_the_router_for_no_track():
+    """docs/physics-subjects.md PR 8: on node's 3V3 pour the pour is the copper between U2.VOUT and J_LOAD.1, so
+    `route_native.net_links` asks for no declared link of Path line 160 (it would lay a track the pour makes)."""
+    from pcbc.route_native import net_links
+
+    ctx = _ctx("node")
+    terms, links, _uf = net_links(ctx.design, ctx.scene, "3V3", (), ctx.cs)
+    assert not any(lk is not None for _a, _b, lk in links), [lk.key for _a, _b, lk in links if lk is not None]
+
+
+def test_no_pattern_draws_a_current_paths_link_at_the_class_floor():
+    """docs/physics-subjects.md PR 3: a current is a Path's, so the class width is the floor. A hop or a chain writes at
+    the class width with no link of its own, so a net whose Path carries a field is left to the router (measured
+    2026-10-02 on node: a hop drew the 1 A link J_LOAD.2 -> Q1.D at 0.16 mm, 0.633 A by `power_bottlenecks`)."""
+    from pcbc.patterns import hop
+
+    ctx = _ctx("node")
+    assert "LOAD" not in hop.specs(ctx) and ctx.cs.fielded("LOAD")
+    assert "LOAD" in [s.net for s in chain_specs(ctx) if s.skip]

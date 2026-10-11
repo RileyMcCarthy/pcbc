@@ -69,12 +69,13 @@ class TapSpec:
     via: tuple[float, float]  # (diameter, drill)
     why: str  # why that via size, with its arithmetic, for the report and the refusal
     skip: str = ""  # "" for a tap; otherwise the reason there is none
+    count: int = 1  # vias this pad's joint needs: a station of a Path on the pour draws through it (PR 8)
 
 
 # --- the via a tap gets ---------------------------------------------------------------------------
 
 
-def tap_via(scene: Scene, cs, net: str, pads: int) -> tuple[tuple[float, float], str, float]:
+def tap_via(scene: Scene, cs, net: str, pads: int, pad: str | None = None) -> tuple[tuple[float, float], str, float]:
     """The smallest via whose current rating covers one pad's share of the net's current, capped at
     the net's class via. Returns ((diameter, drill), why, share).
 
@@ -92,10 +93,15 @@ def tap_via(scene: Scene, cs, net: str, pads: int) -> tuple[tuple[float, float],
     """
     c = cs.by_net(net)
     stack = scene.stack
-    amps = c.current.amps if (c is not None and c.current is not None) else 0.0
-    share = round(amps / max(pads, 1), 4)
+    # `docs/physics-subjects.md` PR 3: a net declares no current, so a tap's share is the current of the
+    # path link that ends at the tapped pad (`pad`, a pad id), and 0 where none does.
+    lk = None
+    if pad is not None and c is not None:
+        lk = next((x for p in c.paths for x in p.links if x.current is not None and x.amps_written and not x.join and pad in x.b), None)
+    amps = float(lk.current.amps) if lk is not None else 0.0
+    share = round(amps, 4)
     cap = (c.via.diameter_mm, c.via.drill_mm) if c is not None else (stack.via_diameter, stack.via_drill)
-    dt = c.current.temp_rise_c if (c is not None and c.current is not None) else 10.0
+    dt = lk.current.temp_rise_c if lk is not None else 10.0
     sizes: list[tuple[float, float]] = []
     for size in ((stack.via_diameter, stack.via_drill), cap):
         if size[1] <= cap[1] + 1e-9 and size not in sizes:
@@ -105,7 +111,11 @@ def tap_via(scene: Scene, cs, net: str, pads: int) -> tuple[tuple[float, float],
         one = via_amps(drill, stack.via_plating_mm, dt)
         if one + 1e-9 >= share:
             if (dia, drill) == (stack.via_diameter, stack.via_drill):
-                why = f"the fab's standard via: {one:g} A carries this pad's {share:g} A of {net}'s {amps:g} A across {pads} pads"
+                why = (
+                    f"the fab's standard via: {one:g} A carries the {share:g} A {lk.source}'s link {lk.key} brings to this pad"
+                    if lk is not None
+                    else f"the fab's standard via: no Path declares a current into this pad of {net}, and {one:g} A is what it carries"
+                )
             else:
                 why = f"the {c.class_name} class via: this pad's {share:g} A needs more than the fab's standard {stack.via_drill:g} mm barrel"
             return ((dia, drill), why, share)
@@ -170,6 +180,14 @@ def _welded(scene: Scene, net: str, plane: str) -> frozenset[str]:
     return frozenset(it.owner for i, it in enumerate(mine) if it.kind == "pad" and find(i) in reach)
 
 
+def joints_of(cs, net: str) -> dict:
+    """`{pad id: Joint}` for every station of a Path on `net`'s pour (`constraints.Joint`, PR 8)."""
+    c = cs.by_net(net) if cs is not None else None
+    if c is None:
+        return {}
+    return {pad: j for p in c.paths for j in p.joints for pad in j.pads}
+
+
 def specs(ctx: PatternCtx) -> tuple[TapSpec, ...]:
     """Every plane pad, in `sorted(ref, pad_num)` — B.0's order for a pad-driven pattern.
 
@@ -195,7 +213,15 @@ def specs(ctx: PatternCtx) -> tuple[TapSpec, ...]:
                 rows.append((t, layer, ""))
         taps = sum(1 for _t, _l, skip in rows if not skip)
         via, why, _share = tap_via(scene, ctx.cs, net, taps)
+        joints = joints_of(ctx.cs, net)
         for t, layer, skip in rows:
+            j = joints.get(t.owner)
+            if j is not None and not skip and j.barrel_mm is None:
+                # docs/physics-subjects.md PR 8: a station of a Path on this pour draws through this pad's joint.
+                from ..paths import joint_text
+
+                out.append(TapSpec(pad=t, layer=layer, plane=plane, via=j.via, why=f"the joint of {joint_text(j)}", skip=skip, count=j.vias))
+                continue
             out.append(TapSpec(pad=t, layer=layer, plane=plane, via=via, why=why, skip=skip))
     return tuple(sorted(out, key=lambda s: _pad_key(s.pad.owner)))
 
@@ -267,9 +293,9 @@ def anchor(spec: TapSpec) -> Pt:
     return spec.pad.item.at()
 
 
-def _pieces(ctx: PatternCtx, spec: TapSpec, at: Pt, w: float) -> tuple[Piece, ...]:
+def _pieces(ctx: PatternCtx, spec: TapSpec, at: Pt, w: float, n: int = 0) -> tuple[Piece, ...]:
     t = spec.pad
-    uid = (ctx.board, "pcbc", REASON, t.net, t.owner)
+    uid = (ctx.board, "pcbc", REASON, t.net, t.owner) + ((str(n),) if n else ())
     return (
         seg_piece(t.net, REASON, spec.layer, anchor(spec), at, w, owner=t.owner, uuid=stable_uuid(*uid, "stub")),
         via_piece(t.net, REASON, at, spec.via[0], spec.via[1], owner=t.owner, uuid=stable_uuid(*uid, "via")),
@@ -325,7 +351,9 @@ def _pieces_via(spec: TapSpec, at: Pt) -> Piece:
 
 
 def run(ctx: PatternCtx, spec: TapSpec) -> PatternResult:
-    """One pad. The first site that clears is the answer; nothing else is consulted."""
+    """One pad. The first site that clears is the answer; nothing else is consulted. A pad whose joint needs
+    more than one via (`TapSpec.count`, a station's draw on the pour, PR 8) takes the next sites that clear,
+    each judged against the vias already chosen (on a fork of the scene, so a refused pad writes nothing)."""
     t = spec.pad
     scene = ctx.scene
     if spec.skip:
@@ -338,26 +366,38 @@ def run(ctx: PatternCtx, spec: TapSpec) -> PatternResult:
     tried = 0
     raster = _raster(ctx, spec)
     unreached = 0
-    for side, _d, k, at, w in sites:
-        pieces = _pieces(ctx, spec, at, w)
+    work = scene if spec.count <= 1 else scene.fork()
+    got: list[Piece] = []
+    chosen: list[str] = []
+    dirs: list[tuple[int, int]] = []  # the exit direction of each chosen via, in `chosen`'s order
+    notes: tuple[str, ...] = ()
+    for side, d, k, at, w in sites:
+        if d in dirs:
+            # One via per exit side (refutation physics r1, `pour_two`): every stub starts at the pad's centre, so
+            # a second site further out on the same side lays its stub over the first (the self-check's "turn
+            # sharper than 135 degrees" back along itself) and the shared copper would carry both vias' current.
+            continue
+        if not _legal_star(dirs + [d]) and len(dirs) + 1 >= spec.count:
+            continue  # two stubs at a right angle out of one pad centre are a 90 degree turn in the copper
+        pieces = _pieces(ctx, spec, at, w, len(chosen))
         if pieces[0].mm < MICRO_MM:
             continue  # a stub KiCad's own `track_segment_length` would count; the next site is longer
         tried += 1
         clash = (
-            _in_a_pad(scene, spec, at)
-            or blocked(scene, pieces, t.net, ignore=mine)
+            _in_a_pad(work, spec, at)
+            or blocked(work, pieces, t.net, ignore=mine)
             # The plane this via does NOT join is the one it can quietly cut: a row of taps at a
             # footprint's own pitch merges its antipads into a slot (finding 10). `_sites` offers 16
             # distances on each of four sides, so a row that cannot be tapped one-per-pad in line can
             # still be tapped by stepping alternate pads out until the neck holds.
-            or antipad_clash(scene, at, spec.via[0], t.net, ignore=mine)
+            or antipad_clash(work, at, spec.via[0], t.net, ignore=mine)
         )
         if clash is not None:
             seen.append(clash)
             if worst is None or (clash.need - clash.have) > worst[0]:
                 worst = (clash.need - clash.have, clash)
             continue
-        fits, why = lane_ok(scene, pieces, (t.ref,))
+        fits, why = lane_ok(work, pieces, (t.ref,))
         if not fits:
             lane_why = lane_why or why
             continue
@@ -367,14 +407,31 @@ def run(ctx: PatternCtx, spec: TapSpec) -> PatternResult:
             # nothing, and an island the pour cannot reach is worse than no tap at all (D.5).
             unreached += 1
             continue
+        got.extend(pieces)
+        chosen.append(f"{side}+{k} {spec.via[0]:g}/{spec.via[1]:g}")
+        dirs.append(d)
+        notes = notes or _neck_note(ctx, spec, w)
+        if len(chosen) >= spec.count:
+            break
+        work.add(work.item_of(p) for p in pieces)
+    while len(dirs) > 1 and not _legal_star(dirs):
+        # Short of the count with a right-angle pair left over: keep the vias whose stubs make legal copper; the
+        # gate states the joint's shortfall on the emitted board (E23).
+        dirs.pop()
+        chosen.pop()
+        del got[-2:]
+    if got:
+        if len(chosen) < spec.count:
+            # The joint is short of what the draw needs; the gate states it on the emitted board (E23).
+            notes = notes + (f"style: tap {t.net}: {t.owner} has {len(chosen)} of the {spec.count} vias {spec.why}",)
         return PatternResult(
             reason=REASON,
             net=t.net,
-            pieces=pieces,
+            pieces=tuple(got),
             joins=((t.owner, f"{t.net} plane on {spec.plane}"),),
-            candidate=f"{side}+{k} {spec.via[0]:g}/{spec.via[1]:g}",
+            candidate=", ".join(chosen),
             tried=tried,
-            notes=_neck_note(ctx, spec, w),
+            notes=notes,
         )
     return PatternResult(
         reason=REASON,
@@ -382,6 +439,16 @@ def run(ctx: PatternCtx, spec: TapSpec) -> PatternResult:
         refusal=_refuse(ctx, spec, worst[1] if worst else None, seen, len(sites), tried, lane_why, unreached),
         tried=tried,
     )
+
+
+def _legal_star(dirs: list[tuple[int, int]]) -> bool:
+    """Do stubs leaving one pad centre in `dirs` make copper `route_verify.verify_copper` accepts? One stub, or
+    three or more (the centre is then a junction, not a corner), or two in opposite directions (one straight
+    line); two at a right angle are a 90 degree corner (`route_geom.turn_ok`)."""
+    if len(dirs) != 2:
+        return True
+    (ax, ay), (bx, by) = dirs
+    return (ax, ay) == (-bx, -by)
 
 
 def _neck_note(ctx: PatternCtx, spec: TapSpec, w: float) -> tuple[str, ...]:
@@ -417,30 +484,6 @@ def _raster(ctx: PatternCtx, spec: TapSpec):
 
 
 # --- the refusal ----------------------------------------------------------------------------------
-
-
-def _moves(ctx: PatternCtx, spec: TapSpec, clash: Clash | None, unreached: int) -> str:
-    """Two edits, both real: one that moves a part, one that moves the copper in the way.
-
-    The part to move is this pad's own footprint — a tap is one pad's business and there is no
-    second terminal to move instead — and the direction is away from whatever is in the way.
-    """
-    t = spec.pad
-    ref = t.ref
-    if clash is not None:
-        dx, dy = t.at[0] - clash.at[0], t.at[1] - clash.at[1]
-        toward = ("right" if dx >= 0 else "left") if abs(dx) >= abs(dy) else ("down" if dy >= 0 else "up")
-        who = clash.item.owner
-        second = f'or NetReq("{clash.item.net}", layers=["{_other(ctx, spec.layer)}"]) takes {who} off this row'
-        if not clash.item.net:
-            second = f"or move {who} itself, which carries no net and so cannot be routed away"
-        return f'Place("{ref}", toward="{toward}") opens the {toward} side of {t.owner}; {second}.'
-    if unreached:
-        return (
-            f'Place("{ref}", toward="right") moves {t.owner} out of the pocket the pour cannot reach; '
-            f'or route less copper across it - NetReq(..., layers=["{_other(ctx, spec.layer)}"]) on whatever fences it in.'
-        )
-    return f'Place("{ref}", toward="right") gives {t.owner} a side to leave from; or drop the plane on {t.net} and route it.'
 
 
 def _other(ctx: PatternCtx, layer: str) -> str:
@@ -491,7 +534,6 @@ def _refuse(ctx: PatternCtx, spec: TapSpec, clash: Clash | None, seen: list[Clas
             f"{t.owner} at ({t.at[0]:g},{t.at[1]:g})",
             f"the {t.net} plane on {spec.plane} with a {spec.via[0]:g}/{spec.via[1]:g} via ({spec.why})",
             blockers,
-            "Moves: " + _moves(ctx, spec, clash, unreached),
             sep="\n  ",
         ),
     )

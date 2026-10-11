@@ -9,7 +9,7 @@ octilinear polyline keeps every direction, so the halves are parallel everywhere
 construction; the only length difference between them is the bend term `pitch * tan(theta/2)` per
 corner, which is exactly what the cost prices.
 
-**What is routed as a pair.** The stations of the two nets' declared `Chain()`s, pairwise: link k of a
+**What is routed as a pair.** The stations of the two nets' declared `Path()`s, pairwise: link k of a
 pair joins (DP station k, DN station k) to (DP station k+1, DN station k+1). A pair net's other pads
 (a USB-C connector's flip side) and a pair with no declared chain are linked singly by the router
 afterwards; the coupling of what was emitted is measured on the emitted board (`route_verify.

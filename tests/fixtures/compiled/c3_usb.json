@@ -1,8 +1,5 @@
 {
- "board_size_mm": [
-  40.0,
-  30.0
- ],
+ "board_size_mm": null,
  "classes": [
   {
    "clearance_mm": 0.16,
@@ -242,13 +239,16 @@
    "width": null
   },
   {
-   "at": null,
+   "at": [
+    33.95,
+    11.7
+   ],
    "bottom": null,
    "edge": null,
-   "from_box": "courtyard",
+   "from_box": "origin",
    "gap": null,
    "height": null,
-   "left": null,
+   "left": 33.95,
    "locked": true,
    "margin_bottom": 0,
    "margin_left": 0,
@@ -259,12 +259,12 @@
    "position": "absolute",
    "reason": "LDO",
    "ref": "U2",
-   "right": 4,
+   "right": null,
    "rot": 0.0,
    "rot_set": false,
    "side": "F",
    "to": null,
-   "top": 10,
+   "top": 11.7,
    "toward": null,
    "translate_x": null,
    "translate_y": null,

@@ -199,6 +199,34 @@ def _relink_model(mod_text: str, model_name: str | None) -> str:
     return _MODEL.sub(f'(model "{model_name}"', mod_text, count=1)
 
 
+_OFFSET = re.compile(r"(\(offset\s*\(xyz\s+)[-0-9.eE+]+\s+[-0-9.eE+]+\s+[-0-9.eE+]+(\s*\))")
+
+
+def _set_model_offset(mod_text: str, offset: tuple[float, float, float]) -> str:
+    """The first `(model …)` block's `(offset (xyz …))` set to `offset` (`model3d.model_offset`)."""
+    j = mod_text.find("(model ")
+    if j < 0:
+        return mod_text
+    xyz = " ".join(f"{v:g}" for v in offset)
+    return mod_text[:j] + _OFFSET.sub(lambda m: f"{m.group(1)}{xyz}{m.group(2)}", mod_text[j:], count=1)
+
+
+def _placed_model(mod_text: str, model: Path, placed: Path | None, cli: Path | None) -> tuple[str, str | None]:
+    """(`mod_text` with its model's offset measured, a finding or None). easyeda2kicad writes a zero
+    offset and bakes EasyEDA's placement into the `.wrl` only (`model3d`); the offset that puts the kept
+    model where EasyEDA puts it is measured by KiCad against that `.wrl`."""
+    from .model3d import model_offset, model_rotate
+
+    if placed is None:
+        return mod_text, f"3D model offset not measured: easyeda2kicad wrote no .wrl, so EasyEDA's placement of {model.name} is unknown; the offset stays (0 0 0)"
+    if cli is None:
+        return mod_text, f"3D model offset not measured: kicad-cli not found; {model.name} keeps easyeda2kicad's offset (0 0 0)"
+    offset, why = model_offset(model, placed, model_rotate(mod_text), cli)
+    if offset is None:
+        return mod_text, f"3D model offset not measured: {why}; {model.name} keeps easyeda2kicad's offset (0 0 0)"
+    return _set_model_offset(mod_text, offset), None
+
+
 def fetch_lcsc(
     lcsc_id: str,
     into: Path,
@@ -246,11 +274,16 @@ def fetch_lcsc(
             shutil.copyfile(src3d, dest / model_name)
         mod_path = dest / mod_name
         repaired, repairs = repair_footprint(mod_path.read_text())
+        placed_note = None
+        if src3d is not None and "(model " in repaired:
+            repaired, placed_note = _placed_model(repaired, src3d, wrl, cli)
         mod_path.write_text(_relink_model(repaired, model_name))
 
     report = score_part(dest, symbol=sym_name, footprint=mod_name)
     for note in repairs:
         report["findings"].append(("info", f"repaired: {note}"))
+    if placed_note:
+        report["findings"].append(("warn", placed_note))
     part_py = dest / "part.py"
     wrote = False
     if force or not part_py.exists():
@@ -361,7 +394,7 @@ def score_symbol(text: str) -> dict:
 
     units = symbol_units(text)
     if units > 1:
-        add("fail", 40, f"{units} units (A, B, ...): pcbc draws one unit per symbol; use a single-unit symbol")
+        add("fail", 40, f"{units} units (A, B, ...): pcbc draws one unit per symbol")
     if not pins:
         add("fail", 100, "no pins")
         return {"findings": findings, "pins": [], "penalty": penalty}

@@ -35,7 +35,7 @@ import itertools
 import math
 import re
 from collections.abc import Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 
 from .compile import CompiledJob
 from .copper import copper_by_net, net_table
@@ -111,6 +111,10 @@ class Bottleneck:
     provenance, never a location. buck is the proof — its 2 A path is `J_IN.1 -> U1.3` and the pair
     reported is `C_IN1.1 -> R_EN.1`, a 100 k enable pull-up drawing 0.12 mA. Telling an author to
     move those two parts closer names two parts that are not on the rail."""
+    pour_vias: str = ""
+    """On a `zoned` net only: the vias joining its pads to the pour that rate under the declared current,
+    as one sentence, or "". Version 1 does not size a poured net's tap vias (`docs/net-path-physics.md`
+    §10 A), so a zoned row whose joints rate under its `amps=` says `not rated: pour` instead of `ok`."""
     verdict: str = "ok"
     """Which of three different things is wrong, because they are not the same severity.
 
@@ -166,8 +170,14 @@ def _via_clusters(vs: list[dict]) -> dict[int, int]:
     return {i: size[find(i)] for i in range(len(vs))}
 
 
-def net_nodes(text: str, net: str, pads: list, *, dt: float, stack, plane_h: float | None, plating: float = 0.018) -> list[Node]:
-    """Every piece of copper on `net`, each carrying what it can carry."""
+def net_nodes(text: str, net: str, pads: list, *, dt: float, stack, plane_h: float | None, plating: float = 0.018, plane_of: dict | None = None, groups: dict | None = None) -> list[Node]:
+    """Every piece of copper on `net`, each carrying what it can carry.
+
+    `plane_of` is `{layer: height to its reference}`: each track is rated at **its own layer's** plane
+    (`docs/net-path-physics.md` §4.6; a B.Cu track on two layers has none), falling back to `plane_h`.
+    `groups` is `{(x, y): (members, landing_mm)}` for the barrels of the router's via groups, joined by
+    their landings (`fab._via_groups`): such a barrel is rated at what its whole group carries before
+    its worst barrel reaches `via_amps` (`stackup.via_group_shares`, lumped DC), never by distance."""
     names = net_table(text)
     out: list[Node] = []
     for i, m in enumerate(_SEG.finditer(text)):
@@ -175,12 +185,13 @@ def net_nodes(text: str, net: str, pads: list, *, dt: float, stack, plane_h: flo
         if name != net:
             continue
         x1, y1, x2, y2, w = (float(m.group(k)) for k in range(1, 6))
+        h = plane_of.get(m.group(6), None) if plane_of is not None else plane_h
         out.append(
             Node(
                 key=("seg", i),
                 shape=track_shape((x1, y1), (x2, y2), w),
                 layers=frozenset({m.group(6)}),
-                amps=track_amps(w, dt, stack, plane_h),
+                amps=track_amps(w, dt, stack, h, m.group(6)),
                 mm=math.hypot(x2 - x1, y2 - y1),
             )
         )
@@ -195,12 +206,24 @@ def net_nodes(text: str, net: str, pads: list, *, dt: float, stack, plane_h: flo
     # two-layer board said "B.Cu/F.Cu/In1.Cu/In2.Cu" (the refuters, buck's VIN).
     through = frozenset(stack.copper_layers()) if hasattr(stack, "copper_layers") else ALL_CU
     for i, v in enumerate(vs):
+        one = via_amps(v["drill"], plating, dt)
+        amps = round(parallel[i] * one, 3)
+        g = (groups or {}).get((round(v["at"][0], 4), round(v["at"][1], 4)))
+        if g is not None:
+            from .stackup import via_group_shares
+
+            members, landing = g[0], g[1]
+            cu = stack.landing_oz(g[2] if len(g) > 2 else ())  # round 3: the landing layers' thinnest copper, as the gate's
+            n = len(members)
+            span = max(math.dist(a, b) for a in members for b in members) if n > 1 else 0.0
+            frac = max(via_group_shares(n, 1.0, v["drill"], plating, stack.board_mm, span / (n - 1) if n > 1 else 1.0, landing, cu))
+            amps = round(one / frac, 3) if frac > 0 else amps
         out.append(
             Node(
                 key=("via", i),
                 shape=via_shape(v["at"], v["size"]),
                 layers=through,
-                amps=round(parallel[i] * via_amps(v["drill"], plating, dt), 3),
+                amps=amps,
                 mm=0.0,
             )
         )
@@ -254,7 +277,7 @@ def widest_path(adj: dict[tuple, set[tuple]], amps: dict[tuple, float], sources:
     return best
 
 
-def power_bottlenecks(job: CompiledJob, text: str, *, redundant: frozenset = frozenset()) -> dict[str, dict]:
+def power_bottlenecks(job: CompiledJob, text: str, *, redundant: frozenset = frozenset(), groups: dict | None = None, sense_copper: frozenset = frozenset(), necks: frozenset = frozenset()) -> dict[str, dict]:
     """Per power net with a declared current: the worst pad-to-pad path, as a JSON-able dict.
 
     A net that carries a zone is reported with `zoned` true and no path walk: a plane is the rail's
@@ -278,7 +301,11 @@ def power_bottlenecks(job: CompiledJob, text: str, *, redundant: frozenset = fro
     for connectivity and fully load-bearing for current; a guard is the only one of the three that is
     not on the net whose current is in question at all.
 
-    Empty by default, so a caller that names no redundant copper measures the whole net."""
+    Empty by default, so a caller that names no redundant copper measures the whole net.
+
+    `necks` is the `copper_bar.bar_key`s of the pad necks `route_verify.pad_necks` accepted (decision 1): by
+    the same rule that accepts them they are not a bottleneck — rated like the pad they leave (unbounded)
+    and not counted in `under_mm`. A narrow piece the rule refused is measured as it is."""
     cs = job.constraints
     if cs is None:
         return {}
@@ -286,54 +313,115 @@ def power_bottlenecks(job: CompiledJob, text: str, *, redundant: frozenset = fro
     pads = board_pad_geoms(text, layers=layers)
     census = copper_by_net(text)
     out: dict[str, dict] = {}
-    for net in job.nets:
-        if net.kind != "power" or not net.amps:
+    # No net rows (`docs/physics-subjects.md` PR 3): a net declares no current, so the only currents the
+    # gate walks are the paths'.
+    # docs/net-path-physics.md §4.6: each path that writes amps= is measured between its consecutive
+    # stations at its own current and temperature rise, each piece at its own layer's plane.
+    for c in cs.constraints:
+        for p in c.paths:
+            if p.amps is None or not p.links or p.links[0].current is None:
+                continue
+            steps = [lk for lk in p.links if not lk.join]
+            # A number path is one row, every link at its one current. A draws-Path is one row per link,
+            # each walked at its own current and need (`docs/physics-subjects.md` PR 2), so a narrower link
+            # downstream is not judged at the sum the first link carries.
+            groups_of = [(f"{c.net} (Path line {p.line})", steps)] if not p.draws else [
+                (f"{c.net} (Path line {p.line}, link {lk.written[0]} -> {lk.written[1]})", [lk]) for lk in steps
+            ]
+            for name, mine in groups_of:
+                lk = mine[0]
+                cur = lk.current
+                if cur is None:
+                    continue
+                zoned = bool(census.get(c.net, {}).get("zone"))
+                nodes = net_nodes(text, c.net, pads, dt=cur.temp_rise_c, stack=cs.stackup, plane_h=cur.plane_h_mm, plane_of=_planes_of(cs, c), groups=groups)
+                if redundant:
+                    nodes = [n for n in nodes if _bar_key_of(n) not in redundant]
+                nodes = _rate_necks(nodes, necks)
+                w0 = lk.width_on(lk.layers[0]) if lk.layers else lk.widest()
+                under = round(sum(n.mm for n in nodes if n.key[0] == "seg" and n.amps < math.inf and n.mm and _narrow(n, lk.narrowest())), 3)
+                row = Bottleneck(
+                    net=name, amps=float(cur.amps), carries=math.inf, width_mm=0.0, kind="track", where="",
+                    need_mm=round(max(cur.width_ipc2221.value, cur.width_ipc2152.value), 4), class_mm=round(w0, 4), under_mm=under, zoned=zoned,
+                )
+                if not zoned:
+                    pairs = [(tuple(x.a), tuple(x.b)) for x in mine]
+                    row = _verdict(_walk_pairs(row, nodes, pairs))
+                out[name] = {**asdict(row), "carries": None if row.carries == math.inf else row.carries}
+    return out
+
+
+def _rate_necks(nodes: list[Node], necks: frozenset) -> list[Node]:
+    """The accepted pad necks rated like the pad they leave (decision 1); every other node as it is."""
+    if not necks:
+        return nodes
+    return [replace(n, amps=math.inf) if n.key[0] == "seg" and _bar_key_of(n) in necks else n for n in nodes]
+
+
+def _pour_joints(row: Bottleneck, nodes: list[Node], amps: float) -> Bottleneck:
+    """A zoned net that declares `amps=`: its vias that rate under that current (barrels within
+    `VIA_PARALLEL_MM` counted together, as `net_nodes` rates them). The pour is the conductor, but a
+    pad on the other layer reaches it only through its vias, and version 1 sizes none of them by
+    current; a row with such a via is `not rated: pour`, never `ok` (refutation round 1, defect 1:
+    buck's `GND` declared 2 A and reached the pour through single 0.5/0.3 mm vias, 0.707 A each, while
+    the row said `ok`)."""
+    vias = [n for n in nodes if n.key[0] == "via" and n.amps < math.inf]
+    weak = [n for n in vias if n.amps + 1e-9 < amps * (1.0 - CURVE_EPS)]
+    if not weak:
+        return row
+    worst = min(weak, key=lambda n: (n.amps, _at([n])))
+    text = (
+        f"{len(weak)} of its {len(vias)} vias rate under {amps:g} A (the weakest {worst.amps:.3f} A at {_at([worst])}); "
+        f"version 1 does not size a poured net's vias by current (docs/net-path-physics.md §10 A), so which pad's joint "
+        f"carries the {amps:g} A is not checked"
+    )
+    return Bottleneck(**{**asdict(row), "pour_vias": text, "verdict": "not rated: pour"})
+
+
+def _walk_pairs(row: Bottleneck, nodes: list[Node], pairs) -> Bottleneck:
+    """The worst widest path between each given pair's two sides (pad-set pairs)."""
+    by_pad: dict[str, list[tuple]] = {}
+    for n in nodes:
+        if n.key[0] == "pad":
+            by_pad.setdefault(n.key[1], []).append(n.key)
+    if not pairs:
+        return row
+    adj = _adjacency(nodes)
+    amps = {n.key: n.amps for n in nodes}
+    width = {n.key: round(n.shape.r * 2.0, 4) for n in nodes if n.key[0] == "seg"}
+    worst: tuple[float, str] | None = None
+    for a_side, b_side in pairs:
+        src = [k for pid in a_side for k in by_pad.get(pid, ())]
+        dst = [k for pid in b_side for k in by_pad.get(pid, ())]
+        if not src or not dst:
             continue
-        # Every net on the board's pads as well as every net with copper: a declared rail the build left
-        # with no copper at all (an unfinished net ships none, docs/direction.md §5) reads `open`, and
-        # does not drop out of the table (the refuters' D1 fix emptied node's and c3_usb's `VBUS`).
-        # A net on one pad has nothing to join and stays out, as it did (blinky's `VCC`).
-        pad_count: dict[str, set] = {}
-        for p in pads:
-            if p.net:
-                pad_count.setdefault(p.net, set()).add((p.ref, p.num))
-        on_board = set(census) | {n for n, ps in pad_count.items() if len(ps) >= 2}
-        for name in sorted(n for n in on_board if any(fnmatch.fnmatch(n, p) for p in net.patterns)):
-            if name in out:
-                continue
-            c = cs.by_net(name)
-            if c is None or c.current is None:
-                continue
-            cur = c.current
-            need = round(max(cur.width_ipc2221.value, cur.width_ipc2152.value), 4)
-            cls = round(float(c.width_mm.value), 4)
-            # The zone **in the file**, and nothing else: whether a rail is poured is read off the
-            # emitted board, where every pour the route stage wrote is a zone, and never predicted
-            # from `job.planes` (a prediction is how a move could silence a rail it did not pour).
-            zoned = bool(census.get(name, {}).get("zone"))
-            nodes = net_nodes(text, name, pads, dt=cur.temp_rise_c, stack=cs.stackup, plane_h=cur.plane_h_mm)
-            if redundant:
-                # Filtered before `_adjacency` and before `under_mm`, so a shield is neither counted
-                # as narrow rail nor offered to the widest-path walk as a rung of one. The key is
-                # rebuilt from the node's own shape rather than carried, because `net_nodes` is the
-                # one reader of the board's copper here and `bar_key` is the one spelling of a piece.
-                nodes = [n for n in nodes if _bar_key_of(n) not in redundant]
-            under = round(sum(n.mm for n in nodes if n.key[0] == "seg" and n.amps < math.inf and n.mm and _narrow(n, cls)), 3)
-            row = Bottleneck(
-                net=name,
-                amps=float(cur.amps),
-                carries=math.inf,
-                width_mm=0.0,
-                kind="track",
-                where="",
-                need_mm=need,
-                class_mm=cls,
-                under_mm=under,
-                zoned=zoned,
-            )
-            if not zoned:
-                row = _verdict(_walk(row, nodes, pads, name))
-            out[name] = {**asdict(row), "carries": None if row.carries == math.inf else row.carries}
+        best = widest_path(adj, amps, src)
+        hit = [best[k] for k in dst if k in best]
+        got = max(hit) if hit else -1.0
+        tag = f"{'/'.join(a_side)}->{'/'.join(b_side) if len(b_side) <= 3 else b_side[0] + '/...'}"
+        if worst is None or got < worst[0]:
+            worst = (got, tag)
+    if worst is None:
+        return row
+    carries, where = worst
+    if carries < 0:
+        return Bottleneck(**{**asdict(row), "carries": 0.0, "kind": "open", "where": where})
+    at = [n for n in nodes if abs(n.amps - carries) < 1e-9]
+    kind = "via" if at and all(n.key[0] == "via" for n in at) else "track"
+    w = min((width[n.key] for n in at if n.key in width), default=0.0)
+    return Bottleneck(**{**asdict(row), "carries": round(carries, 3), "kind": kind, "width_mm": w, "where": where, "at_mm": _at(at)})
+
+
+def _planes_of(cs, c) -> dict[str, float | None]:
+    """`{layer: height to its reference}` for the net's layers, as the compiler sized each (§4.6)."""
+    from .constraints import _reference_for
+
+    out: dict[str, float | None] = {}
+    for lay in cs.stackup.copper_layers():
+        # The compiler's own reading: the pours the board will have (`cs.planes`: `Board(planes=)` on
+        # four layers, the back GND pour on two when GND is a power net, else none).
+        ref = _reference_for(cs.stackup, lay, tuple(cs.planes))
+        out[lay] = ref[0] if ref is not None else None
     return out
 
 
@@ -366,49 +454,6 @@ def _bar_key_of(node: Node) -> tuple:
         cy = sum(p[1] for p in pts) / len(pts)
         return bar_key("via", (cx, cy))
     return ("pad", node.key)
-
-
-def _walk(row: Bottleneck, nodes: list[Node], pads: list, net: str) -> Bottleneck:
-    by_pad: dict[str, list[tuple]] = {}
-    for n in nodes:
-        if n.key[0] == "pad":
-            by_pad.setdefault(n.key[1], []).append(n.key)
-    if len(by_pad) < 2:
-        return row
-    adj = _adjacency(nodes)
-    amps = {n.key: n.amps for n in nodes}
-    width = {n.key: round(n.shape.r * 2.0, 4) for n in nodes if n.key[0] == "seg"}
-    ids = sorted(by_pad)
-    worst: tuple[float, str, tuple] | None = None
-    for a in ids:
-        best = widest_path(adj, amps, by_pad[a])
-        for b in ids:
-            if b <= a:
-                continue
-            hit = [best[k] for k in by_pad[b] if k in best]
-            got = max(hit) if hit else -1.0
-            if worst is None or got < worst[0]:
-                worst = (got, f"{a}->{b}", ())
-    if worst is None:
-        return row
-    carries, where, _ = worst
-    if carries < 0:
-        return Bottleneck(**{**asdict(row), "carries": 0.0, "kind": "open", "where": where})
-    # Which piece is the bottleneck, and how wide it is — a via has no width a class can be compared
-    # against, so `width_mm` is 0.0 there and `kind` says which number to read.
-    at = [n for n in nodes if abs(n.amps - carries) < 1e-9]
-    kind = "via" if at and all(n.key[0] == "via" for n in at) else "track"
-    w = min((width[n.key] for n in at if n.key in width), default=0.0)
-    return Bottleneck(
-        **{
-            **asdict(row),
-            "carries": round(carries, 3),
-            "kind": kind,
-            "width_mm": w,
-            "where": where,
-            "at_mm": _at(at),
-        }
-    )
 
 
 def _at(nodes: list[Node]) -> str:
@@ -450,7 +495,10 @@ def bottleneck_lines(rows: dict[str, dict]) -> list[str]:
     out = []
     for name, r in sorted(rows.items()):
         if r["zoned"]:
-            out.append(f"{name}: a zone carries {r['amps']:g} A; no series track to measure")
+            if r.get("pour_vias"):
+                out.append(f"{name}: a zone carries {r['amps']:g} A; {r['pour_vias']} [{r['verdict']}]")
+            else:
+                out.append(f"{name}: a zone carries {r['amps']:g} A; no series track to measure")
             continue
         carries = r["carries"]
         piece = f"{r['width_mm']:g} mm track" if r["kind"] == "track" else f"one {r['kind']}"
@@ -490,7 +538,8 @@ def _plane_layer(layers: Sequence[str], taken: Sequence[tuple[str, str]] = ()) -
 def power_moves(
     rows: dict[str, dict], layers: Sequence[str] = (), planes: Sequence[tuple[str, str]] = ()
 ) -> list[str]:
-    """The rails that cannot carry what the board declares, phrased as the edits that fix them.
+    """The rails that cannot carry what the board declares, as warnings: the measured facts, no edit
+    (docs/direction.md §7b; the four edits this used to list are below for the record).
 
     `bottleneck_lines` is the *ledger* — every power net, passing or not, in `FAB_NOTES.md` for a
     person reading the electrics. This is the *move*: only the nets whose verdict is not `ok`, each
@@ -527,16 +576,21 @@ def power_moves(
     edit only the author can make, and a gate that stops a board on one teaches an author to pass
     `--force`, which is worse than a move they read.
     """
-    plane = _plane_layer(layers, planes)
+    del layers, planes  # kept in the signature: callers pass them; no edit names a plane any more
     out = []
     for name, r in sorted(rows.items()):
+        if r["zoned"] and r.get("verdict") == "not rated: pour" and r.get("pour_vias"):
+            # Not a width and not a placement: no edit to board.py sizes these joints in version 1,
+            # and saying `ok` is what shipped them silently.
+            out.append(f"{name}: declared {r['amps']:g} A and is poured; {r['pour_vias']} [not rated: pour]")
+            continue
         if r["zoned"] or r.get("verdict", "ok") == "ok":
             continue
         head = f"{name}: "
         if r["verdict"] == "open":
             out.append(
                 head + f"declared {r['amps']:g} A and no copper joins {r['where']}; the route left "
-                f"the rail in two pieces — this is a tool bug, not a board move, so report it"
+                f"the rail in two pieces (a pcbc defect)"
             )
             continue
         carries = r["carries"] or 0.0
@@ -566,43 +620,12 @@ def power_moves(
             why = (
                 f"declared {r['amps']:g} A, carries {carries:g} A through its narrowest {piece} {at}"
             )
-        # Every edit below is an edit to a line the board **already has**. A move that reads as a
-        # new statement is a build refusal, not a fix: a second `NetReq("VIN", ...)` is refused
-        # twice over (`kind="generic"` does not take `amps=`, and the net is already named by
-        # another NetReq), and a second bare `Board()` raises before `check` even runs.
-        edits = []
-        if not at_floor and r["kind"] != "via":
-            # A shorter path is a narrower one less often: the neck is the leftover router filling a
-            # gap the patterns did not span, and a gap is a placement fact. Left out at the floor,
-            # where the copper is on the curve already and the number it misses is a constant — and
-            # left out for a via, where it is simply the wrong advice (`lead`, below).
-            edits.append("Place() the parts either side of that copper closer together")
-        if plane:
-            edits.append(f'pour it: add ("{name}", "{plane}") to your Board(planes=...)')
-        if not at_floor:
-            edits.append(f'change amps= on the NetReq that already declares "{name}"')
-        # The one sentence a via bottleneck gets that a track does not (`docs/stitch-plan.md` §5).
-        # Every edit above is about **width**, and a barrel has none: `via_amps` is a function of the
-        # drill and the plating, both the fab's, so no `Place()` and no shorter path moves a single
-        # ampere through it. What a via bottleneck wants is a second via beside it, which is
-        # technique 1 — and until S4 places one, saying so is the whole of the honest answer.
-        # `_verdict` only stamps `under floor` on a track, so a via row is always `under current`
-        # here and the `amps=` edit is always offered: this never leaves the move with no edit at all.
-        lead = (
-            "A barrel's rating is a count of vias and not a width — `stackup.via_amps` is the drill "
-            "and the plating, both the fab's — so no Place() and no shorter path moves another ampere "
-            "through it; what this wants is a second via beside it, which `patterns/stitch.py` places "
-            "where the ring has room, so a `stitch` move above this line names what took the room. "
-            if r["kind"] == "via"
-            else ""
-        )
-        tail = (
-            ", or ".join(edits)
-            if edits
-            else "No board.py edit widens it: the copper is the leftover router's and R3 owns its width"
-        )
+        # Facts only (docs/direction.md §7b): no edit is proposed. A via's rating is a count of
+        # barrels, not a width (`stackup.via_amps` is the drill and the plating, both the fab's), and
+        # that is said, since a width number would read as if one applied to it.
+        lead = " A via's rating is set by its drill and plating (stackup.via_amps), not by a width." if r["kind"] == "via" else ""
         out.append(
             head + why + f" ({r['under_mm']:g} mm of this net is narrower than its {r['class_mm']:g} mm "
-            f"class{seen}). " + lead + tail[0].upper() + tail[1:]
+            f"class{seen})." + lead
         )
     return out

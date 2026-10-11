@@ -1,15 +1,20 @@
-"""Saved pictures of the example schematics.
+"""Saved pictures of the example schematics, two per board (docs/schematic-layout.md §7).
 
-A pull request that changes how a sheet is drawn updates the picture in
-``tests/benchmarks/schematics``. Vibes reads ``vibes.images.json`` and posts
-current, new, and the difference; the first time a picture is saved, current
-and the difference are empty. The check itself is the drawing (the SVG with
-the export date removed), so a different font renderer does not fail a run
-whose sheet did not move.
+``<board>.png`` is the sheet with the board's ``schematic.core.py`` (the cleaned-up sheet); ``<board>.auto.png`` is the
+bare auto-layout, drawn with no core (``load_board(path, schematic_core=False)``), so a lock can never hide a regression
+in the auto-layout. A pull request that changes how a sheet is drawn updates its picture in
+``tests/benchmarks/schematics``. Vibes reads ``vibes.images.json`` and posts current, new, and the difference; the first
+time a picture is saved, current and the difference are empty. The check is the drawing (the SVG with the export date
+removed), so a different font renderer does not fail a run whose sheet did not move.
+
+Each picture has its readability vector beside it (``<board>.score.json``, ``<board>.auto.score.json``; text boxes from
+KiCad's own SVG, ``sch_score.kicad_vector``). A hard number above 0 fails, and so does a soft number worse than the
+saved one, unless the run saves the new ones (``PCBC_UPDATE_SCHEMATICS=1``).
 """
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -42,20 +47,35 @@ def normalize_svg(svg: str) -> str:
     return svg.replace("\r\n", "\n")
 
 
-def render_sheet(board: Path, name: str) -> str:
-    """Draw ``board`` and return the cropped schematic SVG."""
+MODES = (("", True), (".auto", False))  # (file suffix, with the board's schematic.core.py)
+# The soft numbers a picture may not get worse on, and which way is worse (§7 item 3).
+RATCHET = {
+    "lint_issues": 1, "labels": 1, "label_partner_mm": 1, "wrong_way_up": 1, "upside_down_power": 1, "text_crowding": 1,
+    "ambiguous_names": 1, "tight_pairs": 1, "extent_area": 1,
+}
+
+
+def render_sheet(board: Path, name: str, *, schematic_core: bool = True) -> tuple[str, dict]:
+    """Draw ``board`` (with its schematic.core.py, or none) and return the cropped SVG and the readability vector."""
+    from .sch_score import kicad_vector
+
     with tempfile.TemporaryDirectory() as td:
         dest = Path(td)
         sch = dest / f"{name}.kicad_sch"
-        emit_schematic_file(load_board(board), sch, title=name)
+        report: dict = {}
+        emit_schematic_file(load_board(board, core=False, schematic_core=schematic_core), sch, title=name, report=report)
         subprocess.run(
             [str(kicad_cli()), "sch", "export", "svg", "--exclude-drawing-sheet", "--no-background-color", "-o", str(dest), str(sch)],
             check=True,
             capture_output=True,
             text=True,
         )
-        produced = next(dest.glob("*.svg"))
-        return crop_svg_to_content(normalize_svg(produced.read_text()), pad_mm=6.0, px_per_mm=8.0)
+        raw = next(dest.glob("*.svg")).read_text()
+        vec = kicad_vector(sch, report, svg=raw)
+        w, h = vec.get("extent_mm") or (0.0, 0.0)
+        vec = {k: v for k, v in vec.items() if not k.startswith("_") and k not in ("svg_texts_matched", "svg_texts_unmatched")}
+        vec["extent_area"] = round(w * h, 1)
+        return crop_svg_to_content(normalize_svg(raw), pad_mm=6.0, px_per_mm=8.0), vec
 
 
 def rasterize(svg: str, dest: Path, width: int = 1400) -> None:
@@ -116,17 +136,35 @@ def _page(rows: list[tuple[str, bool]]) -> None:
     (OUT / "index.html").write_text("\n".join(parts))
 
 
-def check_board(name: str, board: Path, *, update: bool) -> str | None:
-    """Return an error string when the saved picture is not what the tool draws."""
-    svg = render_sheet(board, name)
-    golden_svg = GOLDEN / f"{name}.svg"
-    golden_png = GOLDEN / f"{name}.png"
-    folder = OUT / name
+def score_errors(name: str, vec: dict, saved: dict | None) -> list[str]:
+    """A hard number above 0, or a soft number worse than the saved picture's, as facts."""
+    out = [f"{name}: {k} {m}" for k, ms in (vec.get("detail") or {}).items() for m in ms]
+    if saved:
+        for k in RATCHET:
+            if k in vec and k in saved and vec[k] is not None and saved[k] is not None and vec[k] > saved[k] + 0.05:
+                out.append(f"{name}: {k} is {vec[k]}, worse than the saved {saved[k]}")
+    return out
+
+
+def check_board(name: str, board: Path, *, update: bool, schematic_core: bool = True) -> str | None:
+    """Return an error string when the saved picture is not what the tool draws, or its scores fail."""
+    suffix = "" if schematic_core else ".auto"
+    svg, vec = render_sheet(board, name, schematic_core=schematic_core)
+    stem = f"{name}{suffix}"
+    golden_svg = GOLDEN / f"{stem}.svg"
+    golden_png = GOLDEN / f"{stem}.png"
+    golden_score = GOLDEN / f"{stem}.score.json"
+    folder = OUT / stem
+    saved = json.loads(golden_score.read_text()) if golden_score.exists() else None
+    errors = score_errors(stem, vec, None if update else saved)
     if update:
         GOLDEN.mkdir(parents=True, exist_ok=True)
         golden_svg.write_text(svg)
         rasterize(svg, golden_png)
-        return None
+        golden_score.write_text(json.dumps({k: v for k, v in vec.items() if k != "detail"}, indent=1, sort_keys=True) + "\n")
+        return "; ".join(errors) if errors else None
+    if errors:
+        return "; ".join(errors)
     if not golden_svg.exists():
         return f"{name}: no saved schematic picture. Run with PCBC_UPDATE_SCHEMATICS=1."
     if golden_svg.read_text() == svg:
@@ -138,10 +176,10 @@ def check_board(name: str, board: Path, *, update: bool) -> str | None:
         shutil.copyfile(golden_png, folder / "current.png")
         write_diff(golden_png, folder / "new.png", folder / "diff.png")
     return (
-        f"{name}: the schematic picture changed. "
+        f"{stem}: the schematic picture changed. "
         f"Open {OUT / 'index.html'} for the saved picture, the new one, and the difference. "
         f"If the new picture is right, run PCBC_UPDATE_SCHEMATICS=1 pytest tests/test_schematic_bench.py "
-        f"and commit tests/benchmarks/schematics/{name}.svg and {name}.png."
+        f"and commit tests/benchmarks/schematics/{stem}.svg, {stem}.png and {stem}.score.json."
     )
 
 
@@ -153,10 +191,11 @@ def main() -> None:
     errors: list[str] = []
     rows: list[tuple[str, bool]] = []
     for name, board in BOARDS:
-        err = check_board(name, board, update=update)
-        rows.append((name, err is not None))
-        if err:
-            errors.append(err)
+        for suffix, core in MODES:
+            err = check_board(name, board, update=update, schematic_core=core)
+            rows.append((name + suffix, err is not None))
+            if err:
+                errors.append(err)
     if not update:
         _page(rows)
     if errors:

@@ -5,6 +5,8 @@ import pytest
 from pcbc.build import build_job
 from pcbc.language import check_board, load_board
 from pcbc.review import review_job
+from conftest import write_split
+from conftest import copy_board_file
 
 BOARD = Path(__file__).resolve().parent.parent / "examples" / "c3_usb" / "c3_usb.py"
 
@@ -40,7 +42,8 @@ def test_c3_usb_uses_library_symbol_pins():
 
 def test_c3_usb_sch_no_symbol_overlap():
     from pcbc.sch_emit import _parts_from_design
-    from pcbc.sch_place import _overlap_body, apply_sch_places
+    from pcbc.sch_place import _overlap_body
+    from pcbc.sch_auto import resolve as apply_sch_places
 
     d = load_board(BOARD)
     kinds = {n.name: n.kind for n in d.nets.values()}
@@ -74,7 +77,7 @@ def test_c3_usb_readability_bar():
 
 def test_c3_usb_upto_place(tmp_path: Path):
     board = tmp_path / "c3_usb.py"
-    board.write_text(BOARD.read_text())
+    copy_board_file(board, BOARD)
     # Components are loaded relative to the board file; copy the tree.
     import shutil
 
@@ -96,7 +99,7 @@ def test_c3_usb_review(tmp_path: Path):
     import shutil
 
     board = tmp_path / "c3_usb.py"
-    board.write_text(BOARD.read_text())
+    copy_board_file(board, BOARD)
     shutil.copytree(BOARD.parent / "components", tmp_path / "components")
     built = build_job(board, upto="place", force=True)
     assert built.get("error") is None, built
@@ -107,3 +110,7 @@ def test_c3_usb_review(tmp_path: Path):
     assert 'data-tab="sch"' in page
     assert 'data-tab="three"' in page
     assert "USB_DP" in page or "J1" in page
+    # and the static page beside it: no script, every section with its pictures (four 3D renders of the placed board)
+    static = Path(result["static_html"])
+    assert static.parent == html.parent and static.name == "static.html" and result["static_problems"] == [], result
+    assert "<script" not in static.read_text().lower() and result["static_bytes"] == static.stat().st_size

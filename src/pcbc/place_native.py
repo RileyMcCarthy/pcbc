@@ -3,7 +3,7 @@ objects, in memory. No board file is written or read, and no board text is searc
 
 `place(design, name=, base=)` does what the place stage always did — the seed grid, `Place()`
 resolved in file order (`pcb_place.resolve_places`), fiducials, the silkscreen references
-(`silk.silk_plan`, three rounds, decaps may hide), the placement reports (`pcb_place.layout_report`,
+(`silk.silk_plan`: a reference with no free spot is hidden and noted; no part moves for it), the placement reports (`pcb_place.layout_report`,
 `route_checks.route_aware_report`) — over the **Python model**: every part is its `.kicad_mod` read
 once (`foot_native.lib_foot`) and posed by a `Pose` (`foot_native.PosedFoot`), starting at its seed
 spot (`seed_feet`). The `Pose`s come from the resolved `Place` objects (`poses_of_places`), never from
@@ -46,6 +46,13 @@ class Placement:
     applied: dict = field(default_factory=dict)
     error: str | None = None
     feet: tuple = ()  # `foot_native.posed_feet(design, poses)`: what the router and the placer read the parts from
+    marks: list = field(default_factory=list)  # the orientation marks the silk pass generated (`orient`): `gr_*` on F.SilkS
+    orient_errors: list = field(default_factory=list)  # facts: a required mark with no legal spot, a core mark naming another pin
+
+    @property
+    def orient_error(self) -> str | None:
+        """The build's refusal for `orient_errors` (docs/direction.md §4c), or None."""
+        return ("orientation: " + "; ".join(self.orient_errors)) if self.orient_errors else None
     _emit: tuple | None = field(default=None, repr=False)
     _text: str | None = field(default=None, repr=False)
 
@@ -65,19 +72,6 @@ def kicad_angle(rot: float) -> float:
     if r > 180.0:
         r -= 360.0
     return 0.0 if abs(r) < 1e-12 else r
-
-
-def _decaps(design: Design) -> list[str]:
-    """Two-pin caps between a supply and a ground: their distance to the pin beats their label."""
-    kinds = {n.name: getattr(n, "kind", "") for n in design.nets.values()}
-    out = []
-    for inst in design.instances:
-        if not inst.ref.startswith("C") or len(inst.pins) != 2:
-            continue
-        ks = {kinds.get(net, "") for net in inst.pins.values()}
-        if ks == {"power", "ground"}:
-            out.append(inst.ref)
-    return out
 
 
 def copper_layer_order(n: int) -> tuple[str, ...]:
@@ -147,17 +141,18 @@ def _keepout_pour(name: str, layers: tuple[str, ...], box, keep: dict) -> Copper
     )
 
 
-def place_objects(job: CompiledJob, name: str) -> tuple[list[Graphic], list[Copper]]:
-    """The outline, the slots, the keepouts and the rule areas of this compiled job, as layout objects."""
+def place_objects(job: CompiledJob, name: str, outline=None) -> tuple[list[Graphic], list[Copper]]:
+    """The outline, the slots, the keepouts and the rule areas of this compiled job, as layout objects. `outline`
+    (x0, y0, x1, y1) is the rectangle they are drawn to; the job's own by default (docs/board-outline.md B.3 step 5)."""
     from .apply import SLOT_WEB_MM, SLOT_WIDTH_MM
 
-    w, h = job.board_size_mm
+    x0, y0, x1, y1 = outline if outline is not None else job.outline
     uid = stable_uuid(name, "edge")
     graphics = [
         Graphic(
             "gr_rect",
             f"rect-{uid[:8]}",
-            {"start": (0.0, 0.0), "end": (float(w), float(h)), "radius": None, "width": 0.05, "stroke_type": "default", "stroke_color": None, "fill": False, "locked": False, "layer": "Edge.Cuts", "layers": None, "solder_mask_margin": None, "net": None, "uuid": uid},
+            {"start": (float(x0), float(y0)), "end": (float(x1), float(y1)), "radius": None, "width": 0.05, "stroke_type": "default", "stroke_color": None, "fill": False, "locked": False, "layer": "Edge.Cuts", "layers": None, "solder_mask_margin": None, "net": None, "uuid": uid},
             source="gen",
         )
     ]
@@ -173,21 +168,27 @@ def place_objects(job: CompiledJob, name: str) -> tuple[list[Graphic], list[Copp
         copper.append(_keepout_pour(ko.name, _zone_layers(("F&B.Cu", "In1.Cu", "In2.Cu"), job.layers), ko.box, keep))
     if job.constraints is not None:
         allowed = {k: "allowed" for k in ("tracks", "vias", "pads", "copperpour", "footprints")}
-        for area in job.constraints.rule_areas:
+        cs = job.constraints
+        if outline is not None and job.derived is not None:
+            from .constraints import respan_rule_areas
+
+            cs = respan_rule_areas(cs, (x0, y0, x1, y1))
+        for area in cs.rule_areas:
             copper.append(_keepout_pour(area.name, _zone_layers(area.layers, job.layers), area.box, dict(allowed)))
-        areas = {a.name: a for a in job.constraints.rule_areas}
+        areas = {a.name: a for a in cs.rule_areas}
         for spec in job.constraints.isolation_specs:
             sname = f"ISO_{spec.req.a}_{spec.req.b}"
             area = areas.get(sname)
             if area is None or not spec.req.slot:
                 continue
-            x0, y0, x1, y1 = area.box
+            ax0, ay0, ax1, ay1 = area.box
+            # The slot is recomputed from the outline with its webs (docs/board-outline.md B.3 step 5).
             if spec.axis == "x":
-                cx = (x0 + x1) / 2
-                a, b = (cx - SLOT_WIDTH_MM / 2, SLOT_WEB_MM), (cx + SLOT_WIDTH_MM / 2, h - SLOT_WEB_MM)
+                cx = (ax0 + ax1) / 2
+                a, b = (cx - SLOT_WIDTH_MM / 2, y0 + SLOT_WEB_MM), (cx + SLOT_WIDTH_MM / 2, y1 - SLOT_WEB_MM)
             else:
-                cy = (y0 + y1) / 2
-                a, b = (SLOT_WEB_MM, cy - SLOT_WIDTH_MM / 2), (w - SLOT_WEB_MM, cy + SLOT_WIDTH_MM / 2)
+                cy = (ay0 + ay1) / 2
+                a, b = (x0 + SLOT_WEB_MM, cy - SLOT_WIDTH_MM / 2), (x1 - SLOT_WEB_MM, cy + SLOT_WIDTH_MM / 2)
             suid = stable_uuid("slot", sname)
             graphics.append(
                 Graphic(
@@ -200,6 +201,16 @@ def place_objects(job: CompiledJob, name: str) -> tuple[list[Graphic], list[Copp
     return graphics, geometry_uuids(copper, name)
 
 
+def seed_columns(design: Design) -> int:
+    """The seed grid's columns: `outline width // 8` of a declared outline, 5 with none (derived mode refuses a part
+    with no Place(), so no grid spot is ever a final pose there; docs/board-outline.md B.5-2)."""
+    from .layout import declared_outline
+
+    rect, _src, _line = declared_outline(design)
+    w = rect[2] - rect[0] if rect is not None else 40.0
+    return max(int(w // 8), 1)
+
+
 def seed_feet(design: Design) -> tuple:
     """Every part at its seed pose — the grid `seed.emit_pcb` lays them on, in `design.instances`
     order, `(5 + 8 * col, 5 + 8 * row)` with `Board(width) // 8` columns, turned 0, on F.Cu — each with
@@ -210,8 +221,7 @@ def seed_feet(design: Design) -> tuple:
 
     if design.board is None:
         raise ValueError("no Board()")
-    w, _h = design.board.size_mm
-    cols = max(int(w // 8), 1)
+    cols = seed_columns(design)
     nets_of = _pins_of(design)
     out = []
     for i, inst in enumerate(design.instances):
@@ -234,7 +244,9 @@ def poses_of_places(design: Design, job: CompiledJob, seeds, fids) -> tuple[list
     from .layout import resolve_place, resolve_regions
     from .model import BoardSpec
 
-    board = BoardSpec(size_mm=job.board_size_mm, padding=job.padding, layers=job.layers, stackup=job.stackup, pcb=job.pcb, planes=job.planes)
+    from .pcb_place import _board_of
+
+    board = _board_of(job)
     regions = resolve_regions(board, job.regions)
     libs = {pf.ref: pf.lib for pf in seeds}
     resolved = []
@@ -261,30 +273,75 @@ def poses_of_places(design: Design, job: CompiledJob, seeds, fids) -> tuple[list
     return sorted(poses, key=lambda p: p.ref), missing, resolved, written
 
 
-def silk_parts(posed, written: dict, order: list[str]) -> list[dict]:
+def silk_parts(posed, written: dict, order: list[str], design: Design | None = None) -> list[dict]:
     """The parts as the silkscreen pass reads them (`silk.silk_part`), in board order (`order`: the
     seed's instance order, then the fiducials), from each part's `.kicad_mod` and its pose — the angle
-    as the board text writes it (`:g`), and each pad's board angle (library + footprint, `apply._turn_pads`)."""
-    from .css import rotate_local_bounds
-    from .silk import _rot_pt, silk_part
+    as the board text writes it (`:g`); each pad's mask opening at its board angle (library + footprint).
+    With `design`, each of its parts also as the orientation rules read it (`orient.part_of`: its symbol
+    pins, kind and prefix from `board.py`, its body from its `.kicad_mod`)."""
+    from .orient import part_of, pins_of
+    from .silk import pad_box, silk_part
 
     by = {pf.ref: pf for pf in posed}
+    insts = {i.ref: i for i in design.instances} if design is not None else {}
     out = []
     for ref in order:
         pf = by[ref]
-        rot = written[ref]
-        at = (pf.at[0], pf.at[1], rot)
+        at = (pf.at[0], pf.at[1], written[ref])
+        pads = [b for b in (pad_box(sp, at) for sp in pf.lib.pads) if b is not None]
+        op = None
+        inst = insts.get(ref)
+        if inst is not None:
+            op = part_of(ref, at, pf.lib.pads, body=pf.lib.body, pins=pins_of(inst), kind=inst.part.kind, prefix=inst.part.prefix)
+            op["layer"] = pf.layer
+        out.append(silk_part(ref, at, pf.lib.silk_crtyd, pf.lib.silk_shapes, pads, orient=op))
+    return out
 
-        def pads(pf=pf, rot=rot, at=at):
-            boxes = []
-            for px, py, a, w, h in pf.lib.silk_pads:
-                prot = a if abs(rot) < 1e-9 else _written((a + rot) % 360, "g")
-                x0, y0, x1, y1 = rotate_local_bounds(-w / 2, -h / 2, w / 2, h / 2, 0.0 if prot == 360 else prot)
-                cx, cy = _rot_pt(px, py, at[2])
-                boxes.append((at[0] + cx + x0, at[1] + cy + y0, at[0] + cx + x1, at[1] + cy + y1))
-            return boxes
 
-        out.append(silk_part(ref, at, pf.lib.silk_crtyd, pf.lib.silk_silk, pads))
+def core_silk(design: Design) -> list[tuple[str, dict]]:
+    """Every `layout.core.py` drawing on `F.SilkS` (a circle, polygon, line, rectangle or arc) as (its line, a world
+    silk shape): the silk pass keeps clear of it, and the orientation rules count it as a mark."""
+    from .layout_prims import flat_points
+    from .orient import graphic_shape
+    from .silk import _arc_points
+    import math
+
+    out = []
+    for g in design.graphics:
+        f = g.f
+        if g.source != "core" or f.get("layer") != "F.SilkS" or g.kind not in ("gr_circle", "gr_poly", "gr_line", "gr_rect", "gr_arc"):
+            continue
+        if g.kind == "gr_circle":
+            (cx, cy), (ex, ey) = f["center"], f["end"]
+            r = math.hypot(ex - cx, ey - cy)
+            pts = tuple((cx + r * math.cos(2 * math.pi * k / 32), cy + r * math.sin(2 * math.pi * k / 32)) for k in range(32))
+        elif g.kind == "gr_poly":
+            pts = tuple(flat_points(f["pts"]))
+        elif g.kind == "gr_rect":
+            (x0, y0), (x1, y1) = f["start"], f["end"]
+            pts = ((x0, y0), (x1, y0), (x1, y1), (x0, y1))
+        elif g.kind == "gr_arc":
+            pts = tuple(_arc_points(f["start"], f["mid"], f["end"]))
+        else:
+            pts = (f["start"], f["end"])
+        tag = {"gr_circle": "fp_circle", "gr_poly": "fp_poly", "gr_rect": "fp_rect", "gr_arc": "fp_arc", "gr_line": "fp_line"}[g.kind]
+        out.append((g.where or g.id or "layout.core.py", graphic_shape(tag, pts, float(f.get("width") or 0.0), f.get("fill") is True)))
+    return out
+
+
+def mark_graphics(marks: list[dict], name: str) -> list[Graphic]:
+    """Each generated orientation mark (`orient.plan`'s) as the board primitive it is: a filled `gr_circle` or
+    `gr_poly` on F.SilkS, every field explicit, its uuid derived from the board, the part and the pad."""
+    out = []
+    for m in marks:
+        prim = m["prim"]
+        uid = stable_uuid(name, "orient", m["ref"], m["pad"])
+        common = {"width": prim["width"], "stroke_type": "solid", "stroke_color": None, "fill": True, "locked": False, "layer": "F.SilkS", "layers": None, "solder_mask_margin": None, "net": None, "uuid": uid}
+        if prim["kind"] == "gr_circle":
+            f = {"center": prim["center"], "end": prim["end"], **common}
+        else:
+            f = {"pts": tuple(prim["pts"]), **common}
+        out.append(Graphic(prim["kind"], f"{prim['kind'].replace('gr_', '')}-{uid[:8]}", f, source="gen"))
     return out
 
 
@@ -293,61 +350,78 @@ def place(design: Design, *, name: str, base: Path | None = None) -> Placement:
     `layout/<name>/`): the footprints' 3D model paths are written relative to it."""
     from .foot_native import posed_feet
     from .model import KeepoutSpec
-    from .pcb_place import FID_HALF, GAP, layout_report, resolve_places
+    from .pcb_place import FID_HALF, layout_report, resolve_places
     from .route_checks import route_aware_report
     from .silk import silk_plan
+    from .stackup import get_stackup, silk_limits
 
     job = compile_design(design)
     seeds = seed_feet(design)
     specs = list(job.places)
-    decaps = frozenset(_decaps(design))
     declared = {s.ref for s in specs}
-    moves: list[str] = []
-    silk: dict = {}
-    decisions: dict = {}
-    missing: list[str] = []
-    resolved: list = []
-    fids: list = []
-    poses: list[Pose] = []
-    feet: tuple = ()
-    for round_ in range(3):
-        # A part whose silkscreen reference finds no room is placed again with more gap (relations
-        # only); the anchors and the rest stay put. Two rounds, then the report says so.
-        job.places = specs
-        job.keepouts = [k for k in job.keepouts if not k.name.endswith("_mask")]
+    # The silkscreen never moves a part: a reference with no free spot is not printed, and the note
+    # says so (`silk.silk_plan`). Until 2026-10-03 a part whose reference found no room was placed again
+    # with 0.6 mm more gap, up to three rounds, which spread the board for a label.
+    from .outline import OutlineError
+
+    try:
         job.places, moves, fids = resolve_places(design, job, seeds)
-        # The router keeps off a fiducial's copper dot, not its 2 mm mask opening: a track through the
-        # opening is a solder-mask bridge. A keepout the size of its courtyard.
-        for ref, x, y in fids:
-            job.keepouts.append(KeepoutSpec(name=f"{ref}_mask", box=(x - FID_HALF, y - FID_HALF, x + FID_HALF, y + FID_HALF), no=("copper", "via")))
-        poses, missing, resolved, written = poses_of_places(design, job, seeds, fids)
-        feet = posed_feet(design, poses)
-        order = [pf.ref for pf in seeds] + [ref for ref, _x, _y in fids]
-        decisions, silk = silk_plan(silk_parts(feet, written, order), job.board_size_mm, decaps)
-        cramped = {m.split(":")[0] for m in silk.get("issues", [])}
-        retry = [s for s in specs if s.ref in cramped and s.to and s.ref not in decaps]
-        if not retry or round_ == 2:
-            break
-        specs = [replace(s, gap=(s.gap if s.gap is not None else GAP) + 0.6) if s in retry else s for s in specs]
-    graphics, copper = place_objects(job, name)
-    report = list(moves) + layout_report(design, job, feet) + list(silk.get("issues", []))
+    except OutlineError as exc:
+        # A B.5 fact (docs/board-outline.md): the derived outline cannot be made as layout.core.py is written.
+        return Placement(poses=[], graphics=[], copper=[], job=job, error=str(exc))
+    if job.derived is not None and job.constraints is not None:
+        # The isolation corridors run to the routing box R while placing and routing (B.3 step 3).
+        from .constraints import respan_rule_areas
+
+        job.constraints = respan_rule_areas(job.constraints, job.outline)
+    # The router keeps off a fiducial's copper dot, not its 2 mm mask opening: a track through the
+    # opening is a solder-mask bridge. A keepout the size of its courtyard.
+    for ref, x, y in fids:
+        job.keepouts.append(KeepoutSpec(name=f"{ref}_mask", box=(x - FID_HALF, y - FID_HALF, x + FID_HALF, y + FID_HALF), no=("copper", "via")))
+    poses, missing, resolved, written = poses_of_places(design, job, seeds, fids)
+    feet = posed_feet(design, poses)
+    order = [pf.ref for pf in seeds] + [ref for ref, _x, _y in fids]
+    # The silkscreen stays inside the placement's own fit in derived mode (the routed outline only grows past it,
+    # docs/board-outline.md B.3), and inside the declared outline otherwise.
+    silk_box = (job.derived or {}).get("fit") or job.outline
+    decisions, silk = silk_plan(silk_parts(feet, written, order, design), silk_box, silk_limits(get_stackup(job.stackup)), core_silk(design))
+    # The placed board's Edge.Cuts: the declared outline, or the placement-only fit (`pcbc pcb`, B.3); the route stage
+    # draws the derived one again from O after the fit.
+    graphics, copper = place_objects(job, name, outline=job.derived.fit if job.derived is not None else None)
+    report = list(moves) + layout_report(design, job, feet)
     notes = list(silk.get("notes", []))
     route_moves, route_notes = route_aware_report(design, job, feet)
     report += route_moves
     notes += route_notes
+    if job.constraints is not None:
+        from .pcb_place import posed_feet_of
+        from .place_solve import facing_notes, locks_of, needs_of
+
+        notes += facing_notes(list(posed_feet_of(job, feet).values()), needs_of(job.constraints), locks_of(job))
     for p in poses:
         if p.ref not in declared and not p.ref.startswith("FID"):
-            notes.append(f"{p.ref} has no Place() in board.py; it sits at the default grid spot ({p.at[0]:g}, {p.at[1]:g})")
+            notes.append(f"{p.ref} has no Place() in layout.core.py; it sits at the default grid spot ({p.at[0]:g}, {p.at[1]:g})")
     applied = {
         "placed": [p.ref for p in job.places if p.ref not in missing],
         "resolved": [{"ref": p.ref, "at": list(p.at), "rot": p.rot} for p in resolved if p.at is not None],
         "missing": missing,
         "classes": [c.name for c in job.classes],
     }
-    out = Placement(poses=poses, graphics=graphics, copper=copper, job=job, report=report, notes=notes, applied=applied, feet=feet)
+    applied["orientation"] = silk.get("orient_lines", [])
+    out = Placement(poses=poses, graphics=graphics, copper=copper, job=job, report=report, notes=notes, applied=applied, feet=feet, marks=mark_graphics(silk.get("orient_marks", []), name))
     out._emit = (design, name, base, list(fids), dict(decisions))
+    # A polarised part with no mark the fab can read is not a fab-ready board (docs/direction.md §4c): the build's place
+    # stage refuses it (`orient_error`); `place` itself stays a placement (its outline and pose facts are `error`).
+    out.orient_errors = list(silk.get("orient_errors", []))
     if missing:
         out.error = "missing refs: " + ", ".join(missing)
+    else:
+        # Decision 4: a declared placement that blocks every exit of a path's end pad is an error before routing.
+        from .pcb_place import corridor_errors, posed_feet_of
+
+        blocked = corridor_errors(job, posed_feet_of(job, feet))
+        if blocked:
+            out.error = "a path's exit is blocked by declared placement: " + "; ".join(blocked)
     return out
 
 
@@ -361,15 +435,19 @@ def foreign_uuids(design: Design, placement: "Placement", *, name: str) -> dict[
     `.kicad_mod`, two parts) is named by the first, as a reader of the board would."""
     from .seed import pad_nets
 
+    from .silk import silk_gone_uuids
+
     out: dict[str, str] = {}
     insts = {i.ref: i for i in design.instances}
     by = {pf.ref: pf for pf in placement.feet}
+    # A library silk drawing the silkscreen pass trimmed or left out is not on the board as the library has it.
+    gone = silk_gone_uuids(placement._emit[4]) if placement._emit is not None else {}
     for inst in design.instances:
         pf = by.get(inst.ref)
         if pf is None:
             continue
-        owner = f"footprint {inst.ref} (placed from board.py)"
-        mine = [stable_uuid(name, inst.ref), *pf.lib.uuids]
+        owner = f"footprint {inst.ref} (placed from layout.core.py)"
+        mine = [stable_uuid(name, inst.ref), *(u for u in pf.lib.uuids if u not in gone.get(inst.ref, ()))]
         value = inst.value or inst.part.value or inst.part.mpn
         for prop, v in (("Reference", inst.ref), ("Value", value), ("Mpn", inst.part.mpn), ("LCSC", inst.part.lcsc), ("Manufacturer", inst.part.manufacturer)):
             if v and prop not in pf.lib.props:
@@ -380,9 +458,15 @@ def foreign_uuids(design: Design, placement: "Placement", *, name: str) -> dict[
                 mine.append(stable_uuid(name, inst.ref, "pad", sp.num))
         for u in mine:
             out.setdefault(u, owner)
+    if placement._emit is not None:
+        from .silk import silk_uuids
+
+        # The library silk lines the silkscreen pass cut into pieces carry uuids of their own.
+        for u, ref in silk_uuids(placement._emit[4]).items():
+            out.setdefault(u, f"footprint {ref} (placed from layout.core.py)")
     for ref in sorted(r for r in by if r.startswith("FID") and r not in insts):
         for u in (stable_uuid("fiducial", ref), stable_uuid("fiducial", ref, "ref"), stable_uuid("fiducial", ref, "crtyd"), stable_uuid("fiducial", ref, "pad")):
-            out.setdefault(u, f"footprint {ref} (placed from board.py)")
+            out.setdefault(u, f"footprint {ref} (a fiducial the build places)")
     return out
 
 
@@ -400,7 +484,7 @@ def emit_base(design: Design, job: CompiledJob, *, name: str, base: Path | None,
 
     text = strip_layout(emit_pcb(design, name=name, base=base))
     if fids:
-        text, _ = insert_fiducials(text, job.board_size_mm, spots=fids)
+        text, _ = insert_fiducials(text, job.outline, spots=fids)
     text, _missing, _resolved = _apply_places(text, job)
     return apply_silk(text, decisions)
 
@@ -410,4 +494,4 @@ def emitted_text(design: Design, placement: Placement, *, name: str) -> str:
     `check.check_text` judges before any routing (a bad placement never costs a route)."""
     from .layout_emit import emit_board, stamp
 
-    return emit_board(placement.text, placement.poses, stamp(design, placement.copper), placement.graphics, design=design, board=name)
+    return emit_board(placement.text, placement.poses, stamp(design, placement.copper), [*placement.graphics, *placement.marks], design=design, board=name)

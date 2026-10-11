@@ -51,14 +51,18 @@ def _board(name: str) -> Path:
 
 
 def _scene(name: str, extra=()):
-    """A scene over `name`'s placed board, plus whatever copper the test needs on it."""
+    """A scene over `name`'s placed board, plus whatever copper the test needs on it. The extra copper joins
+    the scene as the route stage adds it (`Scene.item_of`), so a piece keeps its path link: the parallel
+    population is per current-carrying link (docs/physics-subjects.md PR 3), and a board text carries no link."""
     b = _board(name)
     design = load_board(b)
     job = compile_design(design)
-    text = placed_board(name, b).read_text()
+    base = placed_board(name, b).read_text()
+    text = write_pieces(base, extra) if extra else base
+    scene = scene_from_text(design, job, job.constraints, base)
     if extra:
-        text = write_pieces(text, extra)
-    return design, job, scene_from_text(design, job, job.constraints, text), text
+        scene.add(scene.item_of(p) for p in extra)
+    return design, job, scene, text
 
 
 def _ctx(name: str, extra=()):
@@ -66,9 +70,13 @@ def _ctx(name: str, extra=()):
     return PatternCtx(scene=scene, design=design, job=job, cs=job.constraints, board=name, stage="final"), text
 
 
+VBUS_LINK = "J1.A4B9~U2.1"  # node's `Path("VBUS", "J1.VBUS", "U2.VIN", amps=1)`: the 1 A is this link's
+
+
 def _anchor(at=OPEN, net: str = "VBUS"):
-    """One under-rated `VBUS` barrel: node's rail is 1 A and one 0.2 mm barrel carries 0.527 A."""
-    return via_piece(net, "leftover", at, 0.35, 0.2, owner=f"{net} via at ({at[0]:g},{at[1]:g})")
+    """One under-rated `VBUS` barrel on the link that carries node's 1 A (Path line 147): one 0.2 mm barrel
+    carries 0.527 A."""
+    return via_piece(net, "leftover", at, 0.35, 0.2, owner=f"{net} via at ({at[0]:g},{at[1]:g})", link=VBUS_LINK if net == "VBUS" else "")
 
 
 # --- the stage ---------------------------------------------------------------------------------
@@ -191,7 +199,8 @@ def test_the_population_is_an_under_rated_group_on_an_unpoured_rail():
     assert s.width == 0.4, "the class width, never narrowed"
     assert s.bound == len(s.sites) == 32
     assert vias_per_change(1.0, 0.2, ctx.scene.stack.via_plating_mm, 10.0) == 2 and via_amps(0.2) == 0.527
-    assert s.why == "1 x 0.2 mm barrel carries 0.527 A of VBUS's 1 A at 10 C, and vias_per_change asks 2", s.why
+    assert s.why == "1 x 0.2 mm barrel carries 0.527 A of Path line 66's link J1.A4B9~U2.1's 1 A at 10 C, and vias_per_change asks 2", s.why
+    assert s.link == VBUS_LINK, "the current is the link's (docs/physics-subjects.md PR 3)"
 
 
 def test_a_poured_net_is_exempt_and_the_exemption_is_read_from_the_compiled_job():
@@ -262,7 +271,7 @@ def test_the_rungs_own_copper_passes_pcbcs_self_check():
     """`verify_copper` is what `pattern_copper` raises on, and it asks the via-size rule, the angle
     rule, the leg-length rule and every clearance of the copper just written."""
     ctx, text = _ctx("node", (_anchor(),))
-    plan = pattern_copper(load_board(_board("node")), ctx.job, ctx.cs, "node", stage="final", scene=scene_from_text(load_board(_board("node")), ctx.job, ctx.cs, text))
+    plan = pattern_copper(load_board(_board("node")), ctx.job, ctx.cs, "node", stage="final", scene=ctx.scene)
     # Three pieces for the rung and twelve barrels for node's declared array: the whole `final` stage
     # on this board, judged in one pass by the check `pattern_copper` raises on.
     assert plan.moves == () and len(plan.pieces) == 15, plan.moves
@@ -413,8 +422,8 @@ def test_the_window_is_empty_on_two_layers_and_the_refusal_names_the_stackup():
     )
     res = st.run(ctx, spec)
     assert res.refusal is not None and res.pieces == ()
-    assert "Board(layers=4)" in res.refusal.move, res.refusal.move
-    assert "1 mm between two 0.5 mm rings" in res.refusal.move, res.refusal.move
+    assert "(on two layers)" in res.refusal.move and "Board(" not in res.refusal.move, res.refusal.move
+    assert "two 0.5 mm rings need 1 mm not to merge their antipads" in res.refusal.move, res.refusal.move
 
 
 def test_the_real_two_layer_boards_never_reach_that_refusal():
@@ -505,7 +514,7 @@ def test_the_gate_is_fatal_for_a_rung_that_is_not_one_and_for_nothing_else():
         assert len(gate["fails"]) == want, (links, gate["fails"])
         assert len(gate["rungs"]) == 1
         if want:
-            assert "not parallel" in gate["fails"][0] and "pcbc bug, not a board move" in gate["fails"][0]
+            assert "not parallel" in gate["fails"][0] and "(a pcbc defect: pcbc wrote this copper)" in gate["fails"][0]
 
 
 def test_a_rail_whose_rungs_all_went_in_and_did_not_move_is_the_one_other_fatal_case(monkeypatch):

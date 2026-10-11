@@ -1,4 +1,4 @@
-from pcbc import Board, Ground, Led, Net, NetReq, Place, Power, Resistor, SchPlace
+from pcbc import Board, Ground, Led, Net, NetReq, Power, Resistor
 
 VCC = Power("VCC")
 GND = Ground("GND")
@@ -19,37 +19,14 @@ Led(
     "red",
     package="0603",
     mpn="KT-0603R",
-    lcsc="C72043",
+    lcsc="C2286",  # KT-0603R, Kento red 0603 (C72043 is an Everlight 19-217/GHC: docs/spice-stage.md survey 4)
     manufacturer="Kento",
     a=LED,
     k=GND,
 )
 
-Board(width=40, height=25, layers=2, stackup="jlcpcb_2l_1oz")
-Place(
-    "R1",
-    position="absolute",
-    left=8,
-    top=0,
-    bottom=0,
-    margin_top="auto",
-    margin_bottom="auto",
-    locked=True,
-    reason="resistor west of LED",
-)
-Place(
-    "D1",
-    position="absolute",
-    right=8,
-    top=0,
-    bottom=0,
-    margin_top="auto",
-    margin_bottom="auto",
-    locked=True,
-    reason="LED at east edge",
-)
-SchPlace("R1", left=20, top=20)
-SchPlace("D1", pin="A", to="R1.2", gap=2.54)
+Board(layers=2, stackup="jlcpcb_2l_1oz")
 
-NetReq("VCC", "GND", kind="power", volts=3.3, amps=0.05)
+NetReq("VCC", kind="power", volts=3.3)
+NetReq("GND", kind="power")
 NetReq("LED", kind="digital")

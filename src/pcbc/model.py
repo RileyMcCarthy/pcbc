@@ -6,12 +6,27 @@ from pathlib import Path
 
 @dataclass
 class BoardSpec:
-    size_mm: tuple[float, float]
+    # The outline's size and its top-left corner in the frame (KiCad's origin, x right, y down). `board.py`'s
+    # `Board()` takes no size (docs/direction.md §2): a declared outline is `Outline()` in `layout.core.py`, and
+    # with none the build derives one (docs/board-outline.md B). None until one of the two has set it.
+    size_mm: tuple[float, float] | None = None
     layers: int = 4
     stackup: str = "jlcpcb_4l_1oz"
     pcb: str | None = None
     planes: tuple[tuple[str, str], ...] = ()
-    padding: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)
+    origin: tuple[float, float] = (0.0, 0.0)
+
+
+@dataclass
+class OutlineSpec:
+    """`Outline(width=, height=, at=(0, 0))` in `layout.core.py`: a declared board outline, a rectangle whose
+    top-left corner is `at` in the frame. `line`/`source` say where it was written."""
+
+    width: float
+    height: float
+    at: tuple[float, float] = (0.0, 0.0)
+    line: int = 0
+    source: str = "core"
 
 
 @dataclass
@@ -44,8 +59,8 @@ class PlaceSpec:
     edge: str | None = None
     overhang: float = 0.0
     rot_set: bool = False
-    source: str = "board"
-    line: int = 0  # board.py line of the Place(); 0 when not loaded from a board file (a move names it)
+    source: str = "core"
+    line: int = 0  # layout.core.py line of the Place(); 0 when not loaded from a file (a move names it)
 
     def has_css(self) -> bool:
         return any(
@@ -212,6 +227,8 @@ class KeepoutSpec:
     margin_bottom: object = 0
     margin_left: object = 0
     parent: str | None = None
+    source: str = "core"
+    line: int = 0  # layout.core.py line of the Keepout(); 0 when not loaded from a file
 
     def has_css(self) -> bool:
         return self.box is None or any(
@@ -240,11 +257,15 @@ class RegionSpec:
     padding_left: object = 0
     parent: str | None = None
     title: str | None = None
+    source: str = "core"
+    line: int = 0  # layout.core.py line of the Region() (a SchRegion: board.py's); 0 outside a file load
 
 
 @dataclass
 class SchPlaceSpec:
-    """Schematic pose. CSS is body-in-region; pin/to/gap attaches a pin to another."""
+    """`SchPlace(ref, ...)` in `schematic.core.py` (docs/schematic-layout.md §3): at most one anchor — `at=(x, y)` (a pose
+    in its region's frame), `to=` (+ `pin=`, `side=`, `gap=`), `along=` (+ `side=`, `align=`, `gap=`), `below=`, or none
+    (the region's anchor) — and `rotate=`, `mirror=`. `auto` is set on the specs the auto-layout writes for itself."""
 
     ref: str
     pin: str | None = None
@@ -257,56 +278,117 @@ class SchPlaceSpec:
     mirror: str | None = None  # "x" (top/bottom) or "y" (left/right), KiCad sense
     rot: float = 0.0
     rotate_set: bool = False
+    mirror_set: bool = False
+    at: tuple[float, float] | None = None  # the symbol origin, relative to its region's origin (§3.2)
     reason: str = ""
-    position: str = "static"
-    top: object | None = None
-    right: object | None = None
-    bottom: object | None = None
-    left: object | None = None
-    width: object | None = None
-    height: object | None = None
-    margin_top: object = 0
-    margin_right: object = 0
-    margin_bottom: object = 0
-    margin_left: object = 0
-    parent: str | None = None
-
-    def has_css(self) -> bool:
-        return any(
-            getattr(self, k) is not None
-            for k in ("top", "right", "bottom", "left", "width", "height")
-        ) or self.position == "absolute"
+    line: int = 0  # schematic.core.py line of the SchPlace(); 0 for one the auto-layout wrote
+    source: str = "core"  # "core" or "auto"
 
     def has_attach(self) -> bool:
         return bool(self.to or self.along)
+
+    def anchor_kind(self) -> str:
+        """"at", "to", "along", "below" or "anchor" (no anchor keyword: the region's anchor)."""
+        if self.at is not None:
+            return "at"
+        if self.to:
+            return "to"
+        if self.along:
+            return "along"
+        if self.below:
+            return "below"
+        return "anchor"
+
+
+@dataclass
+class SchRegionSpec:
+    """`SchRegion(name, members=, title=, at= | row=/col=, outline=)` in `schematic.core.py` (§3.1). Membership is closed
+    and has this one home. `at` is the region's origin (its frame's top-left corner) in sheet mm."""
+
+    name: str
+    members: tuple[str, ...] = ()
+    title: str | None = None
+    at: tuple[float, float] | None = None
+    row: int | None = None
+    col: int | None = None
+    outline: bool = True
+    reason: str = ""
+    line: int = 0
+
+
+@dataclass
+class SchTextSpec:
+    """`SchText(ref, field, at=(dx, dy), rotate=, justify=, hide=)`: a Reference or Value as it is seen, relative to the
+    symbol origin in sheet axes (§3.4)."""
+
+    ref: str
+    field: str
+    at: tuple[float, float]
+    rotate: int = 0
+    justify: str | None = None
+    hide: bool = False
+    line: int = 0
+
+
+@dataclass
+class SchLabelSpec:
+    """`SchLabel(net, pin=, side=, stub=)` (a label on a stub off the pin, which then takes no wire) or `SchLabel(net,
+    pin=, at=(dx, dy), rotate=, justify=)` (the label of the pin's group, on its wire, relative to the pin end)."""
+
+    net: str
+    pin: str
+    side: str | None = None
+    stub: float | None = None
+    at: tuple[float, float] | None = None
+    rotate: int = 0
+    justify: str | None = None
+    line: int = 0
+
+
+@dataclass
+class SchPowerSpec:
+    """`SchPower(net, pin=, side=, stub=, jog=, rotate=)`: the power symbol of the pin's group, on a stub leaving the
+    pin to `side`, `jog` mm on (down the sheet when positive), turned `rotate` (180: upside down)."""
+
+    net: str
+    pin: str
+    side: str
+    stub: float = 0.0
+    jog: float = 0.0
+    rotate: int = 0
+    line: int = 0
+
+
+@dataclass
+class SchSheetSpec:
+    """`SchSheet(paper=, wire_mm=)` in `schematic.core.py`: the sheet's paper (None: chosen from the extent) and the
+    longest wire drawn between two symbols before a net is joined by labels instead."""
+
+    paper: str | None = None
+    wire_mm: float = 25.4
+    line: int = 0
+
+
+@dataclass
+class SchNetSpec:
+    """`SchNet(net, wire_mm=)` in `schematic.core.py`: one net's wire limit (0: labels only)."""
+
+    net: str
+    wire_mm: float
+    line: int = 0
 
 
 @dataclass
 class NetReqSpec:
     nets: tuple[str, ...]
     kind: str
-    z_diff_ohm: float | None = None
-    z_se_ohm: float | None = None
     volts: float | None = None
-    amps: float | None = None
-    temp_rise_c: float = 10.0
     max_mm: float | None = None
-    match_mm: float | None = None
-    pair: bool = False
-    vias: bool | None = None
-    layers: tuple[str, ...] | None = None
     keep_clear_of: tuple[str, ...] = ()  # globs; constraints.Constraint expands them
     keep_clear_mm: float | None = None
-    autoroute: bool | str | None = None
     class_name: str | None = None
     # R1 (docs/r1-design.md A.2)
-    length_mm: float | None = None  # routed length -> KiCad length (max)
-    uncoupled_mm: float | None = None
-    vias_max: int | None = None
-    reference: str | None = None  # "In1.Cu"
-    clock: str | None = None  # spi: the net the others match to
     pf_max: float | None = None  # i2c bus capacitance budget
-    loop_mm2: float | None = None
     rise_ps: float | None = None  # the fastest edge this net carries, ps; no default anywhere
     line: int = 0  # board.py line of the NetReq; 0 when not loaded from a board file
 
@@ -322,6 +404,11 @@ class PairReq:
     layers: tuple[str, ...] | None = None
     reference: str | None = None
     line: int = 0
+    kind: str | None = None  # "usb_hs": the preset (docs/physics-subjects.md §4.2)
+    written: frozenset = frozenset()  # which of z_diff_ohm/match_mm/uncoupled_mm the line wrote
+    length_mm: float | None = None  # each member's length budget between its stations
+    vias: bool | None = None  # may the pair's copper change layer (None: allowed)
+    vias_max: int | None = None  # the vias each member may pass (None: the kind's, none for a bare Pair)
 
 
 @dataclass(frozen=True)
@@ -331,12 +418,50 @@ class BusReq:
     clock: str | None = None
     length_mm: float | None = None
     line: int = 0
+    kind: str | None = None  # "spi"
+    match_written: bool = True
 
 
 @dataclass(frozen=True)
-class ChainReq:
+class PathReq:
+    """`Path(net, *pads, ...)`: an ordered list of stations on one net, and what belongs to the copper
+    between them (`docs/net-path-physics.md` §1-§2). A field left `None` is not written: the link takes
+    its path kind's default, else the net's value (`constraints`' one combine rule)."""
+
     net: str
     pads: tuple[str, ...]  # ("J2.1", "C4.1", "U1.12"), pin names as Place(to=) takes them
+    line: int = 0
+    amps: float | None = None  # the current entering at the first station: the number written, or the sum of `draws`
+    temp_rise_c: float | None = None
+    vias: bool | None = None
+    layers: tuple[str, ...] | None = None
+    max_mm: float | None = None
+    kind: str | None = None  # "feedback" | "sense": a sense branch
+    vias_max: int | None = None  # the vias this copper may pass (KiCad checks it only on a whole-node Path, KD 12)
+    reference: str | None = None  # the plane under this copper; one layer only (E10)
+    z_se_ohm: float | None = None  # this copper's characteristic impedance over its reference
+    length_mm: float | None = None  # this copper's length budget: the airwire at placement, the routed length after
+    draws: tuple[tuple[str, float], ...] = ()
+    """`amps={station: A}` as written (`docs/physics-subjects.md` §5): each named station draws that
+    current and the first station supplies their sum. `()` when `amps=` is a number (its last station
+    draws it all)."""
+
+    def fields(self) -> tuple[str, ...]:
+        """The keyword fields this line wrote, in signature order."""
+        out = []
+        for name in ("amps", "temp_rise_c", "vias", "layers", "max_mm", "kind", "vias_max", "reference", "z_se_ohm", "length_mm"):
+            v = getattr(self, name)
+            if v is not None and v != ():
+                out.append(name)
+        return tuple(out)
+
+
+@dataclass(frozen=True)
+class LoopReq:
+    """`Loop(*pads, mm2=)`: a check on the area named pads enclose (`docs/net-path-physics.md` §6)."""
+
+    pads: tuple[str, ...]
+    mm2: float | None = None
     line: int = 0
 
 
@@ -398,7 +523,7 @@ class GuardReq:
 class Net:
     name: str
     kind: str = "net"  # net | power | ground
-    wire_mm: float | None = None  # longest schematic wire before a label; None: SchStyle default
+    line: int = field(default=0, compare=False)  # board.py line that declared its kind (Ground("GND") line 4); 0 from Python
 
     def __str__(self) -> str:
         return self.name
@@ -454,16 +579,27 @@ class Design:
     netreqs: list[NetReqSpec] = field(default_factory=list)
     pairs: list[PairReq] = field(default_factory=list)
     buses: list[BusReq] = field(default_factory=list)
-    chains: list[ChainReq] = field(default_factory=list)
+    paths: list[PathReq] = field(default_factory=list)
+    loops: list[LoopReq] = field(default_factory=list)
     isolations: list[IsolationReq] = field(default_factory=list)
     guards: list[GuardReq] = field(default_factory=list)
     bridges: list[BridgeReq] = field(default_factory=list)
     thermals: list[ThermalReq] = field(default_factory=list)
     nets: dict[str, Net] = field(default_factory=dict)
     instances: list[Instance] = field(default_factory=list)
+    # Schematic layout: `schematic.core.py`'s, beside `board.py` (docs/schematic-layout.md §1). `board.py` holds none.
     sch_places: list[SchPlaceSpec] = field(default_factory=list)
-    sch_regions: list[RegionSpec] = field(default_factory=list)
-    sch_wire_mm: float = 25.4
+    sch_regions: list[SchRegionSpec] = field(default_factory=list)
+    sch_sheet: SchSheetSpec | None = None
+    sch_nets: list[SchNetSpec] = field(default_factory=list)
+    sch_texts: list[SchTextSpec] = field(default_factory=list)
+    sch_labels: list[SchLabelSpec] = field(default_factory=list)
+    sch_powers: list[SchPowerSpec] = field(default_factory=list)
+    # `schematic.core.py`'s own load, traced on its own after board.py's trace has closed (§1.1): `{"sha": ..., "reads":
+    # {path: sha}}`, or None when no schematic core was loaded. Only the schematic stamp records it.
+    sch_core: dict | None = None
+    # `Outline()` from `layout.core.py`: the declared outline, or None (derived, docs/board-outline.md B).
+    outline: OutlineSpec | None = None
     source: str | None = None
     # Every Python module file under the board's directory that executing `board.py` imported
     # (`from helper import LEFT`), relative to that directory: a source the build hashes with
@@ -472,6 +608,12 @@ class Design:
     # Every file loading `board.py` was seen to open (`trace`, M2), by content: `{path: sha256}`, the
     # path relative to the board's directory when under it. Every stage's stamp carries it.
     reads: dict[str, str] = field(default_factory=dict)
+    # The same record for `layout.core.py`'s own load, traced on its own (docs/board-outline.md A.2): the
+    # schematic stamp carries `reads` only, so a core edit is stale from place, never from sch.
+    core_reads: dict[str, str] = field(default_factory=dict)
+    # `load_board(core=True)` ran (True, whether or not a layout.core.py exists), `core=False` (False: the
+    # schematic stage, which compiles nothing of core's), or the design was built in Python (None).
+    core_loaded: bool | None = None
     # Copper and placement locks. `source` is "board", "core", or "gen".
     copper: list[Copper] = field(default_factory=list)
     # Footprint poses read from `layout.gen.py` (`Pose`); `board.py`'s `Place()` stays in `places`.

@@ -1,15 +1,12 @@
-"""Resolve SchPlace() into symbol (x, y, rot). No packer — missing SchPlace is a check error."""
+"""The schematic's pose solvers: a SchPlace spec (`to=`, `along=`, `below=`, a region anchor) into a symbol's (x, y, rot,
+mirror). The specs come from schematic.core.py or from the auto-layout (`sch_auto`), which also orders, separates and
+packs them."""
 
 from __future__ import annotations
 
 import math
 
-from .css import Rect, origin_from_border, resolve_rect
-from .layout import content_rect, resolve_regions, style_from
-from .model import BoardSpec, Design, SchPlaceSpec
-
-# Schematic sheet in mm (A3). Independent of Board() PCB size.
-SHEET = BoardSpec(size_mm=(420.0, 297.0), padding=(12.7, 12.7, 12.7, 12.7))
+from .model import SchPlaceSpec
 
 
 def parse_refpin(spec: str) -> tuple[str, str]:
@@ -52,8 +49,7 @@ def _attach_pin(spec: SchPlaceSpec, part, other, other_pin, face: tuple[float, f
     have = ", ".join(f"{p.name}={p.net}" for p in part.pins if getattr(p, "net", ""))
     raise ValueError(
         f"SchPlace({part.ref!r}): no pin of {part.ref} is on net {net!r} like "
-        f"{other.ref}.{other_pin.name} (have {have}). Pass pin= to hang an "
-        f"unconnected pin there on purpose."
+        f"{other.ref}.{other_pin.name} (have {have}), and no pin= names the pin to hang there"
     )
 
 
@@ -205,16 +201,17 @@ def keepout_aabb(part, kinds: dict[str, str] | None) -> tuple[float, float, floa
     )
 
 
-_keepout_memo: dict = {}
-
-
 def _keepout(part, kinds) -> list[tuple[float, float, float, float]]:
-    key = (id(part), part.x, part.y, part.rot, getattr(part, "mirror", None), len(getattr(part, "wired_pins", ())))
-    boxes = _keepout_memo.get(key)
+    """`keepout_boxes`, remembered on the part itself by pose and wired pins. (A module-wide memo keyed by `id(part)`
+    handed a new part the boxes of a freed one at the same address and pose: the layout then depended on memory
+    layout, not on the board — docs/schematic-layout.md §2.5, determinism.)"""
+    memo = part.__dict__.setdefault("_keepout_memo", {})
+    key = (part.x, part.y, part.rot, getattr(part, "mirror", None), frozenset(getattr(part, "wired_pins", ())))
+    boxes = memo.get(key)
     if boxes is None:
-        if len(_keepout_memo) > 4096:
-            _keepout_memo.clear()
-        boxes = _keepout_memo[key] = keepout_boxes(part, kinds)
+        if len(memo) > 512:
+            memo.clear()
+        boxes = memo[key] = keepout_boxes(part, kinds)
     return boxes
 
 
@@ -237,30 +234,6 @@ def _mark_wired(part, our, other, op) -> None:
 
 def _local_box(part) -> tuple[float, float, float, float]:
     return getattr(part, "bbox", (-part.hw, -part.hh, part.hw, part.hh))
-
-
-def _apply_css(spec: SchPlaceSpec, part, regions: dict[str, Rect]) -> None:
-    st = style_from(spec)
-    if spec.parent:
-        if spec.parent not in regions:
-            raise ValueError(f"SchPlace({part.ref!r}): unknown SchRegion {spec.parent!r}")
-        cb = regions[spec.parent]
-    else:
-        cb = content_rect(SHEET)
-    local = _local_box(part)
-    rect = resolve_rect(
-        cb,
-        st,
-        intrinsic_w=local[2] - local[0],
-        intrinsic_h=local[3] - local[1],
-        who=f"SchPlace({part.ref!r})",
-    )
-    at = origin_from_border(rect, local, st.rotate)
-    # KiCad connects on a 1.27 mm grid; library pins sit on it, so the origin must too.
-    part.x, part.y = round(at[0] / 1.27) * 1.27, round(at[1] / 1.27) * 1.27
-    part.rot = float(st.rotate)
-    part.mirror = spec.mirror
-    part.placed = True
 
 
 def _aabb_of(part, box: tuple[float, float, float, float]) -> tuple[float, float, float, float]:
@@ -426,11 +399,14 @@ def _apply_along(spec: SchPlaceSpec, part, other, occupied: list, kinds=None, ga
             part.attach_wire = ((owx, owy), pin_world(part, our))
             part.placed = True
             return
-    part.x, part.y = owx - plx, oy1 + gap + part.hh
+    part.x, part.y = owx - plx, round((oy1 + gap + part.hh) / _GRID) * _GRID  # on the grid, where its pins can connect
     part.stuck_on = set(blockers)
     part.attach_dir = (sx, sy)
     part.attach_ref = other.ref
     part.placed = True
+
+
+FLIP = "#flip"  # a gap_extra key suffix: try this hanger's poses from its second one
 
 
 def _apply_attach(spec: SchPlaceSpec, part, other, other_pin_name: str, occupied: list, kinds=None, degree=None, gap_extra: dict | None = None) -> None:
@@ -518,6 +494,9 @@ def _apply_attach(spec: SchPlaceSpec, part, other, other_pin_name: str, occupied
         for o in occupied
     )
     if taken and part.kind == "c" and not spec.side and len(poses) > 1:
+        poses = poses[1:] + poses[:1]
+    if (gap_extra or {}).get(part.ref + FLIP) and len(poses) > 1:
+        # The layout loop's repair (sch_emit): this hanger's first pose left a hard finding; its next pose goes first.
         poses = poses[1:] + poses[:1]
     gap += float((gap_extra or {}).get(part.ref, 0.0))
     # The first pose at the asked gap, then a stagger of a few grid steps,
@@ -661,176 +640,6 @@ def _apply_below(spec: SchPlaceSpec, part, other, occupied: list, kinds) -> None
     part.attach_ref = other.ref
     part.attach_dir = (0.0, 1.0)
     part.placed = True
-
-
-def apply_sch_places(design: Design, parts: list, gap_extra: dict | None = None) -> None:
-    """Set x/y/rot on schematic parts from design.sch_places."""
-    by_ref = {p.ref: p for p in parts}
-    specs = {s.ref: s for s in design.sch_places}
-    missing = [p.ref for p in parts if p.ref not in specs]
-    if missing:
-        raise ValueError("no SchPlace() for " + ", ".join(missing))
-    extra = [s.ref for s in design.sch_places if s.ref not in by_ref]
-    if extra:
-        raise ValueError("SchPlace() for unknown ref " + ", ".join(extra))
-
-    boxed = [
-        r for r in design.sch_regions
-        if any(getattr(r, k) is not None for k in ("top", "right", "bottom", "left", "width", "height"))
-    ]
-    regions = resolve_regions(SHEET, boxed) if boxed else {}
-    kinds = {n.name: n.kind for n in design.nets.values()}
-    degree: dict[str, int] = {}
-    for p in parts:
-        for pn in p.pins:
-            net = getattr(pn, "net", "")
-            if net:
-                degree[net] = degree.get(net, 0) + 1
-    placed: set[str] = set()
-
-    for spec in design.sch_places:
-        part = by_ref[spec.ref]
-        if spec.has_attach() or spec.below:
-            continue
-        if spec.has_css():
-            _apply_css(spec, part, regions)
-        else:
-            _apply_origin(spec, part)
-        placed.add(spec.ref)
-
-    pending_below = [s for s in design.sch_places if s.below]
-    guard = 0
-    while pending_below:
-        guard += 1
-        if guard > 64:
-            raise ValueError("SchPlace below= cycle: " + ", ".join(s.ref for s in pending_below))
-        nxt_below: list[SchPlaceSpec] = []
-        for spec in pending_below:
-            if spec.below not in placed:
-                nxt_below.append(spec)
-                continue
-            if spec.below not in by_ref:
-                raise ValueError(f"SchPlace({spec.ref!r}): {spec.below} is not on the sheet")
-            _apply_below(spec, by_ref[spec.ref], by_ref[spec.below], [by_ref[r] for r in placed], kinds)
-            placed.add(spec.ref)
-        if len(nxt_below) == len(pending_below) and nxt_below:
-            raise ValueError(
-                "SchPlace below= waiting on unplaced " + ", ".join(s.below or s.ref for s in nxt_below)
-            )
-        pending_below = nxt_below
-
-    def _rigidity(spec: SchPlaceSpec) -> int:
-        part = by_ref[spec.ref]
-        return 0 if part.kind not in ("r", "c", "d") else 1
-
-    # Parts with one pose (an IC, an inductor, a connector) go first, so a
-    # part that can hang from its row is the one that yields.
-    pending = sorted((s for s in design.sch_places if s.has_attach()), key=_rigidity)
-    guard = 0
-    while pending:
-        guard += 1
-        if guard > 64:
-            raise ValueError("SchPlace pin-attach cycle: " + ", ".join(s.ref for s in pending))
-        nxt: list[SchPlaceSpec] = []
-        for spec in pending:
-            target = spec.to or spec.along or ""
-            tref, tpin = parse_refpin(target)
-            aref = parse_refpin(spec.align)[0] if spec.align else None
-            if tref not in placed or (aref and aref not in placed and aref in by_ref):
-                nxt.append(spec)
-                continue
-            if tref not in by_ref:
-                raise ValueError(f"SchPlace({spec.ref!r}): {tref} is not on the sheet")
-            _apply_attach(
-                spec,
-                by_ref[spec.ref],
-                by_ref[tref],
-                tpin,
-                [by_ref[r] for r in placed],
-                kinds,
-                degree,
-                gap_extra,
-            )
-            placed.add(spec.ref)
-        if len(nxt) == len(pending) and nxt:
-            raise ValueError(
-                "SchPlace pin-attach waiting on unplaced "
-                + ", ".join((s.to or s.along or s.ref) for s in nxt)
-            )
-        pending = nxt
-    _separate(parts, {s.ref for s in design.sch_places if not s.has_attach()}, kinds)
-    _pack_groups(design, parts)
-
-
-_PACK_ORIGIN = 12.7
-_PACK_PAD = 10.16
-_PACK_HEADER = 6.35
-_PACK_GUTTER = 25.4
-_PACK_ROW = 380.0
-
-
-def _snap(v: float) -> float:
-    return round(v / _GRID) * _GRID
-
-
-def _pack_groups(design, parts: list) -> None:
-    """Sit each SchRegion's parts in declaration order, one gutter apart.
-
-    The region's left/top/width/height only positioned the anchor while the
-    group was being built. The drawn box is fitted later, around the parts.
-    A part belongs to the region of the anchor it hangs from."""
-    regions = list(getattr(design, "sch_regions", []) or [])
-    if not regions:
-        return
-    by_ref = {p.ref: p for p in parts}
-    specs = {s.ref: s for s in design.sch_places}
-
-    def region_of(part) -> str | None:
-        seen: set[str] = set()
-        cur = part
-        while cur is not None and cur.ref not in seen:
-            seen.add(cur.ref)
-            spec = specs.get(cur.ref)
-            if spec is not None and spec.parent:
-                return spec.parent
-            cur = by_ref.get(getattr(cur, "attach_ref", None))
-        return None
-
-    members: dict[str, list] = {r.name: [] for r in regions}
-    for part in parts:
-        name = region_of(part)
-        if name in members:
-            members[name].append(part)
-    cursor_x = _PACK_ORIGIN
-    cursor_y = _PACK_ORIGIN
-    row_h = 0.0
-    for region in regions:
-        group = members[region.name]
-        if not group:
-            continue
-        xs: list[float] = []
-        ys: list[float] = []
-        for part in group:
-            x0, y0, x1, y1 = world_aabb(part)
-            xs += [x0, x1]
-            ys += [y0, y1]
-        x0, y0, x1, y1 = min(xs), min(ys), max(xs), max(ys)
-        width = (x1 - x0) + 2 * _PACK_PAD
-        height = (y1 - y0) + 2 * _PACK_PAD + _PACK_HEADER
-        if cursor_x > _PACK_ORIGIN and cursor_x + width > _PACK_ROW:
-            cursor_x = _PACK_ORIGIN
-            cursor_y += row_h + _PACK_GUTTER
-            row_h = 0.0
-        dx = _snap((cursor_x + _PACK_PAD) - x0)
-        dy = _snap((cursor_y + _PACK_HEADER + _PACK_PAD) - y0)
-        title = getattr(region, "title", None) or region.name
-        for part in group:
-            part.x += dx
-            part.y += dy
-            part.sch_group = region.name
-            part.sch_title = title
-        cursor_x += width + _PACK_GUTTER
-        row_h = max(row_h, height)
 
 
 def _axis(part, other) -> tuple[float, float]:

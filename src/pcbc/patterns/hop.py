@@ -63,6 +63,11 @@ def specs(ctx: PatternCtx) -> tuple[str, ...]:
             continue  # differential pairs are R4's, and R2 measures nothing about them
         if c is not None and c.group is not None and c.group.kind == "bus":
             continue  # a declared bus member belongs to the ribbon (B.5)
+        if c is not None and c.fielded():
+            # A net whose Path carries a field or a kind is the router's: its links have their own widths, vias and
+            # junction rules, and a hop drew node's 1 A LOAD at the 0.16 mm class floor once the current left the
+            # net (docs/physics-subjects.md PR 3; measured 2026-10-02, power_bottlenecks 0.633 A of 1 A).
+            continue
         if len(terminals(scene, net)) != 2:
             continue
         out.append(net)
@@ -278,36 +283,6 @@ def _toward(dx: float, dy: float) -> str:
     return "down" if dy >= 0 else "up"
 
 
-def _moves(ctx, net: str, a: Terminal, b: Terminal, layer: str, clash, sides, other: str) -> str:
-    """Two edits, both real: one that moves a part, one that moves the net.
-
-    The direction is computed, not waved at. Against a blocker it is the way out of the blocker; with
-    no candidate at all it is the side the other pad's own exits face, because that is what the
-    enumeration could not reach — a hop into a pad whose only exit points away from its partner has
-    no shape, and no amount of retrying gives it one.
-    """
-    if clash is not None:
-        # The part to move is the *smaller* one, not merely the nearer one: both pads are equally in
-        # the way of each other, and "move the 24-pin MCU" is not a move an AI can act on while "move
-        # the resistor hanging off it" is. Distance to the blocker breaks the tie.
-        near = min((a, b), key=lambda t: (len(ctx.scene.feet[t.ref].pads) if t.ref in ctx.scene.feet else 0, math.dist(t.at, clash.at), t.ref))
-        toward = _toward(near.at[0] - clash.at[0], near.at[1] - clash.at[1])
-        why = f"moves it off {clash.item.owner}"
-    else:
-        near = a
-        want = sides[1][0] if sides[1] else ""
-        if want:
-            toward = want
-            why = f"puts it on the side {b.owner}'s {sides[1][0]} exit faces"
-        else:
-            toward = _toward(a.at[0] - b.at[0], a.at[1] - b.at[1])
-            why = f"gives {b.owner} room for an exit"
-    return (
-        f'Place("{near.ref}", toward="{toward}") {why}; '
-        f'or NetReq("{net}", layers=["{other}"]) puts the net on {other}, where this row is not.'
-    )
-
-
 def _refuse(ctx, net, a: Terminal, b: Terminal, layer: str, clash, rule: str, na: int, nb: int, built: int, tried: int, links: int = MAX_LINKS, lane: str = "", strangers: str = "", ratio: float = 0.0, sides=((), ())) -> Refusal:
     """The refusal sentence, in the one shape every pcbc move line uses (`moves.move_line`).
 
@@ -351,7 +326,6 @@ def _refuse(ctx, net, a: Terminal, b: Terminal, layer: str, clash, rule: str, na
             f"so only the straight line between them was tried: {strangers}."
         )
     blockers += f"\n  Tried {na} x {nb} exits x {links} link shapes = {built} candidates, {tried} of them the shape of copper pcbc writes"
-    fixes = "Moves: " + _moves(ctx, net, a, b, layer, clash, sides, _other_layer(ctx, layer))
     return Refusal(
         pattern=REASON,
         net=net,
@@ -365,7 +339,6 @@ def _refuse(ctx, net, a: Terminal, b: Terminal, layer: str, clash, rule: str, na
             f"{a.owner} at ({a.at[0]:g},{a.at[1]:g})",
             f"{b.owner} at ({b.at[0]:g},{b.at[1]:g}) on {where}",
             blockers,
-            fixes,
             sep="\n  ",
         ),
     )

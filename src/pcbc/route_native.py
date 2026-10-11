@@ -8,11 +8,11 @@ it (`docs/direction.md` §5: no router is left contesting space another step too
 
 The order (`docs/native-plan.md` §3.4, as measured in step 5 — see `ORDER`):
 
-1. `hop` (pre), `fanout`, `spine` (mid, `spine=`): least freedom first, on an empty board.
+1. `hop` (pre), `fanout`: least freedom first, on an empty board.
 2. `Pour` objects for `route_scene.plane_targets` (fields only: a pour is not an obstacle).
 3. `tap` (post): every SMD pad of a plane net welded to its plane.
 4. the router: every net still open, in `net_order`, links in MST order over the net's components
-   (a declared `Chain()` is linked station to station first).
+   (a declared `Path()` is linked station to station first).
 5. `stitch` (final): copper whose absence disconnects nothing; nothing routes after it.
 6. `route_relax.relax_pieces` (`relax=`): the string-pull over `RELAXABLE` pieces.
 
@@ -38,12 +38,13 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import time
 from dataclasses import dataclass, field, replace
 from fnmatch import fnmatch
 from pathlib import Path
 
-from .route_cost import NetCost, Router, net_cost, path_mm
+from .route_cost import NetCost, Router, link_nc, net_cost, path_mm
 from .route_emit import Piece, census as _census, seg_piece, via_piece
 from .route_geom import qp
 
@@ -52,14 +53,17 @@ from .route_geom import qp
 
 
 def constrained_nets(job, design) -> frozenset[str]:
-    """Nets a `NetReq` keeps to one layer or forbids vias on, and differential-pair nets: the nets
-    whose copper is structural (the relaxer never pulls one half of a pair or a no-via net on its own).
-    One function: the net order and `route_relax` both read it, so the two cannot drift."""
-    out: set[str] = set()
-    for cn in job.nets:
-        if cn.autoroute == "diff_pair" or cn.vias is False or len(cn.layers) == 1:
-            out.update(n for n in design.nets if any(fnmatch(n, p) for p in cn.patterns))
-    return frozenset(out)
+    """Nets a `NetReq` keeps to one layer or forbids vias on, differential-pair nets, and the sensitive
+    nets a preset marks `autoroute=False` (switch_node, analog): the nets whose copper is structural (the
+    relaxer never pulls one half of a pair or a no-via net on its own) and that route first.
+    One function: the net order and `route_relax` both read it, so the two cannot drift.
+
+    The `autoroute is False` clause is decision 2's (2026-10-01): a switch node may now change layer, so it
+    stopped being "one layer, no vias"; it is still the sensitive net it was, routed first and never pulled."""
+    cs = job.constraints
+    if cs is None:
+        return frozenset()
+    return frozenset(c.net for c in cs.constraints if c.net in design.nets and c.structural())
 
 
 ORDER = "constrained"
@@ -74,7 +78,8 @@ def net_order(scene, nets, cs, *, how: str = ORDER, constrained: frozenset[str] 
     first, each group by (-width_mm, net) — the old plan's stage order, kept for measurement."""
 
     def width(n: str) -> float:
-        return net_cost(cs, n).width_mm
+        # The widest copper the net carries on any layer, its links' included (§4.2).
+        return cs.widest(n) if hasattr(cs, "widest") and cs.by_net(n) is not None else net_cost(cs, n).width_mm
 
     if how == "constrained":
         return sorted(nets, key=lambda n: (n not in constrained, -width(n), n))
@@ -109,6 +114,8 @@ class Failed:
     refs: tuple[str, ...] = ()  # the footprints of the two ends
     ends: tuple[str, str] = ("pad", "pad")  # what each end is: "pad", "via" (a `ViaTerminal`) or "end" (an `EndTerminal`)
     pads: tuple[tuple[str, ...], tuple[str, ...]] = ((), ())  # the pads each end's copper already reached
+    nc: NetCost | None = None  # the cost the link was searched at: the link's (a path's), or the net's
+    link: object = None  # the `constraints.Link` when the failed link is a path's
 
 
 @dataclass
@@ -139,7 +146,7 @@ def plane_pours(design, job, name: str) -> list:
       number from the plan's `--board-edge-clearance`);
     - clearance: the **Default** class clearance, as the plane step always poured (a class clearance
       that is larger is enforced by KiCad's DRC against the pour anyway);
-    - `connect="solid"`, `min_thickness=0.1`, thermal gap and spoke 0.2: the fields every shipped
+    - `connect="solid"`, `min_thickness=stack.pour_min_mm` (0.1 on 1 oz, the 2 oz track_min on 2 oz), thermal gap and spoke 0.2: the fields every shipped
       board's plane carried before the native generator (recorded in tests/fixtures/native/), kept so the plane gates,
       the island and area numbers keep the meaning they were measured with;
     - `filled=True`: KiCad fills it at emit (`kicad_drc(refill=True)` runs before every gate).
@@ -150,16 +157,16 @@ def plane_pours(design, job, name: str) -> list:
     from .stackup import get_stackup
 
     stack = get_stackup(job.stackup)
-    w, h = job.board_size_mm
+    x0, y0, x1, y1 = job.outline
     e = stack.edge_clearance
     default = next((c for c in job.classes if c.name == "Default"), None)
     clear = default.clearance_mm if default is not None else stack.clearance_min
     out = []
     for net, layer in plane_targets(job):
-        pts = ((round(e, 6), round(e, 6)), (round(w - e, 6), round(e, 6)), (round(w - e, 6), round(h - e, 6)), (round(e, 6), round(h - e, 6)))
+        pts = ((round(x0 + e, 6), round(y0 + e, 6)), (round(x1 - e, 6), round(y0 + e, 6)), (round(x1 - e, 6), round(y1 - e, 6)), (round(x0 + e, 6), round(y1 - e, 6)))
         out.append(
             Copper(
-                "pour", "", net, layer=layer, points=pts, connect="solid", clearance=clear, min_thickness=0.1, filled=True,
+                "pour", "", net, layer=layer, points=pts, connect="solid", clearance=clear, min_thickness=stack.pour_min_mm, filled=True,
                 thermal_gap=0.2, thermal_bridge_width=0.2, island_removal_mode=0, source="gen",
             )
         )
@@ -198,7 +205,7 @@ def _pattern_stage(ctx_args, stage, scene, owned, out: RouteOut):
     return plan
 
 
-def route_stage(design, job, placement, *, name: str, core_cu=(), spine: bool = True, relax: bool = True, patterns: bool = True, pours: bool = True, problems: Path | None = None, order: str = ORDER) -> RouteOut:
+def route_stage(design, job, placement, *, name: str, core_cu=(), relax: bool = True, patterns: bool = True, pours: bool = True, problems: Path | None = None, order: str = ORDER) -> RouteOut:
     """See the module doc. `placement` is `place_native.place`'s; `core_cu` the stamped core copper
     (it enters the scene as locked items). The four switches exist for measurement (step 5)."""
     from .fanout import fanout_pieces
@@ -237,9 +244,6 @@ def route_stage(design, job, placement, *, name: str, core_cu=(), spine: bool = 
             scene.add(scene.item_of(p) for p in fan)
         take(fan)
         out.fanout = notes
-        if spine:
-            plan = _pattern_stage(ctx_args, "mid", scene, tuple(owned), out)
-            take(plan.pieces)
     poured = plane_pours(design, job, name) if pours else []
     out.pours = poured
     scene.zone_rules = tuple(scene.zone_rules) + zone_rules_of(poured)
@@ -266,11 +270,15 @@ def route_stage(design, job, placement, *, name: str, core_cu=(), spine: bool = 
     owned, out.stats["unfinished_dropped"] = drop_unfinished(owned, out.unrouted)
     out.pieces, out.stats["dangling_removed"] = prune_dangling(design, job, placement.feet, _dedup_pieces(owned), core_pieces, poured)
     held = frozenset(qp(t.item.pt) for t in first_ends)
-    out.pieces, out.stats["overlaps_merged"] = merge_overlaps(out.pieces, core_pieces, [it for it in scene.items if it.kind == "pad"], held)
+    out.pieces, out.stats["overlaps_merged"] = merge_overlaps(out.pieces, core_pieces, [it for it in scene.items if it.kind == "pad"], held, foreign=_foreign_pair(cs))
     # What is left laid over itself is pinned per board (`tests/test_native_refuted3.py`): 0.
     out.stats["overlap_mm"] = round(sum(o[-1] for o in overlaps(out.pieces, core_pieces)), 4)  # a lock's end held (`hold`) counts here
     for r in out.stats["dangling_removed"]:
         at = f"({r['a'][0]:g},{r['a'][1]:g})" if r["kind"] == "via" else f"({r['a'][0]:g},{r['a'][1]:g})->({r['b'][0]:g},{r['b'][1]:g})"
+        if r["kind"] == "trim":
+            (ta, tb) = r["to"]
+            out.notes.append(f"prune: cut the {r['net']} {r['reason']} track of {r['owner'] or 'no owner'} at {at} back to ({ta[0]:g},{ta[1]:g})->({tb[0]:g},{tb[1]:g}): {r['why']} (KiCad would call it dangling); what it joins stays joined")
+            continue
         out.notes.append(f"prune: removed the {r['net']} {r['reason']} {r['kind']} of {r['owner'] or 'no owner'} at {at}: {r['why']} (KiCad would call it dangling; removing it opens nothing)")
     final, core_items_now = final_scene(design, job, placement.feet, core_pieces, out.pieces, scene.zone_rules)
     out.stats["core_ends"] = core_end_states(final, core_pieces, core_items_now, first_ends, out.stats.get("core_ends") or {}, out.unrouted)
@@ -453,9 +461,10 @@ def prune_dangling(design, job, feet, pieces, core=(), pours=()):
             if it.net and it.kind in ("pad", "track", "via"):
                 by_net.setdefault(it.net, []).append(it)
         drop: dict[int, str] = {}
+        trims: dict[int, object] = {}
         for k, (p, it) in enumerate(zip(keep, mine)):
-            if p.reason in ("guard",):
-                continue  # a shield joins nothing by design; `_guard_gate` judges it
+            if p.reason in ("guard", GROUP_REASON):
+                continue  # a shield joins nothing by design (`_guard_gate` judges it); a via group is one item, joined by its own landings
             others = [o for o in by_net.get(p.net, ()) if o.id != it.id and o.copper is not None]
             if p.kind == "via":
                 layers = set()
@@ -473,15 +482,82 @@ def prune_dangling(design, job, feet, pieces, core=(), pours=()):
                     if not any(p.layer in o.layers and gap(dot, o.copper) <= 0.0 for o in others):
                         if p.layer in planes.get(p.net, ()):
                             continue  # a track end inside its own net's pour is joined by the pour
+                        cut = _trim_overhang(p, it, others)
+                        if cut is not None:
+                            trims[k] = cut
+                            break
                         drop[k] = f"its end at ({end[0]:g},{end[1]:g}) touches nothing" + (" once the pass before removed what it met" if _pass else "")
                         break
+        if trims:
+            for k, cut in sorted(trims.items()):
+                p = keep[k]
+                removed.append({"kind": "trim", "net": p.net, "reason": p.reason, "owner": p.owner, "a": list(p.a), "b": list(p.b), "to": [list(cut.a), list(cut.b)], "why": "its overhang past the last copper it joins touches nothing", "pass": _pass})
+                keep[k] = cut
+            trims.clear()
         if not drop:
+            if any(r.get("kind") == "trim" and r["pass"] == _pass for r in removed):
+                continue
             break
         for k in sorted(drop):
             p = keep[k]
             removed.append({"kind": p.kind, "net": p.net, "reason": p.reason, "owner": p.owner, "a": list(p.a), "b": list(p.b) if p.b else None, "why": drop[k], "pass": _pass})
         keep = [p for k, p in enumerate(keep) if k not in drop]
     return keep, removed
+
+
+def _trim_overhang(p, it, others):
+    """A track with a free end that joins **two or more** other items of its net along its length, which touch one
+    another no other way here, is not dangling copper to remove: removing it opens what it joins (the 2 oz buck copy, 2026-10-02: a VIN spine trunk whose
+    ends overhang its outermost ribs by the pads' half size was removed whole, and its five ribs after it, leaving
+    VIN open). Returns the track cut back to the outermost of the points it joins at — another track's end on its
+    centreline, or a via's or pad's centre on it, each within its copper — when the cut track still touches every
+    item the whole one touched; None otherwise (the caller removes it, as before)."""
+    from .route_geom import gap, track_shape
+
+    touched = [o for o in others if p.layer in o.layers and gap(it.copper, o.copper) <= 0.0]
+    if len(touched) < 2:
+        return None
+    # Only when the track is what joins them: items that already touch one another (a pad and the route that reached
+    # it, under a stub that hangs off both — ds2's ADC_TX escape) lose nothing when it goes.
+    parent = list(range(len(touched)))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            i = parent[i]
+        return i
+
+    for i in range(len(touched)):
+        for j in range(i + 1, len(touched)):
+            if touched[i].layers & touched[j].layers and gap(touched[i].copper, touched[j].copper) <= 0.0:
+                parent[find(i)] = find(j)
+    if len({find(i) for i in range(len(touched))}) < 2:
+        return None
+    a, b = p.a, p.b
+    L = math.dist(a, b)
+    if L <= 0.0:
+        return None
+    ux, uy = (b[0] - a[0]) / L, (b[1] - a[1]) / L
+    ts = []
+    for o in touched:
+        anchors = list(o.copper.pts) if o.kind == "track" else [o.at()]
+        for q in anchors:
+            t = (q[0] - a[0]) * ux + (q[1] - a[1]) * uy
+            off = abs((q[0] - a[0]) * uy - (q[1] - a[1]) * ux)
+            if -1e-6 <= t <= L + 1e-6 and off <= 1e-4:
+                ts.append(min(max(t, 0.0), L))
+    if not ts:
+        return None
+    lo, hi = min(ts), max(ts)
+    if hi - lo < 1e-3:
+        return None
+    na = qp((a[0] + ux * lo, a[1] + uy * lo))
+    nb = qp((a[0] + ux * hi, a[1] + uy * hi))
+    if (na, nb) == (qp(a), qp(b)):
+        return None
+    shape = track_shape(na, nb, p.w)
+    if any(gap(shape, o.copper) > 0.0 for o in touched):
+        return None
+    return replace(p, a=na, b=nb)
 
 
 def _span(a, b, p, q) -> tuple[float, float] | None:
@@ -533,7 +609,7 @@ def _joins_at(pt, w: float, net: str, layer: str, others, pads) -> bool:
     return any(it.net == net and layer in it.layers and it.copper is not None and gap(dot, it.copper) <= 0.0 for it in pads)
 
 
-def merge_overlaps(pieces, core=(), pads=(), hold=frozenset()) -> tuple[list[Piece], list[dict]]:
+def merge_overlaps(pieces, core=(), pads=(), hold=frozenset(), foreign=None) -> tuple[list[Piece], list[dict]]:
     """(the pieces with same-net copper laid over itself resolved, what was done). No copper that joins
     anything is lost and nothing opens: what goes is copper of the same net on the same layer, already
     there (the third refutation round: c3_usb's `USB_DP` ran 3.695 mm over itself and `USB_DN` folded
@@ -552,16 +628,20 @@ def merge_overlaps(pieces, core=(), pads=(), hold=frozenset()) -> tuple[list[Pie
     lock's end back along the lock is a join KiCad counts, and the lock is the author's)."""
     keep = list(pieces)
     done: list[dict] = []
-    fixed = [p for p in core if p.kind == "seg" and p.b is not None and p.a != p.b]
+    # A via group's landings are one item with its barrels (docs/net-path-physics.md §4.3): never cut or
+    # dropped here, only ever a container other copper may lie inside.
+    fixed = [p for p in [*core, *(q for q in keep if q.reason == GROUP_REASON)] if p.kind == "seg" and p.b is not None and p.a != p.b]
     for _pass in range(200):
         changed = False
-        segs = [(k, p) for k, p in enumerate(keep) if p.kind == "seg" and p.b is not None and p.a != p.b]
+        segs = [(k, p) for k, p in enumerate(keep) if p.kind == "seg" and p.b is not None and p.a != p.b and p.reason != GROUP_REASON]
         for k, x in segs:
             if qp(x.a) in hold or qp(x.b) in hold:
                 continue
             for j, y in [*((None, f) for f in fixed), *((j, q) for j, q in segs if j != k)]:
                 if y.net != x.net or y.layer != x.layer or y.w + 1e-9 < x.w:
                     continue
+                if foreign is not None and foreign(x, y):
+                    continue  # §3.2: copper the junction rules keep apart is not merged
                 sp = _span(y.a, y.b, x.a, x.b)
                 if sp is None or sp[0] < -1e-3 or sp[1] > math.dist(y.a, y.b) + 1e-3:
                     continue
@@ -586,6 +666,8 @@ def merge_overlaps(pieces, core=(), pads=(), hold=frozenset()) -> tuple[list[Pie
             for j, y in segs[i + 1 :]:
                 if y.net != x.net or y.layer != x.layer or abs(y.w - x.w) > 1e-9:
                     continue
+                if foreign is not None and foreign(x, y):
+                    continue
                 sp = _span(x.a, x.b, y.a, y.b)
                 L = math.dist(x.a, x.b)
                 if sp is None or min(L, sp[1]) - max(0.0, sp[0]) <= 0.01:
@@ -606,6 +688,26 @@ def merge_overlaps(pieces, core=(), pads=(), hold=frozenset()) -> tuple[list[Pie
         if not changed:
             break
     return keep, done
+
+
+def _foreign_pair(cs):
+    """`merge_overlaps`' scope (§3.2): two pieces of one net are kept apart when the net's paths carry a
+    field or a kind and one of them belongs to a sense path or a path that writes `amps=` that the other
+    does not. None when no net of the board has such a path (every board before the buck migration)."""
+    if cs is None or not hasattr(cs, "fielded") or not any(c.fielded() for c in cs.constraints):
+        return None
+    special: dict[str, bool] = {}
+    for c in cs.constraints:
+        for p in c.paths:
+            for lk in p.links:
+                special[lk.key] = p.kind is not None or p.amps is not None
+
+    def foreign(x, y) -> bool:
+        if x.net != y.net or not cs.fielded(x.net) or x.link == y.link:
+            return False
+        return special.get(x.link, False) or special.get(y.link, False)
+
+    return foreign
 
 
 def _dedup_pieces(pieces) -> list[Piece]:
@@ -647,8 +749,8 @@ def _uf(n):
 
 
 def _chain_stations(design, net: str) -> list[list[str]]:
-    """Every declared `Chain()` on `net`, its members (`REF.PAD` or `REF.PIN`) in station order."""
-    return [list(ch.pads) for ch in (getattr(design, "chains", ()) or ()) if ch.net == net]
+    """Every declared `Path()` on `net`, its members (`REF.PAD` or `REF.PIN`) in station order."""
+    return [list(ch.pads) for ch in (getattr(design, "paths", ()) or ()) if ch.net == net]
 
 
 def _pad_owner(design, member: str, owners: set[str]) -> str | None:
@@ -852,7 +954,7 @@ def pad_terminals(scene, net: str, pad_group: dict) -> list:
     as several pads whose copper is not already one — the ESP32-C3-MINI's nine `49` blocks — is one
     terminal per group of its blocks that touch (`route_scene.Item.block`). KiCad joins pads by copper,
     not by number, so each block is a terminal the router must reach. The first group keeps the owner's
-    name (`U1.49`, which a `Chain()` station names); the others are `U1.49@(x,y)`."""
+    name (`U1.49`, which a `Path()` station names); the others are `U1.49@(x,y)`."""
     from .patterns import Terminal, terminals
 
     out: list = []
@@ -883,13 +985,20 @@ def _is_pad(t) -> bool:
     return not isinstance(t, (ViaTerminal, EndTerminal))
 
 
-def net_links(design, scene, net: str, core_tracks=()) -> tuple[list, list[tuple[int, int]], object]:
+def net_links(design, scene, net: str, core_tracks=(), cs=None) -> tuple[list, list[tuple], object]:
     """(terminals, the links still to route in order, the union-find over terminals by what already
     connects them). The terminals are the net's pads, the vias already on it (`ViaTerminal`) and the free
     ends of its locked core tracks (`EndTerminal`). A component that holds a free core end is reached
     **only** at its free ends: its pads and vias are already joined by the lock, and a link to them would
-    leave the lock dangling. Links: a declared chain's consecutive stations first, then Kruskal over
-    terminal pairs by (distance, owners), skipping pairs already joined."""
+    leave the lock dangling. Links, each `(i, j, Link or None)`: every declared path's consecutive
+    stations first (a multi-pad end station is left at its **anchor**, the pad nearest its neighbour
+    station, and its other pads joined to it), then Kruskal over terminal pairs by (distance, owners),
+    skipping pairs already joined.
+
+    On a net whose paths carry a field or a kind (`docs/net-path-physics.md` §3.2, §4.2) Kruskal never
+    pairs two stations of one path (that link would bypass a station and lay a path's current on copper
+    sized for none), never takes a sense path's far stations as a terminal, and never starts on a via of
+    a path's own copper."""
     from .patterns import terminals
 
     pad_group, via_group = _net_groups(scene, net)
@@ -919,23 +1028,76 @@ def net_links(design, scene, net: str, core_tracks=()) -> tuple[list, list[tuple
     # ordinary terminal here, and `route_nets` joins it on its free layer afterwards if the tree did not.
     locked_groups = {group_of[k] for k, t in enumerate(terms) if isinstance(t, EndTerminal) and t.kind == "track" and k in group_of}
     usable = [not (group_of.get(k) in locked_groups and not isinstance(t, EndTerminal)) for k, t in enumerate(terms)]
-    links: list[tuple[int, int]] = []
-    for seq in _chain_stations(design, net):
-        owners = [_pad_owner(design, m, set(idx)) for m in seq]
-        for x, y in zip(owners, owners[1:]):
-            if x is not None and y is not None and x != y:
-                links.append((idx[x], idx[y]))
+    links: list[tuple] = []
+    c = cs.by_net(net) if cs is not None and hasattr(cs, "by_net") else None
+    specs = list(c.paths) if c is not None and c.paths else None
+    fielded = c is not None and c.fielded()
+    if specs is None:
+        for seq in _chain_stations(design, net):
+            owners = [_pad_owner(design, m, set(idx)) for m in seq]
+            for x, y in zip(owners, owners[1:]):
+                if x is not None and y is not None and x != y:
+                    links.append((idx[x], idx[y], None))
+    else:
+        for ps in specs:
+            if ps.pour is not None:
+                continue  # docs/physics-subjects.md PR 8: the pour is this Path's copper; its joints are tap's
+            joins = {lk.a: lk for lk in ps.links if lk.join}
+            st_links = [lk for lk in ps.links if not lk.join]
+            for k_link, lk in enumerate(st_links):
+                a = _anchor(terms, idx, lk.a, lk.b)
+                b = _anchor(terms, idx, lk.b, lk.a)
+                if a is not None and b is not None and a != b:
+                    links.append((a, b, lk))
+            for st, jl in joins.items():
+                nb = st_links[0].b if st_links and st_links[0].a == st else (st_links[-1].a if st_links else st)
+                anchor = _anchor(terms, idx, st, nb)
+                for pid in st:
+                    o = idx.get(pid)
+                    if o is not None and anchor is not None and o != anchor:
+                        links.append((anchor, o, jl))
+    # The Kruskal filters of §3.2, on a net whose paths carry a field or a kind.
+    same_path: set = set()
+    no_kruskal: set = set()
+    if fielded:
+        for ps in specs or ():
+            st_terms = [idx[pid] for st in ps.stations for pid in st if pid in idx]
+            for x in st_terms:
+                for y in st_terms:
+                    if x != y:
+                        same_path.add((min(x, y), max(x, y)))
+            if ps.kind is not None:
+                for st in ps.stations[1:]:
+                    no_kruskal.update(idx[pid] for pid in st if pid in idx)
+        for k, t in enumerate(terms):
+            if isinstance(t, ViaTerminal) and getattr(t.item, "link", ""):
+                no_kruskal.add(k)  # a path's own copper is met only inside its stations
     pairs = []
     for i in range(len(terms)):
-        if not usable[i]:
+        if not usable[i] or i in no_kruskal:
             continue
         for j in range(i + 1, len(terms)):
-            if not usable[j] or find(i) == find(j):
+            if not usable[j] or j in no_kruskal or find(i) == find(j) or (i, j) in same_path:
                 continue
             pairs.append((round(math.dist(terms[i].item.at(), terms[j].item.at()), 6), terms[i].owner, terms[j].owner, i, j))
     pairs.sort()
-    links += [(i, j) for _d, _a, _b, i, j in pairs]
+    links += [(i, j, None) for _d, _a, _b, i, j in pairs]
     return terms, links, (find, union)
+
+
+def _anchor(terms, idx, station: tuple[str, ...], toward: tuple[str, ...]) -> int | None:
+    """The terminal a link leaves `station` from: its one pad, or for a multi-pad station the pad
+    nearest the neighbour station on the placed board (ties by pad number, §1.2)."""
+    got = [idx[p] for p in station if p in idx]
+    if not got:
+        return None
+    if len(got) == 1:
+        return got[0]
+    far = [idx[p] for p in toward if p in idx]
+    if not far:
+        return got[0]
+    target = terms[far[0]].item.at()
+    return min(got, key=lambda k: (round(math.dist(terms[k].item.at(), target), 6), got.index(k)))
 
 
 def _link(scene, nc, layers, ta, tb, vias_left):
@@ -947,6 +1109,152 @@ def _link(scene, nc, layers, ta, tb, vias_left):
     pb_ = tb.item if _is_pad(tb) else None
     runs = r.link(ta.item.at(), tb.item.at(), la=la or None, lb=lb or None, pa=pa_, pb=pb_) if la and lb else None
     return runs, r, bool(la and lb)
+
+
+def _escape_blockers(scene, r, terms) -> tuple[list[tuple[int, int]], str]:
+    """For a link whose search found no free cell next to a pad (`Router._ends` empty): the items that
+    hold the lattice cells around that pad, most cells first, and one sentence naming the pad and the
+    rule each holds them by (clearance, or a keep-away). Refutation round 1, defect 6: the move said
+    "no free cell" and named nothing, while a 3 mm `keep_clear_of` against the IC's own FB pin held
+    every cell around its SW pin."""
+    from .route_geom import hull_dist2
+
+    count: dict[int, int] = {}
+    need_of: dict[int, float] = {}
+    stuck: list[str] = []
+    for t in terms:
+        if not _is_pad(t):
+            continue
+        p = t.item.at()
+        # Only the layers the pad is on: a pad's stub starts on its own copper (an SMD pad on F.Cu has no B.Cu
+        # start, which the search never offers it either; decision 2 gave the switch node B.Cu).
+        if r._ends(p, only=tuple(t.layers), pad=t.item):
+            continue
+        stuck.append(t.owner)
+        for L in r.layers:
+            if L not in t.layers:
+                continue
+            sl = r.slack[L]
+            half = r.nc.width_on(L) / 2.0
+            for (ix, iy) in r.lat.near(p, rings=3):
+                x, y = r.lat.pt(ix, iy)
+                rule = r.nc.rule
+                for i in scene.query(L, (x, y, x, y), sl.pad):
+                    it = scene.items[i]
+                    if it.kind in ("lane", "edge") or L not in it.layers or it.copper is None:
+                        continue
+                    if i in r.ignore:
+                        continue
+                    if it.net == r.nc.net:
+                        # The net's own copper holds a cell only where the junction rule makes it foreign
+                        # (`Slack.nearest`): a path's copper outside its station pads (decision 2 let buck's SW
+                        # path take a route that walls in its off-path branch at the branch's own pad).
+                        if rule is None or rule.in_allowed((x, y)) or not rule.foreign(it):
+                            continue
+                        dd = min((math.sqrt(hull_dist2(((x, y),), sh.pts)) - sh.r - rule.clearance for sh in sl._foreign_parts(i, it)), default=math.inf)
+                        if dd < half:
+                            count[it.id] = count.get(it.id, 0) + 1
+                            need_of[it.id] = rule.clearance
+                        continue
+                    need = sl.need(it.net)
+                    if math.sqrt(hull_dist2(((x, y),), it.copper.pts)) - it.copper.r - need < half:
+                        count[it.id] = count.get(it.id, 0) + 1
+                        need_of[it.id] = need
+    if not stuck:
+        return [], ""
+    ranked = sorted(count.items(), key=lambda kv: (-kv[1], kv[0]))[:8]
+    rules = _held_by(scene, r, terms, [i for i, _n in ranked[:3]])
+    held = f"No free cell next to {', '.join(stuck)}" + (f": held by {rules}" if rules else "")
+    return ranked, held
+
+
+def _corridor_blockers(scene, r, terms) -> tuple[list[tuple[int, int]], str]:
+    """For a link whose search was walled in by the lattice (no leg judged illegal, no pad stuck): the
+    items that hold the cells between its two ends (their box grown by 1 mm), most cells first, read
+    off `Slack.nearest` (what sets each blocked cell's slack), and the rule each holds them by."""
+    count: dict[int, int] = {}
+    edge = 0
+    (ax, ay), (bx, by) = terms[0].item.at(), terms[1].item.at()
+    x0, x1 = min(ax, bx) - 1.0, max(ax, bx) + 1.0
+    y0, y1 = min(ay, by) - 1.0, max(ay, by) + 1.0
+    lat = r.lat
+    i0, j0 = lat.cell((x0, y0))
+    i1, j1 = lat.cell((x1, y1))
+    for L in r.layers:
+        sl = r.slack[L]
+        half = r.nc.width_on(L) / 2.0
+        for ix in range(max(0, i0), min(lat.nx - 1, i1) + 1):
+            for iy in range(max(0, j0), min(lat.ny - 1, j1) + 1):
+                x, y = lat.pt(ix, iy)
+                d, who = sl.nearest(x, y)
+                if d >= half:
+                    continue
+                if who < 0:
+                    edge += 1
+                elif who not in r.ignore:
+                    count[who] = count.get(who, 0) + 1
+    ranked = sorted(count.items(), key=lambda kv: (-kv[1], kv[0]))[:8]
+    rules = _held_by(scene, r, terms, [i for i, _n in ranked[:3]])
+    if not ranked and not edge:
+        return [], ""
+    held = "The cells between the two ends are held" + (f" by {rules}" if rules else "") + (" and by the board edge" if edge and rules else (" by the board edge" if edge else ""))
+    return ranked, held
+
+
+def _station_of_same_path(cs, net: str, terms, pad: str) -> str | None:
+    """`station U1.VIN of Path line 69, not an end of this link` when `pad` is a station pad of the Path whose link
+    joins `terms` (postfix B6: buck's U1.3, Path line 69's last station, was labelled "off-path copper")."""
+    if cs is None:
+        return None
+    c = cs.by_net(net)
+    ends = {t.owner for t in terms}
+    for p in c.paths if c is not None else ():
+        if not any(set(lk.a) & ends and set(lk.b) & ends for lk in p.links if not lk.join):
+            continue
+        for written, st in zip(p.written, p.stations):
+            if pad in st:
+                return f"station {written} of Path line {p.line}, not an end of this link"
+    return None
+
+
+def _held_by(scene, r, terms, ids, *, keep_only: bool = False) -> str:
+    """`U1.4 [FB] at 3 mm (keep_clear_of SW on NetReq line 58, ...)` for each item id, the rule it is
+    held by; with `keep_only`, only the items a keep-away (not the clearance) holds. When a keep-away
+    holds a pad of a part the link's own pad is on, no Place() edit opens it, and the sentence says so."""
+    rules = []
+    both = []
+    cs = getattr(scene.table, "cs", None)
+    mine = {t.owner.split(".")[0] for t in terms if _is_pad(t)}
+    for iid in ids:
+        it = scene.items[iid]
+        if it.net == r.nc.net and r.nc.rule is not None:
+            if not keep_only:
+                lk = getattr(it, "link", "") or ""
+                st = _station_of_same_path(cs, r.nc.net, terms, it.owner) if not lk else None
+                what = "link " + lk if lk and not lk.startswith("@") else (st or "off-path copper")
+                rules.append(f"{it.owner} [{it.net}, {what}] at {r.nc.rule.clearance:g} mm (the junction rule: a path's copper meets the rest of its net only inside its station pads)")
+            continue
+        mm, why = scene.table.between(r.nc.net, it.net)
+        keep = False
+        if "keep-away" in why and cs is not None:
+            keep = True
+            # Name the line the keep-away came from.
+            for a, b in ((it.net, r.nc.net), (r.nc.net, it.net)):
+                c = cs.by_net(a)
+                k = next((k for k in (c.keep_away if c is not None else ()) if k.other == b), None)
+                if k is not None and c.line:
+                    why = f"keep_clear_of {b} on NetReq line {c.line}, {why}"
+                    ref = it.owner.split(".")[0]
+                    if it.kind == "pad" and ref in mine:
+                        both.append((ref, c.line, k.mm))
+                    break
+        if keep_only and not keep:
+            continue
+        rules.append(f"{it.owner} [{it.net}] at {mm:g} mm ({why})")
+    text = "; ".join(dict.fromkeys(rules))
+    for ref, line, mm in dict.fromkeys(both):
+        text += f". {ref} carries both nets, so the cells next to its own pad are held by its own pad at {mm:g} mm (keep_clear_mm on NetReq line {line})"
+    return text
 
 
 def _kind(t) -> str:
@@ -970,7 +1278,8 @@ def route_nets(design, job, scene, *, name: str, out: RouteOut, order: list[str]
     for net in order:
         nc = net_cost(cs, net)
         layers = route_layers(scene, nc)
-        terms, links, (find, union) = net_links(design, scene, net, core_tracks)
+        terms, links, (find, union) = net_links(design, scene, net, core_tracks, cs)
+        fielded = bool(hasattr(cs, "fielded") and cs.fielded(net))
         before = [find(i) for i in range(len(terms))]
         done = 0
         vias_used = 0
@@ -978,19 +1287,67 @@ def route_nets(design, job, scene, *, name: str, out: RouteOut, order: list[str]
         used: set[int] = set()
         tried: list[tuple[int, int, Failed]] = []
 
-        def fail(i: int, j: int, r, reachable: bool) -> Failed:
+        def fail(i: int, j: int, r, reachable: bool, lnc: NetCost = nc, llayers: tuple = layers, lk=None) -> Failed:
             ta, tb = terms[i], terms[j]
-            why = "" if reachable else f"no layer both {ta.owner} and {tb.owner} are on is open to {net} ({', '.join(layers) or 'none'})"
+            why = "" if reachable else f"no layer both {ta.owner} and {tb.owner} are on is open to {net} ({', '.join(llayers) or 'none'})"
             pads = tuple(tuple(sorted(t.owner for k, t in enumerate(terms) if _is_pad(t) and find(k) == find(x))) for x in (i, j))
-            return Failed(net, ta.owner, tb.owner, ta.item.at(), tb.item.at(), layers, sorted(r.last_hits.items(), key=lambda kv: (-kv[1], kv[0]))[:8], why, tuple(x for x in (ta.ref, tb.ref) if x), (_kind(ta), _kind(tb)), pads)
+            hits = sorted(r.last_hits.items(), key=lambda kv: (-kv[1], kv[0]))[:8]
+            if reachable and not hits:
+                # The search never left a pad: name what holds every cell around it, and the rule.
+                hits, held = _escape_blockers(scene, r, (ta, tb))
+                if held:
+                    why = held
+                if not hits:
+                    # It left them and was walled in by the lattice alone (no leg it tried was judged
+                    # illegal): name what holds the cells between the two ends. Refutation round 2: an
+                    # off-path branch walled in by its own net's path copper was told "nothing near them
+                    # holds a cell".
+                    hits, held = _corridor_blockers(scene, r, (ta, tb))
+                    if held:
+                        why = held
+            elif reachable:
+                # A blocker held by a keep-away rather than the clearance: say which line holds it.
+                kept = _held_by(scene, r, (ta, tb), [i for i, _n in hits[:3]], keep_only=True)
+                if kept:
+                    why = "Held by " + kept
+                if lnc.rule is not None:
+                    # The legs the search tried were refused by other items (`hits`), and the lattice may
+                    # also be walled by the net's own path copper, which no leg is refused by (the
+                    # junction rule holds the cells, `Slack`): name that copper too, or the error blames
+                    # only what the vias met (decision 2 let a switch node's branch try B.Cu).
+                    ch, _held = _corridor_blockers(scene, r, (ta, tb))
+                    own = [(i, n) for i, n in ch if scene.items[i].net == net]
+                    if own:
+                        hits = sorted(dict(hits + own).items(), key=lambda kv: (-kv[1], kv[0]))[:8]
+                        rule_text = _held_by(scene, r, (ta, tb), [i for i, _n in own[:3]])
+                        why = (why + "; " if why else "") + "The cells between the two ends are held by " + rule_text
+            # Postfix B13: when the pad-neck limit is what stops the link, say so with the room each exit has.
+            if reachable and getattr(r, "neck_facts", None):
+                why = (why + "; " if why else "") + "; ".join(r.neck_facts)
+            return Failed(
+                net, ta.owner, tb.owner, ta.item.at(), tb.item.at(), llayers, hits, why,
+                tuple(x for x in (ta.ref, tb.ref) if x), (_kind(ta), _kind(tb)), pads, nc=lnc, link=lk,
+            )
 
-        def lay(i: int, j: int) -> Failed | None:
+        def lay(i: int, j: int, lk=None) -> Failed | None:
             nonlocal vias_used, done
-            left = None if nc.via_count_max is None else max(0, nc.via_count_max - vias_used)
-            runs, r, reachable = _link(scene, nc, layers, terms[i], terms[j], left)
+            lnc = link_nc(nc, lk) if lk is not None else nc
+            if fielded:
+                from .route_scene import junction_rule
+
+                lnc = replace(lnc, rule=junction_rule(scene, cs, net, lk, lnc))
+            llayers = route_layers(scene, lnc) if lk is not None else layers
+            left = None if lnc.via_count_max is None else max(0, lnc.via_count_max - vias_used)
+            runs, r, reachable = _link(scene, lnc, llayers, terms[i], terms[j], left)
             if runs is None:
-                return fail(i, j, r, reachable)
-            pieces = _runs_to_pieces(net, nc, runs)
+                return fail(i, j, r, reachable, lnc, llayers, lk)
+            pieces = _runs_to_pieces(net, lnc, runs, r.groups, link=(lk.key if (fielded and lk is not None) else ""), necks=r.necks)
+            for g in r.groups:
+                if g is not None:
+                    out.stats.setdefault("groups", []).append(
+                        {"net": net, "link": lk.key if lk is not None else "", "count": len(g.barrels), "pitch": g.pitch_mm, "length": round(math.dist(g.p1, g.pn), 4),
+                         "landing": g.landing_mm, "worst_a": g.worst_a, "layers": [g.layer_from, g.layer_to], "barrels": [list(b) for b in g.barrels]}
+                    )
             vias_used += sum(1 for p in pieces if p.kind == "via")
             if pieces:
                 scene.add(scene.item_of(p) for p in pieces)
@@ -1000,10 +1357,33 @@ def route_nets(design, job, scene, *, name: str, out: RouteOut, order: list[str]
             done += 1
             return None
 
-        for (i, j) in links:
+        # Which path each station terminal belongs to: a Kruskal link may not join two components that
+        # hold stations of one path (a failed station link leaves the net open; it is never bypassed
+        # through an off-path pad at the net's numbers, §4.2).
+        station_paths: dict[int, set] = {}
+        if fielded:
+            idx_of = {t.owner: k for k, t in enumerate(terms)}
+            for n_path, ps in enumerate(cs.by_net(net).paths):
+                for st in ps.stations:
+                    for pid in st:
+                        if pid in idx_of:
+                            station_paths.setdefault(idx_of[pid], set()).add(n_path)
+
+        def bridges(i: int, j: int) -> bool:
+            """Would an off-path link join two components holding stations of one path?"""
+            if not station_paths:
+                return False
+            ri, rj = find(i), find(j)
+            a = set().union(*(v for k, v in station_paths.items() if find(k) == ri)) if any(find(k) == ri for k in station_paths) else set()
+            b = set().union(*(v for k, v in station_paths.items() if find(k) == rj)) if any(find(k) == rj for k in station_paths) else set()
+            return bool(a & b)
+
+        for (i, j, lk) in links:
             if find(i) == find(j):
                 continue
-            f = lay(i, j)
+            if lk is None and bridges(i, j):
+                continue
+            f = lay(i, j, lk)
             if f is not None:
                 tried.append((i, j, f))
         # A free core end the tree did not use still has to be joined, or the lock dangles: it is linked
@@ -1059,7 +1439,7 @@ def route_nets(design, job, scene, *, name: str, out: RouteOut, order: list[str]
                     out.notes.append(note)
                     ends[end_key(t)] = {"route": "failed", "why": note}
                     break
-                pieces = _runs_to_pieces(net, nc, runs)
+                pieces = _runs_to_pieces(net, nc, runs, r.groups)
                 vias_used += sum(1 for p in pieces if p.kind == "via")
                 if pieces:
                     scene.add(scene.item_of(p) for p in pieces)
@@ -1122,14 +1502,14 @@ def route_pairs(design, job, scene, *, out: RouteOut) -> list[Piece]:
     for p, n in pair_nets(job):
         cp, cn = _chain_stations(design, p), _chain_stations(design, n)
         if len(cp) != 1 or len(cn) != 1 or len(cp[0]) != len(cn[0]) or len(cp[0]) < 2:
-            out.notes.append(f"pair {p}/{n}: no declared Chain() of one length on both nets, so it is routed as two nets and its coupling is measured on the board")
+            out.notes.append(f"pair {p}/{n}: no declared Path() of one length on both nets, so it is routed as two nets and its coupling is measured on the board")
             continue
         tp = {t.owner: t for t in terminals(scene, p)}
         tn = {t.owner: t for t in terminals(scene, n)}
         sp = [_pad_owner(design, m, set(tp)) for m in cp[0]]
         sn = [_pad_owner(design, m, set(tn)) for m in cn[0]]
         if None in sp or None in sn:
-            out.notes.append(f"pair {p}/{n}: a chain station is not a pad of the net, so it is routed as two nets")
+            out.notes.append(f"pair {p}/{n}: a path station is not a pad of the net, so it is routed as two nets")
             continue
         ncp, ncn = net_cost(cs, p), net_cost(cs, n)
         layers = tuple(L for L in route_layers(scene, ncp) if L in route_layers(scene, ncn))
@@ -1150,17 +1530,35 @@ def route_pairs(design, job, scene, *, out: RouteOut) -> list[Piece]:
     return made
 
 
-def _runs_to_pieces(net: str, nc: NetCost, runs) -> list[Piece]:
+GROUP_REASON = "route_group"
+"""The reason a via group's barrels and landings carry (`docs/net-path-physics.md` §4.3): outside
+`route_relax.RELAXABLE`, so the relaxer never moves one barrel, and the role the emitted-board check
+finds a group by."""
+
+
+def _runs_to_pieces(net: str, nc: NetCost, runs, groups=(), link: str = "", necks=None) -> list[Piece]:
+    """The router's runs as pieces, each laid at its layer's width (`NetCost.width_on`). Between two runs
+    one via, or, where the search placed a group (`groups[k]`, a `route_cost.GroupPlan`), the group: its
+    barrels and a landing on both layers from the first barrel to the last. `link` stamps `Piece.link`
+    (a path link's key on a net whose paths carry a field or kind; `""` elsewhere)."""
     pieces: list[Piece] = []
     prev_end = None
     for k, (L, pp) in enumerate(runs):
         if k and prev_end is not None:
-            pieces.append(via_piece(net, "route", prev_end, nc.via_dia, nc.via_drill, owner=net))
+            plan = groups[k - 1] if groups and k - 1 < len(groups) else None
+            if plan is None:
+                pieces.append(via_piece(net, "route", prev_end, nc.via_dia, nc.via_drill, owner=net, link=link))
+            else:
+                for lay in (plan.layer_from, plan.layer_to):
+                    pieces.append(seg_piece(net, GROUP_REASON, lay, plan.p1, plan.pn, plan.landing_mm, owner=net, link=link))
+                for at in plan.barrels:
+                    pieces.append(via_piece(net, GROUP_REASON, at, nc.via_dia, nc.via_drill, owner=net, link=link))
         for a, b in zip(pp, pp[1:]):
             if qp(a) == qp(b):
                 continue
-            pieces.append(seg_piece(net, "route", L, a, b, nc.width_mm, owner=net))
-        prev_end = pp[-1]
+            w = (necks or {}).get(frozenset((qp(a), qp(b))), nc.width_on(L))  # a pad neck (decision 1) or full width
+            pieces.append(seg_piece(net, "route", L, a, b, w, owner=net, link=link))
+        prev_end = pp[-1] if pp else prev_end
     return pieces
 
 
@@ -1189,7 +1587,10 @@ def to_objects(pieces, board: str) -> tuple[list, list]:
     copper = geometry_uuids(copper, board)
     by_role: dict[tuple[str, str], list[str]] = {}
     for p, c in zip(pieces, copper):
-        members = by_role.setdefault((p.reason, p.owner or p.net), [])
+        # A path link's copper is its own role, `pcbc:route:<link key>` (docs/net-path-physics.md §4.2):
+        # the emitted-board checks find a path's copper by it. Off-path copper keeps the net.
+        role = p.link if (p.link and not p.link.startswith("@")) else (p.owner or p.net)
+        members = by_role.setdefault((p.reason, role), [])
         if c.uuid not in members:
             members.append(c.uuid)
     groups = []
@@ -1202,9 +1603,10 @@ def to_objects(pieces, board: str) -> tuple[list, list]:
 # --- moves and problem files ------------------------------------------------------------------------
 
 
-def _source_of(design, item) -> str:
+def _source_of(design, item, net: str = "") -> str:
     """The line that put a scene item where it is: a part's `Place()`, a core line, or the net whose
-    copper was routed earlier."""
+    copper was routed earlier; for copper of the failing link's own net (`net`), the link or branch it
+    belongs to (it is in the way only by the junction rule of docs/net-path-physics.md §3.2)."""
     kind = item.kind
     if kind in ("pad", "hole"):
         # "J1.A7", or "J1 pad at 32.9,38.7" for a pad with no number (the refuters: that one was read
@@ -1212,16 +1614,25 @@ def _source_of(design, item) -> str:
         ref = item.owner.split(" ")[0].split(".")[0]
         spec = next((p for p in design.places if p.ref == ref), None)
         if spec is None:
-            return f"{item.owner} pad [{item.net or 'no net'}] — {ref} has no Place() in board.py"
+            return f"{item.owner} pad [{item.net or 'no net'}] — {ref} has no Place() in layout.core.py"
         line = getattr(spec, "line", 0)
-        return f"{item.owner} pad [{item.net or 'no net'}] — {ref} is placed by board.py:{line} Place({ref!r})" if line else f"{item.owner} pad [{item.net or 'no net'}] — {ref}'s Place() in board.py"
+        return f"{item.owner} pad [{item.net or 'no net'}] — {ref} is placed by layout.core.py:{line} Place({ref!r})" if line else f"{item.owner} pad [{item.net or 'no net'}] — {ref}'s Place() in layout.core.py"
     if kind in ("track", "via"):
         if item.reason == "core":
             return f"{item.owner} ({kind} on {item.net or 'no net'}, a core line)"
+        if net and item.net == net:
+            lk = getattr(item, "link", "") or ""
+            whose = f"of link {lk}" if lk and not lk.startswith("@") else "of its off-path copper"
+            return f"{item.net} {kind} {whose} ({item.reason or 'copper'}, laid earlier; a path's copper meets the rest of its net only inside its station pads)"
         req = _netreq_line(design, item.net)
         return f"{item.net} {kind} ({item.reason or 'copper'}, written before this net{', its NetReq ' + req if req else ', a net with no NetReq line'})"
     if kind == "keepout":
-        return item.owner if item.reason == "core" else f"{item.owner} (a Keepout or rule area of board.py)"
+        if item.reason == "core":
+            return item.owner
+        if re.fullmatch(r"FID\d+_mask", str(item.owner)):
+            # place_native puts a copper keepout over each fiducial's mask opening; no core line declares it
+            return f"{item.owner} (the copper keepout of fiducial {str(item.owner)[:-5]}, placed by the build)"
+        return f"{item.owner} (a Keepout or rule area of layout.core.py)"
     return item.label()
 
 
@@ -1238,32 +1649,23 @@ def _netreq_of(design, net: str):
     return None
 
 
-def _via_move(design, job, scene, net: str, nc: NetCost) -> str:
-    """The `NetReq` edit that would let a no-via link change layers, or "" when there is none worth
-    offering. It names the line the net is already on (the refuters: "allow vias with
-    NetReq('REFN_F', vias=True)" was refused by `pcbc check` as naming REFN_F twice), says to split the
-    net out when that line names others, and when the net's layers leave one copper layer a via alone
-    cannot help, so the edit is layers= and vias= together."""
+def _via_fact(design, job, lk, net: str, nc: NetCost) -> str:
+    """Where a link's "no vias" comes from, as a fact (docs/direction.md §7b: never the edit): the
+    path line, the NetReq line, or the preset. "" when vias are allowed."""
     if nc.via_allowed:
         return ""
-    r = _netreq_of(design, net)
-    if r is None:
-        return f"or declare NetReq({net!r}, vias=True) in board.py"
-    others = [n for n in r.nets if n != net]
-    where = f"its NetReq at board.py:{r.line}"
-    split = f" (that line also names {', '.join(others)}: split {net} out into a NetReq of its own first)" if others else ""
-    lays = route_layers(scene, nc)
-    board = tuple(L for L in scene.layers)
-    if len(lays) >= 2:
-        return f"or let {net} change layers: add vias=True to {where}{split}"
-    if len(board) < 2:
-        return ""
-    two = ", ".join(repr(L) for L in board[:1] + board[-1:])
-    return f"or let {net} change layers: {where} keeps it on {', '.join(lays) or 'no layer'}, so give it layers=({two}) and vias=True there{split}"
+    if lk is not None and getattr(lk, "vias_src", ""):
+        return f"vias are not allowed on this link ({lk.vias_src})"
+    # A net writes no vias= since docs/physics-subjects.md PR 5: a link's "no vias" is its Path's or its path kind's.
+    c = job.constraints.by_net(net) if job.constraints is not None else None
+    if c is not None and c.pair is not None:
+        return f"vias are not allowed on {net} (Pair line {c.line})"
+    return f"vias are not allowed on {net} (preset {c.kind})" if c is not None else f"vias are not allowed on {net}"
 
 
 def move_lines(design, job, out: RouteOut, problems_dir: str | None = None) -> list[str]:
-    """One move per failed link, each ending in a `board.py` or `layout.core.py` edit."""
+    """One error per failed link (docs/direction.md §7b): what did not route, at what numbers and
+    under which rules, what is in the way, and where the problem file is. Facts only, no edit."""
     scene = out.scene
     lines = []
     count: dict[str, int] = {}
@@ -1274,7 +1676,7 @@ def move_lines(design, job, out: RouteOut, problems_dir: str | None = None) -> l
         seen = set()
         for iid, _n in f.blockers:
             it = scene.items[iid]
-            s = _source_of(design, it)
+            s = _source_of(design, it, f.net)
             if s not in seen:
                 seen.add(s)
                 blockers.append(s)
@@ -1288,29 +1690,41 @@ def move_lines(design, job, out: RouteOut, problems_dir: str | None = None) -> l
             if it.kind == "keepout" and it.reason == "core" and it.copper is not None:
                 for who, at in ((f.a, f.at_a), (f.b, f.at_b)):
                     if hull_dist2((tuple(at),), it.copper.pts) <= 1e-12:
-                        blockers.insert(0, f"{it.owner} covers {who}: clear it off that pad or delete it")
-        nc = net_cost(job.constraints, f.net)
+                        blockers.insert(0, f"{it.owner} covers {who}")
+        nc = f.nc if f.nc is not None else net_cost(job.constraints, f.net)
         how = f"on {', '.join(f.layers)}" + (" without vias" if not nc.via_allowed else "")
-        head = f"{f.net}: {_end_text(f, 0)} cannot reach {_end_text(f, 1)} {how} at {nc.width_mm:g} mm + {nc.clearance_mm:g} mm clearance."
+        lk = f.link
+        if lk is not None:
+            # A path's link (docs/net-path-physics.md §7): its own numbers and the line they came from.
+            kind = f", kind {lk.kind}" if lk.kind else ""
+            widths = ", ".join(f"{nc.width_on(L):g} mm on {L}" for L in f.layers) or f"{nc.width_mm:g} mm"
+            head = f"{f.net}: {_end_text(f, 0)} -> {_end_text(f, 1)} ({lk.source}{kind}) did not route at {widths} + {nc.clearance_mm:g} mm clearance"
+            if lk.group is not None and nc.via_allowed:
+                g = lk.group
+                head += (
+                    f": no layer change has room for its {g.count}-via group (flow-through, {g.pitch_mm:g} mm pitch, "
+                    f"{g.length_mm:g} mm landing at {g.landing_mm:g} mm on both layers) and no single-layer route was found"
+                )
+            head += "."
+        else:
+            head = f"{f.net}: {_end_text(f, 0)} cannot reach {_end_text(f, 1)} {how} at {nc.width_mm:g} mm + {nc.clearance_mm:g} mm clearance."
         if f.why:
             head += f" {f.why}."
-        way = ("  In the way: " + "; ".join(blockers) + ".") if blockers else "  The search found no free cell next to one of the pads."
-        refs = sorted(set(f.refs) or {x.split(".")[0] for x in (*f.pads[0], *f.pads[1])} or {f.a.split('.')[0], f.b.split('.')[0]})
-        fix = (
-            f"  Move: give the link room — edit the Place() of {' or '.join(refs)} (or of what is in the way) in board.py, "
-            f"or lock this link's copper in layout.core.py"
-        )
-        via = _via_move(design, job, scene, f.net, nc)
+        way = ("  In the way: " + "; ".join(blockers) + ".") if blockers else "  In the way: nothing the search could name: no item holds a cell next to either pad."
+        rules = []
+        via = _via_fact(design, job, lk, f.net, nc)
         if via:
-            fix += ", " + via
-        fix += "."
+            rules.append(via)
+        if lk is not None and getattr(lk, "layers_src", ""):
+            rules.append(f"layers {', '.join(lk.layers)} ({lk.layers_src})")
+        why_rules = ("  Rules: " + "; ".join(rules) + ".") if rules else ""
         tail = f"  Problem file: {problems_dir}/{f.net}-{k}.json" if problems_dir else ""
-        lines.append("\n".join(x for x in (head, way, fix, tail) if x))
+        lines.append("\n".join(x for x in (head, way, why_rules, tail) if x))
     for net in sorted({f.net for f in out.failed}):
         gone = (out.stats.get("unfinished_dropped") or {}).get(net)
         if gone:
             what = ", ".join(f"{n} {k}{'s' if n != 1 else ''}" for k, n in gone.items())
-            lines.append(f"{net}: unfinished, so none of its generated copper ({what}) is in layout.gen.py or on the board; the moves above name the links still missing.")
+            lines.append(f"{net}: unfinished, so none of its generated copper ({what}) is in layout.gen.py or on the board; the errors above name the links still missing.")
     return lines
 
 
@@ -1339,7 +1753,7 @@ def write_problems(root: Path, design, job, scene, out: RouteOut) -> None:
     count: dict[str, int] = {}
     for pos, f in enumerate(out.failed):
         count[f.net] = count.get(f.net, 0) + 1
-        nc = net_cost(job.constraints, f.net)
+        nc = f.nc if f.nc is not None else net_cost(job.constraints, f.net)
         x0, y0 = min(f.at_a[0], f.at_b[0]) - 2.0, min(f.at_a[1], f.at_b[1]) - 2.0
         x1, y1 = max(f.at_a[0], f.at_b[0]) + 2.0, max(f.at_a[1], f.at_b[1]) + 2.0
         near = []
@@ -1359,7 +1773,8 @@ def write_problems(root: Path, design, job, scene, out: RouteOut) -> None:
             "layers": list(f.layers),
             "order": out.order.index(f.net) if f.net in out.order else None,
             "failed_index": pos,
-            "cost": {"width_mm": nc.width_mm, "clearance_mm": nc.clearance_mm, "pitch_mm": nc.pitch_mm, "via_mm": (None if math.isinf(nc.via_mm) else round(nc.via_mm, 6)), "via_allowed": nc.via_allowed},
+            "cost": {"width_mm": nc.width_mm, "clearance_mm": nc.clearance_mm, "pitch_mm": nc.pitch_mm, "via_mm": (None if math.isinf(nc.via_mm) else round(nc.via_mm, 6)), "via_allowed": nc.via_allowed,
+                     **({"link": nc.link, "layer_widths": [list(x) for x in nc.layer_widths], "group": (None if nc.group is None else {"count": nc.group.count, "pitch_mm": nc.group.pitch_mm})} if nc.link or nc.layer_widths or nc.group is not None else {})},
             "blockers": [{"item": scene.items[i].label(), "kind": scene.items[i].kind, "hits": n} for i, n in f.blockers],
             "scene_near": near,
             "replay": f"python -m pcbc.route_native --replay <this file> --board <board.py>",

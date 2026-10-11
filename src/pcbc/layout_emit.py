@@ -94,7 +94,7 @@ def normalise_outline(entries) -> tuple:
     return tuple(out)
 
 
-def stamp(design: Design, items: list[Copper]) -> list[Copper]:
+def stamp(design: Design, items: list[Copper], outline=None) -> list[Copper]:
     """Fill the fields a hand-written line may omit: track width and via size/drill from the compiled
     constraint of the net, a pour's outline from the board, its clearance and minimum thickness from
     the constraints, its other numbers from KiCad's defaults (`ZONE_DEFAULTS`, and `HATCH_DEFAULTS`
@@ -122,7 +122,13 @@ def stamp(design: Design, items: list[Copper]) -> list[Copper]:
     job = compile_design(design)
     cs = job.constraints
     stack = get_stackup(job.stackup) if cs is not None else None
-    w, h = design.board.size_mm if design.board else (0.0, 0.0)
+    # A point-less core Pour fills the outline inset 0.5 mm: the declared one, or the job's (R while routing, O
+    # after the fit) handed in as `outline` (docs/board-outline.md B.3 step 5).
+    if outline is None:
+        from .layout import declared_outline
+
+        outline = declared_outline(design)[0]
+    bx0, by0, bx1, by1 = outline if outline is not None else (0.0, 0.0, 0.0, 0.0)
     inset = 0.5
     out: list[Copper] = []
     for c in items:
@@ -137,7 +143,7 @@ def stamp(design: Design, items: list[Copper]) -> list[Copper]:
                 fix["size"] = con.via.diameter_mm
         if c.kind == "pour":
             if not c.points and design.board is not None:
-                fix["points"] = ((inset, inset), (w - inset, inset), (w - inset, h - inset), (inset, h - inset))
+                fix["points"] = ((bx0 + inset, by0 + inset), (bx1 - inset, by0 + inset), (bx1 - inset, by1 - inset), (bx0 + inset, by1 - inset))
             if c.keepout is not None:
                 # A rule area: KiCad writes it with no clearance and its placement block switched off,
                 # whatever it was handed (measured: a 0.127 clearance comes back 0).

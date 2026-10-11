@@ -14,13 +14,13 @@ from pathlib import Path
 
 import pytest
 
-from conftest import routed_board
+from conftest import declared_examples, put_core, routed_board, vehicle_examples, write_split
 from pcbc.gen import Unmapped, decompile
 from pcbc.language import load_board
 from pcbc.sexp import board_footprint_spans, footprint_reference, parse_tree
 
 ROOT = Path(__file__).resolve().parent.parent
-EXAMPLES = ROOT / "examples"
+EXAMPLES = vehicle_examples()  # buck is the pre-migration board here: conftest.vehicle_examples
 PNG = "iVBORw0KGgoAAAANSUhEUgAAAAwAAAADCAIAAAAoQXllAAAAUklEQVR4nA3KMQEAIRADwYhABCKuTk29NSIQERGIQAQiEPM/9UiiiS5KDDHFEhFbHHHFE5Jpppsyw0yzTMw2x1zz/KfQQg8VRphhhYQdTrjhhQ/ngSX5Bo9g+gAAAABJRU5ErkJggg=="
 
 
@@ -37,17 +37,19 @@ def test_pcb_job_never_vouches_for_a_schematic_and_a_changed_board_py_redraws_it
     while the BOM said 4k7, and the build said ok (fifth review, MAJOR). The schematic has its own
     record, written by the sch stage alone; without it, or drawn from another board.py, the build is
     stale from check and the sch stage runs."""
-    from pcbc.build import SCH_INPUTS, pcb_job, planned, sch_stage, stale_reason
+    from pcbc.build import SCH_INPUTS, pcb_job, sch_reason, sch_stage, stale_reason
 
     board = _copy("blinky", tmp_path)
     layout = board.parent / "layout" / "blinky"
     assert not pcb_job(board).get("error")
     assert not (layout / "schematic.kicad_sch").exists() and not (layout / SCH_INPUTS).exists()
-    stage, why = stale_reason(layout, board)
-    assert stage is None and "the sch stage has not run" in why and "sch" in planned(stage, upto="fab", force=False)
+    # docs/schematic-layout.md §1.1: the sch stage is a side branch. The placed board stays current, and the
+    # sheet's own reason says the schematic was never drawn, so a build draws it before anything else.
+    assert stale_reason(layout, board) == ("place", None)
+    assert "the sch stage has not run" in sch_reason(layout, board)
     _step, err = sch_stage(load_board(board), board, layout, name="blinky")
     assert err is None and stale_reason(layout, board) == ("place", None)
-    board.write_text(board.read_text().replace('"1k"', '"4k7"', 1))
+    write_split(board, board.read_text().replace('"1k"', '"4k7"', 1))
     assert not pcb_job(board).get("error")  # re-places from the new board.py
     assert stale_reason(layout, board) == (None, "board.py, a module it imports or a part file changed since the schematic was drawn")
 
@@ -151,9 +153,9 @@ def test_insert_fiducials_reports_only_what_it_appended():
     from pcbc.fab import _fiducial_sexp, existing_fiducials, insert_fiducials
 
     bare = "(kicad_pcb\n\t(version 20260206)\n)\n"
-    text, added = insert_fiducials(bare, (40.0, 30.0))
+    text, added = insert_fiducials(bare, (0.0, 0.0, 40.0, 30.0))  # the outline rect (docs/board-outline.md PR 2)
     assert [r for r, _x, _y in added] == ["FID1", "FID2", "FID3"] and existing_fiducials(text) == added
-    again, none = insert_fiducials(text, (40.0, 30.0))
+    again, none = insert_fiducials(text, (0.0, 0.0, 40.0, 30.0))
     assert none == [] and again == text
     one = _fiducial_sexp("FID1", 5, 5)
     uuids = re.findall(r'\(uuid "([^"]+)"\)', one)
@@ -213,7 +215,7 @@ def test_fab_holds_the_board_to_the_routed_one_in_order_and_leaves_nothing_when_
     job = compile_design(design)
     cases = {
         "pad_size_swap": (_in_fp("C_IN2", "(at -0.95 0)\n\t\t\t(size 1 1.45)", "(at -0.95 0)\n\t\t\t(size 1.45 1)"), r"footprint C_IN2 is on the routed board and not on the fab board as it was"),
-        "silk_line_swap": (_in_fp("C_IN2", "(start -0.261252 -0.735)", "(start -0.735 -0.261252)"), r"footprint C_IN2 is on the routed board"),
+        "silk_line_swap": (_in_fp("C_IN2", "(start -0.22 -0.735)", "(start -0.735 -0.22)"), r"footprint C_IN2 is on the routed board"),
         "outline_swap": (lambda t: t.replace("\t\t(start 0 0)\n\t\t(end 40 25)\n", "\t\t(start 0 0)\n\t\t(end 25 40)\n", 1), r"gr_rect .* is on the routed board and not on the fab board as it was"),
         "fid_stacked": (_stack_fid, r"footprint FID1 is on the fab board and nothing routed it|carries the uuid .* 2 times \(footprint FID1, footprint FID1\)"),
         "ref_huge": (_ref_huge, r"footprint C_IN2 is on the routed board"),
@@ -231,7 +233,13 @@ def test_fab_holds_the_board_to_the_routed_one_in_order_and_leaves_nothing_when_
     assert clean["error"] is None and clean["copper_equal"] is True and clean["gerbers"] == 10
     assert all_uuids_of((tmp_path / "clean" / "layout.kicad_pcb").read_text()) == all_uuids_of(final.read_text())
     assert [f["by"] for f in clean["fiducials"]] == ["place"] * 3
-    assert clean["silk"]["moved"] == [] and clean["dates_pinned"] > 0
+    # fab reads the silk, writes none: the hidden references and the library marks not printed (2026-10-07), and the
+    # orientation marks (docs/direction.md §4c, 2026-10-08), all off the board
+    assert set(clean["silk"]) == {"hidden", "marks", "orientation", "orientation_fails", "silk_mask"} and clean["dates_pinned"] > 0
+    # A library mark not printed is one the silk pass left out because it would mislead (§4c, round 2: buck U1's two
+    # dots by L1's pad, L1's by J_IN's housing), each stated as that fact, never "no spot".
+    assert all("silkscreen mark not printed" in m and "no spot" not in m for m in clean["silk"]["marks"]), clean["silk"]["marks"]
+    assert clean["silk"]["orientation_fails"] == [] and clean["silk"]["orientation"] and clean["silk"]["silk_mask"] == []
 
 
 def test_pin_dates_rewrites_every_wall_clock_kicad_stamps(tmp_path: Path):
@@ -257,9 +265,13 @@ def _load(tmp_path: Path, line: str):
     from pcbc.layout_job import load_core
     from pcbc.seed import emit_pcb
 
-    board = _copy("blinky", tmp_path)
+    # blinky as shipped with a declared outline (a vehicle): its seed board carries the outline's uuid
+    shutil.copytree(declared_examples() / "blinky", tmp_path / "blinky", ignore=shutil.ignore_patterns("layout"))
+    board = tmp_path / "blinky" / "blinky.py"
+    core = board.parent / "layout.core.py"
+    # The core file runs with board.py (`load_board`, docs/board-outline.md A.2); `load_core` validates what it put in.
+    put_core(core, "# fifth review\n" + line + "\n")
     design = load_board(board)
-    (board.parent / "layout.core.py").write_text("# fifth review\n" + line + "\n")
     placed = emit_pcb(design, name="blinky")
     return load_core(design, board, placed, name="blinky")
 
@@ -287,7 +299,7 @@ REFUSED_AT_LOAD = [
     # drawing layers= is (copper, its own mask)
     ('Line((1, 1), (4, 1), layers=("F.Cu", "B.Mask"), id="l1")', r"layers=\('F.Cu', 'B.Mask'\): a drawing's layers= is KiCad's form"),
     ('Line((1, 1), (4, 1), layers=("F.Cu", "F.Mask", "B.Mask"), id="l1")', r"KiCad's form for copper with its mask opened"),
-    ('Line((1, 1), (4, 1), layer="F.Cu", layers=("F.Cu", "F.Mask"), id="l1")', r"give layer= or layers=, not both"),
+    ('Line((1, 1), (4, 1), layer="F.Cu", layers=("F.Cu", "F.Mask"), id="l1")', r"layer= and layers= are both given"),
     # values KiCad's save rewrites
     ('Text("x", (2, 2), justify=("left", "right"), id="t1")', r"justify names both 'left' and 'right'"),
     ('Text("x", (2, 2), justify=("left", "left"), id="t1")', r"justify names 'left' twice"),
@@ -328,8 +340,8 @@ REFUSED_AT_LOAD = [
     # uuids: one object each, never the build's
     ('Line((1, 1), (4, 1), layer="Cmts.User", uuid="aaaaaaaa-1111-4111-8111-aaaaaaaaaaa1", id="l1")\nText("x", (2, 2), uuid="aaaaaaaa-1111-4111-8111-aaaaaaaaaaa1", id="t1")', r"uuid aaaaaaaa-1111-4111-8111-aaaaaaaaaaa1 is already"),
     ('Table((0, 20), [["a"]], id="tb")\nLine((1, 1), (4, 1), layer="Cmts.User", uuid="{table}", id="l1")', r"is already"),
-    ('Line((1, 1), (4, 1), layer="Cmts.User", uuid="{outline}", id="l1")', r"is the board outline \(Board\(\) in board.py\)'s"),
-    ('Line((1, 1), (4, 1), layer="Cmts.User", uuid="{r1}", id="l1")', r"is footprint R1 \(placed from board.py\)'s"),
+    ('Line((1, 1), (4, 1), layer="Cmts.User", uuid="{outline}", id="l1")', r"is the board outline \(Outline\(\) in layout.core.py, or derived\)'s"),
+    ('Line((1, 1), (4, 1), layer="Cmts.User", uuid="{r1}", id="l1")', r"is footprint R1 \(placed from layout.core.py\)'s"),
     # words through `_word`, one form for every refusal
     ('Pour("GND", layer="B.Cu", points=[(1, 1), (9, 1), (9, 9)], connect="bogus", id="p1")', r"connect must be one of 'thermal', 'solid', 'none', 'thru_hole_only', got 'bogus'"),
     ('Target((5, 5), shape="o", id="t1")', r"shape must be one of 'plus', 'x', got 'o'"),
@@ -346,7 +358,8 @@ def test_a_core_line_kicad_would_not_keep_is_refused_at_load_naming_the_line(tmp
     from pcbc.sexp import stable_uuid
 
     if any(k in line for k in ("{table}", "{outline}", "{r1}")):
-        placed = emit_pcb(lb(_copy("blinky", tmp_path / "probe")), name="blinky")
+        shutil.copytree(declared_examples() / "blinky", tmp_path / "probe" / "blinky", ignore=shutil.ignore_patterns("layout"))
+        placed = emit_pcb(lb(tmp_path / "probe" / "blinky" / "blinky.py"), name="blinky")
         r1 = next(t for s, e in board_footprint_spans(placed) if footprint_reference(t := placed[s:e]) == "R1")
         # the table's uuid is derived from its id; the outline's and R1's are the placed board's
         line = line.replace("{table}", stable_uuid("blinky", "layout", "tb")).replace("{outline}", stable_uuid("blinky", "edge"))
@@ -442,7 +455,7 @@ def test_a_pour_is_adopted_only_when_every_field_is_the_build_s(tmp_path: Path):
     wider = re.sub(r"clearance=[0-9.]+", "clearance=0.6", pour, count=1)
     assert wider != pour
     board = _copy("buck", tmp_path / "e1")
-    (board.parent / "layout.core.py").write_text(wider + "\n")
+    put_core(board.parent / "layout.core.py", wider + "\n")
     result = build_job(board, upto="route", force=True)
     route = next(s for s in result["steps"] if s["stage"] == "route")
     pid = wider.rsplit('id="', 1)[1].split('"')[0]
@@ -450,7 +463,7 @@ def test_a_pour_is_adopted_only_when_every_field_is_the_build_s(tmp_path: Path):
     assert route["adopted"] == [] and route["locked"] == [pid]
     # c3_usb: the build's own outline as a minimal core pour is a lock, and the plane gate names it
     board = _copy("c3_usb", tmp_path / "c1")
-    (board.parent / "layout.core.py").write_text('Pour("GND", layer="B.Cu", points=[(0.3, 0.3), (39.7, 0.3), (39.7, 29.7), (0.3, 29.7)], id="gndplane")\n')
+    put_core(board.parent / "layout.core.py", 'Pour("GND", layer="B.Cu", points=[(0.3, 0.3), (39.7, 0.3), (39.7, 29.7), (0.3, 29.7)], id="gndplane")\n')
     result = build_job(board, upto="route", force=True)
     route = next(s for s in result["steps"] if s["stage"] == "route")
     assert route["lock_passes"][0]["reproduced"] == [], route["lock_passes"]

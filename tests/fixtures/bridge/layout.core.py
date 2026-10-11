@@ -1,0 +1,6 @@
+Outline(width=40, height=25)
+Place("C1", position="absolute", left=6, top=6, locked=True, reason="analog decoupling, west")
+Place("C2", position="absolute", left=6, top=15, locked=True, reason="analog decoupling, west")
+Place("R11", position="absolute", left=18.5, top=10.5, locked=True, reason="the one tie, between the domains")
+Place("C3", position="absolute", right=6, top=6, locked=True, reason="digital decoupling, east")
+Place("C4", position="absolute", right=6, top=15, locked=True, reason="digital decoupling, east")

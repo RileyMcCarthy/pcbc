@@ -1,4 +1,4 @@
-"""Constraints: every NetReq / Pair / Bus / Chain / Isolation / Guard line turned into numbers with
+"""Constraints: every NetReq / Pair / Bus / Path / Isolation / Guard line turned into numbers with
 their sources (docs/r1-design.md sections A and D).
 
 `compile_constraints(design)` is pure: a `Design` in, a `ConstraintSet` out. It never reads a board
@@ -14,10 +14,11 @@ a note as a `Derived`, and the report (`ConstraintSet.lines`) prints one number 
 from __future__ import annotations
 
 import fnmatch
+import pathlib
 from dataclasses import asdict, dataclass, field, replace
 
 from .layout import resolve_regions
-from .model import BridgeReq, BusReq, ChainReq, Design, GuardReq, IsolationReq, NetReqSpec, PairReq, ThermalReq
+from .model import BridgeReq, BusReq, Design, GuardReq, IsolationReq, NetReqSpec, PairReq, ThermalReq
 from .stackup import (
     IPC2221_TABLE_6_1,
     IEC60664_TABLE_F5_PD2,
@@ -26,6 +27,8 @@ from .stackup import (
     Source,
     Stackup,
     capacitance_pf_per_mm,
+    cu_text,
+    ipc2221_formula,
     current_width_mm,
     diff_pair_geometry,
     diff_pair_width_mm,
@@ -52,6 +55,7 @@ from .stackup import (
 )
 
 __all__ = [
+    "PAD_NECK_MAX_MM",
     "CREEPAGE_FROM_V",
     "FORMULAS",
     "PAIR_FIT_MM",
@@ -106,7 +110,7 @@ SOFT = " [soft: warning in R1]"
 KIND_ALIASES = {"digital": "generic", "default": "generic"}
 
 # Kwargs every kind accepts (A.4); `z_se_ohm` and `volts` are "on any kind" (D, notes on the table).
-COMMON_KWARGS = ("max_mm", "layers", "vias", "autoroute", "class_name", "keep_clear_of", "keep_clear_mm", "volts", "z_se_ohm", "rise_ps")
+COMMON_KWARGS = ("max_mm", "class_name", "keep_clear_of", "keep_clear_mm", "volts", "rise_ps")
 
 # The four-layer tuple today's power class carries on every board (byte-identical projection).
 POWER_LAYERS = ("F.Cu", "B.Cu", "In1.Cu", "In2.Cu")
@@ -138,6 +142,8 @@ class PairSpec:  # compiled; the language-level object is model.PairReq
     skew_mm: Derived
     uncoupled_mm: Derived
     controlled: bool  # False when the stackup cannot reach the target (2-layer USB)
+    length_mm: float | None = None  # Pair(length_mm=): each member Path's length budget between its stations
+    line: int = 0  # the Pair line
 
 
 @dataclass(frozen=True)
@@ -146,8 +152,9 @@ class GroupSpec:
     members: tuple[str, ...]  # bus: net names (clock included); chain: "REF.PIN" in feed order
     match_mm: float | None  # bus skew budget
     clock: str | None
-    line: int = 0  # the Bus / Chain / NetReq line
+    line: int = 0  # the Bus / Path / NetReq line
     source: str = ""  # "preset clock" | "Bus line 12" | "NetReq line 40"
+    length_mm: float | None = None  # Bus(length_mm=): each member's budget between the stations its Path names
 
 
 @dataclass(frozen=True)
@@ -175,6 +182,133 @@ class KeepAway:
 
 
 @dataclass(frozen=True)
+class ViaGroup:
+    """The via group a layer change carrying a current places (`docs/net-path-physics.md` §4.3): a
+    **flow-through line** of `count` barrels at `pitch_mm`, both layers' copper (the landing,
+    `landing_mm` wide, the wider of the two layer widths) running over every barrel, the current
+    entering at the first and leaving at the last. `count` is the smallest whose worst barrel, by
+    `stackup.via_group`'s lumped DC model, carries at most `rating_a`."""
+
+    amps: float
+    count: int
+    pitch_mm: float
+    landing_mm: float
+    worst_a: float
+    rating_a: float
+    drill_mm: float
+    temp_rise_c: float
+
+    @property
+    def length_mm(self) -> float:
+        return round((self.count - 1) * self.pitch_mm, 4)
+
+    def text(self, plating_mm: float) -> str:
+        """`3 vias per layer change, flow-through at 1.3 mm pitch, worst barrel 0.750 A of 0.871 (...)`."""
+        over = "" if self.worst_a <= self.rating_a + 1e-9 else f"; no line up to {self.count} barrels holds it"
+        return (
+            f"{self.count} vias per layer change, flow-through at {_g(self.pitch_mm)} mm pitch, worst barrel {self.worst_a:.3f} A of "
+            f"{self.rating_a:.3f} (via_barrel {_g(self.drill_mm)}/{_g(plating_mm)} mm at {_g(self.temp_rise_c)} C; lumped DC model{over})"
+        )
+
+
+@dataclass(frozen=True)
+class Link:
+    """Two consecutive stations of a `Path()` (or the join of a multi-pad end station), with the
+    numbers the router and the gates read for the copper between them (§4.1). `width` is per allowed
+    layer; clearance, via size and length budget stay the net's."""
+
+    net: str
+    a: tuple[str, ...]  # resolved pad ids of the station
+    b: tuple[str, ...]
+    written: tuple[str, str]  # as the author wrote them
+    source: str  # "Path line 62", or "Path line N (station J1.VBUS)" for a join
+    key: str  # "C_OUT1.1~R_FB_TOP.1", from the first resolved pad of each station
+    width: tuple[tuple[str, Derived], ...]  # per allowed layer
+    via: ViaSpec
+    group: ViaGroup | None
+    layers: tuple[str, ...]
+    current: CurrentSpec | None
+    keep_away: tuple[KeepAway, ...]
+    sense: bool
+    join: bool
+    line: int = 0
+    kind: str | None = None  # the path kind, "feedback" | "sense"
+    amps_written: bool = False  # the Path wrote amps=: rule 2 of §3.2 applies to it
+    layers_src: str = ""  # where `layers` came from, for a move
+    vias_src: str = ""  # where `via.allowed` came from, for a move
+    z_se: tuple[tuple[str, tuple[float, Derived]], ...] = ()  # per layer (target, computed z) when the Path writes z_se_ohm=
+    reference: tuple[tuple[str, str], ...] = ()  # per layer, the plane under this copper (z_se_ohm= / reference=)
+
+    def width_on(self, layer: str) -> float:
+        for lay, d in self.width:
+            if lay == layer:
+                return d.value
+        return max((d.value for _lay, d in self.width), default=0.0)
+
+    def widest(self) -> float:
+        return max((d.value for _lay, d in self.width), default=0.0)
+
+    def narrowest(self) -> float:
+        return min((d.value for _lay, d in self.width), default=0.0)
+
+
+@dataclass(frozen=True)
+class PathSpec:
+    """One `Path()` line, compiled (§4.1)."""
+
+    net: str
+    stations: tuple[tuple[str, ...], ...]  # resolved pad ids per station
+    written: tuple[str, ...]  # the members as written
+    line: int
+    kind: str | None
+    links: tuple[Link, ...]  # station links, then joins
+    length_mm: float | None  # the length budget (Path(length_mm=) or the path kind's): airwire at placement, routed length after
+    fielded: bool  # writes a field or a kind
+    amps: float | None  # the current it wrote: the number, or the sum of its draws (what the first station supplies)
+    draws: tuple[tuple[str, float], ...] = ()  # `amps={station: A}` as written; () for a number
+    z_se_ohm: float | None = None  # the impedance target it wrote (N4), or None
+    pour: str | None = None  # the pour layer, when the Path's current is on a poured net (PR 8): the pour is its copper
+    joints: tuple["Joint", ...] = ()  # PR 8: each station's joint to that pour, sized for its own draw
+    length_src: str = ""  # whose budget `length_mm` is: "Path line 9", "Pair line 12", "Bus line 14", "" for a path kind's
+
+
+@dataclass(frozen=True)
+class Joint:
+    """A station's joint to its net's pour (`docs/physics-subjects.md` PR 8): on a poured rail the pour is the copper
+    between the stations, so what a draw needs is a joint from the station's pad to the pour that carries it. An SMD
+    pad's joint is its tap via group: `vias` stackup vias, each `one_amps` at `temp_rise_c` (IPC-2221B eq. 6-2 on
+    the barrel, `stackup.via_amps`); a through-hole pad's own barrel reaches the pour, and the gate rates that."""
+
+    station: str  # as written: "J_LOAD.1"
+    pads: tuple[str, ...]  # its pad ids
+    amps: float  # what it draws, or for the first station what it supplies (the sum)
+    supplies: bool  # the first station
+    vias: int  # stackup vias an SMD pad of this station needs: ceil(amps / one_amps), at least 1; 0 for a barrel
+    via: tuple[float, float]  # (diameter, drill)
+    one_amps: float  # one stackup via's rating, or the barrel's when `barrel_mm` is set
+    temp_rise_c: float
+    barrel_mm: float | None = None  # every pad of the station is through-hole: its own barrel (this drill) joins the pour
+    lines: tuple[int, ...] = ()  # the Path lines whose currents meet at this station, when more than one (their sum)
+    verb: str = ""  # "supplies"/"draws" from `supplies`; "carries" when the Paths meeting here supply and draw
+    # Round 3 (refute-current f1c): what each pad carries when Paths name overlapping pad sets of one station (a pin
+    # and one of its pads); empty means `amps` split evenly over `pads`. `paths.joint_pad_amps` reads the worst pad.
+    pad_amps: tuple[tuple[str, float], ...] = ()
+
+
+@dataclass(frozen=True)
+class LoopSpec:
+    """One `Loop()` line, compiled (`docs/net-path-physics.md` §6): a check on the area its pads
+    enclose, closed from the last back to the first; it lays no copper."""
+
+    pads: tuple[str, ...]  # one pad id per station, in the order written
+    written: tuple[str, ...]
+    line: int
+    budget: Derived  # mm2: Loop(mm2=) or the pcbc default
+    steps: tuple[str, ...]  # per step: "net <name>" or "part <ref>"
+    parts: tuple[str, ...]  # the refs a loop names (caps and ICs): the guessed loops skip them
+
+
+@dataclass(frozen=True)
 class Constraint:
     net: str  # one per real net; globs expanded, sorted
     kind: str  # preset name (aliases resolved: digital/default -> generic); "pair" for a bare Pair()
@@ -185,15 +319,13 @@ class Constraint:
     lane_clearance_mm: float  # the kind number alone: what fanout lanes are sized from
     via: ViaSpec
     layers: tuple[str, ...]
-    reference: str | None  # reference plane layer for controlled impedance
-    z_se: tuple[float, Derived] | None  # (target, computed at width_mm)
+    reference: str | None  # reference plane layer of a pair (a single-ended impedance is a Path's link's, PR 5)
     pair: PairSpec | None
     group: GroupSpec | None
     airwire_max_mm: float | None  # today's max_mm: a placement budget, never a KiCad rule
     length_max_mm: Derived | None  # routed length -> KiCad length (max)
     keep_away: tuple[KeepAway, ...]
     spacing_w: int  # 3 or 5; printed in R1, a router cost in R3
-    current: CurrentSpec | None
     voltage: VoltageSpec | None
     loop_mm2: Derived | None  # switch_node hot-loop budget, or the power decap-loop budget
     rise_ps: float | None
@@ -229,10 +361,42 @@ class Constraint:
     for that is made here where the netlist is (`_compile`), not in a pattern that has only a scene.
     """
     isolation_side: str | None  # Region name
-    autoroute: bool | str  # `diff_pair` marks a pair (routed as one object); False a sensitive preset, whose layer/via constraint the router honours
+    autoroute: bool | str  # `diff_pair` marks a pair (routed as one object); True otherwise (PR 7: no NetReq sets it)
     soft: tuple[str, ...]  # rule kinds written as warnings in R1: subset of SOFT_RULES
     notes: tuple[str, ...]  # honest caveats, e.g. the 2-layer USB line
     req_index: int = -1  # index into Design.netreqs; -1 when synthesised from Pair/Bus alone
+    paths: tuple["PathSpec", ...] = ()
+    """Every `Path()` on this net, in board order (§4.1)."""
+    off_path: tuple[str, ...] = ()
+    """The net's pads no `Path()` names, as pad ids, when the net has a path (§3.1)."""
+
+    def width_on(self, layer: str) -> float:
+        """The width of the net's own (off-path) copper on `layer`: one number on every layer, because a net
+        carries no current of its own (`docs/physics-subjects.md` PR 3); a path's link has its own."""
+        return self.width_mm.value
+
+    def fielded(self) -> bool:
+        """Does a path of this net carry a field or a kind? Only then do role owners, the junction
+        rules and the off-path report apply (§4.2)."""
+        return any(p.fielded for p in self.paths)
+
+    def structural(self) -> bool:
+        """Is this net's copper structural — a pair member, a sensitive net kind (`SENSITIVE_KINDS`), or a net whose one
+        Path is the whole node and may not change layer (`vias=False`) or has one layer? Those route first and the
+        relaxer never pulls them (`route_native.constrained_nets`, `fanout._excluded`). Since docs/physics-subjects.md
+        PR 5 a net writes no `vias=`/`layers=`; any other path's constraint rides on its own links."""
+        if self.pair is not None or self.autoroute == "diff_pair" or self.kind in SENSITIVE_KINDS:
+            return True
+        whole = self.whole_node_path()
+        return whole is not None and any((not lk.via.allowed) or len(lk.layers) == 1 for lk in whole.links)
+
+    def whole_node_path(self) -> "PathSpec | None":
+        """The one Path that names every pad of this net, when it is the net's only Path: that Path's copper
+        is the whole node, so a KiCad rule selected by net checks exactly it (`docs/physics-subjects.md`
+        KD 12). None otherwise."""
+        if len(self.paths) == 1 and not self.off_path and self.paths[0].fielded:
+            return self.paths[0]
+        return None
 
 
 @dataclass(frozen=True)
@@ -372,8 +536,14 @@ def _thermal_refusals(design: Design, stack: Stackup, pours: tuple[tuple[str, st
     """
     from .fab import passive_refs
 
+    from .paths import station_pads
+
+    planes_declared = bool(design.board.planes) if design.board is not None else False
     out: list[ThermalSpec] = []
     seen: dict[str, int] = {}
+    # One land, one array, keyed on the pads the line resolves to: "U1.GND" (a pin of 22 pads) and
+    # "U1.49" (one of them) name the same copper, and two arrays on it are two answers to one question.
+    seen_pads: dict[str, tuple[int, str]] = {}
     for th in design.thermals:
         who = f'Thermal("{th.pad}") line {th.line}'
         ref, _, pin = th.pad.partition(".")
@@ -387,7 +557,28 @@ def _thermal_refusals(design: Design, stack: Stackup, pours: tuple[tuple[str, st
         if th.pad in seen:
             refusals.append(f"{who}: {th.pad} already has a Thermal() on line {seen[th.pad]}; one land, one array")
             continue
+        pads = station_pads(design, net, th.pad)
+        if len(pads) > 1:
+            # Round 3 (refute-onehome, bt_gnd035): "U1.GND" is 22 pads, 21 of them separate lands around the module's
+            # edge. The array was budgeted for "one land", the stitch pattern laid barrels in edge pads and in no pad,
+            # and the build's own gate called it a pcbc bug. An array sits under one land: one pad number (which may
+            # be several primitives, as U1.49's nine blocks are).
+            shown = sorted((x.split(".", 1)[1] for x in pads), key=lambda n: (len(n), n))
+            listing = ", ".join(shown) if len(shown) <= 6 else ", ".join(shown[:6]) + ", ..."
+            refusals.append(f"{who}: {th.pad} is {len(pads)} pads of {ref} ({listing}); a thermal array is under one land, and a land is one pad")
+            continue
+        shared = [p for p in pads if p in seen_pads]
+        if shared:
+            line, written = seen_pads[shared[0]]
+            refusals.append(
+                f"{who}: {th.pad} is pad{'s' if len(pads) != 1 else ''} {', '.join(pads)}, and "
+                f"{', '.join(shared)} {'is' if len(shared) == 1 else 'are'} already the land of "
+                f'Thermal("{written}") on line {line}; one land, one array'
+            )
+            continue
         seen[th.pad] = th.line
+        for p in pads:
+            seen_pads[p] = (th.line, th.pad)
         # R-M4, and it is the one refusal in this statement that no amount of fab money buys off: a
         # via inside a two-terminal passive's pad wicks the joint whatever the barrel is filled with,
         # and `fab.via_in_pad_blockers` refuses the board for it. Refused here so the author reads it
@@ -396,9 +587,7 @@ def _thermal_refusals(design: Design, stack: Stackup, pours: tuple[tuple[str, st
         if ref in passive_refs(design):
             refusals.append(
                 f"{who}: {ref} is a two-terminal passive, and a via inside a passive's pad wicks the joint "
-                f"whatever the fab fills it with (fab.via_in_pad_blockers refuses the board for it). "
-                f"Drop the line; a passive that has to shed heat sheds it through its own copper, so widen "
-                f"the track with NetReq(\"{net}\", amps=...) instead"
+                f"whatever the fab fills it with (fab.via_in_pad_blockers refuses the board for it)"
             )
             continue
         # The array's whole job is to reach a plane. Without one the vias land in nothing: on a
@@ -408,11 +597,11 @@ def _thermal_refusals(design: Design, stack: Stackup, pours: tuple[tuple[str, st
         if not plane:
             refusals.append(
                 f"{who}: {net} has no plane or pour to reach, so an array under {th.pad} would be "
-                f"{th.watts:g} W of vias into bare laminate. "
+                f"{th.watts:g} W of vias into bare laminate"
                 + (
-                    f'Board(planes=[("{net}", "In1.Cu")]) gives it one'
-                    if stack.layers > 2
-                    else f'NetReq("{net}", kind="power") is what gives it the back pour (route_scene.plane_targets)'
+                    f" (Board(planes=) pours no {net} plane)"
+                    if (stack.layers > 2 or planes_declared)
+                    else f" (a two-layer board pours B.Cu only when GND is a power net, route_scene.plane_targets)"
                 )
             )
             continue
@@ -422,15 +611,13 @@ def _thermal_refusals(design: Design, stack: Stackup, pours: tuple[tuple[str, st
         if stack.via_fill == "none":
             refusals.append(
                 f'{who}: stackup "{stack.name}" does not fill its vias, and tenting is a mask dam rather '
-                f"than a plug — solder wicks down an open barrel and starves the joint. "
-                f"Board(stackup=...) on a stackup whose via_fill is set is the edit"
+                f"than a plug — solder wicks down an open barrel and starves the joint"
             )
             continue
         if not (stack.via_fill_min_drill - 1e-9 <= stack.via_drill <= stack.via_fill_max_drill + 1e-9):
             refusals.append(
                 f'{who}: stackup "{stack.name}" fills {stack.via_fill_min_drill:g} to {stack.via_fill_max_drill:g} mm '
-                f"and its standard via is {stack.via_drill:g} mm, so these barrels cannot be plugged. "
-                f"Board(stackup=...) on a stackup whose standard via is inside that range is the edit"
+                f"and its standard via is {stack.via_drill:g} mm, so these barrels cannot be plugged"
             )
             continue
         foreign = tuple((pnet, lay) for pnet, lay in pours if pnet != net)
@@ -440,9 +627,8 @@ def _thermal_refusals(design: Design, stack: Stackup, pours: tuple[tuple[str, st
                 f"{who}: every via here is a through via, so {vias_for_theta(stack.board_mm, stack.via_drill, th.watts, th.rise_c, stack.via_plating_mm)} "
                 f"of them punch {vias_for_theta(stack.board_mm, stack.via_drill, th.watts, th.rise_c, stack.via_plating_mm)} antipads in {anti}, "
                 f"which this net does not join. That is finding 10 at nine times the scale — one row of taps at a "
-                f"footprint's own pitch already slotted a plane and turned a 1.80 mm path across it into 8.09 mm. "
-                f"Thermal(\"{th.pad}\", watts={th.watts:g}, across_planes=True) consents to it, and the pitch the array "
-                f"is then placed at is derived so the webs survive rather than chosen"
+                f"footprint's own pitch already slotted a plane and turned a 1.80 mm path across it into 8.09 mm; "
+                f"Thermal() gives no across_planes=True"
             )
             continue
         theta = via_theta_c_per_w(stack.board_mm, stack.via_drill, stack.via_plating_mm)
@@ -549,7 +735,7 @@ class ReturnRule:
     change: tuple[str, str] | None  # the layer pair the verdict is about; None when `pinned`
     verdict: str  # one of RETURN_VERDICTS
     why: str
-    move: str  # ends in a board.py edit, or "" for `kept` / `pinned`, which ask for none
+    move: str  # "" always since docs/direction.md §7b: the verdict and why are the facts; no edit is proposed
 
     def to_dict(self) -> dict:
         return {
@@ -573,19 +759,9 @@ class ReturnRule:
         assert self.change is not None
         a, b = self.change
         goal = next((f"{r[1]} on {r[0]}" for _lay, r in self.refs if r), "a reference plane")
-        return move_line(self.net, f"the return current crossing {a}->{b}", goal, f"{self.why} ({self.verdict})", self.move)
+        return move_line(self.net, f"the return current crossing {a}->{b}", goal, f"{self.why} ({self.verdict})")
 
 
-def _plane_move(stack: Stackup, want_net: str, ref_layers: tuple[str, ...], planes: tuple[tuple[str, str], ...]) -> str:
-    """`Board(planes=[...])` with `want_net` under every layer in `ref_layers` — the declaration that
-    would make a layer change keep one reference net. Ordered by the stackup's own layer order so the
-    edit is byte-identical run to run, and every plane the board already declares that is not one of
-    the two is carried through rather than silently dropped."""
-    order = stack.copper_layers()
-    keep = [(net, lay) for net, lay in planes if lay not in ref_layers]
-    out = keep + [(want_net, lay) for lay in ref_layers]
-    body = ", ".join(f'("{net}", "{lay}")' for net, lay in sorted(out, key=lambda p: order.index(p[1])))
-    return f"Board(planes=[{body}])"
 
 
 def return_rule(stack: Stackup, planes: tuple[tuple[str, str], ...], c: Constraint) -> ReturnRule | None:
@@ -642,14 +818,7 @@ def return_rule(stack: Stackup, planes: tuple[tuple[str, str], ...], c: Constrai
             f"{a} is referenced to {fr[1]} on {fr[0]} and {b} to {to[1]} on {to[0]}, the reference changes net across the via, "
             f"and a via joins one net to itself, so no return via anywhere carries this current"
         )
-        ref_layers = tuple(dict.fromkeys(r[0] for _lay, r in refs if r))
-        fixes = [
-            f"{_plane_move(stack, fr[1], ref_layers, planes)} puts one net under both layers, at the cost of {to[1]}'s plane.",
-            f"Left as they are, the return wants a capacitor between {fr[1]} and {to[1]} at the crossing, which is Bridge()'s "
-            f"shape and not a via's — and Bridge() ties two Ground() nets, so {to[1]} declared with Power() is not one today "
-            f"(measured 2026-09-21: Bridge(\"{fr[1]}\", \"{to[1]}\") is refused with 'a bridge ties two grounds').",
-        ]
-        return ReturnRule(c.net, tuple(c.layers), refs, (a, b), verdict, why, " ".join(fixes))
+        return ReturnRule(c.net, tuple(c.layers), refs, (a, b), verdict, why, "")
 
     # lost
     gone, other, kept = (a, b, to) if fr is None else (b, a, fr)
@@ -662,29 +831,7 @@ def return_rule(stack: Stackup, planes: tuple[tuple[str, str], ...], c: Constrai
         )
     else:
         why = f"{gone} has no plane above or below it, and the via leaves {other}'s {kept[1]} on {kept[0]} behind"
-    with_ref = tuple(lay for lay, r in refs if r)
-    # `"GND"` where `kept` is None is not invented here: it is the spelling the compiler's own
-    # existing refusal for this exact situation already uses ("... wants a plane on In1.Cu;
-    # Board(planes=[("GND", "In1.Cu")]) declares it"), so the two moves ask for the same edit.
-    want_net = kept[1] if kept else "GND"
-    lost_fixes = []
-    if with_ref:
-        layers_txt = ", ".join(f'"{lay}"' for lay in with_ref)
-        lost_fixes.append(f"NetReq(layers=[{layers_txt}]) on line {c.line} keeps it on the layer{'' if len(with_ref) == 1 else 's'} that has one.")
-    elif stack.layers <= 2:
-        lost_fixes.append('NetReq("GND", kind="power") is what gives this board the back pour this net would reference (route_scene.plane_targets).')
-    if stack.layers > 2:
-        # One neighbour, not both: `gone` needs *a* plane, and declaring two would be a larger edit
-        # than the fault asks for.
-        want = stack.plane_below(gone) or stack.plane_above(gone)
-        if want:
-            lost_fixes.append(f"{_plane_move(stack, want_net, (want,), planes)} gives {gone} one.")
-    else:
-        lost_fixes.append(
-            f'Board(layers=4, stackup="jlcpcb_4l_1oz", planes=[("{want_net}", "In1.Cu")]) gives the net a second '
-            f"plane, which is a different board rather than a one-line edit."
-        )
-    return ReturnRule(c.net, tuple(c.layers), refs, (a, b), verdict, why, " ".join(lost_fixes))
+    return ReturnRule(c.net, tuple(c.layers), refs, (a, b), verdict, why, "")
 
 
 def return_rules(cs: ConstraintSet) -> tuple[ReturnRule, ...]:
@@ -694,7 +841,34 @@ def return_rules(cs: ConstraintSet) -> tuple[ReturnRule, ...]:
     and nothing here opens a file. `tests/test_return_rules.py` asserts every verdict on all five
     boards with no `layout/` directory present at all.
     """
-    return tuple(r for c in cs.constraints if (r := return_rule(cs.stackup, cs.planes, c)) is not None)
+    out: list[ReturnRule] = []
+    for c in cs.constraints:
+        r = return_rule(cs.stackup, cs.planes, c)
+        if r is not None:
+            out.append(r)
+            continue
+        # A single-ended impedance is a Path's (docs/physics-subjects.md PR 5, N4/N14): its first link with a
+        # reference is classified the same way, over the layers and vias that link may use.
+        for p in c.paths:
+            lk = next((x for x in p.links if not x.join and x.z_se and x.reference), None)
+            if lk is None:
+                continue
+            proxy = _LinkReturn(net=c.net, reference=lk.reference[0][1], layers=tuple(lk.layers), via=lk.via)
+            r = return_rule(cs.stackup, cs.planes, proxy)  # type: ignore[arg-type]
+            if r is not None:
+                out.append(r)
+            break
+    return tuple(out)
+
+
+@dataclass(frozen=True)
+class _LinkReturn:
+    """What `return_rule` reads of a constraint, for one path link that carries an impedance."""
+
+    net: str
+    reference: str
+    layers: tuple[str, ...]
+    via: ViaSpec
 
 
 def _return_caveat(rule: ReturnRule, spelling: str, reference_name: str) -> str:
@@ -749,11 +923,13 @@ class ConstraintSet:
     isolations: tuple[IsolationReq, ...]
     rule_areas: tuple[RuleArea, ...]  # R1: one per Isolation (the corridor between the two Regions)
     canary_net: str | None  # compile._canary_net(design), carried so dru.py needs no Design
-    refusals: tuple[str, ...]  # what `pcbc check` fails on (a Chain pin off its net, ...)
+    refusals: tuple[str, ...]  # what `pcbc check` fails on (a Path pin off its net, ...)
     lines: tuple[str, ...]  # the report, one number per line, sorted by net
     isolation_specs: tuple[IsolationSpec, ...] = ()  # the numbers behind `isolations`
     bridges: tuple[BridgeSpec, ...] = ()  # one per `Bridge()`; no geometry, see `BridgeSpec`
     thermals: tuple[ThermalSpec, ...] = ()  # one per `Thermal()`; the budget, not the placement
+    loops: tuple["LoopSpec", ...] = ()  # one per `Loop()` (§6): a check on named pads
+    _index: dict = field(default_factory=dict, init=False, repr=False, compare=False)
     planes: tuple[tuple[str, str], ...] = ()
     """(net, layer) for every pour this board will **have** — not only what `Board(planes=)` says.
 
@@ -763,12 +939,11 @@ class ConstraintSet:
     (`"B.Cu pour"`). Without this, classifying a layer change needed a PCB file, and the whole value
     of `docs/stitch-plan.md` S5 is that it does not.
 
-    On four layers it is `Board(planes=)` verbatim. On two it is the back `GND` pour the route stage
-    writes when `GND` is a power net — and only that: a two-layer `Board(planes=)` is not read here,
-    while `route_scene.plane_targets` (what the route stage pours) takes it on every stackup. The two
-    agree on the five boards, none of which declares `planes=` on two layers
-    (`tests/test_return_rules.py::test_the_compiled_planes_are_the_route_plans_own`); they differ on a
-    two-layer board that does (`tests/fixtures/planes`).
+    It is `route_scene.plane_targets`' answer: `Board(planes=)` verbatim when the board declares any, on
+    every stackup; otherwise, on two layers, the back `GND` pour the route stage writes when `GND` is a
+    power net (`tests/test_return_rules.py::test_the_compiled_planes_are_the_route_plans_own`). Until
+    postfix A7 a two-layer `Board(planes=)` was not read here while the route stage poured it, so a
+    current Path on that pour got no joints and a sense Path on it was not refused.
 
     **Not `CompiledJob.planes`**, which is `Board(planes=)` verbatim on every stackup and is therefore
     `()` on all four two-layer boards here. The two differ exactly where it matters — the 2L pour — so
@@ -781,6 +956,79 @@ class ConstraintSet:
             if c.net == name:
                 return c
         return None
+
+    # -- paths and links (docs/net-path-physics.md §4.1) ---------------------------------------------
+
+    def _links(self) -> dict:
+        """(net, pad, pad) -> Link, both orders, and key -> Link; built once per set."""
+        idx = self._index.get("links")
+        if idx is None:
+            by_pads: dict = {}
+            by_key: dict = {}
+            for c in self.constraints:
+                for p in c.paths:
+                    for lk in p.links:
+                        by_key.setdefault(lk.key, lk)
+                        for x in lk.a:
+                            for y in lk.b:
+                                if x != y:
+                                    by_pads.setdefault((c.net, x, y), lk)
+                                    by_pads.setdefault((c.net, y, x), lk)
+            idx = (by_pads, by_key)
+            self._index["links"] = idx
+        return idx
+
+    def link(self, net: str, pad_a: str, pad_b: str) -> Link | None:
+        """The link between two pads (pad ids, `U1.4`), when they are consecutive stations of a path or
+        two pads of one multi-pad end station (its join); None otherwise."""
+        return self._links()[0].get((net, pad_a.split("@")[0], pad_b.split("@")[0]))
+
+    def link_by_key(self, key: str) -> Link | None:
+        return self._links()[1].get(key)
+
+    def links_of(self, net: str) -> tuple[Link, ...]:
+        c = self.by_net(net)
+        return tuple(lk for p in (c.paths if c is not None else ()) for lk in p.links)
+
+    def fielded(self, net: str) -> bool:
+        c = self.by_net(net)
+        return c is not None and c.fielded()
+
+    def pad_width(self, net: str, pad: str, layer: str | None = None) -> float:
+        """The width copper leaving `pad` on `layer` must have: the widest link at the pad, or the
+        net's width where an off-path branch may end there."""
+        c = self.by_net(net)
+        if c is None:
+            d = next((k for k in self.classes if k.name == "Default"), None)
+            return d.track_width_mm if d is not None else self.stackup.track_min
+        own = c.width_on(layer) if layer else c.width_mm.value
+        pad = pad.split("@")[0]
+        # An off-path branch may end on any pad but a sense path's far stations (§3.2), so the net's own
+        # width reaches every other pad.
+        far = {x for p in c.paths if p.kind is not None for st in p.stations[1:] for x in st}
+        best = own if pad not in far else 0.0
+        for lk in self.links_of(net):
+            if pad in lk.a or pad in lk.b:
+                best = max(best, lk.width_on(layer) if layer else lk.widest())
+        return best or own
+
+    def widest(self, net: str) -> float:
+        """The widest copper of the net on any layer: its own width and every link's."""
+        c = self.by_net(net)
+        if c is None:
+            return 0.0
+        vals = [c.width_mm.value]
+        vals += [lk.widest() for lk in self.links_of(net)]
+        return max(vals)
+
+    def narrowest(self, net: str) -> float:
+        """The narrowest copper of the net on any layer: its own width and every link's."""
+        c = self.by_net(net)
+        if c is None:
+            return 0.0
+        vals = [c.width_mm.value]
+        vals += [lk.narrowest() for lk in self.links_of(net)]
+        return min(vals)
 
     def fastest_edge(self) -> tuple[str, float] | None:
         """`(net, rise_ps)` for the fastest edge any `NetReq(rise_ps=)` on this board declares, or
@@ -820,6 +1068,7 @@ class ConstraintSet:
             "rule_areas": [asdict(a) for a in self.rule_areas],
             "canary_net": self.canary_net,
             "planes": [list(p) for p in self.planes],
+            "loops": [_to_json(asdict(lp)) for lp in self.loops],
             "refusals": list(self.refusals),
             "lines": list(self.lines),
         }
@@ -854,35 +1103,79 @@ class Preset:
     layers: tuple[str, ...]
     airwire_mm: float | None
     spacing_w: int
-    autoroute: bool | str
 
 
 PRESETS: dict[str, Preset] = {
-    "generic": Preset("Default", ("z_se_ohm",), None, None, None, True, None, ("F.Cu", "B.Cu"), None, 3, True),
-    "power": Preset("Power", ("amps", "temp_rise_c", "volts", "loop_mm2"), None, 0.20, (0.8, 0.4), True, None, POWER_LAYERS, None, 3, True),
-    "analog": Preset("Analog", ("keep_clear_of", "keep_clear_mm"), 0.20, 0.20, (0.6, 0.3), False, None, ("F.Cu",), 25.0, 5, False),
-    "switch_node": Preset("SwitchNode", ("loop_mm2", "amps"), 0.30, 0.20, (0.6, 0.3), False, None, ("F.Cu",), 8.0, 3, False),
-    "clock": Preset("Clock", ("match_mm", "vias_max"), 0.15, 0.20, (0.6, 0.3), True, 2, ("F.Cu", "B.Cu"), None, 5, True),
-    "usb_hs": Preset(
-        "USB", ("z_diff_ohm", "pair", "match_mm", "uncoupled_mm", "vias_max", "reference", "length_mm"), None, None, None, True, 2, ("F.Cu", "B.Cu"), None, 3, "diff_pair"
-    ),
-    "spi": Preset("SPI", ("clock", "match_mm", "length_mm", "z_se_ohm"), None, 0.20, None, True, None, ("F.Cu", "B.Cu"), None, 3, True),
-    "i2c": Preset("I2C", ("pf_max",), None, 0.20, None, True, None, ("F.Cu", "B.Cu"), None, 3, True),
-    "sense": Preset("Sense", ("match_mm", "keep_clear_of", "keep_clear_mm"), 0.20, 0.20, (0.6, 0.3), False, None, ("F.Cu",), 25.0, 5, False),
-    "feedback": Preset("Feedback", ("keep_clear_of", "keep_clear_mm"), 0.20, 0.20, (0.6, 0.3), False, None, ("F.Cu",), 15.0, 5, False),
+    # docs/physics-subjects.md PR 5 (§4.1): a net kind keeps only what holds at every pad — the clearance number,
+    # the spacing, the span and the loops it generates. No net kind sets a width, a via, a layer or a current:
+    # its copper is the class floor at the stackup via on every layer `Board(planes=)` does not give to a plane.
+    "generic": Preset("Default", (), None, None, None, True, None, POWER_LAYERS, None, 3),
+    "power": Preset("Power", ("volts",), None, 0.20, None, True, None, POWER_LAYERS, None, 3),
+    "analog": Preset("Analog", ("keep_clear_of", "keep_clear_mm"), None, 0.20, None, True, None, POWER_LAYERS, 25.0, 5),
+    # Decision 2 (owner, 2026-10-01, "ok do 1-4"): switch-node copper may change layer through a via group sized for
+    # its current (`paths.make_group`); its copper area stays priced by the route cost and measured
+    # (`route_verify.switch_copper`).
+    "switch_node": Preset("SwitchNode", (), None, 0.20, None, True, None, POWER_LAYERS, 8.0, 3),
+    "clock": Preset("Clock", (), None, 0.20, None, True, None, POWER_LAYERS, None, 5),
+    "i2c": Preset("I2C", ("pf_max",), None, 0.20, None, True, None, POWER_LAYERS, None, 3),
+}
+
+
+PAIR_PRESETS: dict[str, Preset] = {
+    # docs/physics-subjects.md PR 6 (§4.2): `usb_hs` is a Pair kind. It is also the geometry every Pair is
+    # compiled with (edge-coupled microstrip, C.3); a Pair with no kind carries only its own line's numbers.
+    "usb_hs": Preset("USB", (), None, None, None, True, 2, POWER_LAYERS, None, 3),
+}
+BARE_PAIR = Preset("Pair", (), None, None, None, True, None, POWER_LAYERS, None, 3)
+"""A Pair with no kind (refutation one-home r1, defect 2): the pair geometry from its own line, vias allowed at the
+stackup via with no budget, the 3W spacing every net kind but analog and clock has. Not a kind a line can write."""
+BUS_KINDS_MATCH = {"spi": 2.5}
+"""Bus kinds and their default skew budget (§4.2): `spi`, matched to its clock within 2.5 mm by default."""
+SENSITIVE_KINDS = ("switch_node", "analog")
+"""Net kinds whose copper routes first and the relaxer never pulls (decision 2, owner 2026-10-01). Until
+docs/physics-subjects.md PR 7 this was read off `Preset.autoroute is False`; the field is gone (it was the old
+router's switch), and the routing fact it carried is the net kind's (`Constraint.structural`)."""
+NET_KINDS = tuple(sorted(PRESETS))
+"""The kinds a NetReq takes (§4.2): what a node is. A Pair kind, a Bus kind and a Path kind are refused on it."""
+
+
+@dataclass(frozen=True)
+class PathPreset:
+    """A path kind's defaults (`docs/physics-subjects.md` KD 15): what a branch that carries a measurement
+    gets when its Path does not say. pcbc defaults with no published source, carried over unchanged."""
+
+    width_mm: float
+    vias_allowed: bool
+    layers: tuple[str, ...]
+    length_mm: float
+
+
+PATH_PRESETS: dict[str, PathPreset] = {
+    "feedback": PathPreset(0.20, False, ("F.Cu",), 15.0),
+    "sense": PathPreset(0.20, False, ("F.Cu",), 25.0),
 }
 
 # Preset defaults with no standard behind them (printed "pcbc default") and the ones with a source.
-DEFAULT_MATCH_MM = {"clock": 2.0, "usb_hs": 0.5, "spi": 2.5, "sense": 1.0}
-MATCH_SOURCE = {"clock": "pcbc default", "usb_hs": "TI usb_layout_basics", "spi": "about 15 ps on FR-4, pcbc default", "sense": "R-A2, pcbc default"}
+DEFAULT_MATCH_MM = {"clock": 2.0, "usb_hs": 0.5, "spi": 2.5}
+MATCH_SOURCE = {"clock": "pcbc default", "usb_hs": "TI usb_layout_basics", "spi": "about 15 ps on FR-4, pcbc default"}
 DEFAULT_LOOP_MM2 = {"power": 6.0, "switch_node": 20.0}
 LOOP_NOTE = {"power": "decap loop, pcbc default", "switch_node": "hot loop, pcbc default"}
 USB_UNCOUPLED_MM = 2.0
 USB_Z_DIFF = 90.0
 I2C_PF_MAX = 400.0
 KEEP_CLEAR_DEFAULT_MM = 3.0
-POWER_DEFAULT_AMPS = 0.2
-KEEP_AWAY_KINDS = ("analog", "sense", "feedback")
+PAD_NECK_MAX_MM = 1.0
+"""How far from a pad's edge a path's copper may run narrower than the path, at no more than that pad's own
+width across the exit direction (decision 1, owner 2026-10-01, *"ok do 1-4"*; `docs/direction.md` §5b). Source:
+IPC-2152/IPC-2221 widths are derived for long conductors, and a short neck between a wide trace and the part's
+pad dumps its heat into both; TI's TPS54202 EVM (SLVUAP3, Figure 3-1) leaves SW through a pad-width neck into
+vias. The neck must end in full-width copper of that path, a via group sized for the path, or a pour of the
+net (`route_verify.pad_necks`). A board that does not route under this limit is reported; the limit is not
+raised to make one route."""
+CURRENT_FLOOR_STEP_AMPS = 0.2
+"""The step of the current floor (`docs/physics-subjects.md` KD 10): a copper that carries `amps=` is at least
+0.4 mm at this current or more, 0.25 mm below it. A pcbc default with no source (O7)."""
+KEEP_AWAY_KINDS = ("analog",)  # docs/physics-subjects.md PR 7: sense and feedback are Path kinds
 
 _KIND_CLASS = {kind: p.class_name for kind, p in PRESETS.items()}
 _KIND_CLASS.update({"digital": "Default", "default": "Default"})
@@ -945,11 +1238,12 @@ def _has_glob(pattern: str) -> bool:
 
 
 def _closest(name: str, net_names: list[str]) -> str:
-    """'; did you mean X?' when one of the board's nets is close to what was written."""
+    """'; the nearest net name on this board is X' when one of the board's nets is close to what was
+    written: a measurement of the names, never a guess at the one that was meant."""
     import difflib
 
     near = difflib.get_close_matches(name, net_names, n=1, cutoff=0.6)
-    return f"; did you mean {near[0]!r}?" if near else ""
+    return f"; the nearest net name on this board is {near[0]!r}" if near else ""
 
 
 def _expand(patterns: tuple[str, ...], net_names: list[str]) -> list[str]:
@@ -990,15 +1284,35 @@ def _refpin_net(design: Design, ref: str, pin: str) -> str | None:
     return None
 
 
+def canon_reference(stack: Stackup, reference: str) -> str:
+    """A written `reference=` as the name the compiler keys planes by. On a two-layer board the plane under
+    F.Cu is the B.Cu pour, which the plane list prints as "B.Cu (GND)" and `height_to_reference` names
+    "B.Cu pour"; a line that writes the layer it sees, "B.Cu", names that pour (postfix A3: E10 refused
+    "B.Cu" while the compiler said F.Cu runs over the B.Cu pour). Round 3 (refute-onehome): the same holds for a
+    declared F.Cu pour, the plane over B.Cu: "F.Cu" names "F.Cu pour"."""
+    return f"{reference} pour" if stack.layers <= 2 and reference in ("F.Cu", "B.Cu") else reference
+
+
+def is_poured_reference(ref: str, poured) -> bool:
+    """`ref` (canonical, `canon_reference`) names a pour of `poured` (layers): a layer, or "B.Cu pour"/"F.Cu pour"."""
+    return ref in poured or (ref.endswith(" pour") and ref[: -len(" pour")] in poured)
+
+
 def _reference_for(stack: Stackup, layer: str, planes: tuple[tuple[str, str], ...]) -> tuple[float, str, str] | None:
-    """(height, reference layer, printed name) for a track on `layer`: the adjacent declared plane
-    ("In1.Cu (GND)"), or on a 2-layer board the B.Cu pour the route plan always writes."""
-    found = stack.height_to_reference(layer, planes, two_layer_pour=True)
+    """(height, reference layer, printed name) for a track on `layer`, read off `planes`, the pours the
+    board **will have** (`ConstraintSet.planes`): the adjacent plane ("In1.Cu (GND)"), or on a 2-layer
+    board the B.Cu GND pour when the route stage writes one (GND compiled to kind power). A 2-layer
+    board with no such pour has no plane under F.Cu, and a width sized as if it had one carries less
+    than its label says (refutation round 2: 1.999 A on the gate, 1.665 A by the repo's own model)."""
+    found = stack.height_to_reference(layer, planes, two_layer_pour=False)
     if found is None:
         return None
     h, ref = found
-    if ref == "B.Cu pour":
-        return h, ref, "the B.Cu pour"
+    if stack.layers <= 2:
+        # Round 3 (refute-onehome): on two layers the plane facing a layer is a pour on the other outer layer,
+        # either one (a declared `planes=[("GND", "F.Cu")]` is the plane over B.Cu); it is named "<layer> pour".
+        # This read only a B.Cu pour, so a B.Cu track under a declared F.Cu pour had no reference plane.
+        return h, f"{ref} pour", f"the {ref} pour"
     net = next(n for n, lay in planes if lay == ref)
     return h, ref, f"{ref} ({net})"
 
@@ -1007,17 +1321,10 @@ def _given(req: NetReqSpec) -> list[str]:
     """The kwargs the NetReq line wrote, in signature order."""
     out: list[str] = []
     for name in (
-        "z_diff_ohm", "z_se_ohm", "volts", "amps", "temp_rise_c", "max_mm", "length_mm", "match_mm", "uncoupled_mm", "pair", "vias",
-        "vias_max", "layers", "reference", "keep_clear_of", "keep_clear_mm", "clock", "pf_max", "loop_mm2", "rise_ps", "autoroute", "class_name",
+        "volts", "max_mm", "keep_clear_of", "keep_clear_mm", "pf_max", "rise_ps", "class_name",
     ):
         v = getattr(req, name)
-        if name == "temp_rise_c":
-            if v != 10.0:
-                out.append(name)
-        elif name == "pair":
-            if v:
-                out.append(name)
-        elif name == "keep_clear_of":
+        if name == "keep_clear_of":
             if v:
                 out.append(name)
         elif v is not None:
@@ -1025,8 +1332,20 @@ def _given(req: NetReqSpec) -> list[str]:
     return out
 
 
+def _and_list(xs) -> str:
+    """"F.Cu", "F.Cu and B.Cu", "F.Cu, In1.Cu and B.Cu": a list as a sentence names it."""
+    xs = list(xs)
+    return xs[0] if len(xs) == 1 else ", ".join(xs[:-1]) + " and " + xs[-1]
+
+
+def _net_kinds_text() -> str:
+    """The kinds a NetReq takes, in §4.2's order, as a sentence's list."""
+    order = [k for k in ("generic", "power", "switch_node", "analog", "clock", "i2c") if k in PRESETS]
+    return ", ".join(order[:-1]) + " or " + order[-1]
+
+
 def _kwargs_of(kind: str) -> tuple[str, ...]:
-    own = PRESETS[kind].own
+    own = (PRESETS.get(kind) or PAIR_PRESETS[kind]).own
     return own + tuple(k for k in COMMON_KWARGS if k not in own)
 
 
@@ -1049,7 +1368,6 @@ class _Numbers:
     layers: tuple[str, ...]
     reference: str | None
     reference_name: str | None
-    z_se: tuple[float, Derived] | None
     pair_geometry: tuple[Derived, Derived, float, Derived, float, Derived, Derived, bool] | None  # (w, g, z_target, z, tol, skew, uncoupled, controlled)
     airwire: float | None
     airwire_src: Source | None
@@ -1057,7 +1375,6 @@ class _Numbers:
     length_none: bool  # print "length none (give length_mm=)"
     keep_away: tuple[KeepAway, ...]
     spacing: int
-    current: CurrentSpec | None
     voltage: VoltageSpec | None
     loop: Derived | None
     rise_ps: float | None
@@ -1068,6 +1385,7 @@ class _Numbers:
     via_src: str  # "stackup jlcpcb_2l_1oz" | "preset power"
     layers_src: str  # "preset analog" | "NetReq line 96" | "Pair line 262"
     pair_of: dict[str, str]  # net -> partner
+    pair_length: float | None = None  # Pair(length_mm=)
 
 
 def compile_constraints(design: Design) -> ConstraintSet:
@@ -1095,7 +1413,6 @@ def compile_constraints(design: Design) -> ConstraintSet:
 
     # -- who names which net -----------------------------------------------------------------
     owner: dict[str, tuple[str, int]] = {}  # net -> ("NetReq"|"Pair", line)
-    pair_for_req: dict[int, PairReq] = {}  # req index -> the Pair that overrides it
     bare_pairs: list[PairReq] = []
     req_nets: list[list[str]] = [_expand(r.nets, net_names) for r in design.netreqs]
     known = set(net_names)
@@ -1115,41 +1432,100 @@ def compile_constraints(design: Design) -> ConstraintSet:
         for name in bus_req.nets:
             if name not in known and not _has_glob(name):
                 refusals.append(f'Bus line {bus_req.line}: no net {name!r}{_closest(name, net_names)}')
+    owner_idx: dict[str, int] = {}  # net -> the index of the NetReq that names it
     for i, req in enumerate(design.netreqs):
         for n in req_nets[i]:
             if n in owner:
                 who, line = owner[n]
                 # No Pair is involved when two NetReqs collide: pointing at a Pair's overrides
                 # sent the AI somewhere it could not go.
-                how = (
-                    "(merge them: every net of one NetReq shares every number)"
-                    if who == "NetReq"
-                    else "(a Pair carries its own z_diff_ohm, match_mm, uncoupled_mm, gap_mm, layers, reference)"
-                )
-                refusals.append(f"{n}: {who} line {line} and NetReq line {req.line} both name it; say it once {how}")
+                how = "(every net of one NetReq shares every number)" if who == "NetReq" else "(a net is named by one NetReq or one Pair)"
+                refusals.append(f"{n}: {who} line {line} and NetReq line {req.line} both name it, and a net is named once {how}")
             else:
                 owner[n] = ("NetReq", req.line)
-    for pr in design.pairs:
-        owners = [owner.get(n) for n in (pr.p, pr.n)]
-        req_idx = [i for i, nets in enumerate(req_nets) if pr.p in nets and pr.n in nets]
-        if req_idx and KIND_ALIASES.get(design.netreqs[req_idx[0]].kind, design.netreqs[req_idx[0]].kind) == "usb_hs" and req_idx[0] not in pair_for_req:
-            pair_for_req[req_idx[0]] = pr
+                owner_idx[n] = i
+    # Refutation one-home r1 (defect 1): what holds at every pad of a node (volts=, max_mm=, rise_ps=, keep_clear_of=,
+    # class_name=, docs/physics-subjects.md §2.1) is a NetReq's, a pair net's too. A NetReq that names both nets of a
+    # Pair, and nothing else, gives them those node facts; the Pair keeps its own numbers (impedance, gap, skew,
+    # layers, reference, vias). Its kind stays generic: what the two nodes are is the Pair's (a coupled pair).
+    pair_node: dict[int, int] = {}  # index into design.pairs -> index into design.netreqs
+    for k, pr in enumerate(design.pairs):
+        named = [n for n in (pr.p, pr.n) if n in owner]
+        if not named:
+            owner[pr.p] = owner[pr.n] = ("Pair", pr.line)
+            bare_pairs.append(pr)
             continue
-        named = [(n, o) for n, o in zip((pr.p, pr.n), owners) if o is not None]
-        if named:
-            n, (who, line) = named[0]
-            # The overrides listed here are only available on a usb_hs NetReq; on any other kind a
-            # Pair is refused outright, so pointing the AI at them would be a dead end.
-            how = (
-                "(a Pair overrides only z_diff_ohm, match_mm, uncoupled_mm, gap_mm, layers, reference "
-                "on a kind=\"usb_hs\" NetReq)"
-                if who == "NetReq"
-                else "(one of them, not both)"
+        whos = {owner[n][0] for n in named}
+        if whos != {"NetReq"}:
+            n = named[0]
+            who, line = owner[n]
+            how = "(a net is named by one NetReq or one Pair)" if who == "NetReq" else "(one of them, not both)"
+            refusals.append(f"{n}: {who} line {line} and Pair line {pr.line} both name it, and a net is named once {how}")
+            continue
+        idx = {owner_idx[n] for n in named}
+        i = min(idx)
+        req = design.netreqs[i]
+        head = ", ".join(f'"{x}"' for x in req.nets)
+        kind = KIND_ALIASES.get(req.kind, req.kind)
+        others = [x for x in req_nets[i] if x not in (pr.p, pr.n)]
+        if len(named) < 2 or len(idx) > 1:
+            n = named[0]
+            partner = pr.n if n == pr.p else pr.p
+            refusals.append(
+                f"{n}: NetReq line {req.line} names it and not {partner}, its partner on Pair line {pr.line}; the two nets of a Pair "
+                "are one class (their width and gap are the pair's), so a NetReq names both of them or neither"
             )
-            refusals.append(f"{n}: {who} line {line} and Pair line {pr.line} both name it; say it once {how}")
+            continue
+        if others:
+            refusals.append(
+                f"NetReq({head}) line {req.line}: names {pr.p} and {pr.n}, the nets of Pair line {pr.line}, and {', '.join(others)}; a Pair's "
+                "nets are a class of their own (width and gap from its impedance), and every net of one NetReq shares one class"
+            )
+            continue
+        if kind not in ("generic",):
+            refusals.append(
+                f'NetReq({head}) line {req.line}: kind="{req.kind}" says what a node is, and {pr.p} and {pr.n} are the coupled pair of '
+                f"Pair line {pr.line}; a NetReq that names a Pair's nets states their node facts (volts=, max_mm=, rise_ps=, "
+                "keep_clear_of=, class_name=) and takes kind generic"
+            )
             continue
         owner[pr.p] = owner[pr.n] = ("Pair", pr.line)
+        pair_node[k] = i
         bare_pairs.append(pr)
+    node_reqs = set(pair_node.values())
+    # A skew budget is one Pair's or one Bus's (docs/physics-subjects.md KD 8, G1/G3): a net timed by two of them
+    # carries two budgets for one length difference (refutation one-home r1: `Bus("USB_DP", "USB_DN")` over a Pair,
+    # and two Buses on SDA/SCL, were both accepted and both printed).
+    timed: dict[str, tuple[str, int, str]] = {}
+    for pr in design.pairs:
+        for name in (pr.p, pr.n):
+            timed.setdefault(name, ("Pair", pr.line, f"{pr.p} and {pr.n} within {_g(pr.match_mm)} mm of each other"))
+    for bus_req in design.buses:
+        members = [m for m in _expand(bus_req.nets, net_names) if m in known]
+        clash: dict[tuple[str, int, str], list[str]] = {}
+        for m in members:
+            if m in timed:
+                clash.setdefault(timed[m], []).append(m)
+        for (who, line, what), nets in clash.items():
+            verb = "is" if len(nets) == 1 else "are"
+            refusals.append(
+                f"Bus line {bus_req.line}: {', '.join(nets[:-1]) + ' and ' + nets[-1] if len(nets) > 1 else nets[0]} {verb} timed by {who} line {line} "
+                f"already ({what}); a net's skew budget is one Pair's or one Bus's"
+            )
+        for m in members:
+            timed.setdefault(m, ("Bus", bus_req.line, f"within {_g(bus_req.match_mm)} mm"))
+
+    # -- the pours this board will have ------------------------------------------------------
+    #
+    # Read before any width is sized, because a width depends on the plane under it: on four layers
+    # `Board(planes=)` verbatim, on two the back GND pour the route stage writes when GND is a power
+    # net (`route_scene.plane_targets`), asked of the NetReq that names GND; a declared `planes=` on any
+    # stackup (see `ConstraintSet.planes`).
+    # Postfix A7 (refutation physics r2): a two-layer `planes=` IS read, as `route_scene.plane_targets` reads it (a
+    # declared planes= is the board's answer on every stackup). It was ignored here while the route stage poured it,
+    # so a current Path on a two-layer 3V3 pour got no joints and no E23, and a sense Path on it was not refused.
+    gnd_power = any("GND" in req_nets[i] and KIND_ALIASES.get(r.kind, r.kind) == "power" for i, r in enumerate(design.netreqs))
+    pours = planes if (planes or stack.layers > 2) else ((("GND", "B.Cu"),) if gnd_power else ())
 
     # -- per NetReq numbers ------------------------------------------------------------------
     numbers: list[tuple[int, list[str], _Numbers]] = []  # (req index, nets, numbers)
@@ -1157,7 +1533,22 @@ def compile_constraints(design: Design) -> ConstraintSet:
         kind = KIND_ALIASES.get(req.kind, req.kind)
         first = req.nets[0]
         if kind not in PRESETS:
-            refusals.append(f'NetReq("{first}") line {req.line}: unknown kind {req.kind!r}; known: {", ".join(sorted(PRESETS))}')
+            head = ", ".join(f'"{n}"' for n in req.nets)
+            if kind in PAIR_PRESETS:
+                # E5 (docs/physics-subjects.md §7): a pair's kind holds for two paths at once.
+                refusals.append(f'NetReq({head}) line {req.line}: kind="{kind}" is a Pair kind: it holds for two paths at once; a NetReq takes kind {_net_kinds_text()}')
+            elif kind in BUS_KINDS_MATCH:
+                # E6: a bus kind times two or more paths together.
+                refusals.append(f'NetReq({head}) line {req.line}: kind="{kind}" is a Bus kind: it times two or more paths together; a NetReq takes kind {_net_kinds_text()}')
+            elif kind in PATH_PRESETS:
+                # E14 (PR 7): a sense or feedback branch is a Path's kind.
+                refusals.append(
+                    f'NetReq({head}) line {req.line}: kind="{kind}" is a Path kind: it names a branch of a net that carries a measurement; '
+                    f"a NetReq takes kind {_net_kinds_text()}"
+                )
+            else:
+                # E19: the kinds a NetReq takes, and the aliases.
+                refusals.append(f'NetReq("{first}") line {req.line}: unknown kind {req.kind!r}; known: {", ".join(NET_KINDS)}, and the aliases digital and default')
             kind = "generic"
         allowed = _kwargs_of(kind)
         for kw in _given(req):
@@ -1168,48 +1559,59 @@ def compile_constraints(design: Design) -> ConstraintSet:
             if "'" in name or '"' in name:
                 refusals.append(
                     f'NetReq("{first}") line {req.line}: the net name {name!r} carries a quote; KiCad\'s rule file '
-                    "reads the condition as ending there and silently drops every rule. Rename the net."
+                    "reads the condition as ending there and silently drops every rule"
                 )
         if req.class_name and ("'" in req.class_name or '"' in req.class_name):
             refusals.append(
                 f'NetReq("{first}") line {req.line}: class_name={req.class_name!r} carries a quote; it goes into '
                 "every rule condition as `A.hasNetclass('...')` and silently drops the whole rule file"
             )
-        if kind == "usb_hs" and req.z_se_ohm is not None:
-            refusals.append(
-                f'NetReq("{first}") line {req.line}: kind="usb_hs" does not take z_se_ohm=; '
-                "a pair is sized by z_diff_ohm= (the single-ended number follows from it)"
-            )
-        if kind == "usb_hs" and req.layers and not any(is_outer(lay) for lay in req.layers):
-            refusals.append(
-                f'NetReq("{first}") line {req.line}: kind="usb_hs" on {", ".join(req.layers)}: R1 sizes coupled pairs on outer '
-                'layers only (C.3 is edge-coupled microstrip); layers=["F.Cu"] or ["B.Cu"]'
-            )
-        if kind == "usb_hs" and len(nets) != 2:
-            refusals.append(f'NetReq("{first}") line {req.line}: kind="usb_hs" pairs exactly two nets; got {len(nets)}')
-        if kind == "usb_hs" and len(nets) == 2 and not _kicad_pairs(nets[0], nets[1]):
-            refusals.append(f'NetReq("{first}", "{nets[1]}") line {req.line}: KiCad pairs names ending P/N, _P/_N or +/-; rename {nets[0]}/{nets[1]}')
-        if kind == "spi" and len(nets) > 1:
-            if req.clock is None:
-                refusals.append(f'NetReq("{first}") line {req.line}: kind="spi" with {len(nets)} nets needs clock=; which one is the clock?')
-            elif req.clock not in nets:
-                refusals.append(f'NetReq("{first}") line {req.line}: clock "{req.clock}" is not one of {", ".join(nets)}')
+        # E3 (docs/physics-subjects.md §7): a Ground() net is the 0 V its domain's voltages are measured from,
+        # so a volts= that holds for every net of the line is false of it.
+        if req.volts is not None:
+            src = pathlib.Path(design.source).name if design.source else "board.py"
+            head = ", ".join(f'"{n}"' for n in req.nets)
+            for name in nets:
+                net = design.nets.get(name)
+                if net is not None and net.kind == "ground":
+                    at = f" ({src} line {net.line})" if net.line else ""
+                    refusals.append(
+                        f"NetReq({head}) line {req.line}: volts={_g(req.volts)} holds for every net the line names, and {name} is "
+                        f'Ground("{name}"){at}, the 0 V its domain\'s voltages are measured from'
+                    )
+        if i in node_reqs:
+            continue  # the node facts of a Pair's two nets: compiled with the Pair, below
         num = _compile_req(
-            design, stack, planes, req, kind, nets, pair_for_req.get(i), pads_by_net, refusals, has_switch_node,
-            floor_w, floor_w_src, class_clear, floor_clear, floor_clear_src,
+            design, stack, planes, req, kind, nets, None, pads_by_net, refusals, has_switch_node,
+            floor_w, floor_w_src, class_clear, floor_clear, floor_clear_src, pours=pours,
         )
         numbers.append((i, nets, num))
 
     # -- bare Pairs: usb_hs's pair logic with the Pair's numbers, class Pair_<p> ---------------
+    pair_index = {id(pr): k for k, pr in enumerate(design.pairs)}
     for pr in bare_pairs:
         if not _kicad_pairs(pr.p, pr.n):
-            refusals.append(f"Pair line {pr.line}: KiCad pairs names ending P/N, _P/_N or +/-; rename {pr.p}/{pr.n}")
-        req = NetReqSpec(nets=(pr.p, pr.n), kind="usb_hs", z_diff_ohm=pr.z_diff_ohm, pair=True, line=pr.line, class_name=f"Pair_{pr.p}")
+            refusals.append(f"Pair line {pr.line}: KiCad pairs names ending P/N, _P/_N or +/-, and {pr.p}/{pr.n} are not such a pair")
+        # A Pair with no kind is compiled from its own line only (refutation one-home r1, defect 2): never the
+        # usb_hs preset's via budget, and no "preset usb_hs" source on a number the line did not write.
+        pkind = pr.kind or "pair"
+        nreq = design.netreqs[pair_node[pair_index[id(pr)]]] if pair_index[id(pr)] in pair_node else None
+        cname = "USB" if pr.kind == "usb_hs" else f"Pair_{pr.p}"
+        if nreq is not None:
+            req = NetReqSpec(
+                nets=(pr.p, pr.n), kind=pkind, line=pr.line, class_name=nreq.class_name or cname, volts=nreq.volts, max_mm=nreq.max_mm,
+                keep_clear_of=nreq.keep_clear_of, keep_clear_mm=nreq.keep_clear_mm, rise_ps=nreq.rise_ps,
+            )
+        else:
+            req = NetReqSpec(nets=(pr.p, pr.n), kind=pkind, line=pr.line, class_name=cname)
         num = _compile_req(
-            design, stack, planes, req, "usb_hs", [pr.p, pr.n], pr, pads_by_net, refusals, has_switch_node,
-            floor_w, floor_w_src, class_clear, floor_clear, floor_clear_src, bare_pair=True,
+            design, stack, planes, req, pkind, [pr.p, pr.n], pr, pads_by_net, refusals, has_switch_node,
+            floor_w, floor_w_src, class_clear, floor_clear, floor_clear_src, bare_pair=True, pours=pours,
+            node_line=nreq.line if nreq is not None else None,
         )
         numbers.append((-1, [pr.p, pr.n], num))
+    # Board order: a Pair line takes its place among the NetReq lines, so the classes read as the file does.
+    numbers.sort(key=lambda t: t[2].line)
 
     # -- classes: a view on the numbers of one NetReq; collisions get a suffix ------------------
     classes: dict[str, CompiledClass] = {
@@ -1264,14 +1666,12 @@ def compile_constraints(design: Design) -> ConstraintSet:
                 via=num.via,
                 layers=num.layers,
                 reference=num.reference,
-                z_se=num.z_se,
                 pair=_pair_spec(num, net),
                 group=None,
                 airwire_max_mm=num.airwire,
                 length_max_mm=num.length,
                 keep_away=num.keep_away,
                 spacing_w=num.spacing,
-                current=num.current,
                 voltage=num.voltage,
                 loop_mm2=num.loop,
                 rise_ps=num.rise_ps,
@@ -1284,17 +1684,12 @@ def compile_constraints(design: Design) -> ConstraintSet:
                 req_index=idx,
             )
 
-    # -- groups: the NetReq's own bus, then Bus() and Chain() ------------------------------------
+    # -- groups: the NetReq's own bus, then Bus() and Path() ------------------------------------
     groups: list[GroupSpec] = []
     for idx, nets, num in numbers:
         if idx < 0:
             continue
-        req = design.netreqs[idx]
-        bus = _preset_bus(num.kind, nets, req)
-        if bus is not None:
-            groups.append(bus)
-            for net in nets:
-                constraints[net] = replace(constraints[net], group=bus)
+        # docs/physics-subjects.md PR 7: no net kind makes a bus (sense's pair of nets left with the kind).
 
     def synthesised(net: str) -> None:
         if net in constraints:
@@ -1305,8 +1700,8 @@ def compile_constraints(design: Design) -> ConstraintSet:
         )
         constraints[net] = Constraint(
             net=net, kind="generic", class_name="Default", line=0, width_mm=num.width, clearance_mm=num.clearance,
-            lane_clearance_mm=num.lane_clearance, via=num.via, layers=num.layers, reference=None, z_se=None, pair=None, group=None,
-            airwire_max_mm=None, length_max_mm=None, keep_away=(), spacing_w=3, current=None, voltage=None, loop_mm2=None,
+            lane_clearance_mm=num.lane_clearance, via=num.via, layers=num.layers, reference=None, pair=None, group=None,
+            airwire_max_mm=None, length_max_mm=None, keep_away=(), spacing_w=3, voltage=None, loop_mm2=None,
             rise_ps=None, guard_stitch_mm=None, guard_ground=None, isolation_side=None, autoroute=True, soft=(), notes=(), req_index=-1,
         )
 
@@ -1314,46 +1709,67 @@ def compile_constraints(design: Design) -> ConstraintSet:
         members = _expand(bus_req.nets, net_names)
         if bus_req.clock is not None and bus_req.clock not in members:
             refusals.append(f'Bus line {bus_req.line}: clock "{bus_req.clock}" is not one of {", ".join(members)}')
-        spec = GroupSpec("bus", tuple(members), bus_req.match_mm, bus_req.clock, bus_req.line, f"Bus line {bus_req.line}")
+        src = f"Bus line {bus_req.line}" if bus_req.match_written else f"preset {bus_req.kind}, Bus line {bus_req.line}"
+        spec = GroupSpec("bus", tuple(members), bus_req.match_mm, bus_req.clock, bus_req.line, src,
+                         length_mm=round(bus_req.length_mm, 4) if bus_req.length_mm is not None else None)
         groups.append(spec)
         for net in members:
             synthesised(net)
             c = constraints[net]
             length = c.length_max_mm
-            if bus_req.length_mm is not None:
+            # Round 3 (refute-onehome): Bus(length_mm=) is each member's budget between the stations its Path names,
+            # as Pair(length_mm=) is (`paths._compile_one`); a whole-net length counts stubs no path times (node's
+            # SDA: the R_SDA pull-up). A member no Path names is two pads (E13), so its net is its path.
+            if bus_req.length_mm is not None and not any(q.net == net for q in design.paths):
                 length = Derived(round(bus_req.length_mm, 4), "mm", Source("Bus", f"line {bus_req.line}"))
             constraints[net] = replace(c, group=spec, length_max_mm=length)
 
-    for ch in design.chains:
+    for ch in design.paths:
         if ch.net not in design.nets:
-            refusals.append(f'Chain("{ch.net}") line {ch.line}: no net "{ch.net}"')
+            refusals.append(f'Path("{ch.net}") line {ch.line}: no net "{ch.net}"')
             continue
         ok = True
         for pad in ch.pads:
             if "." not in pad:
-                refusals.append(f'Chain("{ch.net}") line {ch.line}: {pad!r}: write REF.PIN, e.g. U1.VIN')
+                refusals.append(f'Path("{ch.net}") line {ch.line}: {pad!r} is not REF.PIN (a part reference, a dot, a pin name or pad number)')
                 ok = False
                 continue
             ref, pin = pad.split(".", 1)
             if not any(inst.ref == ref for inst in design.instances):
-                refusals.append(f'Chain("{ch.net}") line {ch.line}: no part {ref}')
+                refusals.append(f'Path("{ch.net}") line {ch.line}: no part {ref}')
                 ok = False
                 continue
             net = _refpin_net(design, ref, pin)
             if net is None:
-                refusals.append(f'Chain("{ch.net}") line {ch.line}: {ref} has no pin {pin}')
+                refusals.append(f'Path("{ch.net}") line {ch.line}: {ref} has no pin {pin}')
                 ok = False
             elif net != ch.net:
-                refusals.append(f'Chain("{ch.net}") line {ch.line}: {pad} is on {net}, not {ch.net}')
+                # The part's pad on the path's net, when it has exactly one: the line to write.
+                inst = next(i for i in design.instances if i.ref == ref)
+                mine = [n for pname, pin_ in inst.part.pins.items() if inst.pins.get(pname) == ch.net for n in pin_.pads]
+                # A fact about the part (its pad on the path's net), never the rewritten line.
+                hint = f"; {ref}'s {ch.net} pad is {ref}.{mine[0]}" if len(mine) == 1 else (f"; {ref} has no pad on {ch.net}" if not mine else "")
+                refusals.append(f'Path("{ch.net}") line {ch.line}: {pad} is on {net}, not {ch.net}{hint}')
                 ok = False
         if not ok:
             continue
-        spec = GroupSpec("chain", tuple(ch.pads), None, None, ch.line, f"Chain line {ch.line}")
+        spec = GroupSpec("chain", tuple(ch.pads), None, None, ch.line, f"Path line {ch.line}")
         groups.append(spec)
         synthesised(ch.net)
         c = constraints[ch.net]
         if c.group is None or c.group.kind != "bus":
             constraints[ch.net] = replace(c, group=spec)
+
+    # -- E13 (docs/physics-subjects.md §7): a Pair or Bus compares the lengths of its members' paths, so a member
+    # with three or more pads needs exactly one Path naming the stations being compared.
+    for who, members in [(f"Pair line {pr.line}", (pr.p, pr.n)) for pr in design.pairs] + [(f"Bus line {b.line}", tuple(_expand(b.nets, net_names))) for b in design.buses]:
+        for m in members:
+            pads = [f"{r}.{n}" for r, n in pads_by_net.get(m, [])]
+            if len(pads) < 3:
+                continue
+            k = sum(1 for q in design.paths if q.net == m)
+            if k != 1:
+                refusals.append(f"{who}: {m} has {len(pads)} pads ({', '.join(pads)}) and {k} Paths name its stations, so the length the {who.split()[0].lower()} compares is not defined")
 
     # -- guards: the shielded net, the pitch, and the net the shield is made of -------------------
     #
@@ -1362,10 +1778,17 @@ def compile_constraints(design: Design) -> ConstraintSet:
     # router had no way to write a guard in anything but whatever net a pattern defaulted to. The
     # refusal below is the mirror of the one above it and lives here for the same reason — this is
     # the one place that holds the netlist, and a pattern is handed a scene.
+    guarded: dict[str, int] = {}
     for gd in design.guards:
         if gd.net not in design.nets:
             refusals.append(f'Guard("{gd.net}") line {gd.line}: no net "{gd.net}"')
             continue
+        if gd.net in guarded:
+            # Round 3 (refute-onehome): one net, one guard. The second Guard overwrote the first's pitch and
+            # ground while the report credited the first line.
+            refusals.append(f'Guard("{gd.net}") line {gd.line}: {gd.net} already has a Guard() on line {guarded[gd.net]}; one net, one guard')
+            continue
+        guarded[gd.net] = gd.line
         if gd.ground not in design.nets:
             refusals.append(
                 f'Guard("{gd.net}") line {gd.line}: no net "{gd.ground}" to make the guard out of'
@@ -1395,7 +1818,7 @@ def compile_constraints(design: Design) -> ConstraintSet:
             elif net.kind != "ground":
                 said = "Power" if net.kind == "power" else "Net"
                 refusals.append(
-                    f'{who}: {name} is declared with {said}(); a bridge ties two grounds — write Ground("{name}")'
+                    f'{who}: {name} is declared with {said}(); a bridge ties two grounds, and {name} is not declared with Ground()'
                 )
                 ok = False
         pair = frozenset((br.a, br.b))
@@ -1430,15 +1853,23 @@ def compile_constraints(design: Design) -> ConstraintSet:
     # -- isolations: sides from Place() lines, the corridor, the numbers -------------------------
     rule_areas: list[RuleArea] = []
     iso_specs: list[IsolationSpec] = []
-    if design.isolations:
-        region_rects = resolve_regions(board, design.regions)
+    # An Isolation's sides are Regions of layout.core.py (docs/board-outline.md A.1): with core not loaded
+    # (`load_board(core=False)`, the schematic stage) there is nothing to resolve them against.
+    if design.isolations and design.core_loaded is not False:
+        from .layout import declared_outline, frame_board
+
+        # The Regions resolve in the frame: against the declared outline, or the derived frame (B.1).
+        region_rects = resolve_regions(frame_board(board, declared_outline(design)[0]), design.regions)
         region_parent = {r.name: r.parent for r in design.regions}
         sides = _part_sides(design)
+        bname = pathlib.Path(design.source).name if design.source else "board.py"
         for iso in design.isolations:
             missing = [s for s in (iso.a, iso.b) if s not in region_rects]
             if missing:
+                has_core = design.source is not None and (pathlib.Path(design.source).parent / "layout.core.py").exists()
                 for s in missing:
-                    refusals.append(f'Isolation line {iso.line}: no Region "{s}"')
+                    tail = f'layout.core.py declares no Region "{s}"' if has_core or design.source is None else f"there is no layout.core.py next to {bname}"
+                    refusals.append(f'{bname}:{iso.line}: Isolation("{iso.a}", "{iso.b}") names Region "{s}", and {tail}')
                 continue
             spec, area = _compile_isolation(design, stack, board, iso, region_rects, region_parent, sides, pads_by_net, refusals)
             iso_specs.append(spec)
@@ -1455,12 +1886,8 @@ def compile_constraints(design: Design) -> ConstraintSet:
     #
     # On two layers the route stage pours the back GND when GND is one of the power nets; asked of the
     # compiled constraints that is "GND compiled to kind=power", the same question with the globs
-    # already expanded. A two-layer `planes=` is not read here (see `ConstraintSet.planes`).
-    pours = (
-        planes
-        if stack.layers > 2
-        else ((("GND", "B.Cu"),) if any(c.net == "GND" and c.kind == "power" for c in constraints.values()) else ())
-    )
+    # already expanded. A declared `planes=` is read on every stackup (see `ConstraintSet.planes`).
+    assert pours == (planes if (planes or stack.layers > 2) else ((("GND", "B.Cu"),) if any(c.net == "GND" and c.kind == "power" for c in constraints.values()) else ())), "the pours read before the widths are the compiled ones"
     # The caveat goes on the net's own `notes` so it prints beside its numbers rather than at the
     # bottom of the report, and it is spelled with the **sorted** pair name for a pair so both members
     # write byte-identical text and `_report` prints it once (the width note next to it does the same
@@ -1497,7 +1924,12 @@ def compile_constraints(design: Design) -> ConstraintSet:
         thermals=thermal_specs,
         planes=pours,
     )
-    return replace(cs, lines=tuple(_report(cs, design, numbers, notes_lines, has_switch_node)))
+    # Paths and loops (docs/net-path-physics.md): compiled onto the net numbers, which are final here.
+    from .paths import compile_paths
+
+    cs, path_lines, _loops = compile_paths(design, cs, refusals)
+    cs = replace(cs, refusals=tuple(refusals))
+    return replace(cs, lines=tuple(_report(cs, design, numbers, notes_lines, has_switch_node, path_lines)))
 
 
 def _kicad_pairs(p: str, n: str) -> bool:
@@ -1512,24 +1944,75 @@ def _pair_spec(num: _Numbers, net: str) -> PairSpec | None:
     if num.pair_geometry is None:
         return None
     w, g, z_target, z, tol, skew, uncoupled, controlled = num.pair_geometry
-    return PairSpec(num.pair_of.get(net, ""), w, g, z_target, z, tol, skew, uncoupled, controlled)
+    return PairSpec(num.pair_of.get(net, ""), w, g, z_target, z, tol, skew, uncoupled, controlled, num.pair_length, num.line)
 
 
-def _preset_bus(kind: str, nets: list[str], req: NetReqSpec) -> GroupSpec | None:
-    """clock: a bus of the NetReq's nets when > 1; spi: matched to the clock; sense: exactly two."""
-    if kind == "clock" and len(nets) > 1:
-        return _bus(nets, kind, req, None)
-    if kind == "spi" and len(nets) > 1 and req.clock in nets:
-        return _bus(nets, kind, req, req.clock)
-    if kind == "sense" and len(nets) == 2:
-        return _bus(nets, kind, req, None)
-    return None
+def z_se_width(stack: Stackup, z_target: float, layer: str, lane: float) -> tuple[Derived, tuple[float, Derived], str]:
+    """(width, (target, computed z), note) for a single-ended impedance on `layer` (C.1/C.4/C.5): the one
+    block a Path's link calls (`docs/physics-subjects.md` N4: an impedance is a piece of copper's). `lane`
+    is the net's clearance (the 2-layer CPWG pour gap is `max(0.3, 2 x lane)`). `note` is "" or why the
+    target is not reached."""
+    pour = None
+    if stack.layers == 2 and is_outer(layer):
+        pour = max(0.3, 2 * lane)
+    w = width_for_z0(z_target, stack, layer=layer, pour_gap=pour)
+    z = microstrip_z0(w, stack, layer=layer, pour_gap=pour)
+    if not is_outer(layer):
+        formula, ref = "wadell_stripline_asym", f"{stack.name} {layer} (formula only, +-5 %)"
+    elif pour is not None:
+        formula, ref = "ghione_naldi_cpwg", f"x {_g(stack.z_bias_se)} {stack.jlc_code or stack.name} pour gap {_g(pour)} t = 0"
+    else:
+        formula, ref = "hj_microstrip", f"x {_g(stack.z_bias_se)} {stack.jlc_code or stack.name}"
+    cal = stack.z_bias_source if is_outer(layer) else "JLC publishes no inner-layer rows"
+    off = abs(z - z_target) / z_target if z_target else 0.0
+    why = ""
+    if off > 0.02:
+        why = (
+            f"the fab floor {_g(stack.track_min)} mm stops at {_g(z)} ohm"
+            if abs(w - stack.track_min) < 1e-9
+            else f"6 mm of copper only reaches {_g(z)} ohm"
+            if w >= 5.999
+            else f"the solver lands {off * 100:.0f} % off"
+        )
+    reached = f"; not reached: {why}" if why else ""
+    return Derived(w, "mm", Source(formula, ref, cal)), (z_target, Derived(z, "ohm", Source(formula, ref, f"{cal}; target {_g(z_target)}{reached}"))), why
 
 
-def _bus(nets: list[str], kind: str, req: NetReqSpec, clock: str | None) -> GroupSpec:
-    if req.match_mm is not None:
-        return GroupSpec("bus", tuple(nets), req.match_mm, clock, req.line, f"NetReq line {req.line}")
-    return GroupSpec("bus", tuple(nets), DEFAULT_MATCH_MM[kind], clock, req.line, f"preset {kind}")
+def _current_width(amps: float, dt: float, stack: Stackup, plane: tuple[float, str, str] | None, layer: str | None = None) -> tuple[Derived, CurrentSpec]:
+    """The width a current needs on one layer, and its `CurrentSpec`: the one block a path's link
+    (`paths.compile_paths`) and a multi-pad station's join call (`docs/net-path-physics.md` §2); a net
+    carries no current of its own (`docs/physics-subjects.md` PR 3). `plane` is `_reference_for` of that layer.
+
+    IPC-2221B against IPC-2152 (`current_width_mm`), floored at 0.4 mm at `CURRENT_FLOOR_STEP_AMPS` or
+    more and 0.25 mm below it, whatever the net's kind (`docs/physics-subjects.md` KD 10: one floor for
+    every copper that carries a current; the switch node's 0.3 mm folds into it). A pcbc default with no
+    published source, kept so that no declared copper moves (O7)."""
+    plane_h = plane[0] if plane is not None else None
+    cu = stack.layer_oz(layer)
+    f2221, side = ipc2221_formula(stack, layer)
+    w2221 = Derived(ipc2221_width_mm(amps, dt, cu, outer=not stack.is_inner(layer)), "mm", Source(f2221, f"IPC-2221B eq. 6-2 {side} {_g(amps)} A {_g(dt)} C {cu_text(stack, layer)}"))
+    bm = ipc2152_board_modifier(stack.board_mm)
+    pm = ipc2152_plane_modifier(plane_h)
+    plane_txt = f"plane {pm:.3f} at {_g(plane_h)} mm {plane[1]}" if plane is not None else "no plane"
+    w2152 = Derived(
+        ipc2152_width_mm(amps, dt, cu, stack.board_mm, plane_h),
+        "mm",
+        Source("ipc2152_fit", f"IPC-2152 Fig 5-1, 5-8, 5-11 {_g(amps)} A {_g(dt)} C {cu_text(stack, layer)} x board {bm:.3f} x {plane_txt}", "below 0.274 A the fit extrapolates" if 0 < amps < 0.274 else ""),
+    )
+    current = CurrentSpec(amps, dt, w2221, w2152, plane_h)
+    cur = current_width_mm(amps, dt, stack, plane_h, layer)
+    both = f"{f2221} {_g(amps)} A {_g(dt)} C {cu_text(stack, layer)} {w2221.value:.3f}; ipc2152_fit x board {bm:.3f} x {plane_txt} {w2152.value:.3f}"
+    floor = 0.4 if amps >= CURRENT_FLOOR_STEP_AMPS else 0.25
+    if floor >= cur.value:
+        width = Derived(floor, "mm", Source("pcbc_floor", f"amps {'>=' if amps >= CURRENT_FLOOR_STEP_AMPS else '<'} {_g(CURRENT_FLOOR_STEP_AMPS)}", both))
+    else:
+        width = cur
+    # C.6: below 0.274 A the IPC-2152 fit extrapolates. The Derived carried that clause and the
+    # report line dropped it, so a 0.1 A rail read as if the chart covered it.
+    clause = next((part for part in (cur.source.note or "").split("; ") if "extrapolat" in part), "")
+    if clause and clause not in (width.source.note or ""):
+        width = replace(width, source=replace(width.source, note=f"{width.source.note}; {clause}"))
+    return width, current
 
 
 def _compile_req(
@@ -1549,33 +2032,36 @@ def _compile_req(
     floor_clear: float,
     floor_clear_src: Source,
     bare_pair: bool = False,
+    pours: tuple[tuple[str, str], ...] = (),
+    node_line: int | None = None,
 ) -> _Numbers:
-    preset = PRESETS[kind]
+    preset = PRESETS.get(kind) or PAIR_PRESETS.get(kind) or BARE_PAIR
     line = req.line
+    # The line the node facts (volts=, max_mm=, keep_clear_of=, ...) came from: the NetReq's, also when it names a
+    # Pair's two nets and they are compiled with the Pair (refutation one-home r1, defect 1).
+    nline = node_line if node_line is not None else line
+    is_pair = pair_req is not None
     first = req.nets[0]
     notes: list[str] = []
     soft: list[str] = []
-    dt = req.temp_rise_c
 
-    # layers (Pair overrides the NetReq's; a bare Pair carries only its own)
-    layers: tuple[str, ...] = preset.layers
-    layers_src = f"preset {kind}"
-    if req.layers is not None:
-        layers, layers_src = tuple(req.layers), f"NetReq line {line}"
+    # layers: every copper layer `Board(planes=)` does not give to a plane (docs/physics-subjects.md P4); a
+    # Pair's own layers= for its two paths (G2). A net kind sets none.
+    have = stack.copper_layers()
+    plane_layers = {lay for _n, lay in planes} if stack.layers > 2 else set()
+    layers: tuple[str, ...] = tuple(lay for lay in have if lay not in plane_layers) or tuple(have)
+    layers_src = "every layer no plane takes" if plane_layers else f"preset {kind}"
+    if is_pair:
+        # A pair is sized as edge-coupled microstrip (C.3), which exists on an outer layer only; its default is
+        # the outer layers no plane takes (its Pair(layers=) can say otherwise).
+        layers = tuple(lay for lay in layers if is_outer(lay)) or layers
+        layers_src = f"preset {kind}" if kind in PAIR_PRESETS else "a pair's default: the outer layers no plane takes"
     if pair_req is not None and pair_req.layers is not None:
         layers, layers_src = tuple(pair_req.layers), f"Pair line {pair_req.line}"
-    have = stack.copper_layers()
-    if layers == POWER_LAYERS:  # the preset names four; a 2-layer board has two
-        layers = tuple(lay for lay in POWER_LAYERS if lay in have)
-    written = req.layers is not None or (pair_req is not None and pair_req.layers is not None)
-    unknown = [lay for lay in layers if lay not in have] if written else []
+    unknown = [lay for lay in layers if lay not in have] if (pair_req is not None and pair_req.layers is not None) else []
     if unknown:
         # This used to reach stackup.plane_below and die with `tuple.index(x): x not in tuple`.
-        refusals.append(
-            f'NetReq("{first}") line {line}: {", ".join(unknown)}: {stack.name} has {", ".join(have)}'
-            if pair_req is None or pair_req.layers is None
-            else f'Pair line {pair_req.line}: {", ".join(unknown)}: {stack.name} has {", ".join(have)}'
-        )
+        refusals.append(f'Pair line {pair_req.line}: {", ".join(unknown)}: {stack.name} has {", ".join(have)}')  # type: ignore[union-attr]
         layers = tuple(lay for lay in layers if lay in have) or (have[0],)
     layer0 = layers[0] if layers else "F.Cu"
     inner_only = bool(layers) and not any(is_outer(lay) for lay in layers)
@@ -1584,36 +2070,9 @@ def _compile_req(
     width: Derived = Derived(floor_w, "mm", floor_w_src)
     if preset.width_mm is not None:
         width = _preset(preset.width_mm, "mm", kind)
-    current: CurrentSpec | None = None
-    plane = _reference_for(stack, layer0, planes)
-    if kind in ("power", "switch_node") and (kind == "power" or req.amps is not None):
-        amps = req.amps if req.amps is not None else POWER_DEFAULT_AMPS
-        plane_h = plane[0] if plane is not None else None
-        w2221 = Derived(ipc2221_width_mm(amps, dt, stack.copper_oz), "mm", Source("ipc2221_ext", f"IPC-2221B eq. 6-2 external {_g(amps)} A {_g(dt)} C {_g(stack.copper_oz)} oz"))
-        bm = ipc2152_board_modifier(stack.board_mm)
-        pm = ipc2152_plane_modifier(plane_h)
-        plane_txt = f"plane {pm:.3f} at {_g(plane_h)} mm {plane[1]}" if plane is not None else "no plane"
-        w2152 = Derived(
-            ipc2152_width_mm(amps, dt, stack.copper_oz, stack.board_mm, plane_h),
-            "mm",
-            Source("ipc2152_fit", f"IPC-2152 Fig 5-1, 5-8, 5-11 {_g(amps)} A {_g(dt)} C {_g(stack.copper_oz)} oz x board {bm:.3f} x {plane_txt}", "below 0.274 A the fit extrapolates" if 0 < amps < 0.274 else ""),
-        )
-        current = CurrentSpec(amps, dt, w2221, w2152, plane_h)
-        cur = current_width_mm(amps, dt, stack, plane_h)
-        both = f"ipc2221_ext {_g(amps)} A {_g(dt)} C {_g(stack.copper_oz)} oz {w2221.value:.3f}; ipc2152_fit x board {bm:.3f} x {plane_txt} {w2152.value:.3f}"
-        if kind == "power":
-            floor = 0.4 if amps >= POWER_DEFAULT_AMPS else 0.25
-            if floor >= cur.value:
-                width = Derived(floor, "mm", Source("pcbc_floor", f"amps {'>=' if amps >= POWER_DEFAULT_AMPS else '<'} 0.2", both))
-            else:
-                width = cur
-        else:
-            width = cur if cur.value > preset.width_mm else _preset(preset.width_mm, "mm", kind, both)  # type: ignore[arg-type]
-        # C.6: below 0.274 A the IPC-2152 fit extrapolates. The Derived carried that clause and the
-        # report line dropped it, so a 0.1 A rail read as if the chart covered it.
-        clause = next((part for part in (cur.source.note or "").split("; ") if "extrapolat" in part), "")
-        if clause and clause not in (width.source.note or ""):
-            width = replace(width, source=replace(width.source, note=f"{width.source.note}; {clause}"))
+    # No current is sized here: a net carries none of its own (`docs/physics-subjects.md` PR 3). A
+    # power net's copper no Path names is the class floor; a Path's links carry their own widths.
+    plane = _reference_for(stack, layer0, pours)
 
     # clearance: the kind number, then the voltage row, then the floor
     lane = preset.clearance_mm if preset.clearance_mm is not None else class_clear
@@ -1641,64 +2100,95 @@ def _compile_req(
     else:
         via_d, via_h = stack.via_diameter, stack.via_drill
         via_src = f"stackup {stack.name}"
-    allowed = preset.vias_allowed if req.vias is None else bool(req.vias)
+    allowed = preset.vias_allowed
     count_max = preset.vias_max
-    if req.vias_max is not None:
-        count_max = int(req.vias_max)
-    if not allowed:
-        count_max = 0
-    via_a: Derived | None = None
-    per_change = 1
-    if current is not None:
-        via_a = Derived(via_amps(via_h, stack.via_plating_mm, dt), "A", Source("via_barrel", f"{_g(via_h)}/{_g(stack.via_plating_mm)} mm", f"IPC-2221B eq. 6-2 internal on the barrel at {_g(dt)} C"))
-        per_change = vias_per_change(current.amps, via_h, stack.via_plating_mm, dt)
-    via = ViaSpec(via_d, via_h, allowed, count_max, via_a, per_change)
+    if pair_req is not None and (pair_req.vias is not None or pair_req.vias_max is not None):
+        # Pair(vias=, vias_max=): the pair's copper, both members (refutation one-home r1, defect 2).
+        if pair_req.vias is not None:
+            allowed = bool(pair_req.vias)
+        if pair_req.vias_max is not None:
+            count_max = pair_req.vias_max
+        via_src = f"Pair line {pair_req.line}" if pair_req.vias is False else via_src
+    via = ViaSpec(via_d, via_h, allowed, 0 if not allowed else count_max, None, 1)
 
     # controlled impedance: the pair, or a single-ended target
     reference: str | None = None
     reference_name: str | None = None
-    reference_src = req.reference
-    if pair_req is not None and pair_req.reference is not None:
-        reference_src = pair_req.reference
+    reference_src = None
+    pair_ref = canon_reference(stack, pair_req.reference) if pair_req is not None and pair_req.reference is not None else None
+    ref_refused = False
+    if pair_ref is not None:
+        reference_src = pair_ref
     pair_geometry = None
     width_line: str | None = None
-    z_se: tuple[float, Derived] | None = None
     pair_of: dict[str, str] = {}
-    wants_reference = kind == "usb_hs" or req.z_se_ohm is not None
+    wants_reference = is_pair
+    if wants_reference and pair_req is not None and pair_ref is not None:
+        # E10 on a Pair (refutation one-home r1, defect 3): a reference plane is the plane under one layer's
+        # copper (N14, G2), as on a Path.
+        under = [lay for lay in layers if (r_ := _reference_for(stack, lay, pours)) is not None and r_[1] == pair_ref]
+        poured = {lay for _n, lay in pours}
+        if not is_poured_reference(pair_ref, poured):
+            # Postfix A2: on any layer count, as on a Path (paths._path_refusals). It was refused on four
+            # layers only, so a two-layer Pair printed "over Banana".
+            plane_list = ", ".join(f"{lay} ({n})" for n, lay in pours) or "none"
+            refusals.append(f'Pair line {pair_req.line}: reference="{pair_req.reference}" is not a plane this board pours ({plane_list})')
+            ref_refused = True
+        elif len(layers) > 1:
+            on = f"the plane under {_and_list(under)} only" if under else "under none of its layers"
+            refusals.append(f'Pair line {pair_req.line}: reference="{pair_req.reference}" is {on}, and this Pair may run on {_and_list(layers)}')
+        elif not under:
+            refusals.append(f'Pair line {pair_req.line}: reference="{pair_req.reference}" is not the plane under {layers[0]}, the one layer this Pair may run on')
     if wants_reference:
         if reference_src is not None:
             reference = reference_src
             net = next((n for n, lay in planes if lay == reference), None)
-            reference_name = f"{reference} ({net})" if net else reference
-            if stack.layers > 2 and net is None:
-                refusals.append(f'{first}: {_g(req.z_diff_ohm or (pair_req.z_diff_ohm if pair_req else USB_Z_DIFF)) if kind == "usb_hs" else _g(req.z_se_ohm)} ohm on {layer0} wants a plane on {reference}; Board(planes=[("GND", "{reference}")]) declares it')
+            reference_name = f"the {reference}" if reference.endswith(" pour") else (f"{reference} ({net})" if net else reference)
+            if stack.layers > 2 and net is None and not ref_refused:
+                refusals.append(f'{first}: {_g(pair_req.z_diff_ohm if pair_req else USB_Z_DIFF)} ohm on {layer0} (Pair line {line}) names reference {reference}, which is not in Board(planes=)')
         elif plane is not None:
             reference, reference_name = plane[1], plane[2]
         elif stack.layers > 2 and is_outer(layer0):
             want = stack.plane_below(layer0) or stack.plane_above(layer0)
-            z_txt = _g(req.z_diff_ohm or (pair_req.z_diff_ohm if pair_req else USB_Z_DIFF)) if kind == "usb_hs" else _g(req.z_se_ohm)
-            refusals.append(f'{first}: {z_txt} ohm on {layer0} wants a plane on {want}; Board(planes=[("GND", "{want}")]) declares it')
+            z_txt = _g(pair_req.z_diff_ohm if pair_req else USB_Z_DIFF)
+            refusals.append(f"{first}: {z_txt} ohm on {layer0} (Pair line {line}) has no reference plane: {want}, the layer next to {layer0}, is not in Board(planes=)")
+        elif stack.layers <= 2 and pours:
+            # Round 3 (refute-onehome): the board pours, just not the layer facing this one.
+            z_txt = _g(pair_req.z_diff_ohm if pair_req else USB_Z_DIFF)
+            other = "B.Cu" if layer0 == "F.Cu" else "F.Cu"
+            refusals.append(
+                f"{first}: {z_txt} ohm on {layer0} (Pair line {line}) has no reference plane: {other}, the layer facing {layer0}, is not poured "
+                f"(this board pours {', '.join(f'{lay} ({n})' for n, lay in pours)})"
+            )
+        elif stack.layers <= 2:
+            # Two layers and no back pour (GND is not a power net, so `route_scene.plane_targets` pours
+            # nothing): an impedance with nothing to return through, which nothing can size.
+            z_txt = _g(pair_req.z_diff_ohm if pair_req else USB_Z_DIFF)
+            refusals.append(
+                f"{first}: {z_txt} ohm on {layer0} (Pair line {line}) has no reference plane: this two-layer board pours B.Cu only "
+                "when GND is a power net (route_scene.plane_targets), and no NetReq names GND with kind power"
+            )
 
-    if kind == "usb_hs":
+    if is_pair:
         if len(nets) == 2:
             pair_of = {nets[0]: nets[1], nets[1]: nets[0]}
-        z_target = float(req.z_diff_ohm) if req.z_diff_ohm is not None else USB_Z_DIFF
-        z_src_who = f"NetReq line {line}" if req.z_diff_ohm is not None else f"preset {kind}"
+        # docs/physics-subjects.md PR 6: every pair is a Pair line; `kind="usb_hs"` fills what the line leaves out
+        # from the preset, and a Pair with no kind carries only its own line's numbers.
+        preset_pair = pair_req is not None and pair_req.kind == "usb_hs"
+        z_target = float(pair_req.z_diff_ohm) if pair_req is not None else USB_Z_DIFF
+        z_src_who = f"preset {kind}" if (preset_pair and "z_diff_ohm" not in pair_req.written) else f"Pair line {line}"  # type: ignore[union-attr]
         gap_given = None
         gap_src = Source("stackup", stack.name, f"gap max(0.15, clearance_min {_g(stack.clearance_min)})")
-        if pair_req is not None:
-            z_target = float(pair_req.z_diff_ohm)
-            z_src_who = f"Pair line {pair_req.line}"
-            if pair_req.gap_mm is not None:
-                gap_given = pair_req.gap_mm
-                raised = pair_gap_mm(stack, gap_given) > gap_given
-                gap_src = Source(
-                    "Pair",
-                    f"line {pair_req.line}",
-                    f"gap_mm={_g(pair_req.gap_mm)} raised to the fab floor clearance_min {_g(stack.clearance_min)}"
-                    if raised
-                    else f"overrides gap max(0.15, clearance_min {_g(stack.clearance_min)})",
-                )
+        if pair_req is not None and pair_req.gap_mm is not None:
+            gap_given = pair_req.gap_mm
+            raised = pair_gap_mm(stack, gap_given) > gap_given
+            gap_src = Source(
+                "Pair",
+                f"line {pair_req.line}",
+                f"gap_mm={_g(pair_req.gap_mm)} raised to the fab floor clearance_min {_g(stack.clearance_min)}"
+                if raised
+                else f"overrides gap max(0.15, clearance_min {_g(stack.clearance_min)})",
+            )
         pair_layer = layer0 if is_outer(layer0) else "F.Cu"
         w, g = diff_pair_geometry(z_target, stack, pair_layer, gap_given)
         solved = diff_pair_width_mm(z_target, stack, pair_layer, gap_given)
@@ -1714,24 +2204,22 @@ def _compile_req(
             row_note = "uncalibrated"
         else:
             row_note = "formula only"
-        tol = 15.0 if not bare_pair else 10.0
+        tol = 15.0 if preset_pair else 10.0
         src = Source("hj_coupled_microstrip", f"x {_g(stack.z_bias_diff)} {code}", row_note)
         w_d = Derived(w, "mm", src)
         g_d = Derived(g, "mm", gap_src)
         z_d = Derived(z, "ohm", Source("hj_coupled_microstrip", f"x {_g(stack.z_bias_diff)} {code}", f"{row_note}; target {_g(z_target)} +-{_g(tol)} %"))
         skew_default = DEFAULT_MATCH_MM["usb_hs"]
-        skew = _preset(skew_default, "mm", kind, MATCH_SOURCE["usb_hs"])
-        uncoupled = _preset(USB_UNCOUPLED_MM, "mm", kind, MATCH_SOURCE["usb_hs"])
-        if req.match_mm is not None:
-            skew = _override(req.match_mm, "mm", "NetReq", line, kind, _g(skew_default))
-        if req.uncoupled_mm is not None:
-            uncoupled = _override(req.uncoupled_mm, "mm", "NetReq", line, kind, _g(USB_UNCOUPLED_MM))
-        if pair_req is not None:
-            skew = _override(pair_req.match_mm, "mm", "Pair", pair_req.line, kind, _g(skew_default))
-            uncoupled = _override(pair_req.uncoupled_mm, "mm", "Pair", pair_req.line, kind, _g(USB_UNCOUPLED_MM))
-        if bare_pair:
-            skew = Derived(pair_req.match_mm, "mm", Source("Pair", f"line {pair_req.line}"))  # type: ignore[union-attr]
-            uncoupled = Derived(pair_req.uncoupled_mm, "mm", Source("Pair", f"line {pair_req.line}"))  # type: ignore[union-attr]
+        if preset_pair:
+            written = pair_req.written  # type: ignore[union-attr]
+            skew = _override(pair_req.match_mm, "mm", "Pair", line, kind, _g(skew_default)) if "match_mm" in written else _preset(skew_default, "mm", kind, MATCH_SOURCE["usb_hs"])  # type: ignore[union-attr]
+            uncoupled = (
+                _override(pair_req.uncoupled_mm, "mm", "Pair", line, kind, _g(USB_UNCOUPLED_MM)) if "uncoupled_mm" in written  # type: ignore[union-attr]
+                else _preset(USB_UNCOUPLED_MM, "mm", kind, MATCH_SOURCE["usb_hs"])
+            )
+        else:
+            skew = Derived(pair_req.match_mm if pair_req else skew_default, "mm", Source("Pair", f"line {line}"))
+            uncoupled = Derived(pair_req.uncoupled_mm if pair_req else USB_UNCOUPLED_MM, "mm", Source("Pair", f"line {line}"))
         pair_geometry = (w_d, g_d, z_target, z_d, tol, skew, uncoupled, controlled)
         width = Derived(w, "mm", src)
         pair_clear = max(min(0.16, w), floor_clear)
@@ -1741,6 +2229,11 @@ def _compile_req(
             # D, "volts on any kind": the class clearance is max(kind number, IPC-2221B 6-1 row).
             # This block used to overwrite the row the voltage block had already applied.
             clearance = replace(voltage.clearance_mm, source=replace(voltage.clearance_mm.source, note=f"over preset {kind} {_g(pair_clear)}"))
+        elif voltage is not None:
+            # The row the pair's own clearance already covers, said as on any other net (a NetReq naming the
+            # pair's nets, refutation one-home r1 defect 1).
+            row_txt = f"ipc2221_6_1 row {_ipc2221_row_label(voltage.volts)} V {voltage.row} {_g(voltage.clearance_mm.value)}"
+            clearance = replace(clearance, source=replace(clearance.source, note=f"{clearance.source.note}; {row_txt}" if clearance.source.note else row_txt))
         over = f" over {reference_name}" if reference_name else ""
         extra = "" if controlled else "; uncontrolled"
         width_line = f"{_g(w)} mm wide, gap {_g(g)} mm on {pair_layer}{over}: {_g(z)} ohm ({z_d.source.formula} {z_d.source.ref}; {z_d.source.note}{extra}; {z_src_who})"
@@ -1750,62 +2243,28 @@ def _compile_req(
             # rows -> interpolated, neither -> formula only (the 2-layer case).
             cal_word = "fitted" if stack.rows else ("interpolated" if stack.jlc_code else "formula only")
             advice = (
-                'fine for USB full speed, use Board(stackup="jlcpcb_4l_1oz") for high speed'
+                "within the USB full speed tolerance, outside the high speed one"
                 if stack.layers <= 2
-                else f"widen the gap (Pair(gap_mm=)) or take a thinner prepreg "
-                f'(Board(stackup="jlcpcb_4l_1oz_1080")) to reach {_g(z_target)} ohm within {_g(PAIR_FIT_MM)} mm members'
+                else f"{_g(z_target)} ohm is not reached within {_g(PAIR_FIT_MM)} mm members at this gap on this prepreg"
             )
             notes.append(
                 f"{a}/{b}: {_g(z_target)} ohm needs {_g(solved)} mm members at gap {_g(pair_gap_mm(stack, gap_given))} on {stack.name} "
                 f"({cal_word}); pair written at the fab floor {_g(stack.track_min)}/{_g(stack.clearance_min)} = {z:.1f} ohm; {advice}"
             )
         soft += ["track_width", "skew", "via_budget", "diff_pair_uncoupled"]
-    elif req.z_se_ohm is not None:
-        z_target = float(req.z_se_ohm)
-        pour = None
-        if stack.layers == 2 and is_outer(layer0):
-            pour = max(0.3, 2 * lane)
-        w = width_for_z0(z_target, stack, layer=layer0, pour_gap=pour)
-        z = microstrip_z0(w, stack, layer=layer0, pour_gap=pour)
-        if not is_outer(layer0):
-            formula, ref = "wadell_stripline_asym", f"{stack.name} {layer0} (formula only, +-5 %)"
-        elif pour is not None:
-            formula, ref = "ghione_naldi_cpwg", f"x {_g(stack.z_bias_se)} {stack.jlc_code or stack.name} pour gap {_g(pour)} t = 0"
-        else:
-            formula, ref = "hj_microstrip", f"x {_g(stack.z_bias_se)} {stack.jlc_code or stack.name}"
-        cal = stack.z_bias_source if is_outer(layer0) else "JLC publishes no inner-layer rows"
-        width = Derived(w, "mm", Source(formula, ref, cal))
-        # A target the fab floor (or 6 mm of copper) cannot reach was printed as if it were met.
-        off = abs(z - z_target) / z_target if z_target else 0.0
-        if off > 0.02:
-            why = (
-                f"the fab floor {_g(stack.track_min)} mm stops at {_g(z)} ohm"
-                if abs(w - stack.track_min) < 1e-9
-                else f"6 mm of copper only reaches {_g(z)} ohm"
-                if w >= 5.999
-                else f"the solver lands {off * 100:.0f} % off"
-            )
-            reached = f"; not reached: {why}"
-            notes.append(f"{first}: z_se_ohm={_g(z_target)} is not reachable on {stack.name} {layer0}: {why}")
-        else:
-            reached = ""
-        z_se = (z_target, Derived(z, "ohm", Source(formula, ref, f"{cal}; target {_g(z_target)}{reached}")))
-        if w > stack.track_min:
-            soft.append("track_width")
 
     # airwire budget (placement), routed length (KiCad)
     airwire = preset.airwire_mm
     airwire_src = Source("preset", kind) if airwire is not None else None
     if req.max_mm is not None:
         airwire = req.max_mm
-        airwire_src = Source("NetReq", f"line {line}", f"overrides preset {kind} {_g(preset.airwire_mm)}" if preset.airwire_mm is not None else "")
+        airwire_src = Source("NetReq", f"line {nline}", f"overrides preset {kind} {_g(preset.airwire_mm)}" if preset.airwire_mm is not None else "")
     length: Derived | None = None
     length_none = False
-    if kind in ("usb_hs", "spi") and not bare_pair:
-        if req.length_mm is not None:
-            length = Derived(round(req.length_mm, 4), "mm", Source("NetReq", f"line {line}"))
-        else:
-            length_none = True
+    if is_pair and pair_req is not None and pair_req.length_mm is not None:
+        pass  # a Pair's length_mm= is each member Path's budget (`paths`), never a net rule (KD 12: a net rule sums stubs)
+    elif is_pair and pair_req is not None and pair_req.kind == "usb_hs":
+        length_none = True  # the usb_hs Pair kind reports none until a length is written (§4.1)
     if kind == "i2c":
         pf_max = req.pf_max if req.pf_max is not None else I2C_PF_MAX
         pf_src = f"NetReq line {line}" if req.pf_max is not None else "UM10204 7.1"
@@ -1827,9 +2286,18 @@ def _compile_req(
 
     # keep-away
     keep: list[KeepAway] = []
+    if req.keep_clear_mm is not None and not req.keep_clear_of:
+        refusals.append(f'NetReq("{first}") line {nline}: keep_clear_mm={_g(req.keep_clear_mm)} sizes a keep-away, and this NetReq gives no keep_clear_of=')
+    for pat in req.keep_clear_of or ():
+        if not any(n in design.nets for n in _expand((pat,), sorted(design.nets))):
+            refusals.append(f'NetReq("{first}") line {nline}: keep_clear_of names {pat!r}, and no net on this board matches it')
     if req.keep_clear_of:
         mm = req.keep_clear_mm if req.keep_clear_mm is not None else KEEP_CLEAR_DEFAULT_MM
-        ksrc = Source("NetReq", f"line {line}") if req.keep_clear_mm is not None else Source("preset", kind, "3 mm when keep_clear_of is given")
+        ksrc = (
+            Source("NetReq", f"line {nline}")
+            if req.keep_clear_mm is not None
+            else (Source("NetReq", f"line {nline}", "3 mm when keep_clear_of is given, pcbc default") if is_pair else Source("preset", kind, "3 mm when keep_clear_of is given"))
+        )
         for other in _expand(tuple(req.keep_clear_of), sorted(design.nets)):
             if other not in nets:
                 keep.append(KeepAway(other, mm, ksrc))
@@ -1839,27 +2307,16 @@ def _compile_req(
     loop: Derived | None = None
     if kind in DEFAULT_LOOP_MM2:
         loop = _preset(DEFAULT_LOOP_MM2[kind], "mm2", kind, LOOP_NOTE[kind])
-        if req.loop_mm2 is not None:
-            loop = _override(round(req.loop_mm2, 1), "mm2", "NetReq", line, kind, _g(DEFAULT_LOOP_MM2[kind]))
 
     if kind == "power":
         soft.append("track_width")
     if kind == "clock":
         soft += ["skew", "via_budget"]
-    if kind == "spi" and len(nets) > 1:
-        soft.append("skew")
-    if kind == "sense" and len(nets) == 2:
-        soft.append("skew")
 
-    autoroute: bool | str = preset.autoroute
-    if req.autoroute is not None:
-        autoroute = req.autoroute
-    if req.pair:
-        autoroute = "diff_pair"
+    # `diff_pair` marks a pair, routed as one object (every pair is compiled from its Pair line, PR 6).
+    autoroute: bool | str = "diff_pair" if is_pair else True
 
     class_base = req.class_name or preset.class_name
-    if req.class_name is None and kind == "generic" and req.z_se_ohm is not None:
-        class_base = f"Z{int(req.z_se_ohm)}"
 
     return _Numbers(
         kind="pair" if bare_pair else kind,
@@ -1872,7 +2329,6 @@ def _compile_req(
         layers=layers,
         reference=reference,
         reference_name=reference_name,
-        z_se=z_se,
         pair_geometry=pair_geometry,
         airwire=airwire,
         airwire_src=airwire_src,
@@ -1880,7 +2336,6 @@ def _compile_req(
         length_none=length_none,
         keep_away=tuple(keep),
         spacing=preset.spacing_w,
-        current=current,
         voltage=voltage,
         loop=loop,
         rise_ps=req.rise_ps,
@@ -1891,6 +2346,7 @@ def _compile_req(
         via_src=via_src,
         layers_src=layers_src,
         pair_of=pair_of,
+        pair_length=pair_req.length_mm if (is_pair and pair_req is not None) else None,
     )
 
 
@@ -1952,7 +2408,8 @@ def _compile_isolation(
             continue
         side_of[inst.ref] = _side_root(sides.get(inst.ref), region_parent, (iso.a, iso.b))
         if side_of[inst.ref] is None:
-            refusals.append(f'{tag} line {iso.line}: {inst.ref} is placed on neither side; Place("{inst.ref}", parent="{iso.a}", ...) or list it in across=')
+            bname = pathlib.Path(design.source).name if design.source else "board.py"
+            refusals.append(f"{tag} ({bname}:{iso.line}): {inst.ref} is on neither side: no Place(parent=) in layout.core.py puts it in {iso.a} or {iso.b}, and it is not in across=")
     nets_a: list[str] = []
     nets_b: list[str] = []
     for net in sorted(pads_by_net):
@@ -1986,17 +2443,22 @@ def _compile_isolation(
 
     # the corridor between the two Regions
     ra, rb = rects[iso.a], rects[iso.b]
-    bw, bh = board.size_mm
+    # The corridor's along-span is the outline (docs/board-outline.md B.3 step 5): the declared one here; in derived
+    # mode the derived frame, which the place stage replaces with R and the fit with O (`respan_rule_areas`).
+    from .layout import declared_outline
+
+    rect = declared_outline(design)[0]
+    ox0, oy0, ox1, oy1 = rect if rect is not None else (0.0, 0.0, 0.0, 0.0)
     area: RuleArea | None = None
     axis = ""
     if ra.x1 <= rb.x0 or rb.x1 <= ra.x0:
         axis = "x"
         left, right = (ra, rb) if ra.x1 <= rb.x0 else (rb, ra)
-        box = (round(left.x1, 4), 0.0, round(right.x0, 4), float(bh))
+        box = (round(left.x1, 4), float(oy0), round(right.x0, 4), float(oy1))
     elif ra.y1 <= rb.y0 or rb.y1 <= ra.y0:
         axis = "y"
         top, bottom = (ra, rb) if ra.y1 <= rb.y0 else (rb, ra)
-        box = (0.0, round(top.y1, 4), float(bw), round(bottom.y0, 4))
+        box = (float(ox0), round(top.y1, 4), float(ox1), round(bottom.y0, 4))
     else:
         refusals.append(f"{tag} line {iso.line}: Regions overlap in both axes; no straight line separates them")
         box = None
@@ -2013,7 +2475,7 @@ def _compile_isolation(
 # ---------------------------------------------------------------------------------------------
 
 
-def _report(cs: ConstraintSet, design: Design, numbers, notes_lines: list[str], has_switch_node: bool) -> list[str]:
+def _report(cs: ConstraintSet, design: Design, numbers, notes_lines: list[str], has_switch_node: bool, path_lines: dict | None = None) -> list[str]:
     by_net_num: dict[str, _Numbers] = {}
     for _idx, nets, num in numbers:
         for n in nets:
@@ -2024,37 +2486,33 @@ def _report(cs: ConstraintSet, design: Design, numbers, notes_lines: list[str], 
     for c in cs.constraints:
         num = by_net_num.get(c.net)
         n = c.net
-        preset_of = "usb_hs" if c.kind == "pair" else c.kind
+        pr_of = next((x for x in design.pairs if x.line == c.line and c.net in (x.p, x.n)), None) if c.kind == "pair" else None
+        preset_of = (pr_of.kind or None) if pr_of is not None else ("usb_hs" if c.kind == "pair" else c.kind)
         if c.pair is not None and num is not None and num.width_line:
             lines.append(f"{n}: pair with {c.pair.partner}, {num.width_line}")
         else:
             lines.append(f"{n}: width {c.width_mm.line()}")
-        if c.z_se is not None:
-            target, z = c.z_se
-            over = f" over {num.reference_name}" if num is not None and num.reference_name else ""
-            lines.append(f"{n}: {_g(c.width_mm.value)} mm on {c.layers[0] if c.layers else 'F.Cu'}{over}: {z.line()}")
         lines.append(f"{n}: clearance {c.clearance_mm.line()}")
         v = c.via
         if num is not None:
             via_src = num.via_src
-        else:  # synthesised from a Bus / Chain / Guard alone: the stackup via
+        else:  # synthesised from a Bus / Path / Guard alone: the stackup via
             via_src = f"stackup {stack.name}" if (v.diameter_mm, v.drill_mm) == (stack.via_diameter, stack.via_drill) else f"preset {preset_of}"
         if not v.allowed:
             lines.append(f"{n}: no vias ({via_src})")
         else:
             line = f"{n}: via {_g(v.diameter_mm)}/{_g(v.drill_mm)} mm ({via_src})"
             if v.count_max is not None:
-                line += f", at most {v.count_max} ({'NetReq line ' + str(c.line) if _vias_max_given(design, c) else 'preset ' + preset_of}){SOFT}"
-            if v.amps is not None:
-                line += f", {v.per_change} per layer change (via_barrel {v.amps.source.ref} {_g(v.amps.value)} A at {_g(c.current.temp_rise_c if c.current else 10.0)} C) [report only in R1]"
+                budget_src = f"Pair line {pr_of.line}" if (pr_of is not None and pr_of.vias_max is not None) else f"preset {preset_of}"
+                line += f", at most {v.count_max} ({budget_src}){SOFT}"
             lines.append(line)
         if c.pair is not None:
             lines.append(f"{n}: skew {c.pair.skew_mm.line()}{SOFT}")
             lines.append(f"{n}: uncoupled {c.pair.uncoupled_mm.line()}{SOFT}")
         if c.length_max_mm is not None:
             lines.append(f"{n}: length {c.length_max_mm.line()}")
-        elif num is not None and num.length_none:
-            lines.append(f"{n}: length none (give length_mm=)")
+        elif num is not None and num.length_none and not any(p.length_mm is not None for p in c.paths):
+            lines.append(f"{n}: length none (no length_mm= on Pair line {c.line} or on a Path of {n})")
         if c.airwire_max_mm is not None:
             src = num.airwire_src if num is not None and num.airwire_src is not None else Source("preset", c.kind)
             inner = f"{src.formula} {src.ref}" + (f"; {src.note}" if src.note else "")
@@ -2066,15 +2524,26 @@ def _report(cs: ConstraintSet, design: Design, numbers, notes_lines: list[str], 
             hint = ""
             if has_switch_node:
                 sw = sorted(x.net for x in cs.constraints if x.kind == "switch_node")
-                hint = f'; NetReq("{n}", kind="{c.kind}", keep_clear_of="{sw[0]}") holds {_g(KEEP_CLEAR_DEFAULT_MM)} mm' if sw else ""
+                hint = f"; this board has a switch node ({', '.join(sw)})" if sw else ""
             lines.append(f"{n}: keep_clear_of none{hint}")
         if c.group is not None:
             g = c.group
             if g.kind == "bus":
                 to = f" matched to {g.clock}" if g.clock else ""
                 lines.append(f"{n}: bus {', '.join(g.members)}{to} within {_g(g.match_mm or 0)} mm ({g.source}){SOFT}")
-            else:
-                lines.append(f"{n}: chain {' -> '.join(g.members)} ({g.source})")
+        if path_lines and path_lines.get(n):
+            lines.extend(path_lines[n])
+        # KD 12 / O3: a KiCad rule selects copper by net or class, never the copper between two pads, so
+        # a path's numbers reach KiCad only when one Path is the whole node. Every other fielded path is
+        # checked by pcbc's copper gate alone, and the report says so.
+        whole = c.whole_node_path()
+        for p in c.paths:
+            if not p.fielded or p is whole:
+                continue
+            lines.append(
+                f"{n}: KiCad does not check Path line {p.line}'s copper (width, vias, layers): a KiCad rule selects copper by net or class, "
+                f"never the copper between two pads; pcbc's copper gate checks it on the emitted board"
+            )
         if c.voltage is not None and c.voltage.creepage_mm is not None:
             lines.append(f"{n}: creepage {c.voltage.creepage_mm.line()}")
         if c.loop_mm2 is not None:
@@ -2089,7 +2558,7 @@ def _report(cs: ConstraintSet, design: Design, numbers, notes_lines: list[str], 
             iso = next((i for i in design.isolations if c.isolation_side in (i.a, i.b)), None)
             lines.append(f"{n}: isolation side {c.isolation_side} (Isolation {iso.a}/{iso.b} line {iso.line})" if iso else f"{n}: isolation side {c.isolation_side}")
         lines.append(f"{n}: layers {', '.join(c.layers)} ({num.layers_src if num is not None else 'preset generic'})")
-        lines.append(f"{n}: spacing {c.spacing_w}W (preset {preset_of})")
+        lines.append(f"{n}: spacing {c.spacing_w}W ({f'preset {preset_of}' if preset_of else 'a bare Pair: 3W, pcbc default'})")
         for note in c.notes:
             if note not in seen_notes:
                 seen_notes.add(note)
@@ -2118,13 +2587,12 @@ def _report(cs: ConstraintSet, design: Design, numbers, notes_lines: list[str], 
             lines.append(f"{tag}: creepage {spec.creepage_mm.line()}; slot=True: the contour gap + 2 x board {_g(stack.board_mm)} mm satisfies it, gap >= {_g(spec.gap_min_mm)} mm")
         else:
             lines.append(f"{tag}: creepage {spec.creepage_mm.line()}")
+    for lp in cs.loops:
+        src = f"{lp.budget.source.formula}{'; ' + lp.budget.source.note if lp.budget.source.note else ''}" if lp.budget.source.formula != "Loop" else f"Loop line {lp.line}"
+        lines.append(f"loop {' -> '.join(lp.written)} (Loop line {lp.line}): {_g(lp.budget.value)} mm2 ({src})")
     lines.extend(notes_lines)
     lines.append("classes: " + ", ".join(_class_summary(c, stack) for c in cs.classes))
     return lines
-
-
-def _vias_max_given(design: Design, c: Constraint) -> bool:
-    return c.req_index >= 0 and design.netreqs[c.req_index].vias_max is not None
 
 
 def _class_summary(c: CompiledClass, stack: Stackup) -> str:
@@ -2196,8 +2664,8 @@ class ClearanceTable:
             v = self._class_away.get((ca.class_name, b))
             if v is not None and v > best[0]:
                 best = (v, f"{ca.class_name} keep-away from {b}")
-        # Class creepage (E.6): the written rule is "this class against any other net", not "against
-        # another class that also carries creepage", and the table has to cover what is written.
+        # Class creepage (E.6): the written rules are "this class against any other net" and, since F1
+        # (physics-subjects PR 4), "this class against another net of the same class"; the table covers both.
         # Enforcing a creepage as a straight-line distance is conservative: the surface path between
         # two pieces of copper is never shorter than the air between them.
         for a, b in ((net_a, net_b), (net_b, net_a)):
@@ -2205,8 +2673,8 @@ class ClearanceTable:
             cb = self._by_net.get(b)
             if ca is None or not b:
                 continue
-            if cb is not None and cb.class_name == ca.class_name:
-                continue
+            # docs/physics-subjects.md §3.9 (F1, PR 4): two nets of one class at 60 V or more get the class's
+            # creepage between them too (NetReq("HV_P", "HV_N", volts=400) may be 800 V apart).
             v = self._class_creepage.get(ca.class_name)
             if v is not None and v > best[0]:
                 best = (v, f"creepage {ca.class_name}")
@@ -2273,3 +2741,22 @@ def clearance_table(cs: ConstraintSet) -> ClearanceTable:
         _class_creepage=creepage,
         _default_clearance=max(default, cs.stackup.clearance_min),
     )
+
+
+def respan_rule_areas(cs: ConstraintSet, outline) -> ConstraintSet:
+    """`cs` with each isolation corridor's along-span drawn to `outline` (x0, y0, x1, y1): R while placing and routing,
+    O after the fit (docs/board-outline.md B.3 step 5). The across-span stays the two Regions'. A declared outline
+    gives the boxes compile drew, unchanged."""
+    if cs is None or not cs.rule_areas:
+        return cs
+    x0, y0, x1, y1 = outline
+    axis = {f"ISO_{s.req.a}_{s.req.b}": s.axis for s in cs.isolation_specs}
+    areas = []
+    for a in cs.rule_areas:
+        ax = axis.get(a.name)
+        if ax == "x":
+            a = replace(a, box=(a.box[0], float(y0), a.box[2], float(y1)))
+        elif ax == "y":
+            a = replace(a, box=(float(x0), a.box[1], float(x1), a.box[3]))
+        areas.append(a)
+    return replace(cs, rule_areas=tuple(areas))

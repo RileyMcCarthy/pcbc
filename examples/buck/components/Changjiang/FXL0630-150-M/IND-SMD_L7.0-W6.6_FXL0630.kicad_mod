@@ -178,7 +178,7 @@
 	(embedded_fonts no)
 	(model "IND-SMD_L7.0-W6.6_FXL0630.step"
 		(offset
-			(xyz 0 0 0)
+			(xyz 0 0 0.01)
 		)
 		(scale
 			(xyz 1 1 1)

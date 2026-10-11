@@ -8,7 +8,8 @@ from pathlib import Path
 
 from pcbc.language import check_board, load_board
 from pcbc.sch_emit import _parts_from_design, emit_from_design
-from pcbc.sch_place import apply_sch_places, pin_world
+from pcbc.sch_auto import resolve as apply_sch_places
+from pcbc.sch_place import pin_world
 
 BOARD = Path(__file__).resolve().parent.parent / "examples" / "node" / "node.py"
 
@@ -54,13 +55,13 @@ def test_divider_and_pullups_stand_the_right_way_up():
 
 
 def test_load_group_reads_left_to_right():
+    """The auto-layout's load group (schematic.core.py names its members only): the pull-down and the gate resistor
+    on the gate's row, left of the gate, and the load connector above the drain."""
     _d, by = _placed()
     r_g, r_pd, q1, j = by["R_G"], by["R_PD"], by["Q1"], by["J_LOAD"]
-    gate = _pin(r_g, "2")
-    assert abs(_pin(r_g, "1")[1] - gate[1]) < 0.01  # R_G lies along
-    assert abs(_pin(r_pd, "1")[0] - gate[0]) < 0.01 and _pin(r_pd, "1")[1] > gate[1]  # R_PD hangs from the node
     g = _pin(q1, "G")
-    assert abs(g[1] - gate[1]) < 0.01 and g[0] > gate[0]  # Q1's gate on the node row, to the right
+    on_gate = [_pin(r_pd, p.number) for p in r_pd.pins if p.net == "GATE"] + [_pin(r_g, p.number) for p in r_g.pins if p.net == "GATE"]
+    assert all(abs(pt[1] - g[1]) < 0.01 and pt[0] < g[0] for pt in on_gate), (on_gate, g)
     assert _pin(j, "2")[1] < _pin(q1, "D")[1]  # the load connector above the drain
 
 
@@ -84,4 +85,7 @@ def test_node_layout_bar():
     # records why no preset number was invented instead). `tests/test_route_checks.py` pins the text.
     fast = [m for m in result["layout_report"] if "no budget checks it" in m]
     assert sorted(m.split(":")[0] for m in fast) == ["USB_DN", "USB_DP"], fast
+    # docs/board-outline.md PR 4: node declares no Outline(), and its J1 group is docked below U2 (B.2). The one move the
+    # declared board had (R_CC1.2 [GND] in Path line 111's VBUS corridor; pinned on the declared vehicle in
+    # `tests/test_route_checks.py`) is gone: old 1 move, new 0.
     assert [m for m in result["layout_report"] if m not in fast] == [], result["layout_report"]

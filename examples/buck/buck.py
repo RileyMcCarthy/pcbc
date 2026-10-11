@@ -1,7 +1,7 @@
 # 12 V in, 5 V / 2 A out: TPS54202 synchronous buck. The circuit is the
-# netlist below; every pose on the sheet is a SchPlace() line, and the tool
-# draws the wires, names and power symbols from the netlist.
-from pcbc import Board, Capacitor, Ground, Net, NetReq, Place, Power, Resistor, SchPlace, SchRegion, load
+# netlist below; the tool draws the sheet from the netlist (schematic.core.py
+# locks what it should not move).
+from pcbc import Board, Capacitor, Ground, Loop, Net, NetReq, Path, Power, Resistor, load
 
 VIN = Power("VIN")
 V5 = Power("5V")
@@ -32,40 +32,22 @@ Resistor("R_FB_TOP", "100k", mpn="0402WGF1003TCE", lcsc="C25741", p1=V5, p2=FB, 
 Resistor("R_FB_BOT", "13.3k", mpn="0402WGF1332TCE", lcsc="C25879", p1=FB, p2=GND, **res)
 Resistor("R_EN", "100k", mpn="0402WGF1003TCE", lcsc="C25741", p1=VIN, p2=EN, **res)
 
-# PCB: 40 x 25 mm, 2 layers. Input on the left edge, output on the right.
-Board(width=40, height=25, layers=2, stackup="jlcpcb_2l_1oz")
-Place("U1", position="absolute", left=15, top=8, locked=True, reason="buck IC in the middle")
+# PCB: 2 layers, the outline derived from the placement. Input on the left edge, output on the right.
+Board(layers=2, stackup="jlcpcb_2l_1oz")
+# Where each part goes: layout.core.py, next to this file.
 
-# Schematic. This symbol has SW and VIN both on the left, so the output rail
-# runs left from the inductor and the input stage sits under the IC.
-SchRegion("sheet", title="Buck", left=12, top=12, width=380, height=200)
-SchPlace("U1", parent="sheet", left=150, top=60)
-SchPlace("L1", to="U1.SW")
-SchPlace("C_OUT1", to="L1.2")
-SchPlace("C_OUT2", along="C_OUT1.1", side="bottom")
-SchPlace("J_OUT", to="C_OUT2.1", side="left")  # past the caps, at the end of the rail
-SchPlace("C_IN1", to="U1.VIN", side="bottom")
-SchPlace("C_IN2", along="C_IN1.1", side="left")
-SchPlace("J_IN", to="C_IN2.1", side="left")
-SchPlace("C_BOOT", to="U1.BOOT")
-SchPlace("R_EN", to="U1.EN")
-SchPlace("R_FB_TOP", to="U1.FB")
-SchPlace("R_FB_BOT", along="R_FB_TOP.2", side="bottom")
-
-NetReq("VIN", "5V", "GND", kind="power", volts=12, amps=2)
+# Currents at 12 V -> 5 V / 2 A, TI TPS54202 (SLVSD26C Table 4-1 pin roles; L1 15 uH; fsw 500 kHz; dI = 7 D / (L fsw)): VIN 1.36 A rms = sqrt(D (Iout^2 + dI^2/12)) at D = 0.463 (~90 % efficient, 0.926 A in); GND 1.53 A rms = sqrt((1 - D) (Iout^2 + dI^2/12)) at the ideal D = 5/12; SW and the 5V load 2 A, Iout.
+NetReq("VIN", kind="power", volts=12)
+NetReq("GND", kind="power")
+NetReq("5V", kind="power", volts=5)
 NetReq("SW", kind="switch_node", max_mm=6)
 NetReq("FB", kind="analog")
-
-# Copper. Input on the west edge, output on the east; the regulator in the middle and
-# every passive says which pin it serves. `pcbc pcb buck.py` lists what to move.
-Place("J_IN", edge="left", reason="input connector")
-Place("J_OUT", edge="right", reason="output connector")
-Place("C_IN1", to="U1.VIN")
-Place("C_IN2", to="U1.VIN")
-Place("L1", to="U1.SW")
-Place("C_OUT1", to="L1.2")
-Place("C_OUT2", to="L1.2")
-Place("C_BOOT", to="U1.BOOT")
-Place("R_EN", to="U1.EN")
-Place("R_FB_TOP", to="U1.FB")
-Place("R_FB_BOT", to="U1.FB")
+# The switch current: the regulator's SW pin to the inductor. The boot cap's branch stays thin.
+Path("SW", "U1.SW", "L1.1", amps=2)
+# The load current: the inductor's output, through the first output cap, to the connector.
+Path("5V", "L1.2", "C_OUT1.1", "J_OUT.1", amps=2)
+# The divider's top: leaves the rail inside the output cap's pad and touches 5V nowhere else.
+Path("5V", "C_OUT1.1", "R_FB_TOP.1", kind="feedback")
+# The input hot loop, checked at placement.
+Loop("C_IN1.1", "U1.VIN", "U1.GND", "C_IN1.2")
+Path("VIN", "J_IN.1", "C_IN2.1", "C_IN1.1", "U1.VIN", amps=1.36)  # the input current, through both input caps (their ripple)

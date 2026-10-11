@@ -185,7 +185,7 @@
 	(embedded_fonts no)
 	(model "SOT-23-3_L2.9-W1.3-P1.90-LS2.4-BR.step"
 		(offset
-			(xyz 0 0 0)
+			(xyz 0 0 -0.051)
 		)
 		(scale
 			(xyz 1 1 1)

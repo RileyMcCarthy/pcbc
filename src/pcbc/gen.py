@@ -781,10 +781,12 @@ HEADER = """\
 # One line is one KiCad primitive, every field explicit (docs/layout-properties.md has the table).
 # To lock an object, copy its line verbatim into layout.core.py next to board.py and rebuild: every
 # copper and drawing line here passed KiCad's DRC at the board's hard minimums, which is what
-# layout.core.py is held to. Three kinds of line cannot be locked: a Place (a part is placed in
-# board.py), a Group named "pcbc:<reason>:<owner>" (a piece's role, the build's own, rewritten
-# from the board every build) and the Edge.Cuts outline (Board(width, height) in board.py).
-# {n_place} Place, {n_pour} Pour, {n_via} Via, {n_seg} Seg, {n_arc} Arc, {n_draw} drawing(s).
+# layout.core.py is held to. A part's Place line replaces that part's Place line in layout.core.py:
+# a part takes one Place(). Four kinds of line cannot be locked: a fiducial's Place (FIDn, the
+# build's own), a Group named "pcbc:<reason>:<owner>" (a piece's role, the build's own, rewritten
+# from the board every build), the Edge.Cuts outline (Outline() in layout.core.py, or derived when
+# there is none) and a Keepout's rule area (Keepout() in layout.core.py).
+# {n_place} Place, {n_pour} Pour, {n_via} Via, {n_seg} Seg, {n_arc} Arc, {n_draw} drawing(s).{outline}
 """
 
 
@@ -799,11 +801,20 @@ def _drawing_key(g: Graphic) -> tuple:
     return (HEADS.index(g.kind), g.uuid or "", g.id)
 
 
-def gen_source(poses: list[Pose], copper: list[Copper], *, board: str, graphics: list[Graphic] = ()) -> str:
+def outline_header(source: str | None, line: int = 0) -> str:
+    """The header's line naming the outline's source (docs/board-outline.md B.4)."""
+    if source == "derived":
+        return "\n# Edge.Cuts outline: derived (no Outline() in layout.core.py)."
+    if source == "declared":
+        return f"\n# Edge.Cuts outline: declared, layout.core.py:{line}." if line else "\n# Edge.Cuts outline: declared."
+    return ""
+
+
+def gen_source(poses: list[Pose], copper: list[Copper], *, board: str, graphics: list[Graphic] = (), outline: str = "") -> str:
     """The text of `layout.gen.py`: a pure function of the objects, so the same board gives the same
-    bytes and a decompile of the emitted board gives this file back."""
+    bytes and a decompile of the emitted board gives this file back. `outline` is `outline_header`'s line."""
     counts = Counter(c.kind for c in copper)
-    head = HEADER.format(board=board, n_place=len(poses), n_pour=counts["pour"], n_via=counts["via"], n_seg=counts["seg"], n_arc=counts["arc"], n_draw=len(graphics))
+    head = HEADER.format(board=board, n_place=len(poses), n_pour=counts["pour"], n_via=counts["via"], n_seg=counts["seg"], n_arc=counts["arc"], n_draw=len(graphics), outline=outline)
     lines = [head, ""]
     lines += [line_of(p) for p in sorted(poses, key=lambda p: p.ref)]
     lines.append("")
@@ -814,8 +825,8 @@ def gen_source(poses: list[Pose], copper: list[Copper], *, board: str, graphics:
     return "\n".join(lines) + "\n"
 
 
-def write_gen(path: Path, poses: list[Pose], copper: list[Copper], *, board: str, graphics: list[Graphic] = ()) -> str:
-    text = gen_source(poses, copper, board=board, graphics=graphics)
+def write_gen(path: Path, poses: list[Pose], copper: list[Copper], *, board: str, graphics: list[Graphic] = (), outline: str = "") -> str:
+    text = gen_source(poses, copper, board=board, graphics=graphics, outline=outline)
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     Path(path).write_text(text)
     return text

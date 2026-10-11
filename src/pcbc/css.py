@@ -18,8 +18,8 @@ AUTO = "auto"
 
 # Properties we will never honor, with the PCB word to use instead.
 _FORBIDDEN = {
-    "z-index": "z-index is not a copper layer. Use side='F' or side='B'.",
-    "z_index": "z-index is not a copper layer. Use side='F' or side='B'.",
+    "z-index": "z-index is not a copper layer; a part's copper side is read from layer= ('F.Cu' or 'B.Cu').",
+    "z_index": "z-index is not a copper layer; a part's copper side is read from layer= ('F.Cu' or 'B.Cu').",
     "color": "color is not a placement property.",
     "background": "background is not a placement property.",
     "background-color": "background is not a placement property.",
@@ -27,21 +27,21 @@ _FORBIDDEN = {
     "font": "font is not a placement property.",
     "font-size": "font is not a placement property.",
     "font_size": "font is not a placement property.",
-    "flex": "flex is not a placer. Put unlocked parts in a Region; the engine packs them.",
-    "flex-direction": "flex is not a placer. Put unlocked parts in a Region; the engine packs them.",
-    "flex_direction": "flex is not a placer. Put unlocked parts in a Region; the engine packs them.",
-    "flex-grow": "flex is not a placer. Put unlocked parts in a Region; the engine packs them.",
-    "flex_grow": "flex is not a placer. Put unlocked parts in a Region; the engine packs them.",
-    "grid": "grid is not a placer. Put unlocked parts in a Region; the engine packs them.",
-    "grid-template-columns": "grid is not a placer. Put unlocked parts in a Region; the engine packs them.",
-    "grid_template_columns": "grid is not a placer. Put unlocked parts in a Region; the engine packs them.",
+    "flex": "flex is not a placer; pcbc places a part by its Place() position or relation, and packs a Region's unlocked parts itself.",
+    "flex-direction": "flex is not a placer; pcbc places a part by its Place() position or relation, and packs a Region's unlocked parts itself.",
+    "flex_direction": "flex is not a placer; pcbc places a part by its Place() position or relation, and packs a Region's unlocked parts itself.",
+    "flex-grow": "flex is not a placer; pcbc places a part by its Place() position or relation, and packs a Region's unlocked parts itself.",
+    "flex_grow": "flex is not a placer; pcbc places a part by its Place() position or relation, and packs a Region's unlocked parts itself.",
+    "grid": "grid is not a placer; pcbc places a part by its Place() position or relation, and packs a Region's unlocked parts itself.",
+    "grid-template-columns": "grid is not a placer; pcbc places a part by its Place() position or relation, and packs a Region's unlocked parts itself.",
+    "grid_template_columns": "grid is not a placer; pcbc places a part by its Place() position or relation, and packs a Region's unlocked parts itself.",
     "float": "float is not a placement property.",
-    "gap": "gap is a packing knob for the engine, not a locked-part inset. Use margin.",
+    "gap": "gap is a packing knob for the engine, not a locked part's inset; a part's inset is read from margin.",
 }
 
 _FORBIDDEN_POSITION = {
-    "sticky": "position:sticky needs a scrollport. Use position='absolute'.",
-    "fixed": "position:fixed needs a viewport. Use position='absolute'.",
+    "sticky": "position:sticky needs a scrollport, which a board has not; position is 'static' or 'absolute'.",
+    "fixed": "position:fixed needs a viewport, which a board has not; position is 'static' or 'absolute'.",
     "relative": "position:relative is not used. Locked parts are absolute; unlocked parts are static (engine).",
 }
 
@@ -219,10 +219,7 @@ def check_forbidden(kwargs: dict, *, who: str) -> None:
             if dv in ("flex", "inline-flex", "grid", "inline-grid"):
                 raise ValueError(f"{who}: {_FORBIDDEN['flex']}")
             if dv not in ("block", "contents", "none", ""):
-                raise ValueError(
-                    f"{who}: display={val!r} is not used. "
-                    "Locked parts are position='absolute'."
-                )
+                raise ValueError(f"{who}: display={val!r} is not used; display is 'block', 'contents' or 'none'.")
 
 
 def parse_transform(transform: str | None) -> dict:
@@ -486,9 +483,9 @@ def _used_size(
             raise ValueError(f"{who}: {axis} would be {size:.3f} mm (negative)")
         return size
     raise ValueError(
-        f"{who}: cannot determine {axis}. Set width/height, or both "
+        f"{who}: cannot determine {axis}: it has no {axis}, not both "
         f"{'left and right' if axis == 'width' else 'top and bottom'}, "
-        "or place a footprint (intrinsic courtyard)."
+        "and no footprint's intrinsic courtyard to size it."
     )
 
 

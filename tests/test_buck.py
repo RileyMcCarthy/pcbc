@@ -9,7 +9,10 @@ from pathlib import Path
 
 from pcbc.language import check_board, load_board
 from pcbc.sch_emit import _parts_from_design, emit_from_design
-from pcbc.sch_place import apply_sch_places, pin_world
+from pcbc.sch_auto import resolve as apply_sch_places
+from pcbc.sch_place import pin_world
+
+from conftest import write_split
 
 BOARD = Path(__file__).resolve().parent.parent / "examples" / "buck" / "buck.py"
 
@@ -73,12 +76,16 @@ def test_a_taken_lane_is_reported(tmp_path: Path):
     board = tmp_path / "buck.py"
     # Ask for the connector on the inductor's side of the cap: its wire would
     # run through the cap, and there is no distance at which that is not so.
-    board.write_text(src.replace('SchPlace("J_OUT", to="C_OUT2.1", side="left")', 'SchPlace("J_OUT", to="C_OUT2.1", side="right")'))
+    write_split(board, src)
+    # buck has no schematic.core.py (the auto-layout draws it); the lock is the one line written here.
+    (board.parent / "schematic.core.py").write_text('SchPlace("J_OUT", to="C_OUT2.1", side="right")\n')
     report: dict = {}
     emit_from_design(load_board(board), title="buck", report=report)
     lines = [i for i in report["issues"] if i.startswith("J_OUT")]
     assert lines, report["issues"]
     assert any("wire from C_OUT2.1 would run through" in i or "pushed" in i or "at every distance" in i for i in lines)
+    # Postfix B10 (direction.md §7b): the issue states the pin, the blockers and the side, and proposes no SchPlace edit.
+    assert not any("attach J_OUT to" in i or "far end of the run" in i for i in lines), lines
 
 
 def test_buck_readability_bar():

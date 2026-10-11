@@ -21,9 +21,15 @@ BOARDS = {
 }
 EPS = 0.05
 
-_WIRE = re.compile(r"\(wire\n\t\t\(pts \(xy ([0-9.]+) ([0-9.]+)\) \(xy ([0-9.]+) ([0-9.]+)\)\)")
-_LABEL = re.compile(r'\(label "([^"]+)"\n\t\t\(at ([0-9.]+) ([0-9.]+) (\d+)\)\n\t\t\(effects \(font \(size 1.27 1.27\)\) \(justify (\w+) (\w+)\)')
-_HAT = re.compile(r'\(lib_id "(power:\w+)"\) \(at ([0-9.]+) ([0-9.]+) (\d+)\)')
+# The sheet is read as its primitives (`sch_prims.decompile`, field for field), not with patterns over its layout.
+def _prims(text: str, kind: str) -> list:
+    from pcbc.sch_prims import decompile
+
+    return [p for p in decompile(text)[1] if p.kind == kind]
+
+
+def _hats(text: str) -> list:
+    return [p for p in _prims(text, "symbol") if p.lib_id.startswith("power:")]
 
 
 @pytest.fixture(scope="module")
@@ -36,7 +42,7 @@ def sheets():
 
 
 def _wires(text: str) -> list[tuple[float, float, float, float]]:
-    return [tuple(float(v) for v in m.groups()) for m in _WIRE.finditer(text)]
+    return [(w.a[0], w.a[1], w.b[0], w.b[1]) for w in _prims(text, "wire")]
 
 
 def _inside(px, py, x0, y0, x1, y1) -> bool:
@@ -62,14 +68,13 @@ def test_no_two_wires_cross(sheets, name):
     assert bad == []
 
 
-_JUNCTION = re.compile(r"\(junction\n\t\t\(at ([0-9.]+) ([0-9.]+)\)")
 
 
 @pytest.mark.parametrize("name", list(BOARDS))
 def test_only_connecting_geometry(sheets, name):
     text = sheets[name][0]
     ws = _wires(text)
-    junctions = [(float(m.group(1)), float(m.group(2))) for m in _JUNCTION.finditer(text)]
+    junctions = [j.at for j in _prims(text, "junction")]
     ends = [(w[0], w[1]) for w in ws] + [(w[2], w[3]) for w in ws]
     # A wire end on another wire's interior connects only through a junction
     # (kicad-cli: a bare T does not) - so every such point carries one.
@@ -77,20 +82,21 @@ def test_only_connecting_geometry(sheets, name):
     for e in tees:
         assert any(abs(e[0] - j[0]) < EPS and abs(e[1] - j[1]) < EPS for j in junctions), e
     # No symbol pin on a wire's interior: that never connects.
-    hats = [(float(m.group(2)), float(m.group(3))) for m in _HAT.finditer(text)]
+    hats = [h.at for h in _hats(text)]
     assert not [(h, w) for h in hats for w in ws if _inside(*h, *w)]
 
 
 @pytest.mark.parametrize("name", list(BOARDS))
 def test_labels_sit_on_their_wire(sheets, name):
     text = sheets[name][0]
-    labels = list(_LABEL.finditer(text))
+    labels = _prims(text, "label")
     assert labels
-    assert {m.group(6) for m in labels} == {"bottom"}
+    assert {lb.justify[1] for lb in labels} == {"bottom"}
     # Every label is anchored on a wire (end or interior) or on a pin end; the
-    # netlist test proves the pin-end case, so here: rot 0/90 only, so the
-    # text runs along whatever it sits on.
-    assert {m.group(4) for m in labels} <= {"0", "90"}
+    # netlist test proves the pin-end case, so here: the text runs along whatever
+    # it sits on, read left to right or bottom to top (KiCad keeps a
+    # right-justified label at 180 or 270 degrees).
+    assert {(int(lb.angle), lb.justify[0]) for lb in labels} <= {(0, "left"), (90, "left"), (180, "right"), (270, "right")}
 
 
 @pytest.mark.parametrize("name", list(BOARDS))
@@ -105,7 +111,7 @@ def test_power_is_symbols_or_one_short_wire(sheets, name):
 @pytest.mark.parametrize("name", list(BOARDS))
 def test_symbols_upright_where_they_can_be(sheets, name):
     text = sheets[name][0]
-    hats = [(m.group(1), int(m.group(4))) for m in _HAT.finditer(text)]
+    hats = [(h.lib_id, int(h.angle)) for h in _hats(text)]
     assert hats
     flipped = [h for h in hats if h[1] == 180]
     # A flip is the exception, never the rule.

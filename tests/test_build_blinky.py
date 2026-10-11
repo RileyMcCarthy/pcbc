@@ -4,6 +4,9 @@ import pytest
 
 from pcbc.build import build_job
 
+from conftest import declared_examples, write_split
+from conftest import copy_board_file
+
 BLINKY = Path(__file__).resolve().parent.parent / "examples" / "blinky" / "blinky.py"
 
 
@@ -11,7 +14,7 @@ BLINKY = Path(__file__).resolve().parent.parent / "examples" / "blinky" / "blink
 def test_blinky_upto_route(tmp_path: Path, monkeypatch):
     # Copy board into tmp so layout/ does not dirty the example until --force CI.
     board = tmp_path / "blinky.py"
-    board.write_text(BLINKY.read_text())
+    copy_board_file(board, BLINKY)
     result = build_job(board, upto="route", force=True)
     assert result.get("error") is None, result
     layout = tmp_path / "layout" / "blinky"
@@ -21,14 +24,14 @@ def test_blinky_upto_route(tmp_path: Path, monkeypatch):
     assert result["steps"][-1]["router"] == "native" and result["steps"][-1]["copper"] == "verified"
     sch = (layout / "schematic.kicad_sch").read_text()
     assert "(kicad_sch" in sch
-    assert '(property "LCSC" "C72043"' in pcb
+    assert '(property "LCSC" "C2286"' in pcb
     assert not (layout / "placed").exists() and not (layout / "seed").exists(), "no board file before the emitted one"
 
 
 @pytest.mark.kicad
 def test_blinky_fab(tmp_path: Path):
     board = tmp_path / "blinky.py"
-    board.write_text(BLINKY.read_text())
+    copy_board_file(board, BLINKY)
     result = build_job(board, upto="fab", force=True)
     assert result.get("error") is None, result
     # The soft-rule counts, as the other examples pin them (E's promotion procedure needs every
@@ -42,7 +45,7 @@ def test_blinky_fab(tmp_path: Path):
     assert (fab / "bom.csv").exists()
     bom = (fab / "bom.csv").read_text()
     assert "C21190" in bom
-    assert "C72043" in bom
+    assert "C2286" in bom
     assert (fab / "cpl.csv").exists()
     gerbers = list((fab / "gerbers").glob("*"))
     assert gerbers, "kicad-cli wrote no gerbers"
@@ -56,7 +59,7 @@ def test_the_relaxer_runs_last_and_its_self_checks_hold_on_blinky(tmp_path: Path
     the old step recorded, measured again natively 2026-09-25 (6 segments in, 4 out, 0.3252 mm
     shorter, no copper orphaned). blinky's `final` stage writes nothing (no declaration asks it to)."""
     board = tmp_path / "blinky.py"
-    board.write_text(BLINKY.read_text())
+    copy_board_file(board, declared_examples() / "blinky" / "blinky.py")  # as measured: blinky with its declared outline
     result = build_job(board, upto="route", force=True)
     assert result.get("error") is None, result
     route = result["steps"][-1]

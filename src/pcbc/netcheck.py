@@ -341,6 +341,24 @@ def check_schematic(design: Design, sch: Path, cli: Path | None = None) -> list[
     return compare(expected_nets(design), kicad_nets(Path(sch), cli))
 
 
+def sheet_svg(sch: Path, cli: Path | None = None) -> str:
+    """KiCad's own drawing of the sheet (`kicad-cli sch export svg`, no drawing sheet), as text: what the readability
+    score takes its text boxes from (`sch_score.with_svg`)."""
+    cli = cli or kicad_cli()
+    if not cli.exists() and shutil.which(str(cli)) is None:
+        raise KicadMissing(f"kicad-cli not found ({cli})")
+    with tempfile.TemporaryDirectory() as td:
+        run = subprocess.run(
+            [str(cli), "sch", "export", "svg", "--exclude-drawing-sheet", "--no-background-color", "-o", td, str(sch)],
+            capture_output=True,
+            text=True,
+        )
+        got = sorted(Path(td).glob("*.svg"))
+        if run.returncode != 0 or not got:
+            raise RuntimeError(f"kicad-cli sch export svg failed: {run.stderr.strip() or run.stdout.strip()}")
+        return got[0].read_text(errors="replace")
+
+
 def check_erc(sch: Path, cli: Path | None = None) -> dict:
     """KiCad's own ERC on the sheet. ``errors`` is a list of strings (empty is
     clean); ``warnings`` counts each warning type. Errors are what a person

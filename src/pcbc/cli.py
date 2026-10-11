@@ -38,18 +38,18 @@ def main(argv: list[str] | None = None) -> int:
     bd.add_argument(
         "--strict-power",
         action="store_true",
-        help="fail the build when a rail cannot carry its declared current, instead of printing it as a move",
+        help="fail the build when a rail cannot carry its declared current, instead of printing it as a warning",
     )
     bd.set_defaults(func=cmd_build)
 
-    sc = sub.add_parser("sch", help="Draw the schematic, prove it is board.py's netlist, list what to move")
+    sc = sub.add_parser("sch", help="Draw the schematic, prove it is board.py's netlist, list its warnings")
     sc.add_argument("board")
     sc.add_argument("--json", action="store_true", help="the full report: parts' poses, issues, netlist")
     sc.set_defaults(func=cmd_sch)
 
-    pc = sub.add_parser("pcb", help="Place the copper from board.py's Place() lines and list what to move")
+    pc = sub.add_parser("pcb", help="Place the parts from layout.core.py's Place() lines, print the outline and list the warnings")
     pc.add_argument("board")
-    pc.add_argument("--json", action="store_true", help="the full report: every part's pose, the moves")
+    pc.add_argument("--json", action="store_true", help="the full report: every part's pose, the warnings")
     pc.add_argument("--constraints", action="store_true", help="also print the constraint report the placement was checked against")
     pc.set_defaults(func=cmd_pcb)
 
@@ -59,7 +59,7 @@ def main(argv: list[str] | None = None) -> int:
     ro.add_argument("--json", action="store_true", help="with --channels: the congestion map as JSON")
     ro.set_defaults(func=cmd_route)
 
-    rv = sub.add_parser("review", help="HTML: schematic, copper, 3D")
+    rv = sub.add_parser("review", help="two HTML pages: index.html (full, interactive) and static.html (pictures, no script, for a phone)")
     rv.add_argument("board")
     rv.add_argument("--no-open", action="store_true")
     rv.set_defaults(func=cmd_review)
@@ -175,7 +175,7 @@ def cmd_build(args: argparse.Namespace) -> int:
 
 
 def cmd_sch(args: argparse.Namespace) -> int:
-    """The inner loop: edit SchPlace() lines, run this, act on the list. No picture needed."""
+    """The inner loop: edit schematic.core.py, run this, act on the vector and the list. No picture needed."""
     path = Path(args.board)
     if not path.exists():
         print(f"no such file: {path}", file=sys.stderr)
@@ -185,25 +185,30 @@ def cmd_sch(args: argparse.Namespace) -> int:
         for f in fails:
             print(f, file=sys.stderr)
         return 1
-    design = load_board(path)
+    design = load_board(path, core=False)  # a layout.core.py error never blocks the schematic
     # The same stage `pcbc build` runs (`build.sch_stage`): one writer of `schematic.kicad_sch`, and
     # its record (`schematic.inputs.json`) written only when KiCad read the netlist and ERC passed.
     from .build import sch_stage
 
-    step, _err = sch_stage(design, path.resolve(), layout_dir(path.resolve()), name=path.stem)
+    step, err = sch_stage(design, path.resolve(), layout_dir(path.resolve()), name=path.stem)
     if "sch" not in step:
         print(f"schematic: {step.get('error')}", file=sys.stderr)
         return 1
     sch = Path(step["sch"])
     report: dict = {"sch": str(sch), "issues": step.get("readability", []), "notes": step.get("notes", [])}
     report["netlist"] = step.get("netlist")
+    report["vector"] = step.get("vector")
+    report["vector_detail"] = step.get("vector_detail", {})
     report["erc"] = step.get("erc")
     report["erc_warnings"] = step.get("erc_warnings", {})
     mismatch = step["netlist"] if isinstance(step.get("netlist"), list) else []
     erc = {"errors": step["erc"] if isinstance(step.get("erc"), list) else [], "warnings": step.get("erc_warnings", {})}
+    # The stage's refusal (a netlist mismatch, ERC errors, a hard readability number, a broken invariant): the same
+    # error `pcbc build` stops on, and the same exit status (refute:tests 2026-10-08: it used to be dropped here).
+    report["error"] = err
     if args.json:
         print(json.dumps(report, indent=2, default=str))
-        return 1 if (mismatch or erc["errors"]) else 0
+        return 1 if err else 0
     print(f"schematic: {sch}")
     if report["netlist"] == "verified":
         print("netlist: kicad-cli reads exactly board.py's netlist")
@@ -222,9 +227,17 @@ def cmd_sch(args: argparse.Namespace) -> int:
             print(f"  ! {e}")
     else:
         print(f"erc: {report['erc']}")
+    if report.get("vector"):
+        from .sch_score import line
+
+        # docs/schematic-layout.md §2.6: the readability vector, text boxes from KiCad's own drawing of the sheet.
+        print(f"vector: {line(report['vector'])}")
+        for kind, lines in (report.get("vector_detail") or {}).items():
+            for m in lines:
+                print(f"  ! {kind}: {m}")
     issues = report.get("issues", [])
     if issues:
-        print(f"readability: {len(issues)} to fix by editing SchPlace() lines")
+        print(f"readability: {len(issues)} warning{'s' if len(issues) != 1 else ''}")
         for i, m in enumerate(issues, 1):
             print(f"  {i}. {m}")
     else:
@@ -234,7 +247,10 @@ def cmd_sch(args: argparse.Namespace) -> int:
         print(f"style: {len(notes)} note{'s' if len(notes) > 1 else ''} (legal, not counted)")
         for m in notes:
             print(f"  - {m}")
-    return 1 if (mismatch or erc["errors"]) else 0
+    if err:
+        print(err, file=sys.stderr)
+        return 1
+    return 0
 
 
 def cmd_review(args: argparse.Namespace) -> int:
@@ -243,7 +259,9 @@ def cmd_review(args: argparse.Namespace) -> int:
         print(f"no such file: {path}", file=sys.stderr)
         return 2
     result = review_job(path, open_html=not args.no_open)
-    print(json.dumps({k: result[k] for k in ("html", "pcb", "error") if k in result}, indent=2))
+    # Both pages: html is the full one (tabs, interactive 3D), static_html the pictures-only one a viewer that runs no
+    # JavaScript (a phone app) can show. Publish both.
+    print(json.dumps({k: result[k] for k in ("html", "static_html", "static_bytes", "static_problems", "pcb", "error") if k in result}, indent=2))
     if result.get("error") and not (result.get("html") and Path(result["html"]).exists()):
         print(result["error"], file=sys.stderr)
         return 1
@@ -269,15 +287,18 @@ def cmd_pcb(args: argparse.Namespace) -> int:
             print(f"  - {f}")
         return 2
     print(f"placed: {result['placed']}")
+    outline_line = (result.get("outline") or {}).get("line")
+    if outline_line:
+        print(outline_line)  # B.4: the AI's compaction feedback, and the numbers B.6 freezes from
     if result.get("error"):
         print(f"error: {result['error']}")
     report = result.get("layout_report", [])
     if report:
-        print(f"layout: {len(report)} to fix by editing Place() lines")
+        print(f"layout: {len(report)} warning{'s' if len(report) != 1 else ''}")
         for i, m in enumerate(report, 1):
             print(f"  {i}. {m}")
     else:
-        print("layout: nothing to move")
+        print("layout: no warnings")
     notes = result.get("layout_notes", [])
     if notes:
         print(f"style: {len(notes)} note{'s' if len(notes) > 1 else ''} (legal, not counted)")
@@ -389,7 +410,7 @@ def cmd_score(args: argparse.Namespace) -> int:
             print(f"no such path: {p}", file=sys.stderr)
             return 2
         if p.is_file() and p.suffix == ".py" and p.name != "part.py":
-            design = load_board(p)
+            design = load_board(p, core=False)
             seen: set[Path] = set()
             for inst in design.instances:
                 if inst.part.origin and inst.part.origin not in seen:

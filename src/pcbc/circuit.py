@@ -88,21 +88,20 @@ def check_design(design: Design, pcb: bool = True, notes: list[str] | None = Non
                 fails.append(f"{inst.ref}: {exc}")
 
     placed = {p.ref for p in design.places}
-    sch_placed = {p.ref for p in design.sch_places}
-    for what, specs in (("Place", design.places), ("SchPlace", design.sch_places)):
-        seen: dict[str, int] = {}
-        for p in specs:
-            seen[p.ref] = seen.get(p.ref, 0) + 1
-        for ref, n in sorted(seen.items()):
-            if n > 1 and (pcb or what == "SchPlace"):
-                fails.append(f"{ref}: {what}() {n} times; keep one (the last one does not win, the check does)")
+    # A part's SchPlace() is optional (docs/schematic-layout.md §2: the sheet is laid out from the netlist) and a second
+    # one is refused when schematic.core.py loads (`sch_core.check_facts`).
+    seen: dict[str, list[int]] = {}
+    for p in design.places:
+        seen.setdefault(p.ref, []).append(int(getattr(p, "line", 0) or 0))
+    for ref, lines in sorted(seen.items()):
+        if len(lines) > 1 and pcb:
+            at = f" (layout.core.py lines {', '.join(str(n) for n in lines)})" if all(lines) else ""
+            fails.append(f"{ref}: Place() {len(lines)} times{at}; a part takes one Place(), and pcbc does not pick between them")
     for inst in design.instances:
         if pcb and inst.ref not in placed:
-            fails.append(f"{inst.ref}: no Place() — every part is CSS-placed")
-        if inst.ref not in sch_placed:
-            fails.append(f"{inst.ref}: no SchPlace() — schematic pose is CSS, not auto-layout")
+            fails.append(f"{inst.ref}: no Place() in layout.core.py — every part is CSS-placed")
     if design.board is not None:
-        # A bad NetReq / Pair / Bus / Chain / Isolation / Guard / Bridge line fails here, before
+        # A bad NetReq / Pair / Bus / Path / Isolation / Guard / Bridge line fails here, before
         # anything is drawn.
         from .constraints import compile_constraints
 
@@ -202,22 +201,12 @@ def _untied_grounds(design: Design) -> list[str]:
                 + (f"; {who}, which is not a tie" if who else "")
                 + f"; the two-pin parts are all on one side or the other ({a}: {', '.join(side_a) or 'none'}; {b}: {', '.join(side_b) or 'none'})"
             )
-            pa = _pads_on(design, a)
-            pb = _pads_on(design, b)
-            off = (
-                f'Bridge("{a}", "{b}", at=("{pa[0]}", "{pb[0]}"), kind="off_board", why="tied in the harness")'
-                if pa and pb
-                else f'Bridge("{a}", "{b}", at=(...), kind="off_board", why="...")'
-            )
             out.append(
                 move_line(
                     f"{a}/{b}",
                     f"{b}",
                     a,
                     blockers,
-                    f"Two grounds with no DC path between them have no defined potential difference, and pcbc writes no copper to make one "
-                    f'(docs/stitch-plan.md section 8 item 4). Say where they meet: Resistor("R11", "0R", p1={a}, p2={b}) then '
-                    f'Bridge("{a}", "{b}", at="R11"); or {off} if they already meet off this board.',
                 )
             )
     return out
@@ -251,22 +240,19 @@ def check_bridges(design: Design, cs) -> tuple[list[str], list[str]]:
         if len(inst.part.pins) != 2:
             fails.append(
                 f"{who}: {spec.tie_ref} has {len(inst.part.pins)} pins, and a tie is a part the current goes **through** — "
-                f"a part that merely binds both grounds is what makes the split matter, not what closes it. "
-                f'Give the two grounds their own part: Resistor("R11", "0R", p1={spec.a}, p2={spec.b}) then Bridge("{spec.a}", "{spec.b}", at="R11").'
+                f"a part that merely binds both grounds is what makes the split matter, not what closes it."
             )
             continue
         if not spec.pads:
             on = sorted(set(inst.pins.values()))
             fails.append(
-                f"{who}: {spec.tie_ref} is on {', '.join(on)}, not one pad on {spec.a} and one on {spec.b}; "
-                f"rebind it: {spec.tie_ref}(p1={spec.a}, p2={spec.b})."
+                f"{who}: {spec.tie_ref} is on {', '.join(on)}, not one pad on {spec.a} and one on {spec.b}."
             )
             continue
         others = [r for r in _two_pin_ties(design, spec.a, spec.b) if r != spec.tie_ref]
         if others:
             fails.append(
-                f"{who}: {', '.join(others)} also join{'s' if len(others) == 1 else ''} {spec.a} to {spec.b}, so the tie is not one point. "
-                f"Drop all but one, or drop the Bridge() line and say what the several ties are for."
+                f"{who}: {', '.join(others)} also join{'s' if len(others) == 1 else ''} {spec.a} to {spec.b}, so the tie is not one point."
             )
             continue
         if inst.part.prefix == "C" or inst.ref.startswith("C"):

@@ -77,7 +77,7 @@ def _emit_errors(design, copper, graphics, *, name: str) -> list[str]:
         try:
             _render(design, *alone, name=name, keep_members=ids)
         except ValueError as exc:
-            out.append(f"{o.where or o.id}: {exc}; KiCad cannot hold the line as written: give the field a value")
+            out.append(f"{o.where or o.id}: {exc}; KiCad cannot hold the line as written")
     return out
 
 
@@ -133,7 +133,7 @@ def _bisect(design, base: str, copper, graphics, *, name: str, msg: str, rec: di
     def walk(part: list, why: str) -> list[str]:
         if len(part) == 1:
             o = part[0]
-            return [f"{o.where or o.id}: KiCad refuses to load the line ({why}); write what KiCad reads, or delete the line"]
+            return [f"{o.where or o.id}: KiCad refuses to load the line ({why})"]
         half = len(part) // 2
         a, b = part[:half], part[half:]
         with ThreadPoolExecutor(2) as ex:
@@ -183,7 +183,7 @@ def round_trip(design, copper, graphics, placed_text: str, *, name: str) -> tupl
         back = decompile(saved)
     except Unmapped as exc:
         rec["seconds"] = round(time.monotonic() - t0, 2)
-        return [f"layout.core.py: KiCad's save of the core lines does not decompile ({exc}): report it"], rec
+        return [f"layout.core.py: KiCad's save of the core lines does not decompile ({exc}) (a pcbc defect)"], rec
     by_uuid = {uuid_of(o, name): o for o in [*copper, *graphics]}
     inv = {u: o.id for u, o in by_uuid.items()}
     got = []

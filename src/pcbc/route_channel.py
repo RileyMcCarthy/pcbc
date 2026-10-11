@@ -868,8 +868,7 @@ def moves(es: Sequence[Escape]) -> tuple[str, ...]:
         out.append(
             f"Place(): {e.pad} has no way out on {e.net}. Its widest channel on {e.layer} is "
             f"{e.at}, and a {e.width:g} mm {e.net} track with its clearances is {-e.slack:g} mm too wide for it "
-            f"({e.ways} channel{'s' if e.ways != 1 else ''} touch this pad and none fit). "
-            f"Move one of the two apart, or give {e.net} a narrower class."
+            f"({e.ways} channel{'s' if e.ways != 1 else ''} touch this pad and none fit)."
         )
     return tuple(out)
 
@@ -948,4 +947,5 @@ def class_widths(job) -> dict[str, float]:
     cs = getattr(job, "constraints", None)
     if cs is None:
         return {}
-    return {c.net: cls[c.class_name] for c in cs.constraints if c.class_name in cls}
+    # The widest copper the net carries on any layer, its paths' links included (§4.4).
+    return {c.net: max(cls[c.class_name], cs.widest(c.net)) if hasattr(cs, "widest") else cls[c.class_name] for c in cs.constraints if c.class_name in cls}

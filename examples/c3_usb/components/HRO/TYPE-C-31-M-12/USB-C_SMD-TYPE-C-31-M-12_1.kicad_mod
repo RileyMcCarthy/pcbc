@@ -344,7 +344,7 @@
 	(embedded_fonts no)
 	(model "USB-C_SMD-TYPE-C-31-M-12_1.step"
 		(offset
-			(xyz 0 0 0)
+			(xyz 0 -2.45 0)
 		)
 		(scale
 			(xyz 1 1 1)

@@ -51,6 +51,7 @@ from pcbc.stackup import (
     vias_per_change,
     width_for_z0,
 )
+from conftest import write_split
 
 L2 = get_stackup("jlcpcb_2l_1oz")
 L4 = get_stackup("jlcpcb_4l_1oz")
@@ -62,7 +63,7 @@ L1080 = get_stackup("jlcpcb_4l_1oz_1080")
 
 def test_the_five_stackups_and_their_jlc_codes():
     """B.2: the 1.6 mm build of each JLC impedance code, jlcpcb.com/impedance read 2026-09-19."""
-    assert sorted(STACKUPS) == ["jlcpcb_2l_1oz", "jlcpcb_4l_1oz", "jlcpcb_4l_1oz_1080", "jlcpcb_4l_1oz_2116", "jlcpcb_4l_1oz_3313"]
+    assert sorted(STACKUPS) == ["jlcpcb_2l_1oz", "jlcpcb_2l_2oz", "jlcpcb_4l_1oz", "jlcpcb_4l_1oz_1080", "jlcpcb_4l_1oz_2116", "jlcpcb_4l_1oz_3313", "jlcpcb_4l_2oz", "jlcpcb_4l_2oz_3313"]
     assert L4.jlc_code == "JLC04161H-7628", "B.3: the default 4L is what JLC builds for a 1.6 mm order without an impedance pick"
     assert get_stackup("JLC04161H-3313") is STACKUPS["jlcpcb_4l_1oz_3313"], "B.1: the JLC code is an alias of the pcbc name"
     assert get_stackup("JLC04161H-7628") is L4 and get_stackup("JLC04161H-2116").name == "jlcpcb_4l_1oz_2116"
@@ -81,7 +82,7 @@ def test_the_five_stackups_and_their_jlc_codes():
         Copper("B.Cu", 0.035),
     ), "B.2: JLC04161H-7628 as jlcpcb.com/impedance lists it (core 1.065 verify)"
     assert L2.stack == (Copper("F.Cu", 0.035), Dielectric("core", 1.53, 4.6, "core"), Copper("B.Cu", 0.035)), "B.3: 1.6 mm less two 0.035 coppers, JLC's core Dk"
-    sums = {name: s.board_mm for name, s in sorted(STACKUPS.items())}
+    sums = {name: s.board_mm for name, s in sorted(STACKUPS.items()) if s.copper_oz == 1.0}
     assert sums == {"jlcpcb_2l_1oz": 1.6, "jlcpcb_4l_1oz": 1.5862, "jlcpcb_4l_1oz_1080": 1.5182, "jlcpcb_4l_1oz_2116": 1.5982, "jlcpcb_4l_1oz_3313": 1.5642}, "B.2 sum column (4 dp)"
     for name, s in sorted(STACKUPS.items()):
         assert s.copper_layers() == (("F.Cu", "B.Cu") if s.layers == 2 else ("F.Cu", "In1.Cu", "In2.Cu", "B.Cu")), name
@@ -90,6 +91,39 @@ def test_the_five_stackups_and_their_jlc_codes():
     for name, (mat, h, dk) in thin.items():
         s = STACKUPS[name]
         assert (s.stack[1], s.stack[3]) == (Dielectric(mat, h, dk, "prepreg"), Dielectric("core", 1.265, 4.6, "core")), f"B.2: {name} prepreg and its 1.265 core"
+
+
+def test_the_2oz_stackups_are_jlcs_numbers_and_every_current_width_names_its_stackup():
+    """Decision 3 (owner, 2026-10-01): JLC's 2 oz outer-copper options beside the 1 oz ones. The 4-layer stacks are
+    JLC's JLC04162H templates (outer 0.07 mm, the JLC04161H prepreg and core); the 2-layer core is the 1 oz rung's rule
+    (1.6 mm less the two coppers); the fab minima are JLC's 2 oz rows. A width derived from a 2 oz board is the 2 oz
+    width and its source names the stackup."""
+    from pcbc.stackup import cu_text, current_width_mm
+
+    two = get_stackup("jlcpcb_2l_2oz")
+    assert two.stack == (Copper("F.Cu", 0.07), Dielectric("core", 1.46, 4.6, "core"), Copper("B.Cu", 0.07)), "1.6 - 2 x 0.07"
+    assert (two.layers, two.copper_oz, two.board_mm, two.t_mm, two.jlc_code) == (2, 2.0, 1.6, 0.07, None)
+    assert (two.track_min, two.clearance_min, two.mask_bridge_min) == (0.16, 0.16, 0.20), "JLC 2 oz, 2-layer: 0.16 / 0.16 mm; mask 0.20 mm"
+    four = get_stackup("JLC04162H-7628")
+    assert four is STACKUPS["jlcpcb_4l_2oz"]
+    assert four.stack == (
+        Copper("F.Cu", 0.07),
+        Dielectric("7628", 0.2104, 4.4, "prepreg"),
+        Copper("In1.Cu", 0.0152),
+        Dielectric("core", 1.065, 4.6, "core"),
+        Copper("In2.Cu", 0.0152),
+        Dielectric("7628", 0.2104, 4.4, "prepreg"),
+        Copper("B.Cu", 0.07),
+    ), "JLC04162H-7628: outer 0.07 mm over the JLC04161H-7628 dielectrics"
+    assert (four.copper_oz, four.board_mm, four.track_min, four.clearance_min, four.mask_bridge_min) == (2.0, 1.6562, 0.15, 0.15, 0.20)
+    assert get_stackup("JLC04162H-3313").stack[1:6] == STACKUPS["jlcpcb_4l_1oz_3313"].stack[1:6]
+    assert all(STACKUPS[n].z_bias_source.startswith("uncalibrated: formula only") for n in ("jlcpcb_2l_2oz", "jlcpcb_4l_2oz", "jlcpcb_4l_2oz_3313"))
+    # The width the 2 A of buck's SW gets over the 2-layer pour: 0.781 mm at 1 oz, 0.391 mm at 2 oz.
+    w1 = current_width_mm(2.0, 10.0, L2, 1.53)
+    w2 = current_width_mm(2.0, 10.0, two, 1.46)
+    assert (w1.value, w2.value) == (0.781, 0.391)
+    assert "2 oz jlcpcb_2l_2oz" in w2.source.ref and "1 oz jlcpcb_2l_1oz" in w1.source.ref, (w1.line(), w2.line())
+    assert cu_text(four) == "2 oz jlcpcb_4l_2oz"
 
 
 def test_the_derived_views_keep_every_existing_caller_working():
@@ -125,7 +159,8 @@ def test_the_fab_limits_are_todays_and_jlcs_own_are_for_the_report():
         s = STACKUPS[name]
         assert (s.track_min, s.clearance_min, s.via_drill, s.via_diameter, s.annular_min) == (0.0889, 0.0889, 0.2, 0.35, 0.075), name
     for s in STACKUPS.values():
-        assert (s.hole_clearance, s.hole_to_hole, s.edge_clearance, s.copper_oz) == (0.25, 0.5, 0.3, 1.0)
+        assert (s.hole_clearance, s.hole_to_hole, s.edge_clearance) == (0.25, 0.5, 0.3)
+        assert s.copper_oz == (2.0 if "_2oz" in s.name else 1.0), s.name
     assert JLC_LIMITS == {(True, 1.0): (0.10, 0.10), (False, 1.0): (0.09, 0.09), (True, 2.0): (0.16, 0.16), (False, 2.0): (0.15, 0.15)}, "JLC capabilities page, 1 oz / 2 oz"
     assert hole_floor(L2) == 0.155 and hole_floor(L4) == 0.18, "hole_clearance - annular_min + 0.005"
 
@@ -303,7 +338,7 @@ def test_vector_18_the_ipc2221_floor_holds_over_ipc2152():
     assert d.unit == "mm" and d.source.formula == "ipc2221_ext", "C.6: the source names the winner"
     assert "0.646" in d.source.note, f"C.6: the note names the loser (IPC-2152 with the pour 0.646); got {d.source.note!r}"
     assert d.source.note == "IPC-2221 floor holds over ipc2152_fit x board 1.092 x plane 0.593 at 1.53 mm 0.646"
-    assert d.source.ref == "IPC-2221B eq. 6-2 external 2 A 10 C 1 oz"
+    assert d.source.ref == "IPC-2221B eq. 6-2 external 2 A 10 C 1 oz jlcpcb_2l_1oz"
     raised = current_width_mm(2, 10, L2, None)
     assert (raised.value, raised.source.formula) == (1.09, "ipc2152_fit"), "C.6: a no-plane track above 1 A is where IPC-2152 raises the width (2 A: 1.090)"
     assert raised.source.note == "over the IPC-2221 external floor 0.781"
@@ -420,3 +455,115 @@ def test_the_ipc2152_fit_says_when_it_is_off_its_chart():
     thin = replace(L2, stack=(Copper("F.Cu", 0.035), Dielectric("core", 0.43, 4.6, "core"), Copper("B.Cu", 0.035)))
     note = current_width_mm(2, 10, thin, 0.43).source.note
     assert "on a 0.5 mm board (the chart covers 0.72 to 2.36)" in note, note
+
+
+def test_every_layer_is_sized_and_rated_on_its_own_copper():
+    """Postfix B2 (refutation stackup r2): on `jlcpcb_4l_2oz` a 2 A link on In1.Cu got 0.4 mm (the floor), sized as 2 oz
+    external copper; the inner copper is 0.0152 mm (0.434 oz) and IPC-2221's internal curve (k 0.024) needs 4.68 mm.
+    Width and rating read the layer's own thickness and curve; the outer layers keep the stackup weight."""
+    from pcbc.stackup import STACKUPS, current_width_mm, track_amps
+
+    s = STACKUPS["jlcpcb_4l_2oz"]
+    assert (s.layer_oz("F.Cu"), s.layer_oz("In1.Cu"), s.is_inner("In1.Cu"), s.is_inner("B.Cu")) == (2.0, 0.4343, True, False)
+    inner = current_width_mm(2.0, 10.0, s, 1.065, "In1.Cu")
+    assert (inner.value, inner.source.formula) == (4.681, "ipc2221_int"), inner
+    assert "0.4343 oz In1.Cu 0.0152 mm jlcpcb_4l_2oz" in inner.source.ref, inner.source.ref
+    assert track_amps(0.4, 10.0, s, 1.065, "In1.Cu") < 0.5 < 2.0 <= track_amps(0.4, 10.0, s, 1.065, "F.Cu") + 0.6
+    assert current_width_mm(2.0, 10.0, s, None, "F.Cu").value == current_width_mm(2.0, 10.0, s, None).value, "an outer layer is the stackup weight"
+
+
+@pytest.mark.parametrize("name", sorted(__import__("pcbc.stackup", fromlist=["STACKUPS"]).STACKUPS))
+def test_the_width_a_current_gets_carries_that_current_on_every_stackup_and_layer(name: str):
+    """Postfix B14 (refutation tests r2): the ampacity the gate uses (`track_amps`) was never round-tripped on the 2 oz
+    stackups; rating 2 oz copper as 1 oz survived the whole suite (0.391 mm for 2 A rated 1.529 A instead of 2.001).
+    Widening to `current_width_mm(I)` and asking back gives `I`, short only by the width's 3 dp rounding (half a micron
+    of width more carries it; on 2 oz that rounding is worth up to 0.003 A), on every stackup, every copper layer, with
+    and without a plane."""
+    from pcbc.stackup import STACKUPS, current_width_mm, track_amps
+
+    s = STACKUPS[name]
+    for layer in s.copper_layers():
+        for h in (None, 0.2, 1.53):
+            for k in range(1, 81):
+                amps = k * 0.1
+                w = current_width_mm(amps, 10.0, s, h, layer).value
+                got = track_amps(w + 0.0005, 10.0, s, h, layer)
+                assert got >= amps - 0.0005, (name, layer, h, amps, w, got)
+    if s.copper_oz == 2.0:
+        w = current_width_mm(2.0, 10.0, s, 1.53 if s.layers == 2 else 0.2104, "F.Cu").value
+        assert track_amps(w, 10.0, s, 1.53 if s.layers == 2 else 0.2104, "F.Cu") >= 1.999, (name, w)
+
+
+IN1_4L_2OZ = '''from pcbc import *
+V3 = Power("3V3"); GND = Ground("GND")
+Resistor("R0", "0R", package="1206", mpn="X", lcsc="C1", p1="VIN", p2=V3)
+Resistor("R1", "10", package="1206", mpn="X", lcsc="C1", p1=V3, p2=GND)
+Board(width=40, height=20, layers=4, stackup="jlcpcb_4l_2oz", planes=[("GND", "In2.Cu")])
+NetReq("3V3", kind="power", volts=3.3)
+Path("3V3", "R0.2", "R1.1", amps=2, layers=["F.Cu", "In1.Cu"])
+Place("R0", at=(5, 10))
+Place("R1", at=(20, 10))
+'''
+
+
+def test_a_via_groups_landing_copper_has_one_home(tmp_path, monkeypatch):
+    """Round 3 (refute-twooz): the compiler (`paths.make_group`) and the path gate spread a via group's current in the
+    thinnest landing layer (B2), while the router (`route_cost._group_plan`), the ampacity gate (`ampacity.net_nodes`)
+    and the census (`route_verify.via_parallelism`) passed the stackup's outer weight. On jlcpcb_4l_2oz an F.Cu+In1.Cu
+    group is 0.434 oz to the first two and 2 oz to the rest (a 4-barrel group: 1.849 A against 2.038 A). Every home
+    now asks `Stackup.landing_oz`; each call of the one arithmetic is recorded and every one is 0.4343 oz."""
+    from types import SimpleNamespace
+
+    import pcbc.stackup as S
+    from pcbc.ampacity import net_nodes
+    from pcbc.compile import compile_design
+    from pcbc.language import load_board
+    from pcbc.route_cost import Router
+    from pcbc.route_emit import Sidecar
+    from pcbc.route_verify import path_copper_failures
+
+    board = tmp_path / "in1.py"
+    write_split(board, IN1_4L_2OZ)
+    job = compile_design(load_board(board))
+    stack = job.constraints.stackup
+    assert stack.landing_oz(("F.Cu", "In1.Cu")) == 0.4343 and stack.landing_oz(()) == 2.0
+    (lk,) = [x for x in job.constraints.by_net("3V3").paths[0].links if not x.join]
+    g = lk.group
+    assert g is not None and g.count == S.via_group(2.0, g.drill_mm, stack.via_plating_mm, 10.0, g.pitch_mm, g.landing_mm, board_mm=stack.board_mm, copper_oz=0.4343)[0], g
+
+    seen: list[float] = []
+    real = S.via_group_shares
+
+    def spy(*a, **k):
+        seen.append(a[7] if len(a) > 7 else k["copper_oz"])
+        return real(*a, **k)
+
+    monkeypatch.setattr(S, "via_group_shares", spy)
+    homes = {}
+    # the compiler
+    from pcbc.paths import make_group
+
+    seen.clear(); make_group(job.constraints, "3V3", 2.0, 10.0, lk.via, lk.width); homes["compile"] = set(seen)
+    # the router: a group plan off the lattice returns None after sizing the line once
+    fake = SimpleNamespace(group=g, nc=SimpleNamespace(width_on=lambda _l: 0.0), step=0.1, scene=SimpleNamespace(stack=stack), lat=SimpleNamespace(nx=0, ny=0))
+    seen.clear(); assert Router._group_plan(fake, 0, 0, "F.Cu", "In1.Cu", 0) is None; homes["router"] = set(seen)
+    # the path gate: the compiled group laid on F.Cu and In1.Cu landings
+    at = [(10.0 + g.pitch_mm * k, 10.0) for k in range(g.count)]
+    items = [{"key": ["via", list(p), ["F.Cu", "B.Cu"]], "uuid": f"v{k}", "reason": "route_group", "net": "3V3", "owner": lk.key, "w": 0.45, "drill": g.drill_mm} for k, p in enumerate(at)]
+    items += [{"key": ["seg", lay, list(at[0]), list(at[-1]), g.landing_mm], "uuid": f"s{lay}", "reason": "route_group", "net": "3V3", "owner": lk.key, "w": g.landing_mm, "drill": 0.0} for lay in ("F.Cu", "In1.Cu")]
+    seen.clear(); assert path_copper_failures(job, Sidecar(items=items)) == []; homes["gate"] = set(seen)
+    # the ampacity walk: a barrel of a router group, its landings on F.Cu and In1.Cu (fab._via_groups' third field)
+    text = f'(via (at {at[0][0]} {at[0][1]}) (size 0.45) (drill {g.drill_mm}) (layers "F.Cu" "B.Cu") (net "3V3"))'
+    from pcbc.fab import _via_groups
+
+    groups = _via_groups(Sidecar(items=items))
+    assert groups[at[0]] == (tuple(at), g.landing_mm, ("F.Cu", "In1.Cu")), groups[at[0]]
+    seen.clear(); net_nodes(text, "3V3", [], dt=10.0, stack=stack, plane_h=None, groups=groups); homes["ampacity"] = set(seen)
+    # the census: the same group on a board, its role items as the board's roles
+    import pcbc.layout_job as LJ
+    from pcbc.route_verify import via_parallelism
+
+    vias = "".join(f'(via (at {p[0]} {p[1]}) (size 0.45) (drill {g.drill_mm}) (layers "F.Cu" "B.Cu") (net "3V3"))\n' for p in at)
+    monkeypatch.setattr(LJ, "roles_doc", lambda _t: Sidecar(items=items))
+    seen.clear(); (row,) = via_parallelism(vias, job.constraints); homes["census"] = set(seen)
+    assert homes == {k: {0.4343} for k in ("compile", "router", "gate", "ampacity", "census")}, homes

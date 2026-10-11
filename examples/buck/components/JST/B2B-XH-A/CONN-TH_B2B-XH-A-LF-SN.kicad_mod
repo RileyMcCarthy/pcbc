@@ -200,7 +200,7 @@
 	(embedded_fonts no)
 	(model "CONN-TH_B2B-XH-A-LF-SN.step"
 		(offset
-			(xyz 0 0 0)
+			(xyz 1.25 2.726 1.8)
 		)
 		(scale
 			(xyz 1 1 1)

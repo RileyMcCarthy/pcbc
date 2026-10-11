@@ -99,6 +99,7 @@ class Chain:
     reason: str
     pts: tuple[Pt, ...]
     keys: tuple[tuple, ...]  # `route_emit.seg_key` of every segment this chain replaces
+    link: str = ""  # the path link this run belongs to (`Piece.link`): a link is a chain boundary too (§4.2)
 
 
 @dataclass(frozen=True)
@@ -682,11 +683,11 @@ def chains_of(segs: list[dict], reason_of) -> tuple[list[Chain], list[dict]]:
     """
     groups: dict[tuple, list[int]] = defaultdict(list)
     for i, s in enumerate(segs):
-        groups[(s["net"], s["layer"], round(s["width"], 4), reason_of(s))].append(i)
+        groups[(s["net"], s["layer"], round(s["width"], 4), reason_of(s), s.get("link", ""))].append(i)
     out: list[Chain] = []
     left: list[dict] = []
     for key in sorted(groups):
-        net, layer, width, reason = key
+        net, layer, width, reason, link = key
         idx = sorted(groups[key])
         if reason not in RELAXABLE:
             left += [segs[i] for i in idx]
@@ -714,7 +715,7 @@ def chains_of(segs: list[dict], reason_of) -> tuple[list[Chain], list[dict]]:
                 if len(adj[here]) != 2 or len(nxt) != 1:
                     break
                 seg = nxt[0]
-            return Chain(net, layer, width, reason, tuple(pts), tuple(seg_key(layer, segs[k]["start"], segs[k]["end"], segs[k]["width"]) for k in mine))
+            return Chain(net, layer, width, reason, tuple(pts), tuple(seg_key(layer, segs[k]["start"], segs[k]["end"], segs[k]["width"]) for k in mine), link)
 
         for start in sorted(adj):  # every open end first, in coordinate order
             if len(adj[start]) == 2:
@@ -803,7 +804,7 @@ def relax_pieces(
             key = seg_key(p.layer, p.a, p.b, p.w)
             seg_of_item[key].append(it.id)
             locked = p.reason == "core"
-            segs.append({"net": p.net, "layer": p.layer, "start": p.a, "end": p.b, "width": p.w, "length": p.mm, "locked": locked})
+            segs.append({"net": p.net, "layer": p.layer, "start": p.a, "end": p.b, "width": p.w, "length": p.mm, "locked": locked, "link": p.link})
             if k >= len(core):
                 reason_at.setdefault(key, (p.reason, k - len(core)))
         else:
@@ -839,6 +840,13 @@ def relax_pieces(
     movable = frozenset(k for c in chains if len(c.pts) >= 3 for k in c.keys)
     for chain in chains:
         others = by_nl[(chain.net, chain.layer)]
+        rule = None
+        if hasattr(cs, "fielded") and cs.fielded(chain.net):
+            # §3.2: a pulled run keeps the junction rules the router laid it under.
+            from .route_cost import net_cost
+            from .route_scene import junction_rule
+
+            rule = junction_rule(scene, cs, chain.net, cs.link_by_key(chain.link) if chain.link else None, net_cost(cs, chain.net))
         hold = holds(chain, pads_by_net[chain.net], vias_by_net[chain.net], others, movable, floor=cs.stackup.clearance_min)
         own = frozenset(chain.keys)
         ends = tuple(
@@ -870,22 +878,25 @@ def relax_pieces(
                 if not hold.ok(cand, chain.width, tally):
                     continue
                 if drawn is not None:
-                    probe = [seg_piece(chain.net, "relax", chain.layer, a, b, chain.width) for a, b in zip(drawn, drawn[1:])]
+                    probe = [seg_piece(chain.net, "relax", chain.layer, a, b, chain.width, link=chain.link) for a, b in zip(drawn, drawn[1:])]
                     if blocked(scene, probe, chain.net, ignore=frozenset(dead)) is not None:
                         tally["blocked"] = tally.get("blocked", 0) + 1
+                        continue
+                    if rule is not None and rule.clashes(scene, probe, ignore=frozenset(dead)) is not None:
+                        tally["junction"] = tally.get("junction", 0) + 1
                         continue
                 cur, best, improved = cand, score, True
                 stats["accepts"] += 1
                 break
         stats["passes"] += passes
-        got = Chain(chain.net, chain.layer, chain.width, chain.reason, cur, chain.keys)
+        got = Chain(chain.net, chain.layer, chain.width, chain.reason, cur, chain.keys, chain.link)
         final.append(got)
         if cur != chain.pts:
             stats["moved"] += 1
             stats["mm_saved"] += math.fsum(math.dist(a, b) for a, b in zip(chain.pts, chain.pts[1:])) - math.fsum(math.dist(a, b) for a, b in zip(cur, cur[1:]))
             for key in chain.keys:
                 dead.update(seg_of_item.get(key, ()))
-            scene.add(scene.item_of(seg_piece(got.net, got.reason, got.layer, a, b, got.width)) for a, b in zip(cur, cur[1:]))
+            scene.add(scene.item_of(seg_piece(got.net, got.reason, got.layer, a, b, got.width, link=got.link)) for a, b in zip(cur, cur[1:]))
     stats["mm_saved"] = round(stats["mm_saved"], 4)
     stats["rejected"] = dict(sorted(tally.items()))
 
@@ -901,7 +912,7 @@ def relax_pieces(
         made: list[Piece] = []
         for a, b in zip(after.pts, after.pts[1:]):
             uid = "" if after.reason == "route" else stable_uuid(board, "relax", after.reason, after.net, after.layer, f"{a[0]:.6f}", f"{a[1]:.6f}", f"{b[0]:.6f}", f"{b[1]:.6f}", f"{after.width:g}")
-            made.append(seg_piece(after.net, after.reason, after.layer, a, b, after.width, owner=owner, uuid=uid))
+            made.append(seg_piece(after.net, after.reason, after.layer, a, b, after.width, owner=owner, uuid=uid, link=after.link))
         if mine:
             stood_in[mine[0]] = made
     new_owned: list[Piece] = []

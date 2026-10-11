@@ -25,18 +25,20 @@ from pathlib import Path
 
 import pytest
 
-from conftest import routed_board, routed_result
+from conftest import core_load, declared_examples, put_core, routed_board, routed_result, vehicle_examples, write_split
 from pcbc.gen import CENSUS, Unmapped, census, decompile, gen_source, line_of, unmapped
-from pcbc.language import load_board, load_layout
+from pcbc.language import check_board, load_board, load_layout
 from pcbc.layout_emit import render_graphics, render_one
 from pcbc.model import Copper, Design, Graphic, Pose
 from pcbc.sexp import Q, parse_tree
+from conftest import ds2_dir
+from conftest import copy_board_file
 
 ROOT = Path(__file__).resolve().parent.parent
-EXAMPLES = ROOT / "examples"
+EXAMPLES = vehicle_examples()  # buck is the pre-migration board here: conftest.vehicle_examples
 FIX = Path(__file__).resolve().parent / "fixtures" / "kicad10"
 PROBES = sorted(FIX.glob("kicad10_primitives*.kicad_pcb"))
-DS2 = Path.home() / "Documents" / "MaD" / "Hardware" / "DS2Addon" / "pcbc"
+DS2 = ds2_dir()
 
 
 def _canon(node):
@@ -132,15 +134,21 @@ def test_the_docs_table_is_the_census_map():
 def _blinky(tmp_path: Path) -> tuple[Path, Design]:
     board = tmp_path / "blinky.py"
     board.write_text((EXAMPLES / "blinky" / "blinky.py").read_text())
+    (tmp_path / "layout.core.py").write_text((EXAMPLES / "blinky" / "layout.core.py").read_text())
     return board, load_board(board)
 
 
-def test_a_place_in_layout_core_is_refused_naming_board_py(tmp_path: Path):
-    board, design = _blinky(tmp_path)
+def test_a_second_place_for_a_part_in_core_is_refused_naming_both_lines(tmp_path: Path):
+    """docs/board-outline.md A.3/A.5 (2026-10-03): a part is placed in layout.core.py, and a pasted gen pose replaces
+    its Place line. A second Place() for the part (the paste added beside the first) is refused naming both lines.
+    Until 2026-10-03 a core Place was refused naming board.py, the part's one home then."""
+    board, _design = _blinky(tmp_path)
     core = tmp_path / "layout.core.py"
-    core.write_text('Seg("LED", (1, 2), (3, 2), width=0.25)\nPlace("R1", at=(10, 10))\n')
-    with pytest.raises(ValueError, match=r"layout\.core\.py:2: Place\('R1'\).*board\.py"):
-        load_layout(core, design, source="core")
+    put_core(core, 'Seg("LED", (1, 2), (3, 2), width=0.25)\nPlace("R1", at=(10, 10))\n')
+    first = next(i + 1 for i, t in enumerate(core.read_text().splitlines()) if t.startswith("Place(") and i > 1)
+    assert f"R1: Place() 2 times (layout.core.py lines 2, {first}); a part takes one Place(), and pcbc does not pick between them" in check_board(board)
+    put_core(core, 'Seg("LED", (1, 2), (3, 2), width=0.25)\n')
+    assert check_board(board) == []
 
 
 def test_a_place_in_layout_gen_is_a_pose_and_leaves_board_py_s_placement_alone(tmp_path: Path):
@@ -232,10 +240,16 @@ def test_the_emitted_board_decompiles_to_the_very_bytes_of_layout_gen(name: str)
     back `layout.gen.py` byte for byte."""
     from pcbc.gen import assign_ids
 
+    from pcbc.compile import compile_design
+    from pcbc.gen import outline_header
+
     final = routed_board(name, EXAMPLES / name / f"{name}.py")
     back = decompile(final.read_text())
     assign_ids(back.copper, set(), back.graphics)
-    assert gen_source(back.poses, back.copper, board=name, graphics=back.graphics) == (final.parent / "layout.gen.py").read_text()
+    # the header's outline line is the board's, not the KiCad file's (docs/board-outline.md B.4)
+    job = compile_design(load_board(EXAMPLES / name / f"{name}.py"))
+    head = outline_header(job.outline_source, job.outline_line)
+    assert gen_source(back.poses, back.copper, board=name, graphics=back.graphics, outline=head) == (final.parent / "layout.gen.py").read_text()
 
 
 @pytest.mark.kicad
@@ -243,7 +257,7 @@ def test_two_builds_are_byte_identical(tmp_path: Path):
     from pcbc.build import build_job
 
     board = tmp_path / "blinky.py"
-    board.write_text((EXAMPLES / "blinky" / "blinky.py").read_text())
+    copy_board_file(board, EXAMPLES / "blinky" / "blinky.py")
     routed = tmp_path / "layout" / "blinky" / "routed"
     got = []
     for _ in range(2):
@@ -269,7 +283,7 @@ def test_a_gen_line_copied_into_core_locks_that_segment(tmp_path: Path):
     gen = Path(first["gen"]).read_text().splitlines()
     line = next(x for x in gen if x.startswith('Seg("FB"'))
     uid = line.split('uuid="')[1].split('"')[0]
-    (board.parent / "layout.core.py").write_text(line + "\n")
+    put_core(board.parent / "layout.core.py", line + "\n")
     again = build_job(board, upto="route", force=True)
     assert again.get("error") is None, again
     route = next(s for s in again["steps"] if s["stage"] == "route")
@@ -291,7 +305,7 @@ def test_an_illegal_core_segment_is_refused_naming_its_line(tmp_path: Path):
     pads, _layers = board_pads(load_board(board), placed.read_text())
     victim = next(p for p in pads if p.net and p.net != "FB" and "F.Cu" in p.cu_layers and p.kind == "smd")
     x, y = victim.at
-    (board.parent / "layout.core.py").write_text(f'\nSeg("FB", ({x - 1.0}, {y}), ({x + 1.0}, {y}), width=0.25, layer="F.Cu")\n')
+    put_core(board.parent / "layout.core.py", f'\nSeg("FB", ({x - 1.0}, {y}), ({x + 1.0}, {y}), width=0.25, layer="F.Cu")\n')
     result = build_job(board, upto="route", force=True)
     assert result["error"] and "layout.core.py:2" in result["error"] and "short" in result["error"], result["error"]
     route = next(s for s in result["steps"] if s["stage"] == "route")
@@ -338,31 +352,30 @@ def test_numbers_kicad_keeps_as_doubles_are_not_cut_to_six_decimals():
 def _layout_file(tmp_path: Path, body: str) -> tuple[Path, Design]:
     board, design = _blinky(tmp_path)
     core = tmp_path / "layout.core.py"
-    core.write_text(body)
+    put_core(core, body)
     return core, design
 
 
 @pytest.mark.parametrize(
     "body,line,says",
     [
-        ('Seg("LED", (1, 2), (3, 2), width=0.25)\nfrom pcbc import Place as BoardPlace\nBoardPlace("R1", at=(12.0, 12.5))\n', 3, "board.py"),
-        ('import pcbc.language as L\nL.Place("R1", at=(12.0, 12.5))\n', 2, "board.py"),
-        ('from pcbc import NetReq\nNetReq("LED", kind="power", volts=3.3, amps=1.5)\n', 2, "board.py"),
-        ('Keepout("KO1", box=(18, 10, 22, 15))\n', 1, "Pour(None, keepout="),
-        ('Region("R", left=1, top=1, width=2, height=2)\n', 1, "Pour(None, keepout="),
+        ('from pcbc import NetReq\nNetReq("LED", kind="power", volts=3.3)\n', 2, "board.py"),
+        ('Board(layers=2, stackup="jlcpcb_2l_1oz")\n', 1, "Board() is board.py's"),
+        ('import pcbc.language as L\nL.SchPlace("R1", left=1, top=1)\n', 2, "board.py"),
         ('Seg("VIN", (18.85, 11.25), (18.85, 9.45), widht=0.781)\n', 1, "widht"),
         ('Seg("LED", (1, 2), (3, 2), width=0.2, id="dup")\nSeg("LED", (1, 3), (3, 3), width=0.2, id="dup")\n', 2, "layout.core.py:1"),
     ],
-    ids=["from-pcbc-import-Place", "pcbc.language.Place", "NetReq", "Keepout", "Region", "typo", "duplicate-id"],
+    ids=["NetReq", "Board", "pcbc.language.SchPlace", "typo", "duplicate-id"],
 )
 def test_a_layout_file_says_layout_primitives_only_and_names_the_line(tmp_path: Path, body: str, line: int, says: str):
-    """Findings 6 and 7 and the typo/duplicate-id minors: a `board.py` object reached by any import path,
-    `Keepout`/`Region`, a misspelt keyword and two objects with one id are each refused naming
-    `layout.core.py:<line>` — never merged over `board.py`, never half-applied, never a traceback."""
+    """Findings 6 and 7 and the typo/duplicate-id minors: a `board.py` object reached by any import path, a
+    misspelt keyword and two objects with one id are each refused naming `layout.core.py:<line>` — never merged
+    over `board.py`, never half-applied, never a traceback. (`Place`, `Region`, `Keepout` and `Outline` are core's
+    own since 2026-10-03: `test_the_core_namespace_holds_the_geometry_by_every_import_path`.)"""
     core, design = _layout_file(tmp_path, body)
     places = [(p.ref, getattr(p, "left", None)) for p in design.places]
     with pytest.raises(ValueError) as got:
-        load_layout(core, design, source="core")
+        design = core_load(core)
     assert f"layout.core.py:{line}" in str(got.value) and says in str(got.value), str(got.value)
     assert [(p.ref, getattr(p, "left", None)) for p in design.places] == places
 
@@ -370,10 +383,29 @@ def test_a_layout_file_says_layout_primitives_only_and_names_the_line(tmp_path: 
 def test_copper_and_drawings_in_board_py_are_refused_naming_the_line(tmp_path: Path):
     """Finding 10: a `Seg` in `board.py` was accepted and silently dropped by the build."""
     board = tmp_path / "blinky.py"
-    board.write_text((EXAMPLES / "blinky" / "blinky.py").read_text() + '\nfrom pcbc import Seg\nSeg("LED", (10.0, 16.0), (30.0, 16.0), width=0.16, id="inboard")\n')
+    write_split(board, (EXAMPLES / "blinky" / "blinky.py").read_text() + '\nfrom pcbc import Seg\nSeg("LED", (10.0, 16.0), (30.0, 16.0), width=0.16, id="inboard")\n')
     n = len(board.read_text().splitlines())
     with pytest.raises(ValueError, match=rf"blinky\.py:{n}: .*belong in layout\.core\.py"):
         load_board(board)
+
+
+def test_the_core_namespace_holds_the_geometry_by_every_import_path(tmp_path: Path):
+    """docs/board-outline.md A.2-A.3: in layout.core.py, `Place`, `Region`, `Keepout` and `Outline` are the core's own,
+    whether named bare, imported from pcbc or reached through pcbc.language; each one lands in the design with its core
+    line and `source="core"`."""
+    board, _design = _blinky(tmp_path)
+    core = tmp_path / "layout.core.py"
+    for body in (
+        'Region("R", position="absolute", left=1, top=1, width=2, height=2)\nKeepout("KO1", box=(18, 10, 22, 15))\n',
+        'from pcbc import Keepout, Region\nRegion("R", position="absolute", left=1, top=1, width=2, height=2)\nKeepout("KO1", box=(18, 10, 22, 15))\n',
+        'import pcbc.language as L\nL.Region("R", position="absolute", left=1, top=1, width=2, height=2)\nL.Keepout("KO1", box=(18, 10, 22, 15))\n',
+    ):
+        put_core(core, body)
+        d = load_board(board)
+        r = next(x for x in d.regions if x.name == "R")
+        k = next(x for x in d.keepouts if x.name == "KO1")
+        n = body.count("\n") - 1
+        assert (r.source, r.line, k.source, k.line) == ("core", n, "core", n + 1), body
 
 
 def test_a_hand_written_pour_takes_compiled_numbers_and_a_low_clearance_is_refused(tmp_path: Path):
@@ -386,7 +418,7 @@ def test_a_hand_written_pour_takes_compiled_numbers_and_a_low_clearance_is_refus
     from pcbc.stackup import get_stackup
 
     core, design = _layout_file(tmp_path, 'Pour("GND", layer="B.Cu", id="p1")\nPour("GND", layer="F.Cu", clearance=0.01, id="p2")\n')
-    load_layout(core, design, source="core")
+    design = core_load(core)
     job = compile_design(design)
     p1, p2 = stamp(design, design.copper)
     assert p1.clearance == job.constraints.by_net("GND").clearance_mm.value and p1.min_thickness == get_stackup(job.stackup).track_min and p1.filled is True
@@ -479,8 +511,8 @@ def test_a_line_of_layout_gen_changed_before_emit_never_reaches_the_board(tmp_pa
 
     orig = lj.write_gen
 
-    def narrowed(path, poses, copper, *, board, graphics=()):
-        text = orig(path, poses, copper, board=board, graphics=graphics)
+    def narrowed(path, poses, copper, *, board, graphics=(), outline=""):
+        text = orig(path, poses, copper, board=board, graphics=graphics, outline=outline)
         new = text.replace('connect="solid"', 'connect="none"', 1)
         assert new != text
         Path(path).write_text(new)
@@ -541,7 +573,7 @@ def test_locking_a_piece_a_pattern_writes_again_puts_it_on_the_board_once(tmp_pa
     first = build_job(board, upto="route", force=True)
     assert first.get("error") is None, first
     line = next(x for x in Path(first["gen"]).read_text().splitlines() if x.startswith('Seg("LED", (10.1951, 13.2551), (30.5524, 13.2551)'))
-    (tmp_path / "layout.core.py").write_text(line + "\n")
+    put_core(tmp_path / "layout.core.py", line + "\n")
     again = build_job(board, upto="route", force=True)
     assert again.get("error") is None, again
     back = decompile((tmp_path / "layout" / "blinky" / "routed" / "layout.kicad_pcb").read_text())
@@ -567,7 +599,7 @@ def test_a_lock_renumbers_nothing_else(tmp_path: Path):
 
     before = ids(first["gen"])
     line = next(x for x in Path(first["gen"]).read_text().splitlines() if x.startswith('Via("GND"'))
-    (board.parent / "layout.core.py").write_text(line + "\n")
+    put_core(board.parent / "layout.core.py", line + "\n")
     again = build_job(board, upto="route", force=True)
     assert again.get("error") is None, again
     after = ids(again["gen"])
@@ -586,13 +618,13 @@ def test_a_refused_core_leaves_nothing_behind_and_an_edit_to_core_is_rebuilt(tmp
     board, _design = _blinky(tmp_path)
     layout = tmp_path / "layout" / "blinky"
     assert build_job(board, upto="fab", force=True).get("ok")
-    (tmp_path / "layout.core.py").write_text('Place("R1", at=(10, 10))\n')
+    put_core(tmp_path / "layout.core.py", 'Place("R1", at=(10, 10))\n')  # a second Place for R1: refused, naming both lines
     refused = build_job(board, upto="fab", force=True)
-    assert refused["error"] and "layout.core.py:1" in refused["error"]
+    assert refused["error"] and "R1: Place() 2 times (layout.core.py lines 1," in refused["error"], refused["error"]
     assert not (layout / "routed" / "layout.kicad_pcb").exists() and not (layout / "routed" / "layout.gen.py").exists() and not (layout / "fab").exists()
     assert build_job(board, upto="fab").get("ok") is None, "a plain build after a refusal is not 'done'"
     gen_line = 'Seg("LED", (10.1951, 13.2551), (30.5524, 13.2551), width=0.16, layer="F.Cu", id="hop")\n'
-    (tmp_path / "layout.core.py").write_text(gen_line)
+    put_core(tmp_path / "layout.core.py", gen_line)
     again = build_job(board, upto="fab")
     assert again.get("ok") and "route" in again["plan"], again.get("error")
     assert next(s for s in again["steps"] if s["stage"] == "route")["core_objects"] == 1
@@ -606,7 +638,7 @@ def test_a_core_via_too_close_to_another_net_is_refused_before_routing(tmp_path:
     from pcbc.build import build_job
 
     board = _buck(tmp_path)
-    (board.parent / "layout.core.py").write_text('Via("VIN", (21.72, 9.46), size=0.8, drill=0.4, id="vin-near-gnd")\n')
+    put_core(board.parent / "layout.core.py", 'Via("VIN", (21.72, 9.46), size=0.8, drill=0.4, id="vin-near-gnd")\n')
     result = build_job(board, upto="route", force=True)
     route = next(s for s in result["steps"] if s["stage"] == "route")
     assert "layout.core.py:1: via on VIN against C_IN2.2" in (result["error"] or "") and "0.05 mm of air where 0.2 mm is needed" in result["error"], result["error"]
@@ -620,7 +652,11 @@ def test_a_drc_failure_on_a_core_object_names_its_line(tmp_path: Path):
     from pcbc.build import build_job
 
     board = _buck(tmp_path)
-    (board.parent / "layout.core.py").write_text('\n\nVia("FB", (5.0, 17.0), size=0.8, drill=0.4, id="fb-via")\n')
+    # Re-measured 2026-10-02 (docs/physics-subjects.md O2 (b)): at (5, 17) the via now walls EN in on the vehicle, so
+    # it sits in the empty corner with a core keepout (no tracks round it, line 4) the router cannot cross.
+    ko = '{"tracks": "not_allowed", "vias": "allowed", "pads": "allowed", "copperpour": "allowed", "footprints": "allowed"}'
+    put_core(board.parent / "layout.core.py", '\n\nVia("FB", (2.5, 22.5), size=0.8, drill=0.4, id="fb-via")\n'
+        f'Pour(None, layer=None, layers=("F.Cu", "B.Cu"), name="moat", keepout={ko}, points=[(1.3, 21.3), (3.7, 21.3), (3.7, 23.7), (1.3, 23.7)], id="moat")\n')
     result = build_job(board, upto="route", force=True)
     assert result["error"] and "layout.core.py:3:" in result["error"], result["error"]
 
@@ -635,7 +671,7 @@ def test_a_net_a_core_rule_area_cuts_off_is_traced_to_that_line(tmp_path: Path):
 
     board, _design = _blinky(tmp_path)
     ko = '{"tracks": "not_allowed", "vias": "not_allowed", "pads": "allowed", "copperpour": "not_allowed", "footprints": "allowed"}'
-    (tmp_path / "layout.core.py").write_text(f'Pour(None, layer=None, layers=("F.Cu", "B.Cu"), name="wall", keepout={ko}, points=[(19.5, 0.3), (20.0, 0.3), (20.0, 24.7), (19.5, 24.7)], id="wall")\n')
+    put_core(tmp_path / "layout.core.py", f'Pour(None, layer=None, layers=("F.Cu", "B.Cu"), name="wall", keepout={ko}, points=[(19.5, 0.3), (20.0, 0.3), (20.0, 24.7), (19.5, 24.7)], id="wall")\n')
     result = build_job(board, upto="route", force=True)
     err = result["error"] or ""
     assert err.startswith("unrouted: LED") and "In the way: layout.core.py:1 (rule area 'wall')" in err, err
@@ -671,8 +707,7 @@ def test_every_drawing_kind_written_by_hand_in_core_survives_kicad_s_save(tmp_pa
 
     board, _design = _blinky(tmp_path)
     png = base64.b64encode(_png_1x1()).decode()
-    (tmp_path / "layout.core.py").write_text(
-        "\n".join(
+    put_core(tmp_path / "layout.core.py", "\n".join(
             [
                 'Rect((3, 2), (1, 1), layer="F.SilkS", radius=0.4, id="box")',
                 'Circle((5, 5), 1, layer="F.SilkS", fill="hatch", id="dot")',
@@ -700,8 +735,7 @@ def test_every_drawing_kind_written_by_hand_in_core_survives_kicad_s_save(tmp_pa
                 'Line((2, 23), (8, 23), layer="F.SilkS", width=0.15, id="bar")',
                 "",
             ]
-        )
-    )
+        ))
     result = build_job(board, upto="route", force=True)
     assert result.get("error") is None, result.get("error")
     route = next(s for s in result["steps"] if s["stage"] == "route")
@@ -773,14 +807,16 @@ def test_fab_judges_the_copper_of_the_board_it_fabricates(tmp_path: Path):
     gen = Design()
     load_layout(work / "layout.gen.py", gen, source="gen")
     by_id = {c.id: c for c in gen.copper}
-    spine = next(by_id[m] for g in gen.graphics if g.kind == "group" and g.f["name"].startswith("pcbc:spine:") for m in g.f["members"] if by_id[m].net == "5V" and by_id[m].kind == "seg")
-    s, e = _seg_block(text, spine.a, spine.b)  # pcbc's 5V spine, class 0.781
-    narrowed = text[:s] + re.sub(r"\(width\s+[0-9.]+\)", "(width 0.2)", text[s:e], count=1) + text[e:]
+    # docs/physics-subjects.md O4 / O2 (b): the spine is deleted and the vehicle declares no current, so the piece is a
+    # 5V `route` segment at the 0.16 mm class floor, narrowed to 0.1 mm (re-measured 2026-10-02).
+    spine = next(by_id[m] for g in gen.graphics if g.kind == "group" and g.f["name"].startswith("pcbc:route:") for m in g.f["members"] if by_id[m].net == "5V" and by_id[m].kind == "seg")
+    s, e = _seg_block(text, spine.a, spine.b)
+    narrowed = text[:s] + re.sub(r"\(width\s+[0-9.]+\)", "(width 0.1)", text[s:e], count=1) + text[e:]
     assert narrowed != text
     (work / "layout.kicad_pcb").write_text(narrowed)
     design = load_board(EXAMPLES / "buck" / "buck.py")
     result = fab_job(compile_design(design), work / "layout.kicad_pcb", out_dir=tmp_path / "fab", design=design)
-    assert result["error"] and "5V spine copper 0.2 mm < the 0.781 mm 5V class" in result["error"], result["error"]
+    assert result["error"] and "5V route copper 0.1 mm on F.Cu < the 0.16 mm 5V needs on F.Cu" in result["error"], result["error"]
     assert not list((tmp_path / "fab" / "gerbers").glob("*.g*")), "no Gerber of a board the gate refused"
 
 
@@ -799,17 +835,15 @@ def test_core_copper_names_a_net_of_board_py(tmp_path: Path):
         ('Line((1, 1), (5, 1), layer="F.Cu", net="NOPE")\n', "net 'NOPE', which is not a net of board.py"),
     ):
         board, design = _blinky(tmp_path)
-        (tmp_path / "layout.core.py").write_text(body)
+        put_core(tmp_path / "layout.core.py", body)
         with pytest.raises(ValueError) as got:
-            load_core(design, board)
+            load_core(load_board(board), board)
         assert "layout.core.py:1" in str(got.value) and says in str(got.value), str(got.value)
     board, design = _blinky(tmp_path)
-    (tmp_path / "layout.core.py").write_text(
-        'Pour(None, layer="F.Cu", keepout={"tracks": "not_allowed"}, points=[(1, 1), (5, 1), (5, 5), (1, 5)])\n'
+    put_core(tmp_path / "layout.core.py", 'Pour(None, layer="F.Cu", keepout={"tracks": "not_allowed"}, points=[(1, 1), (5, 1), (5, 5), (1, 5)])\n'
         'Seg(None, (15.0, 5.0), (20.0, 5.0), width=0.2, layer="F.Cu", id="spreader")\n'
-        'Via(None, (15.0, 5.0), size=0.6, drill=0.3, id="coupon")\n'
-    )
-    copper, _gr = load_core(design, board)
+        'Via(None, (15.0, 5.0), size=0.6, drill=0.3, id="coupon")\n')
+    copper, _gr = load_core(load_board(board), board)
     assert [c.net for c in copper] == [None, "", ""], "no net: a zone has no token, a track or via KiCad's (net \"\")"
     text = render(design, copper, board="blinky")
     assert text.count('(net "")') == 2 and '"None"' not in text and text.count("(net") == 2
@@ -873,8 +907,8 @@ def _core_blinky(tmp_path: Path, body: str):
     from pcbc.layout_emit import render, render_graphics, uuid_of
 
     board, design = _blinky(tmp_path)
-    (tmp_path / "layout.core.py").write_text(body)
-    load_layout(tmp_path / "layout.core.py", design, source="core")
+    put_core(tmp_path / "layout.core.py", body)
+    design = core_load(tmp_path / "layout.core.py")
     ids = {o.id: uuid_of(o, "blinky") for o in [*design.copper, *design.graphics]}
     return design, render(design, design.copper, board="blinky") + render_graphics(design.graphics, board="blinky", uuids=ids)
 
@@ -890,7 +924,7 @@ def test_a_locked_core_pour_on_the_plane_net_is_kept_and_the_router_pours_nothin
     from pcbc.sexp import stable_uuid
 
     board = _buck(tmp_path)
-    (board.parent / "layout.core.py").write_text('Pour("GND", layer="B.Cu", points=[(0.3, 0.3), (39.7, 0.3), (39.7, 24.7), (20.0, 24.7), (0.3, 24.7)], id="gndplane")\n')
+    put_core(board.parent / "layout.core.py", 'Pour("GND", layer="B.Cu", points=[(0.3, 0.3), (39.7, 0.3), (39.7, 24.7), (20.0, 24.7), (0.3, 24.7)], id="gndplane")\n')
     result = build_job(board, upto="route", force=True)
     assert result.get("error") is None, result.get("error")
     route = next(s for s in result["steps"] if s["stage"] == "route")
@@ -925,10 +959,15 @@ def test_every_line_of_layout_gen_can_be_locked_verbatim(name: str, tmp_path: Pa
 
     final, base_result = routed_result(name, EXAMPLES / name / f"{name}.py")
     base = decompile(final.read_text())
-    cu = [ln for ln in (final.parent / "layout.gen.py").read_text().splitlines() if re.match(r"(Seg|Arc|Via|Pour)\(", ln)]
+    # every copper line but a Keepout()'s rule area, which cannot be locked: its one home is the Keepout() (A.5)
+    keepouts = {k.name for k in load_board(EXAMPLES / name / f"{name}.py").keepouts}
+    cu = [
+        ln for ln in (final.parent / "layout.gen.py").read_text().splitlines()
+        if re.match(r"(Seg|Arc|Via|Pour)\(", ln) and not (ln.startswith("Pour(None") and any(f'name="{k}"' in ln for k in keepouts))
+    ]
     shutil.copytree(EXAMPLES / name, tmp_path / name, ignore=shutil.ignore_patterns("layout"))
     board = tmp_path / name / f"{name}.py"
-    (board.parent / "layout.core.py").write_text("\n".join(cu) + "\n")
+    put_core(board.parent / "layout.core.py", "\n".join(cu) + "\n")
     # c3_usb does not finish under N0 (VBUS at the USB-C connector): it is built to the route stage and
     # must stop on the **same** unrouted nets as its baseline, with every other property below intact.
     # It is here because it is the one board with a `Thermal()` (the D2 property below); the refuters
@@ -1029,12 +1068,15 @@ def test_a_board_py_edit_after_a_refused_route_is_placed_again_and_build_output_
         return float(block[block.index("(at ") + 4 :].split()[0])
 
     before = r1_x()
-    (tmp_path / "layout.core.py").write_text('Place("R1", at=(10, 12.5))\n')
+    core = tmp_path / "layout.core.py"
+    own = core.read_text()
+    put_core(core, 'Place("R1", at=(10, 12.5))\n')
     refused = build_job(board, upto="fab")
-    assert refused["error"] and "layout.core.py:1" in refused["error"]
-    (tmp_path / "layout.core.py").unlink()
+    assert refused["error"] and "layout.core.py lines 1," in refused["error"], refused["error"]
+    # the edit after the refusal: R1's Place in layout.core.py (docs/direction.md §2), and a line of board.py
+    core.write_text(own.replace("left=8,", "left=10,", 1))
     src = board.read_text()
-    board.write_text(src.replace("left=8,", "left=10,", 1))
+    board.write_text(src + "# an edit after a refused route\n")
     assert board.read_text() != src
     assert stale_reason(layout, board) == (None, "board.py, a module it imports or a part file changed since the schematic was drawn")  # the schematic's record answers first
     again = build_job(board, upto="fab")
@@ -1069,7 +1111,7 @@ def test_a_changed_part_file_makes_the_placed_board_stale(tmp_path: Path):
     assert result.get("ok"), result.get("error")
     assert stale_reason(layout, board) == ("place", None)
     part = board.parent / "components" / "TI" / "TPS54202DDCR" / "part.py"
-    part.write_text(part.read_text() + "\n# a changed part file\n")
+    write_split(part, part.read_text() + "\n# a changed part file\n")
     stage, why = stale_reason(layout, board)
     # The schematic's record is asked first (it is the earliest stage with an output), and it hashes
     # the same part files; the placed board's own record would say the same one line later.
@@ -1091,12 +1133,17 @@ def test_a_dangling_core_via_is_a_finding_naming_its_line(tmp_path: Path):
     from pcbc.build import build_job
 
     board = _buck(tmp_path)
-    (board.parent / "layout.core.py").write_text('Seg("VIN", (18.85, 11.25), (18.85, 9.45), layer="F.Cu", id="myvin")\nVia("GND", (2.5, 22.5), size=0.5, drill=0.3, id="lonely")\n')
+    # Re-measured 2026-10-02 (docs/physics-subjects.md O2 (b)): with the vehicle declaring no current the router now
+    # finds an F.Cu way past FID3 to the via, so a core keepout (line 3: no tracks on F.Cu round the via) keeps its
+    # free layer unreachable, as FID3's mask keepout did.
+    ko = '{"tracks": "not_allowed", "vias": "allowed", "pads": "allowed", "copperpour": "allowed", "footprints": "allowed"}'
+    put_core(board.parent / "layout.core.py", 'Seg("VIN", (18.85, 11.25), (18.85, 9.45), layer="F.Cu", id="myvin")\nVia("GND", (2.5, 22.5), size=0.5, drill=0.3, id="lonely")\n'
+        f'Pour(None, layer="F.Cu", layers=None, name="moat", keepout={ko}, points=[(1.3, 21.3), (3.7, 21.3), (3.7, 23.7), (1.3, 23.7)], id="moat")\n')
     result = build_job(board, upto="route", force=True)
     err = result["error"] or ""
     assert not result.get("unrouted"), result.get("unrouted")
     assert "layout.core.py:2: via_dangling" in err and "the router could not join this core via's free end" in err, err
-    assert "move that end onto the copper it should join, or unlock the line (delete it)" in err and "pcbc bug" not in err, err
+    assert "the router could not join this core via's free end" in err and "delete" not in err and "pcbc bug" not in err, err
     route = next(s for s in result["steps"] if s["stage"] == "route")
     assert route["copper"] != "verified" and not (board.parent / "layout" / "buck" / "fab").exists()
 
@@ -1137,13 +1184,13 @@ def test_a_pour_joins_a_pad_only_as_its_connect_mode_allows(tmp_path: Path):
     pads = [pad("A", (2.0, 2.0)), pad("B", (8.0, 8.0))]
     for connect, pieces in (("solid", 1), ("thermal", 1), ("none", 2), ("thru_hole_only", 2)):
         board, design = _blinky(tmp_path)
-        (tmp_path / "layout.core.py").write_text(f'Pour("GND", layer="B.Cu", connect="{connect}", points=[(0, 0), (10, 0), (10, 10), (0, 10)], id="p")\n')
-        load_layout(tmp_path / "layout.core.py", design, source="core")
+        put_core(tmp_path / "layout.core.py", f'Pour("GND", layer="B.Cu", connect="{connect}", points=[(0, 0), (10, 0), (10, 10), (0, 10)], id="p")\n')
+        design = core_load(tmp_path / "layout.core.py")
         _fails, notes = check_layout(design, pads, layers=("F.Cu", "B.Cu"))
         assert (pieces == 1) == (not any("GND: its pads are in 2 pieces" in n for n in notes)), (connect, notes)
     board, design = _blinky(tmp_path)
-    (tmp_path / "layout.core.py").write_text('Pour("GND", layer="B.Cu", connect="thru_hole_only", points=[(0, 0), (10, 0), (10, 10), (0, 10)], id="p")\n')
-    load_layout(tmp_path / "layout.core.py", design, source="core")
+    put_core(tmp_path / "layout.core.py", 'Pour("GND", layer="B.Cu", connect="thru_hole_only", points=[(0, 0), (10, 0), (10, 10), (0, 10)], id="p")\n')
+    design = core_load(tmp_path / "layout.core.py")
     _fails, notes = check_layout(design, [pad("A", (2.0, 2.0), "thru_hole"), pad("B", (8.0, 8.0), "thru_hole")], layers=("F.Cu", "B.Cu"))
     assert not any("2 pieces" in n for n in notes), notes
 
@@ -1174,10 +1221,10 @@ def test_a_core_rule_area_over_an_unrouted_pad_names_the_pad_and_the_move(tmp_pa
     p = next(p for p in pads if p.net == "LED" and p.ref == "R1")
     x, y = p.at
     ko = '{"tracks": "not_allowed", "vias": "not_allowed", "pads": "allowed", "copperpour": "not_allowed", "footprints": "allowed"}'
-    (tmp_path / "layout.core.py").write_text(f'Pour(None, layer=None, layers=("F.Cu", "B.Cu"), name="wall", keepout={ko}, points=[({x - 1}, {y - 1}), ({x + 1}, {y - 1}), ({x + 1}, {y + 1}), ({x - 1}, {y + 1})], id="wall")\n')
+    put_core(tmp_path / "layout.core.py", f'Pour(None, layer=None, layers=("F.Cu", "B.Cu"), name="wall", keepout={ko}, points=[({x - 1}, {y - 1}), ({x + 1}, {y - 1}), ({x + 1}, {y + 1}), ({x - 1}, {y + 1})], id="wall")\n')
     result = build_job(board, upto="route", force=True)
     assert str(result["error"]).startswith("unrouted: LED"), result["error"]
-    assert f"layout.core.py:1 (rule area 'wall') covers R1.{p.num}: clear it off that pad or delete it" in result["error"], result["error"]
+    assert f"layout.core.py:1 (rule area 'wall') covers R1.{p.num};" in result["error"] and "delete" not in result["error"], result["error"]
 
 
 def test_the_gen_header_says_which_lines_cannot_be_locked():
@@ -1185,15 +1232,16 @@ def test_the_gen_header_says_which_lines_cannot_be_locked():
     review: so is the Edge.Cuts outline, which the header did not name."""
     from pcbc.gen import HEADER
 
-    assert 'Group named "pcbc:<reason>:<owner>"' in HEADER and "a Place (a part is placed in" in HEADER
-    assert "Three kinds of line cannot be locked" in HEADER and "the Edge.Cuts outline (Board(width, height) in board.py)" in HEADER
+    assert 'Group named "pcbc:<reason>:<owner>"' in HEADER and "a fiducial's Place (FIDn, the" in HEADER
+    assert "Four kinds of line cannot be locked" in HEADER and "the Edge.Cuts outline (Outline() in layout.core.py, or derived when\n# there is none)" in HEADER
+    assert "a Keepout's rule area (Keepout() in layout.core.py)" in HEADER and "A part's Place line replaces that part's Place line in layout.core.py" in HEADER
 
 
 @pytest.mark.kicad
 def test_every_line_of_layout_gen_the_header_does_not_name_can_be_locked(tmp_path: Path):
     """Sixth review: the gen header said two kinds of line cannot be locked, and every board's
-    Edge.Cuts `Rect` was refused too. Each line of blinky's gen alone in core: a line is refused at load
-    only if its kind is one the header names."""
+    Edge.Cuts `Rect` was refused too. Each line of blinky's gen in core (a part's Place line in place of that
+    part's own, docs/board-outline.md A.5): a line is refused only if its kind is one the header names."""
     import re
 
     from pcbc.gen import HEADER
@@ -1204,18 +1252,28 @@ def test_every_line_of_layout_gen_the_header_does_not_name_can_be_locked(tmp_pat
     final = routed_board("blinky", EXAMPLES / "blinky" / "blinky.py")
     placed = place(load_board(EXAMPLES / "blinky" / "blinky.py"), name="blinky").text
     lines = [ln for ln in (final.parent / "layout.gen.py").read_text().splitlines() if re.match(r"[A-Z][A-Za-z]*\(", ln)]
-    named = {"Place": "a Place (a part is placed in", "pcbc group": 'Group named "pcbc:<reason>:<owner>"', "outline": "the Edge.Cuts outline"}
+    named = {"fiducial": "a fiducial's Place (FIDn", "pcbc group": 'Group named "pcbc:<reason>:<owner>"', "outline": "the Edge.Cuts outline"}
+    own = (EXAMPLES / "blinky" / "layout.core.py").read_text()
     refused = set()
+    board = tmp_path / "blinky.py"
+    board.write_text((EXAMPLES / "blinky" / "blinky.py").read_text())
     for ln in lines:
-        (tmp_path / "layout.core.py").write_text(ln + "\n")
-        board = tmp_path / "blinky.py"
-        board.write_text((EXAMPLES / "blinky" / "blinky.py").read_text())
+        ref = re.match(r'Place\("([^"]+)"', ln)
+        core = own
+        if ref and ref.group(1) in ("R1", "D1"):  # the part's Place line, replaced by its gen pose
+            core = re.sub(r'Place\(\n    "' + ref.group(1) + r'",.*?\n\)\n', lambda _m: ln + "\n", own, flags=re.S)
+            assert core != own
+        else:
+            core = own + ln + "\n"
+        (tmp_path / "layout.core.py").write_text(core)
         try:
-            load_core(load_board(board), board, placed, name="blinky")
+            design = load_board(board)
+            load_core(design, board, placed, name="blinky")
+            assert check_board(board) == [], ln
         except ValueError:
-            kind = "Place" if ln.startswith("Place(") else "pcbc group" if ln.startswith('Group("pcbc:') else "outline" if 'layer="Edge.Cuts"' in ln else ln
+            kind = "fiducial" if ln.startswith('Place("FID') else "pcbc group" if ln.startswith('Group("pcbc:') else "outline" if 'layer="Edge.Cuts"' in ln else ln
             refused.add(kind)
-    assert refused == {"Place", "pcbc group", "outline"}, refused
+    assert refused == {"fiducial", "pcbc group", "outline"}, refused
     assert all(named[k] in HEADER for k in refused)
 
 
@@ -1227,34 +1285,38 @@ def test_a_core_load_may_not_add_a_pose_by_any_path(tmp_path: Path):
         'import pcbc.language as L\nL._layout_source = "gen"\nL._gen_place("R1", at=(12.0, 12.5))\n',
         'import pcbc.language as L\nfrom pcbc.model import Pose\nL._current.poses.append(Pose("R1", (12.0, 12.5), 0.0, "F.Cu", True, source="gen"))\n',
     ):
-        core, design = _layout_file(tmp_path, body)
-        with pytest.raises(ValueError, match=r"a pose for 'R1' was made in layout\.core\.py.*board\.py only"):
-            load_layout(core, design, source="core")
-        assert design.poses == []
+        board, _design = _blinky(tmp_path)
+        core = tmp_path / "layout.core.py"
+        core.write_text(core.read_text() + body)  # after the placement: the second body sets the loader's source
+        with pytest.raises(ValueError, match=r"a layout\.gen\.py pose for 'R1' was made in layout\.core\.py \(however it was made\); in layout\.core\.py a part is placed by Place\(\)"):
+            core_load(core)
 
 
 def test_the_outline_has_one_home(tmp_path: Path):
     """m1: core accepted Edge.Cuts drawings on top of Board(width, height); the place stage never
-    saw a core cutout. Refused naming board.py (default for this round, reversible)."""
+    saw a core cutout. The outline is Outline() in layout.core.py, or derived when there is none (2026-10-03)."""
     from pcbc.layout_job import load_core
 
     board, design = _blinky(tmp_path)
-    (tmp_path / "layout.core.py").write_text('Rect((14.0, 18.0), (18.0, 22.0), width=0.05, layer="Edge.Cuts")\n')
-    with pytest.raises(ValueError, match=r"layout\.core\.py:1: gr_rect on Edge\.Cuts; the outline is Board\(width, height\) in board\.py"):
-        load_core(design, board)
+    put_core(tmp_path / "layout.core.py", 'Rect((14.0, 18.0), (18.0, 22.0), width=0.05, layer="Edge.Cuts")\n')
+    with pytest.raises(ValueError, match=r"layout\.core\.py:1: Rect on Edge\.Cuts; the outline is Outline\(\) in layout\.core\.py, or derived when there is none$"):
+        load_core(load_board(board), board)
 
 
 # --------------------------------------------------------------------- third review, round 1
 
 
 def _blinky_with_helper(tmp_path: Path) -> Path:
-    """blinky whose `board.py` says `from helper import LEFT`: a second source file beside it."""
-    src = (EXAMPLES / "blinky" / "blinky.py").read_text()
+    """blinky whose `board.py` says `from helper import LEFT`: a second source file beside it. R1's `left=` is
+    placement, `layout.core.py`'s (docs/direction.md §2), which takes LEFT from the same helper."""
+    src = (declared_examples() / "blinky" / "blinky.py").read_text()
     src = src.replace("from pcbc import Board", "import os, sys\nsys.path.insert(0, os.path.dirname(__file__))\nfrom helper import LEFT\nfrom pcbc import Board", 1)
-    src = src.replace("    left=8,\n", "    left=LEFT,\n", 1)
-    assert "left=LEFT" in src
+    core = (declared_examples() / "blinky" / "layout.core.py").read_text()
+    core = "from helper import LEFT\n" + core.replace("    left=8,\n", "    left=LEFT,\n", 1)
+    assert "left=LEFT" in core
     board = tmp_path / "blinky.py"
     board.write_text(src)
+    (tmp_path / "layout.core.py").write_text(core)
     (tmp_path / "helper.py").write_text("LEFT = 8\n")
     return board
 
@@ -1278,7 +1340,7 @@ def test_the_placed_board_is_stamped_and_a_hand_edit_is_stale_from_the_place_sta
     import hashlib
     import json
 
-    from pcbc.build import INPUTS, NEVER_EDITED, pcb_job, planned, sch_stage, stale_reason
+    from pcbc.build import INPUTS, NEVER_EDITED, pcb_job, planned, sch_reason, sch_stage, stale_reason
 
     board, design = _blinky(tmp_path)
     assert not pcb_job(board).get("error")
@@ -1286,9 +1348,12 @@ def test_the_placed_board_is_stamped_and_a_hand_edit_is_stale_from_the_place_sta
     placed = layout / "placed" / "layout.kicad_pcb"
     stamp = json.loads((layout / "placed" / INPUTS).read_text())
     assert stamp["placed"] == hashlib.sha256(placed.read_bytes()).hexdigest() and "modules" in stamp and "sch" not in stamp
+    # docs/schematic-layout.md §1.1: the sch stage is a side branch. The placed board is current; the missing
+    # schematic is the sheet's own reason, and the build draws it (and only it) before the later stages.
     stage, why = stale_reason(layout, board)
-    assert stage is None and why.startswith("the schematic has no record of the board.py it was drawn from"), (stage, why)
-    assert planned(stage, upto="fab", force=False) == ["check", "sch", "place", "route", "fab"]
+    assert (stage, why) == ("place", None), (stage, why)
+    assert sch_reason(layout, board).startswith("the schematic has no record of what it was drawn from")
+    assert planned(stage, upto="fab", force=False) == ["route", "fab"]
     _step, err = sch_stage(design, board, layout, name="blinky")
     assert err is None, err
     assert stale_reason(layout, board) == ("place", None)
@@ -1319,7 +1384,10 @@ def test_a_module_board_py_imports_is_a_hashed_input(tmp_path: Path):
     assert not pcb_job(board).get("error")
     layout = tmp_path / "layout" / "blinky"
     assert sorted(json.loads((layout / "placed" / INPUTS).read_text())["modules"]) == ["helper.py"]
-    assert stale_reason(layout, board)[0] is None  # `pcbc pcb` never draws the schematic (fifth review)
+    # `pcbc pcb` never draws the schematic (fifth review): the placed board is current, and the sheet's own reason says so
+    from pcbc.build import sch_reason
+
+    assert stale_reason(layout, board)[0] == "place" and "the sch stage has not run" in sch_reason(layout, board)
     from pcbc.build import sch_stage
 
     assert sch_stage(load_board(board), board, layout, name="blinky")[1] is None
@@ -1340,16 +1408,16 @@ def test_core_copper_lives_on_a_copper_layer_and_a_via_with_no_size_is_refused(t
 
     board, design = _blinky(tmp_path)
     core = tmp_path / "layout.core.py"
-    core.write_text('Pour(None, layer="Edge.Cuts", points=[(5, 5), (15, 5), (15, 15), (5, 15)], id="edgepour")\n')
-    with pytest.raises(ValueError, match=r"layout\.core\.py:1: pour on 'Edge\.Cuts', which is not a copper layer of this stackup \(F\.Cu, B\.Cu\).*Board\(40, 25\) in board\.py"):
-        load_core(design, board)
-    core.write_text('Seg("LED", (1, 2), (3, 2), width=0.25, layer="F.SilkS")\n')
+    put_core(core, 'Pour(None, layer="Edge.Cuts", points=[(5, 5), (15, 5), (15, 15), (5, 15)], id="edgepour")\n')
+    with pytest.raises(ValueError, match=r"layout\.core\.py:1: pour on 'Edge\.Cuts', which is not a copper layer of this stackup \(F\.Cu, B\.Cu\); copper is written on a copper layer only$"):
+        load_core(load_board(board), board)
+    put_core(core, 'Seg("LED", (1, 2), (3, 2), width=0.25, layer="F.SilkS")\n')
     with pytest.raises(ValueError, match=r"layout\.core\.py:1: seg on 'F\.SilkS', which is not a copper layer"):
         load_core(load_board(board), board)
-    core.write_text('Via(None, (3, 3), id="v")\n')
+    put_core(core, 'Via(None, (3, 3), id="v")\n')
     with pytest.raises(ValueError, match=r"layout\.core\.py:1: a via on no net needs size= and drill="):
         load_core(load_board(board), board)
-    core.write_text('Seg(None, (1, 2), (3, 2), id="s")\n')
+    put_core(core, 'Seg(None, (1, 2), (3, 2), id="s")\n')
     with pytest.raises(ValueError, match=r"layout\.core\.py:1: a seg on no net needs width="):
         load_core(load_board(board), board)
 
@@ -1450,12 +1518,10 @@ def test_a_core_pour_outline_and_a_hatch_or_teardrop_default_are_what_kicad_will
     kept = [(30, 0), (40, 0), (50, 0), (50, 20), (30, 20)]  # a collinear midpoint stays, as KiCad keeps it
     assert normalise_outline(kept) == tuple((float(x), float(y)) for x, y in kept)
     board, design = _blinky(tmp_path)
-    (tmp_path / "layout.core.py").write_text(
-        'Pour(None, layer="F.Cu", points=[(30, 18), (30, 18), (36, 18), (36, 23), (30, 23), (30, 18)], id="dup")\n'
+    put_core(tmp_path / "layout.core.py", 'Pour(None, layer="F.Cu", points=[(30, 18), (30, 18), (36, 18), (36, 23), (30, 23), (30, 18)], id="dup")\n'
         'Pour(None, layer="F.Cu", fill_mode="hatch", points=[(30, 18), (36, 18), (36, 23), (30, 23)], id="hatchy")\n'
-        'Via("GND", (6, 20), size=0.5, drill=0.3, teardrops={"enabled": True}, id="td")\n'
-    )
-    load_layout(tmp_path / "layout.core.py", design, source="core")
+        'Via("GND", (6, 20), size=0.5, drill=0.3, teardrops={"enabled": True}, id="td")\n')
+    design = core_load(tmp_path / "layout.core.py")
     dup, hatchy, td = stamp(design, design.copper)
     assert dup.points == ((30.0, 18.0), (36.0, 18.0), (36.0, 23.0), (30.0, 23.0))
     assert {k: getattr(hatchy, k) for k in HATCH_DEFAULTS} == HATCH_DEFAULTS
@@ -1475,13 +1541,13 @@ def test_a_refused_field_names_what_kicad_kept_down_to_the_key():
     wrote = Copper("via", "td", "GND", at=(1, 1), size=0.5, drill=0.3, teardrops={**td, "filter_ratio": 1 / 3})
     kept = Copper("via", "td", "GND", at=(1, 1), size=0.5, drill=0.3, teardrops={**td, "filter_ratio": 0.3333333333})
     (msg,) = diff_objects([wrote], [kept], what="KiCad's save")
-    assert "teardrops.filter_ratio (written 0.3333333333333333, KiCad's save has 0.3333333333: write that)" in msg, msg
+    assert "teardrops.filter_ratio (written 0.3333333333333333, KiCad's save has 0.3333333333)" in msg, msg
     assert "best_length_ratio" not in msg
     sq = [(30.0, 18.0), (36.0, 18.0), (36.0, 23.0), (30.0, 23.0)]
     wrote = Copper("pour", "h", None, layer="F.Cu", points=sq, fill_mode="hatch", hatch_orientation=30.123456789)
     kept = Copper("pour", "h", None, layer="F.Cu", points=sq, fill_mode="hatch", hatch_orientation=30.12345679)
     (msg,) = diff_objects([wrote], [kept], what="KiCad's save")
-    assert "hatch_orientation (written 30.123456789, KiCad's save has 30.12345679: write that)" in msg, msg
+    assert "hatch_orientation (written 30.123456789, KiCad's save has 30.12345679)" in msg, msg
 
 
 TEARDROP_DEFAULTS_FOR_TEST = {"best_length_ratio": 0.5, "max_length": 1.0, "best_width_ratio": 1.0, "max_width": 2.0, "curved_edges": False, "filter_ratio": 0.9, "enabled": True, "allow_two_segments": False, "prefer_zone_connections": False}
@@ -1565,7 +1631,8 @@ def test_fab_ships_only_the_copper_the_gates_judged(tmp_path: Path, monkeypatch)
     load_layout(final.parent / "layout.gen.py", gen, source="gen")
     by_id = {c.id: c for c in gen.copper}
     gnd_via = next(c for c in gen.copper if c.kind == "via" and c.net == "GND")
-    spine = next(by_id[m] for g in gen.graphics if g.kind == "group" and g.f["name"].startswith("pcbc:spine:") for m in g.f["members"] if by_id[m].net == "5V" and by_id[m].kind == "seg")
+    # The spine is deleted (docs/physics-subjects.md O4): the narrowed piece is a 5V `route` segment.
+    spine = next(by_id[m] for g in gen.graphics if g.kind == "group" and g.f["name"].startswith("pcbc:route:") for m in g.f["members"] if by_id[m].net == "5V" and by_id[m].kind == "seg")
     boot = next(c for c in gen.copper if c.kind == "seg" and c.net == "BOOT")
 
     def via_block(text, at):
@@ -1638,7 +1705,10 @@ def test_fab_outputs_are_stamped_and_an_export_failure_is_an_error(tmp_path: Pat
     assert first.get("ok"), first.get("error")
     assert stale_reason(layout, board) == ("fab", None)
     fab_board = layout / "fab" / "layout.kicad_pcb"
-    fab_board.write_text(fab_board.read_text().replace("(width 0.25)", "(width 0.2)", 1))
+    import re as _re
+
+    # A width edit (blinky's hop was 0.25 mm before docs/physics-subjects.md PR 3 put VCC at the class floor).
+    fab_board.write_text(_re.sub(r"\(width 0\.16\)", "(width 0.2)", fab_board.read_text(), count=1))
     assert stale_reason(layout, board) == ("route", f"fab/layout.kicad_pcb is not the file the fab stage wrote (edited or deleted): {NEVER_EDITED}")
     again = build_job(board, upto="fab")
     assert again.get("ok") and again["plan"] == ["fab"] and "(width 0.2)" not in fab_board.read_text()
@@ -1684,7 +1754,7 @@ def test_a_pour_locked_verbatim_changes_nothing_else(tmp_path: Path):
     via = next(ln for ln in gen if ln.startswith('Via("GND"'))
     for tag, core in (("pour", pour), ("segviapour", "\n".join((seg, via, pour)))):
         board = _buck(tmp_path / tag)
-        (board.parent / "layout.core.py").write_text(core + "\n")
+        put_core(board.parent / "layout.core.py", core + "\n")
         result = build_job(board, upto="route", force=True)
         assert result.get("error") is None, (tag, result.get("error"))
         route = next(s for s in result["steps"] if s["stage"] == "route")
@@ -1715,7 +1785,7 @@ def test_two_builds_from_two_absolute_paths_are_byte_identical_with_no_normalisa
     dirs = [tmp_path / "a" / "blinky", tmp_path / "some" / "deeper dir" / "b" / "blinky"]
     for d in dirs:
         d.mkdir(parents=True)
-        (d / "blinky.py").write_text((EXAMPLES / "blinky" / "blinky.py").read_text())
+        copy_board_file(d / "blinky.py", EXAMPLES / "blinky" / "blinky.py")
         assert build_job(d / "blinky.py", upto="fab", force=True).get("ok")
 
     def tree(d: Path) -> dict:
@@ -1743,8 +1813,8 @@ def test_a_multi_line_text_and_a_teardrop_via_survive_kicads_save(tmp_path: Path
     from pcbc.netcheck import kicad_drc
 
     board, design = _blinky(tmp_path)
-    (tmp_path / "layout.core.py").write_text('Text("a\\nb \\"q\\"", (10, 10), layer="F.SilkS", id="t")\nVia("GND", (6, 20), size=0.5, drill=0.3, teardrops={"enabled": True}, id="td")\nSeg("GND", (6, 20), (9, 20), width=0.25, id="s")\n')
-    load_layout(tmp_path / "layout.core.py", design, source="core")
+    put_core(tmp_path / "layout.core.py", 'Text("a\\nb \\"q\\"", (10, 10), layer="F.SilkS", id="t")\nVia("GND", (6, 20), size=0.5, drill=0.3, teardrops={"enabled": True}, id="td")\nSeg("GND", (6, 20), (9, 20), width=0.25, id="s")\n')
+    design = core_load(tmp_path / "layout.core.py")
     assert design.graphics[0].f["text"] == 'a\nb "q"'
     ids = {o.id: uuid_of(o, "blinky") for o in [*design.copper, *design.graphics]}
     base = strip_layout((FIX / "kicad10_primitives3.kicad_pcb").read_text())
@@ -1804,7 +1874,8 @@ def test_every_file_a_stage_reads_is_stamped_and_every_sidecar_is_regenerated(tm
     assert build_job(board, upto="place", force=True).get("ok")
     assert stale_reason(layout, board) == ("place", None)
     stamp = _stamp_of(layout, "placed/inputs.json")
-    assert set(stamp) == {"board", "parts", "modules", "reads", "placed", "gen", "sidecars", "traced"} and set(stamp["sidecars"]) == {"layout.kicad_pro", "layout.kicad_dru"}
+    # docs/board-outline.md A.2: the place stamp also records layout.core.py and what its load read
+    assert set(stamp) == {"board", "parts", "modules", "reads", "core", "core_reads", "placed", "gen", "sidecars", "traced"} and set(stamp["sidecars"]) == {"layout.kicad_pro", "layout.kicad_dru"}
     assert "blinky.py" in stamp["reads"] and set(stamp["traced"]) == {"reads", "dirs", "env", "child_env", "tools", "argv"} and "pcbc" in stamp["traced"]["tools"]
     pro = emit_pro(design, name="blinky")
     p = layout / "placed" / "layout.kicad_pro"
@@ -1816,7 +1887,7 @@ def test_every_file_a_stage_reads_is_stamped_and_every_sidecar_is_regenerated(tm
     again = build_job(board, upto="place")
     assert again.get("ok") and again["plan"] == ["place"] and p.read_text() == pro
     src = board.read_text()
-    board.write_text(src.replace('"1k"', '"4k7"', 1))
+    write_split(board, src.replace('"1k"', '"4k7"', 1))
     why = "board.py, a module it imports or a part file changed since the schematic was drawn"
     assert stale_reason(layout, board) == (None, why)
     full = build_job(board, upto="fab")
@@ -1836,8 +1907,13 @@ def test_every_file_a_stage_reads_is_stamped_and_every_sidecar_is_regenerated(tm
     assert build_job(board, upto="fab")["plan"] == ["route", "fab"] and d.read_text() == dru
     sch = layout / "schematic.kicad_sch"
     sch.write_text(sch.read_text() + "\n")
-    assert stale_reason(layout, board) == (None, f"schematic.kicad_sch is not the file the sch stage wrote (edited or deleted): {NEVER_EDITED}")
-    assert build_job(board, upto="fab")["plan"][0] == "check" and stale_reason(layout, board) == ("fab", None)
+    # docs/schematic-layout.md §1.1: the sch stage is a side branch. An edited sheet leaves the board side fresh and
+    # is redrawn alone.
+    from pcbc.build import sch_reason
+
+    assert stale_reason(layout, board) == ("fab", None)
+    assert sch_reason(layout, board) == f"schematic.kicad_sch is not the file the sch stage wrote (edited or deleted): {NEVER_EDITED}"
+    assert build_job(board, upto="fab")["plan"] == ["sch"] and sch_reason(layout, board) is None
 
 
 def _sha(path: Path) -> str:
@@ -1984,13 +2060,13 @@ def test_kicad_s_save_keeps_what_the_loader_writes_for_every_word_and_layer_list
 @pytest.mark.parametrize(
     "line, says",
     [
-        ('Pour("LED", layer="F.Cu", points=[(1, 16), (12, 16), (12, 24), (1, 24)], fill_mode="solid", id="p")', r"fill_mode must be one of 'hatch' \(or leave it out\)"),
+        ('Pour("LED", layer="F.Cu", points=[(1, 16), (12, 16), (12, 24), (1, 24)], fill_mode="solid", id="p")', r"fill_mode must be one of 'hatch' \(or None\)"),
         ('Pour("LED", layer="F.Cu", points=[(1, 16), (12, 16), (12, 24), (1, 24)], hatch=("bogus", 0.5), id="p")', r"hatch style must be one of 'none', 'edge', 'full'"),
         ('Pour("LED", layer="F.Cu", points=[(1, 16), (12, 16), (12, 24), (1, 24)], smoothing="bogus", id="p")', r"smoothing must be one of 'chamfer', 'fillet'"),
         ('Pour("LED", layer="F.Cu", points=[(1, 16), (12, 16), (12, 24), (1, 24)], fill_mode="hatch", hatch_border_algorithm="bogus", id="p")', r"hatch_border_algorithm must be one of"),
         ('Pour(None, layer="F.Cu", points=[(31, 16), (34, 16), (34, 20), (31, 20)], keepout={"tracks": "maybe", "vias": "not_allowed"}, id="k1")', r"keepout\['tracks'\] must be one of 'allowed', 'not_allowed'"),
         ('Via("GND", (20, 5), tenting={"front": "maybe", "back": "yes"}, id="v1")', r"tenting\['front'\] must be one of 'yes', 'no'"),
-        ('Via("GND", (20, 5), tenting={"front": "none", "back": "none"}, id="v1")', r"tenting with every side 'none' is what KiCad writes nothing for; leave tenting= out"),
+        ('Via("GND", (20, 5), tenting={"front": "none", "back": "none"}, id="v1")', r"tenting with every side 'none' is what KiCad writes nothing for: its save drops the field, so the line does not survive a round trip$"),
         ('Via("GND", (20, 5), kind="bogus", id="v1")', r"kind must be one of 'through', 'blind', 'buried', 'micro'"),
         ('Rect((26, 2), (30, 8), layer="F.SilkS", stroke_type="bogus", id="r1")', r"stroke_type must be one of 'solid', 'dash'"),
         ('Text("j", (5, 3), layer="F.SilkS", justify=("middle",), id="t1")', r"justify holds 'middle'; KiCad's words are 'left', 'right', 'top', 'bottom', 'mirror'"),
@@ -2013,9 +2089,9 @@ def test_a_word_kicad_has_no_token_for_is_refused_at_load_naming_the_line(tmp_pa
     save keeps), and a uuid KiCad would rewrite is refused naming what it keeps."""
     board, design = _blinky(tmp_path)
     core = tmp_path / "layout.core.py"
-    core.write_text("# a comment\n" + line + "\n")
+    put_core(core, "# a comment\n" + line + "\n")
     with pytest.raises(ValueError, match=r"layout\.core\.py:2: .*" + says):
-        load_layout(core, design, source="core")
+        design = core_load(core)
 
 
 def test_an_astral_character_in_a_string_round_trips_through_layout_gen(tmp_path: Path):
@@ -2046,7 +2122,7 @@ def test_the_pour_step_pins_the_plane_inset_to_the_stackup():
     from pcbc.stackup import get_stackup
 
     for name in ("blinky", "node"):
-        design = load_board(EXAMPLES / name / f"{name}.py")
+        design = load_board(declared_examples() / name / f"{name}.py")  # a declared outline: (0, 0) to (w, h)
         job = compile_design(design)
         e = get_stackup(job.stackup).edge_clearance
         w, h = job.board_size_mm
@@ -2054,6 +2130,36 @@ def test_the_pour_step_pins_the_plane_inset_to_the_stackup():
         assert pours, name
         for p in pours:
             assert p.points == ((e, e), (w - e, e), (w - e, h - e), (e, h - e)), (name, p.points)
+
+
+def test_a_plane_pours_min_thickness_is_its_stackups_minimum_feature(tmp_path: Path):
+    """Postfix B3 (refutation stackup r2): `plane_pours` wrote `min_thickness 0.1` on every stackup, under JLC's 2 oz
+    minimum feature (2-layer 0.16 mm, multilayer 0.15 mm), so a 2 oz pour could fill necks of 0.10 to 0.16 mm with no
+    error (KiCad's track-width rule does not judge a zone fill). 1 oz stackups keep 0.1 (JLC 0.10 / 0.09 mm), and
+    `group_pitch` leaves the same gap between antipads."""
+    import shutil
+
+    from pcbc.compile import compile_design
+    from pcbc.paths import group_pitch
+    from pcbc.route_native import plane_pours
+
+    for name, stackup, want in (("buck", "jlcpcb_2l_1oz", 0.1), ("buck", "jlcpcb_2l_2oz", 0.16), ("node", "jlcpcb_4l_2oz", 0.15)):
+        work = tmp_path / f"{name}_{stackup}"
+        shutil.copytree(declared_examples() / name, work, ignore=shutil.ignore_patterns("layout"))
+        board = work / f"{name}.py"
+        text = board.read_text()
+        old = 'stackup="jlcpcb_2l_1oz"' if name == "buck" else 'stackup="jlcpcb_4l_1oz"'
+        assert old in text
+        write_split(board, text.replace(old, f'stackup="{stackup}"'))
+        design = load_board(board)
+        job = compile_design(design)
+        pours = plane_pours(design, job, name)
+        assert pours and {p.min_thickness for p in pours} == {want}, (stackup, [p.min_thickness for p in pours])
+    from dataclasses import replace
+
+    cs = job.constraints  # node on jlcpcb_4l_2oz: VBUS barrels pass the GND and 3V3 planes
+    thin = replace(cs, stackup=replace(cs.stackup, pour_min_mm=0.1))
+    assert round(group_pitch(cs, "VBUS", 0.8, 0.4) - group_pitch(thin, "VBUS", 0.8, 0.4), 4) == 0.05
 
 
 @pytest.mark.kicad
@@ -2072,7 +2178,7 @@ def test_a_gen_line_locked_alone_changes_nothing_else(tmp_path: Path):
     base = decompile((tmp_path / "layout" / "blinky" / "routed" / "layout.kicad_pcb").read_text())
     base_drc = next(s for s in first["steps"] if s["stage"] == "route")["drc_by_type"]
     line = next(x for x in Path(first["gen"]).read_text().splitlines() if x.startswith('Via("GND", (28.9179, 12.5)'))
-    (tmp_path / "layout.core.py").write_text(line + "\n")
+    put_core(tmp_path / "layout.core.py", line + "\n")
     again = build_job(board, upto="route", force=True)
     assert again.get("error") is None, again
     route = next(s for s in again["steps"] if s["stage"] == "route")
@@ -2082,7 +2188,7 @@ def test_a_gen_line_locked_alone_changes_nothing_else(tmp_path: Path):
     assert {c.uuid for c in got.copper} == {c.uuid for c in base.copper} and route["drc_by_type"] == base_drc
     assert sorted(g.f["name"] for g in got.graphics if g.kind == "group") == ["pcbc:hop:D1.2", "pcbc:tap:D1.1"]
     # a line the build would not draw is locked on the second pass, and the record says so
-    (tmp_path / "layout.core.py").write_text('Seg("LED", (5, 10), (9, 10), width=0.16, id="s1")\n')
+    put_core(tmp_path / "layout.core.py", 'Seg("LED", (5, 10), (9, 10), width=0.16, id="s1")\n')
     hand = build_job(board, upto="route", force=True)
     route = next(s for s in hand["steps"] if s["stage"] == "route")
     assert route["lock_passes"] == [{"locked": [], "reproduced": [], "missing": ["s1"]}, {"locked": ["s1"], "reproduced": [], "missing": []}] and route["locked"] == ["s1"]
@@ -2107,6 +2213,6 @@ def test_a_core_group_over_a_pattern_s_piece_is_refused_naming_both_groups(tmp_p
     board, _design = _blinky(tmp_path)
     first = build_job(board, upto="route", force=True)
     line = next(x for x in Path(first["gen"]).read_text().splitlines() if x.startswith('Seg("LED", (9.44, 12.5)'))
-    (tmp_path / "layout.core.py").write_text(line + '\nGroup("mine", ["seg-f9491dcd"], id="g1")\n')
+    put_core(tmp_path / "layout.core.py", line + '\nGroup("mine", ["seg-f9491dcd"], id="g1")\n')
     again = build_job(board, upto="route", force=True)
     assert again["error"] and "layout.core.py:2" in again["error"] and "pcbc:hop:D1.2" in again["error"] and "KiCad keeps an item in one group" in again["error"], again["error"]

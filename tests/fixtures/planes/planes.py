@@ -36,7 +36,7 @@ What each line is here for:
   placer that moved a part would move the measurement with it.
 """
 
-from pcbc import Board, Capacitor, Ground, Net, NetReq, Place, Power, Resistor, SchPlace
+from pcbc import Board, Capacitor, Ground, Net, NetReq, Power, Resistor, SchPlace
 
 V33 = Power("3V3")
 GND = Ground("GND")
@@ -54,22 +54,22 @@ Capacitor("C1", "100nF", p1=V33, p2=GND, **c805)
 Capacitor("C2", "100nF", p1=V33, p2=GND, **c805)
 Capacitor("C3", "100nF", p1=V33, p2=GND, **c805)
 
-Board(width=40, height=30, layers=2, stackup="jlcpcb_2l_1oz", planes=[("GND", "F.Cu"), ("GND", "B.Cu")])
-NetReq("3V3", "GND", kind="power", volts=3.3, amps=0.1)
+Board(layers=2, stackup="jlcpcb_2l_1oz", planes=[("GND", "F.Cu"), ("GND", "B.Cu")])
+NetReq("3V3", kind="power", volts=3.3); NetReq("GND", kind="power")
 NetReq("CLK", kind="clock", rise_ps=500)
 
-Place("R1", position="absolute", left=5, top=5, locked=True, reason="CLK, the net that declares the edge")
-Place("R2", position="absolute", left=11, top=5, locked=True, reason="CLK's other end")
-Place("R3", position="absolute", left=5, top=24, locked=True, reason="SIG, a second net for the pours to flow around")
-Place("R4", position="absolute", left=11, top=24, locked=True, reason="SIG's other end")
-Place("C1", position="absolute", left=30, top=5, locked=True, reason="decoupling, north-east")
-Place("C2", position="absolute", left=30, top=24, locked=True, reason="decoupling, south-east")
-Place("C3", position="absolute", left=22.74, top=14.02, locked=True, reason="its 3V3 pad sits on the interior lattice site at (23.4945, 15.0), so one site is refused by copper and the note has a blocker to name")
 
-SchPlace("R1", left=20, top=20)
-SchPlace("R2", left=60, top=20)
-SchPlace("R3", left=20, top=60)
-SchPlace("R4", left=60, top=60)
-SchPlace("C1", left=100, top=20)
-SchPlace("C2", left=100, top=60)
-SchPlace("C3", left=140, top=20)
+
+
+
+
+
+
+
+
+
+
+
+
+
+

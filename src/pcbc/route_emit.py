@@ -61,6 +61,11 @@ class Piece:
     drill: float | None = None  # via only
     owner: str = ""  # "U1.4", for the report and the sidecar
     uuid: str = ""
+    link: str = ""
+    """The path link this copper belongs to (`constraints.Link.key`), on a net whose paths carry a field
+    or a kind; `"@<pad>"` for a fanout escape or tap stub of that pad; `""` for the net's own copper and
+    on every other net (`docs/net-path-physics.md` §4.2). Its role group is built from it; `owner` stays
+    the net."""
 
     def __post_init__(self) -> None:
         if self.kind not in ("seg", "via"):
@@ -91,12 +96,12 @@ class Piece:
         return ((self.b[0] - self.a[0]) ** 2 + (self.b[1] - self.a[1]) ** 2) ** 0.5
 
 
-def seg_piece(net: str, reason: str, layer: str, a: Pt, b: Pt, w: float, *, owner: str = "", uuid: str = "") -> Piece:
-    return Piece("seg", net, reason, layer, a, b, w, owner=owner, uuid=uuid)
+def seg_piece(net: str, reason: str, layer: str, a: Pt, b: Pt, w: float, *, owner: str = "", uuid: str = "", link: str = "") -> Piece:
+    return Piece("seg", net, reason, layer, a, b, w, owner=owner, uuid=uuid, link=link)
 
 
-def via_piece(net: str, reason: str, at: Pt, size: float, drill: float, *, layers: tuple[str, str] = ("F.Cu", "B.Cu"), owner: str = "", uuid: str = "") -> Piece:
-    return Piece("via", net, reason, layers, at, None, size, drill, owner=owner, uuid=uuid)
+def via_piece(net: str, reason: str, at: Pt, size: float, drill: float, *, layers: tuple[str, str] = ("F.Cu", "B.Cu"), owner: str = "", uuid: str = "", link: str = "") -> Piece:
+    return Piece("via", net, reason, layers, at, None, size, drill, owner=owner, uuid=uuid, link=link)
 
 
 def piece_key(p: Piece) -> tuple:

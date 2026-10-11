@@ -230,4 +230,15 @@
 		(uuid "6f994d3d-2800-47d5-b256-665b170cf7f7")
 	)
 	(embedded_fonts no)
+	(model "${KICAD10_3DMODEL_DIR}/Button_Switch_SMD.3dshapes/SW_SPST_B3U-1000P.step"
+		(offset
+			(xyz 0 0 0)
+		)
+		(scale
+			(xyz 1 1 1)
+		)
+		(rotate
+			(xyz 0 0 0)
+		)
+	)
 )

@@ -28,7 +28,7 @@ from pcbc.compile import compile_design
 from pcbc.copper_bar import REDUNDANT
 from pcbc.fanout import fanout_pieces
 from pcbc.language import load_board
-from pcbc.patterns import PatternCtx, merge_plans, pattern_copper
+from pcbc.patterns import PatternCtx, pattern_copper
 from pcbc.route_emit import REASONS
 from boardtext import WithText, write_pieces
 from pcbc.route_geom import EPS_MM, clears, is_octilinear, track_shape, turn_ok
@@ -36,12 +36,14 @@ from pcbc.route_scene import clear_runs, net_runs
 from pcbc.route_verify import BRANCH_REASONS, guard_cover, guard_lines
 import pcbc.patterns.stitch as st
 from boardtext import scene_from_text
+from conftest import ds2_dir, write_split
+from conftest import copy_board_file
 
 ROOT = Path(__file__).resolve().parent.parent
 EXAMPLES = ROOT / "examples"
 FIXTURE = ROOT / "tests" / "fixtures" / "guard" / "guard.py"
 VECTORS = ROOT / "tests" / "fixtures" / "clear_runs_vectors.json"
-DS2 = Path.home() / "Documents" / "MaD" / "Hardware" / "DS2Addon" / "pcbc" / "ds2_addon.py"
+DS2 = ds2_dir() / "ds2_addon.py"
 HAS_DS2 = DS2.exists()
 
 
@@ -78,8 +80,8 @@ def _routed_to_patterns(name: str):
     pre = pattern_copper(design, job, job.constraints, board, stage="pre", scene=scene_from_text(design, job, job.constraints, text))
     fan, _n = fanout_pieces(design, job, board, scene=pre.scene, claimed=pre.claimed)
     pre.scene.add(pre.scene.item_of(p) for p in fan)
-    mid = pattern_copper(design, job, job.constraints, board, stage="mid", scene=pre.scene)
-    merged = WithText(merge_plans(pre, mid), write_pieces(text, list(pre.pieces) + list(fan) + list(mid.pieces)))
+    # No mid stage since the spine pattern was deleted (docs/physics-subjects.md PR 3, KD 14).
+    merged = WithText(pre, write_pieces(text, list(pre.pieces) + list(fan)))
     owned = tuple(merged.pieces) + tuple(fan)
     scene = scene_from_text(design, job, job.constraints, merged.text)
     ctx = PatternCtx(scene=scene, design=design, job=job, cs=job.constraints, board=board, stage="final", owned=owned)
@@ -99,8 +101,13 @@ def _final(name: str):
 ROUTED_BY_PCBC = {
     "blinky": ["LED"],
     "buck": [],
-    "c3_usb": ["CC1", "CC2", "LED"],
-    "node": ["CC1", "CC2", "LED", "LED_A", "LOAD"],
+    # LED left 2026-10-07: U1.3V3's caps stand beside the pin again (pcb_place._relate's decoupling reach), so the spot
+    # right of U1 they took inside I0 is free and R_LED takes it, at (20.48, 13.45): its hop to U1.16 passes U1.14 [GND]
+    # with -0.080 mm of the 0.200 mm Power needs, and the router routes LED instead (3 segments, 6.31 mm; it was a 4.18 mm hop).
+    "c3_usb": ["CC1", "CC2"],
+    # LOAD left 2026-10-02: its 1 A link is a Path's, which a hop or chain does not draw (docs/physics-subjects.md PR 3).
+    # LED_A left 2026-10-03: D1 and R_LED sit 1.34 mm apart and the shortest hop runs 1.885x that (2026-10-03: the silkscreen no longer re-places a part whose reference has no room (node's C_EN, R_EN and R_LED went 0.6 mm further out before)).
+    "node": ["CC1", "CC2", "LED"],
     "ds2": ["A0", "A1", "A2", "A3", "DRDY", "REFN", "REFP", "UART_RX", "UART_TX", "nRESET"],
 }
 """Every net pcbc routes **end to end** on each board, measured 2026-09-21 over the pre + fanout + mid
@@ -138,8 +145,8 @@ def test_the_nets_worth_guarding_on_a_real_board_are_all_krts():
 
     `Guard("AIN0")` is the line the DS2 Addon would carry — `AIN0..AIN3`, `REFP_F` and `REFN_F` are
     its analog inputs and the reason it has two grounds at all. Not one of them is pcbc's, and the
-    reason is structural rather than incidental: `kind="analog"` compiles to a single layer and no
-    vias, which is what sends a net to KRT's constrained step."""
+    reason was structural: `kind="analog"` compiled to a single layer and no vias. Since
+    docs/physics-subjects.md PR 5 it does not, and they are still not pcbc's pattern copper."""
     ctx, merged = _routed_to_patterns("ds2")
     analog = sorted(c.net for c in ctx.cs.constraints if c.kind == "analog")
     assert analog == ["AIN0", "AIN1", "AIN2", "AIN3", "REFN_F", "REFP_F"], analog
@@ -147,9 +154,11 @@ def test_the_nets_worth_guarding_on_a_real_board_are_all_krts():
         "every declared-analog net on the one board that has any is routed by KRT, so B.6's deferral "
         "is the guard's output on a real board and not its exception"
     )
+    # docs/physics-subjects.md PR 5 (§3.5): `kind="analog"` no longer pins a net to one layer with no vias; the
+    # node keeps its span and keep-aways and its copper may use either layer.
     for net in analog:
         c = ctx.cs.by_net(net)
-        assert c.layers == ("F.Cu",) and not c.via.allowed, (net, c.layers, c.via.allowed)
+        assert c.layers == ("F.Cu", "B.Cu") and c.via.allowed, (net, c.layers, c.via.allowed)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -572,7 +581,7 @@ def test_a_ground_with_no_pour_is_a_pattern_refusal_naming_the_board_edit():
     moves = [m for m in plan.moves if m.startswith("guard")]
     assert len(moves) == 2, moves
     assert "has no plane or pour on this board" in moves[0]
-    assert 'NetReq("GND", kind="power")' in moves[0] and 'Board(planes=' in moves[0]
+    assert 'NetReq("GND"' not in moves[0] and "Board(planes=" not in moves[0], moves[0]
     assert not [p for p in plan.pieces if p.reason == "guard"]
 
 
@@ -618,17 +627,37 @@ def test_guard_ground_reaches_the_router_and_an_undeclared_one_is_refused(tmp_pa
         'c = dict(package="0805", manufacturer="Yageo", mpn="CC0805KRX7R9BB104", lcsc="C49678")\n'
         'Capacitor("C1", "100nF", p1=V, p2=G, **c)\nCapacitor("C2", "100nF", p1=S, p2=G, **c)\n'
         'Board(width=40, height=25, layers=2, stackup="jlcpcb_2l_1oz")\n'
-        'NetReq("3V3", "GND", kind="power", volts=3.3, amps=0.1)\n'
+        'NetReq("3V3", kind="power", volts=3.3); NetReq("GND", kind="power")\n'
     )
     good = tmp_path / "good.py"
-    good.write_text(body + 'Guard("SIG", ground="GND")\n')
+    write_split(good, body + 'Guard("SIG", ground="GND")\n')
     cs = compile_design(load_board(good)).constraints
     assert cs.refusals == () and cs.by_net("SIG").guard_ground == "GND"
     bad = tmp_path / "bad.py"
-    bad.write_text(body + 'Guard("SIG", ground="GNDD")\n')
+    write_split(bad, body + 'Guard("SIG", ground="GNDD")\n')
     cs2 = compile_design(load_board(bad)).constraints
     assert cs2.refusals and 'no net "GNDD" to make the guard out of' in cs2.refusals[0], cs2.refusals
-    assert "did you mean 'GND'?" in cs2.refusals[0]
+    assert "the nearest net name on this board is 'GND'" in cs2.refusals[0]
+
+
+def test_one_net_gets_one_guard(tmp_path: Path):
+    """Round 3 (refute-onehome): two `Guard()` lines on one net both compiled. The compile loop overwrote the net's
+    pitch and ground once per line, so the later one won, and the report found the line with `next()`, the first:
+    c3_usb printed "LED: guard stitch 4 mm in 3V3 (Guard line 277; ...)" where line 277 wrote 1 mm in GND."""
+    body = (
+        'from pcbc import Board, Capacitor, Ground, Guard, Net, NetReq, Power\n'
+        'V = Power("3V3")\nG = Ground("GND")\nS = Net("SIG")\n'
+        'c = dict(package="0805", manufacturer="Yageo", mpn="CC0805KRX7R9BB104", lcsc="C49678")\n'
+        'Capacitor("C1", "100nF", p1=V, p2=G, **c)\nCapacitor("C2", "100nF", p1=S, p2=G, **c)\n'
+        'Board(width=40, height=25, layers=2, stackup="jlcpcb_2l_1oz")\n'
+        'NetReq("3V3", kind="power", volts=3.3); NetReq("GND", kind="power")\n'
+        'Guard("SIG", stitch_mm=1.0)\nGuard("SIG", stitch_mm=4.0, ground="3V3")\n'
+    )
+    board = tmp_path / "two.py"
+    write_split(board, body)
+    cs = compile_design(load_board(board)).constraints
+    assert cs.refusals == ('Guard("SIG") line 11: SIG already has a Guard() on line 10; one net, one guard',), cs.refusals
+    assert (cs.by_net("SIG").guard_stitch_mm, cs.by_net("SIG").guard_ground) == (1.0, "GND")
 
 
 @pytest.mark.parametrize("name", ["blinky", "buck", "c3_usb", "node"])
@@ -665,7 +694,7 @@ def test_the_fixture_builds_to_fab_with_the_guard_gate_verified(tmp_path: Path):
     from pcbc.build import build_job
 
     work = tmp_path / "guard.py"
-    work.write_text(FIXTURE.read_text())
+    copy_board_file(work, FIXTURE)
     result = build_job(work, upto="fab", force=True)
     assert result["error"] is None, result["error"]
     route = next(s for s in result["steps"] if s.get("stage") == "route")

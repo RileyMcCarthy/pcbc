@@ -23,10 +23,12 @@ from pcbc.fab import _IGNORE_DRC, _write_notes, copper_drc_errors
 from pcbc.language import load_board
 from pcbc.seed import emit_pcb, emit_pro
 from boardtext import seed_job
+from conftest import ds2_dir, write_split
+from conftest import copy_board_file
 
 EXAMPLES = Path(__file__).resolve().parent.parent / "examples"
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
-DS2 = Path.home() / "Documents" / "MaD" / "Hardware" / "DS2Addon" / "pcbc"
+DS2 = ds2_dir()
 
 NOT_OWN = "!(A.Type == 'Pad' && B.Type == 'Pad' && A.Reference == B.Reference)"
 
@@ -49,17 +51,16 @@ TAIL = '''
 for i, r in enumerate(["R1","R2","R3","R4","R5","R6","R7","R8","R9","C1","C2"]):
     Place(r, at=(5 + 3*i, 5)); SchPlace(r, left=20 + 30*i, top=20)
 '''
-EVERY_KIND = '''NetReq("VCC", "GND", kind="power", volts=5, amps=1)
-NetReq("HV", kind="power", volts=250, amps=0.5)
-NetReq("FB", kind="feedback", keep_clear_of="SW")
-NetReq("SW", kind="switch_node", loop_mm2=45)
+EVERY_KIND = '''NetReq("VCC", kind="power", volts=5); NetReq("GND", kind="power")
+NetReq("HV", kind="power", volts=250)
+NetReq("FB", kind="analog", keep_clear_of="SW")
+NetReq("SW", kind="switch_node")
 NetReq("CLK", kind="clock")
-NetReq("D_P", "D_N", kind="usb_hs")
-NetReq("SCK", "MOSI", "MISO", kind="spi", clock="SCK", length_mm=80)
+Pair("D_P", "D_N", kind="usb_hs")
+Bus("SCK", "MOSI", "MISO", kind="spi", clock="SCK")
 NetReq("SDA", "SCL", kind="i2c", pf_max=400)
-NetReq("SENSE_P", "SENSE_N", kind="sense")
+NetReq("SENSE_P", "SENSE_N", kind="analog")
 NetReq("AIN0", kind="analog", keep_clear_of="SW", keep_clear_mm=3)
-NetReq("Z50", z_se_ohm=50)
 NetReq("SIG", kind="digital", volts=48)
 '''
 TWO = 'Board(width=40, height=25, layers=2, stackup="jlcpcb_2l_1oz")\n'
@@ -75,7 +76,7 @@ Resistor("U7", "opto", package="0603", mpn="X", lcsc="C1", p1="LED_A", p2="OUT")
 Board(width=40, height=25, layers=2, stackup="jlcpcb_2l_1oz")
 Region("primary", left=0, top=0, width=18, height=25)
 Region("secondary", left=22, top=0, width=18, height=25)
-NetReq("VCC", "GND", "VS", "GS", kind="power", volts=5, amps=1)
+NetReq("VCC", "VS", kind="power", volts=5); NetReq("GND", "GS", kind="power")
 '''
 ISO_TAIL = '''Place("R1", parent="primary", left=2, top=2); Place("C1", to="R1.1"); Place("R2", parent="secondary", left=2, top=2); Place("C2", to="R2.1")
 for i, r in enumerate(["R1","R2","C1","C2","U7"]):
@@ -87,7 +88,7 @@ ISO_SLOT = 'Isolation("primary", "secondary", volts=250, across=("U7",), slot=Tr
 
 def _board(tmp_path: Path, name: str, text: str) -> Path:
     p = tmp_path / f"{name}.py"
-    p.write_text(text)
+    write_split(p, text)
     return p
 
 
@@ -107,34 +108,26 @@ def test_every_row_of_e_is_pinned_on_two_layers(tmp_path: Path):
         ("pcbc_geometry_segments", "(constraint track_segment_length (min 0.2mm))", "A.Type == 'Track'", "warning"),
         ("pcbc_geometry_angles", "(constraint track_angle (min 135))", "A.Type == 'Track'", "warning"),
         # E.3 class widths (R-I1), soft: power, z_se_ohm classes; the 2L USB pair sits at track_min and gets none
-        ("width_power", "(constraint track_width (min 0.4mm))", "A.hasNetclass('Power')", "warning"),
-        ("width_power_2", "(constraint track_width (min 0.4mm))", "A.hasNetclass('Power_2')", "warning"),
-        ("width_z50", "(constraint track_width (min 1.5912mm))", "A.hasNetclass('Z50')", "warning"),
+        # docs/physics-subjects.md KD 12: a class's width is the class floor (no net carries a current)
+        ("width_power", "(constraint track_width (min 0.16mm))", "A.hasNetclass('Power')", "warning"),
+        ("width_power_2", "(constraint track_width (min 0.16mm))", "A.hasNetclass('Power_2')", "warning"),
         # E.4 keep-aways (R-D3, R-A1), one per (class, other net), the footprint's own pads exempt
-        ("feedback_away_from_sw", "(constraint clearance (min 3mm))", f"A.hasNetclass('Feedback') && B.NetName == 'SW' && {NOT_OWN}", "error"),
-        ("analog_away_from_sw", "(constraint clearance (min 3mm))", f"A.hasNetclass('Analog') && B.NetName == 'SW' && {NOT_OWN}", "error"),
+        # PR 7: FB, SENSE_P/N and AIN0 are all kind analog and share class Analog; only FB and AIN0 wrote keep_clear_of="SW",
+        # so the rule names those two nets (a keep-away is the NetReq's that wrote it, net to net)
+        ("analog_away_from_sw", "(constraint clearance (min 3mm))", f"(A.NetName == 'AIN0' || A.NetName == 'FB') && B.NetName == 'SW' && {NOT_OWN}", "error"),
         # E.6 creepage by volts (R-V1): the 250 V class only (C.8: IEC 60664-1 F.5 row 250 V IIIa PD2 = 2.5); 48 V gets none
         ("creepage_power_2", "(constraint creepage (min 2.5mm))", "A.hasNetclass('Power_2') && !B.hasNetclass('Power_2') && B.NetName != ''", "error"),
-        # E.7 routed length (R-L1): length_mm= on spi, C.9 on i2c ((400 - 20) / 0.0404 pF/mm), never from max_mm
-        ("length_miso", "(constraint length (max 80mm))", "A.NetName == 'MISO'", "error"),
-        ("length_mosi", "(constraint length (max 80mm))", "A.NetName == 'MOSI'", "error"),
-        ("length_sck", "(constraint length (max 80mm))", "A.NetName == 'SCK'", "error"),
+        # E.7 routed length (R-L1): C.9 on i2c ((400 - 20) / 0.0404 pF/mm), never from max_mm; a Path's
+        # length_mm= reaches KiCad only on a whole-node Path (docs/physics-subjects.md KD 12)
         ("length_scl", "(constraint length (max 9412.47mm))", "A.NetName == 'SCL'", "error"),
         ("length_sda", "(constraint length (max 9412.47mm))", "A.NetName == 'SDA'", "error"),
-        # E.9 no vias (R-D3, R-A1), per net: analog, feedback, sense, switch_node
-        ("novia_ain0", "(constraint via_count (max 0))", "A.NetName == 'AIN0'", "error"),
-        ("novia_fb", "(constraint via_count (max 0))", "A.NetName == 'FB'", "error"),
-        ("novia_sense_n", "(constraint via_count (max 0))", "A.NetName == 'SENSE_N'", "error"),
-        ("novia_sense_p", "(constraint via_count (max 0))", "A.NetName == 'SENSE_P'", "error"),
-        ("novia_sw", "(constraint via_count (max 0))", "A.NetName == 'SW'", "error"),
-        # E.10 via budget (R-Z4), soft: clock and usb_hs at 2 (D)
-        ("vias_clk", "(constraint via_count (max 2))", "A.NetName == 'CLK'", "warning"),
+        # E.9 no vias: no net kind forbids vias since PR 5 (§3.5); a whole-node Path's vias=False is the only source.
+        # E.10 via budget (R-Z4), soft: the usb_hs pair at 2 (the clock's budget is a Path's since PR 5)
         ("vias_d_n", "(constraint via_count (max 2))", "A.NetName == 'D_N'", "warning"),
         ("vias_d_p", "(constraint via_count (max 2))", "A.NetName == 'D_P'", "warning"),
-        # E.8 skew (R-L2), soft: the pair (0.5, TI usb_layout_basics), the spi bus (2.5), the sense pair (1.0, R-A2); members sorted
+        # E.8 skew (R-L2), soft: the pair (0.5, TI usb_layout_basics), the spi bus (2.5); members sorted (sense is a Path kind since PR 7)
         ("skew_d_n_d_p", "(constraint skew (max 0.5mm))", "A.NetName == 'D_N' || A.NetName == 'D_P'", "warning"),
         ("skew_miso_mosi_sck", "(constraint skew (max 2.5mm))", "A.NetName == 'MISO' || A.NetName == 'MOSI' || A.NetName == 'SCK'", "warning"),
-        ("skew_sense_n_sense_p", "(constraint skew (max 1mm))", "A.NetName == 'SENSE_N' || A.NetName == 'SENSE_P'", "warning"),
         # E.11 pair gap (R-Z5), error, the class's own 3-dp gap (the .2f form printed 0.13 where the class and the report say 0.127): max(0.1, 0.127 - 0.03) / 0.127; E.12 uncoupled 2 mm, soft
         ("usb_pair_gap", "(constraint diff_pair_gap (min 0.1mm) (opt 0.127mm))", "A.hasNetclass('USB')", "error"),
         ("uncoupled_usb", "(constraint diff_pair_uncoupled (max 2mm))", "A.hasNetclass('USB')", "warning"),
@@ -148,11 +141,10 @@ def test_every_row_of_e_is_pinned_on_four_layers(tmp_path: Path):
     got = _rules(tmp_path, "four", HEAD + FOUR + EVERY_KIND + TAIL)
     names = [g[0] for g in got]
     assert ("width_usb", "(constraint track_width (min 0.2288mm))", "A.hasNetclass('USB')", "warning") in got, "E.3: the 7628 pair (C.2 vector 9) is wider than track_min, so its class gets the soft width rule"
-    assert ("width_z50", "(constraint track_width (min 0.3244mm))", "A.hasNetclass('Z50')", "warning") in got, "C.2 vector 5: 50 ohm on 7628 = 0.3244"
     assert ("usb_pair_gap", "(constraint diff_pair_gap (min 0.12mm) (opt 0.15mm))", "A.hasNetclass('USB')", "error") in got, "E.11: max(0.1, 0.15 - 0.03) / 0.15 at 2 dp"
     assert ("length_sda", "(constraint length (max 4177.07mm))", "A.NetName == 'SDA'", "error") in got, "C.9 on 7628 at the 0.16 mm floor"
     assert names[:2] == ["pcbc_geometry_segments", "pcbc_geometry_angles"] and names[-2:] == ["pads_of_one_footprint", "pcbc_canary"]
-    assert names.index("width_usb") < names.index("analog_away_from_sw") < names.index("creepage_power_2") < names.index("length_miso") < names.index("novia_ain0") < names.index("vias_clk") < names.index("skew_d_n_d_p") < names.index("usb_pair_gap") < names.index("uncoupled_usb"), "E: general to specific, KiCad applies the last matching rule of a type"
+    assert names.index("width_usb") < names.index("analog_away_from_sw") < names.index("creepage_power_2") < names.index("length_sda") < names.index("vias_d_p") < names.index("skew_d_n_d_p") < names.index("usb_pair_gap") < names.index("uncoupled_usb"), "E: general to specific, KiCad applies the last matching rule of a type"
 
 
 def test_isolation_rows_e13_to_e15_are_pinned(tmp_path: Path):
@@ -190,13 +182,23 @@ def test_todays_rules_are_still_written_unchanged_and_the_examples_lists_are_pin
         lists[name] = [r.name for r in job.dru]
     assert lists == {
         "blinky": ["pcbc_geometry_segments", "pcbc_geometry_angles", "width_power", "pads_of_one_footprint", "pcbc_canary"],
-        "buck": ["pcbc_geometry_segments", "pcbc_geometry_angles", "width_power", "novia_fb", "novia_sw", "pads_of_one_footprint", "pcbc_canary"],
+        # docs/physics-subjects.md PR 3 / KD 12: one Power class at the floor; no Path on buck names every pad of
+        # its net, so KiCad gets no per-net width (the report lists each path width KiCad does not check).
+        # PR 5 (§3.5): FB (analog) forbids no vias any more, so no novia_fb.
+        "buck": ["pcbc_geometry_segments", "pcbc_geometry_angles", "width_power", "pads_of_one_footprint", "pcbc_canary"],
         "c3_usb": ["pcbc_geometry_segments", "pcbc_geometry_angles", "width_power", "vias_usb_dn", "vias_usb_dp", "skew_usb_dn_usb_dp", "usb_pair_gap", "uncoupled_usb", "pads_of_one_footprint", "pcbc_canary"],
-        "node": ["pcbc_geometry_segments", "pcbc_geometry_angles", "width_usb", "width_power", "novia_t_div", "novia_t_out", "vias_usb_dn", "vias_usb_dp", "skew_usb_dn_usb_dp", "usb_pair_gap", "uncoupled_usb", "pads_of_one_footprint", "pcbc_canary"],
+        # KD 12: LOAD's one Path names both of its pads, so it is the whole node and KiCad checks its 0.4 mm.
+        "node": ["pcbc_geometry_segments", "pcbc_geometry_angles", "width_usb", "width_power", "width_net_load", "vias_usb_dn", "vias_usb_dp", "skew_usb_dn_usb_dp", "usb_pair_gap", "uncoupled_usb", "pads_of_one_footprint", "pcbc_canary"],
     }
     c3 = {r.name: r for r in compile_design(load_board(EXAMPLES / "c3_usb" / "c3_usb.py")).dru}
     assert (c3["usb_pair_gap"].constraint, c3["usb_pair_gap"].condition) == ("(constraint diff_pair_gap (min 0.1mm) (opt 0.127mm))", "A.hasNetclass('USB')"), "E.11: today's numbers, the condition rewritten from A.NetClass =="
+    buck = {r.name: r for r in compile_design(load_board(EXAMPLES / "buck" / "buck.py")).dru}
+    # docs/physics-subjects.md KD 12 (O3): KiCad cannot select the copper between two pads, so a path's width
+    # reaches KiCad only as the rule of a net whose one Path names every pad.
+    assert not any(n.startswith("width_net_") or n.endswith("_b_cu") for n in buck), "no buck Path is a whole node"
     node = {r.name: r for r in compile_design(load_board(EXAMPLES / "node" / "node.py")).dru}
+    assert (node["width_net_load"].constraint, node["width_net_load"].condition, node["width_net_load"].severity) == (
+        "(constraint track_width (min 0.4mm))", "A.NetName == 'LOAD'", "warning"), "KD 12: LOAD's Path is the whole node"
     assert node["usb_pair_gap"].constraint == "(constraint diff_pair_gap (min 0.12mm) (opt 0.15mm))", "H.2: node's pair at 0.2288 / 0.15"
     assert node["width_usb"].constraint == "(constraint track_width (min 0.2288mm))"
 
@@ -274,12 +276,20 @@ def test_project_classes_are_ordered_like_todays_files_and_seed_and_apply_agree(
         _apply_pro(pro, job)
         applied = json.loads(pro.read_text())
         assert [{k: r[k] for k in row} for r, row in zip(applied["net_settings"]["classes"], rows)] == rows, "identical class rows from both writers"
+        if name == "buck":
+            # docs/physics-subjects.md PR 3: every power net of buck is one Power class at the floor.
+            assert [r["name"] for r in rows] == ["Default", "Analog", "Power", "SwitchNode"], rows
+            continue
+        # Re-recorded 2026-10-02 for docs/physics-subjects.md PR 3 and PR 5, the only changes: every class but the pair's
+        # is the 0.16 mm class floor at the stackup via (a net kind sets no width or via), and node's LOAD is in Default (§8).
+        # Re-recorded 2026-10-03, the only change: the fab's silk rules (`stackup.silk_rules`) and KiCad's five silk
+        # checks as errors (`stackup.SILK_SEVERITIES`).
         assert pro.read_text() == (FIXTURES / "project" / f"{name}.kicad_pro").read_text(), f"{name}: the placed/routed/fab .kicad_pro is byte-identical to the one recorded before S3"
     node = project_classes(compile_design(load_board(EXAMPLES / "node" / "node.py")).constraints)
     assert node == [
         {"name": "Default", "clearance": 0.18, "track_width": 0.16, "via_diameter": 0.35, "via_drill": 0.2},
-        {"name": "Analog", "clearance": 0.2, "track_width": 0.2, "via_diameter": 0.6, "via_drill": 0.3},
-        {"name": "Power", "clearance": 0.2, "track_width": 0.4, "via_diameter": 0.8, "via_drill": 0.4},
+        {"name": "Analog", "clearance": 0.2, "track_width": 0.16, "via_diameter": 0.35, "via_drill": 0.2},
+        {"name": "Power", "clearance": 0.2, "track_width": 0.16, "via_diameter": 0.35, "via_drill": 0.2},
         {"name": "USB", "clearance": 0.18, "track_width": 0.2288, "via_diameter": 0.35, "via_drill": 0.2, "diff_pair_gap": 0.15, "diff_pair_width": 0.2288},
     ], "node's rows: H.2 pair 0.2288 / 0.15; everything else today's"
 
@@ -293,7 +303,7 @@ def test_apply_pro_keeps_what_kicad_added_to_a_row(tmp_path: Path):
     names = [c["name"] for c in got["classes"]]
     assert names == ["Default", "Analog", "Power", "SwitchNode", "KRT"], "today's order: the listed classes first, then the rest as the file had them"
     power = next(c for c in got["classes"] if c["name"] == "Power")
-    assert (power["track_width"], power["clearance"], power["pcb_color"]) == (0.781, 0.2, "rgba(1, 2, 3, 1.000)")
+    assert (power["track_width"], power["clearance"], power["pcb_color"]) == (0.16, 0.2, "rgba(1, 2, 3, 1.000)")  # the class floor (physics-subjects PR 3)
     assert got["netclass_patterns"][0] == {"netclass": "Default", "pattern": "SW"} or {"netclass": "Power", "pattern": "VIN"} in got["netclass_patterns"]
 
 
@@ -396,9 +406,9 @@ def test_fab_notes_print_the_constraint_lines_and_the_rule_count(tmp_path: Path)
     job = compile_design(load_board(EXAMPLES / "node" / "node.py"))
     _write_notes(tmp_path, job, {"via_in_pad": [], "fiducials": [], "missing_lcsc": []})
     notes = (tmp_path / "FAB_NOTES.md").read_text()
-    assert "\n## Constraints\n\n- 3V3: width 0.4 mm (pcbc_floor amps >= 0.2; ipc2221_ext 1 A 10 C 1 oz 0.300; ipc2152_fit x board 1.099 x plane 0.430 at 0.2104 mm In1.Cu 0.134)\n" in notes
+    assert "\n## Constraints\n\n- 3V3: width 0.16 mm (class_floor max(0.16, track_min 0.0889))\n" in notes
     assert "- USB_DP: skew 0.5 mm (preset usb_hs; TI usb_layout_basics) [soft: warning in R1]\n" in notes
-    assert notes.endswith("- classes: Default 0.16/0.18, USB 0.2288/0.18 pair 0.2288/0.15, Power 0.4/0.2 via 0.8/0.4, Analog 0.2/0.2 via 0.6/0.3\n- rules: 13 written (4 error, 6 soft), canary on net 3V3\n"), "node: 13 rules; error: novia x2, usb_pair_gap, pads_of_one_footprint; soft: width x2, vias x2, skew, uncoupled; the geometry rules and the canary are warnings of neither kind"
+    assert notes.endswith("- classes: Default 0.16/0.18, USB 0.2288/0.18 pair 0.2288/0.15, Power 0.16/0.2, Analog 0.16/0.2\n- rules: 12 written (2 error, 7 soft), canary on net 3V3\n"), "node: 12 rules; error: usb_pair_gap, pads_of_one_footprint (no novia since PR 5); soft: width x2, width_net_load (KD 12), vias x2, skew, uncoupled; the geometry rules and the canary are warnings of neither kind"
 
 
 def test_power_ampacity_gates_the_copper_pcbc_wrote_and_not_the_nets_widest_track():
@@ -412,7 +422,8 @@ def test_power_ampacity_gates_the_copper_pcbc_wrote_and_not_the_nets_widest_trac
     leftover, which is the honest number and is a ledger rather than a build stopper.
     """
     job = compile_design(load_board(EXAMPLES / "node" / "node.py"))
-    assert job.constraints.by_net("VBUS").current.width_ipc2221.value == 0.3
+    lk = job.constraints.link("VBUS", "J1.A4B9", "U2.1")
+    assert lk is not None and lk.current.width_ipc2221.value == 0.3 and lk.key == "J1.A4B9~U2.1"
     text = (
         '(kicad_pcb\n\t(net 1 "VBUS")\n\t(net 2 "LOAD")\n'
         '\t(segment\n\t\t(start 1 1)\n\t\t(end 5 1)\n\t\t(width 0.2)\n\t\t(layer "F.Cu")\n\t\t(net 1)\n\t)\n'
@@ -421,13 +432,16 @@ def test_power_ampacity_gates_the_copper_pcbc_wrote_and_not_the_nets_widest_trac
     )
     assert copper_by_net(text)["VBUS"] == {"segment": 2, "via": 0, "zone": 0, "width": 0.781, "width_min": 0.2}, "both, because a presence test wants the max and an ampacity question wants the min"
     assert power_ampacity_failures(job, text) == [], "nothing here is pcbc's, so the gate has nothing of pcbc's to judge"
-    # The same board with that 0.2 mm segment written by a spine, which is the bug the gate exists
-    # to catch: B.0 says a pattern never degrades, and the class is 0.4 mm.
-    assert power_ampacity_failures(job, text, owned=[("VBUS", "spine", 0.2)]) == [
-        "VBUS spine copper 0.2 mm < the 0.4 mm VBUS class (1 A, IPC asks 0.3 mm)"
+    # docs/physics-subjects.md PR 3: the current is the Path's, so the 0.2 mm piece is judged against its link
+    # (Path line 111, 1 A, 0.4 mm), and a power net's copper no link owns against the 0.16 mm class floor.
+    assert power_ampacity_failures(job, text, owned=[("VBUS", "route", 0.2, "J1.A4B9~U2.1", "F.Cu")]) == [
+        "VBUS route copper 0.2 mm on F.Cu < the 0.4 mm Path line 66's link J1.A4B9~U2.1 needs on F.Cu (1 A)"
     ]
-    assert power_ampacity_failures(job, text, owned=[("VBUS", "tap", 0.2)]) == [], "R-I3's neck into a pad is a tap's and a fanout's alone"
-    assert power_ampacity_failures(replace(job, constraints=None), text, owned=[("VBUS", "spine", 0.2)]) == [], "without a ConstraintSet there is no class width to judge against"
+    assert power_ampacity_failures(job, text, owned=[("VBUS", "hop", 0.127, "", "F.Cu")]) == [
+        "VBUS hop copper 0.127 mm on F.Cu < the 0.16 mm VBUS needs on F.Cu off its paths (on no Path: the net's own numbers, NetReq line 63)"
+    ], "a pattern never writes a power net under its class width"
+    assert power_ampacity_failures(job, text, owned=[("VBUS", "tap", 0.127, "", "F.Cu")]) == [], "R-I3's neck into a pad is a tap's and a fanout's alone"
+    assert power_ampacity_failures(replace(job, constraints=None), text, owned=[("VBUS", "route", 0.2, "J1.A4B9~U2.1", "F.Cu")]) == [], "without a ConstraintSet there is no width to judge against"
 
 
 # ---------------------------------------------------------------------------------------------
@@ -587,9 +601,10 @@ def buck_routed(tmp_path_factory) -> tuple[Path, Path]:
     from pcbc.build import build_job
 
     work = tmp_path_factory.mktemp("buck")
-    src = Path(__file__).resolve().parent.parent / "examples" / "buck"
+    # The pre-migration buck (conftest.vehicle_examples): a complete board to probe the rule kinds on.
+    src = Path(__file__).resolve().parent / "fixtures" / "buck_netreq"
     board = work / "buck.py"
-    board.write_text((src / "buck.py").read_text())
+    copy_board_file(board, src / "buck.py")
     shutil.copytree(src / "components", work / "components")
     result = build_job(board, upto="route", force=True)
     assert result.get("error") is None, result.get("error")
@@ -673,8 +688,9 @@ def test_the_gate_reports_soft_and_rule_counts_on_the_routed_ds2_board(ds2_route
     # class width; the old router necked power tracks at closed rows, and the native router draws every
     # net at its compiled class width (`route_cost.NetCost.width_mm`), so the hit count is zero.
     assert gate["soft"] == {"width_power": 0}, "H.3: no power copper below its class width on the natively routed DS2 board"
-    assert set(gate["rules"]) == {"pcbc_geometry_segments", "pcbc_geometry_angles", "width_power", "novia_ain0", "novia_ain1", "novia_ain2", "novia_ain3", "novia_refn_f", "novia_refp_f", "pads_of_one_footprint", "pcbc_canary"}
-    assert gate["rules"]["pcbc_canary"] == 1 and all(gate["rules"][n] == 0 for n in gate["rules"] if n.startswith("novia_"))
+    # docs/physics-subjects.md PR 5 (§3.5): the analog nets forbid no vias any more, so no novia_ rules.
+    assert set(gate["rules"]) == {"pcbc_geometry_segments", "pcbc_geometry_angles", "width_power", "pads_of_one_footprint", "pcbc_canary"}
+    assert gate["rules"]["pcbc_canary"] == 1
     assert gate["rules"]["pcbc_geometry_segments"] == gate["geometry"]["segments"] and gate["rules"]["pcbc_geometry_angles"] == gate["geometry"]["angles"]
 
 

@@ -1,0 +1,11 @@
+from pcbc import *
+Seg("W", (20, 3.1125), (20, 20.8875), width=0.3, layer="F.Cu")
+Outline(width=40, height=24)
+Place("R1", at=(5, 12))
+Place("R2", at=(34, 13))
+Place("R3", at=(34, 6))
+Place("R4", at=(9, 19))
+Place("R5", at=(29, 19))
+Place("R6", at=(26, 19))
+Place("RW1", at=(20, 2.2), rot=90)
+Place("RW2", at=(20, 21.8), rot=270)

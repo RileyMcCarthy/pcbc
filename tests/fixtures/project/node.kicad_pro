@@ -10,10 +10,18 @@
         "min_through_hole_diameter": 0.2,
         "min_hole_clearance": 0.25,
         "min_hole_to_hole": 0.5,
-        "min_copper_edge_clearance": 0.3
+        "min_copper_edge_clearance": 0.3,
+        "min_text_height": 1.0,
+        "min_text_thickness": 0.15,
+        "min_silk_clearance": 0.15
       },
       "rule_severities": {
-        "hole_to_hole": "error"
+        "hole_to_hole": "error",
+        "silk_overlap": "error",
+        "silk_over_copper": "error",
+        "silk_edge_clearance": "error",
+        "text_height": "error",
+        "text_thickness": "error"
       }
     }
   },
@@ -33,16 +41,16 @@
       {
         "name": "Analog",
         "clearance": 0.2,
-        "track_width": 0.2,
-        "via_diameter": 0.6,
-        "via_drill": 0.3
+        "track_width": 0.16,
+        "via_diameter": 0.35,
+        "via_drill": 0.2
       },
       {
         "name": "Power",
         "clearance": 0.2,
-        "track_width": 0.4,
-        "via_diameter": 0.8,
-        "via_drill": 0.4
+        "track_width": 0.16,
+        "via_diameter": 0.35,
+        "via_drill": 0.2
       },
       {
         "name": "USB",
@@ -55,6 +63,10 @@
       }
     ],
     "netclass_patterns": [
+      {
+        "netclass": "Default",
+        "pattern": "LOAD"
+      },
       {
         "netclass": "USB",
         "pattern": "USB_DP"
@@ -74,10 +86,6 @@
       {
         "netclass": "Power",
         "pattern": "GND"
-      },
-      {
-        "netclass": "Power",
-        "pattern": "LOAD"
       },
       {
         "netclass": "Analog",

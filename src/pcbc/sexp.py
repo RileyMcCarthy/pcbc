@@ -205,3 +205,31 @@ def fmt_exact(v: float) -> str:
     if "." in s:
         s = s.rstrip("0").rstrip(".")
     return s
+
+
+_GR_RECT_XY = re.compile(r"\((start|end)\s+([-0-9.eE+]+)\s+([-0-9.eE+]+)\)")
+
+
+def edge_outline(text: str) -> tuple[float, float, float, float] | None:
+    """The board outline a board text carries: the largest board-level `gr_rect` on Edge.Cuts, as (x0, y0, x1, y1);
+    a slot is a smaller one inside it. None when the board has none. Fab and review read the outline here, from
+    the emitted board, which is exactly what gets fabricated (docs/board-outline.md B.4)."""
+    best = None
+    i = 0
+    while True:
+        j = text.find("(gr_rect", i)
+        if j < 0:
+            break
+        k = matching_paren(text, j)
+        block = text[j : k + 1]
+        i = k + 1
+        if '(layer "Edge.Cuts")' not in block:
+            continue
+        pts = {m.group(1): (float(m.group(2)), float(m.group(3))) for m in _GR_RECT_XY.finditer(block)}
+        if "start" not in pts or "end" not in pts:
+            continue
+        (ax, ay), (bx, by) = pts["start"], pts["end"]
+        r = (min(ax, bx), min(ay, by), max(ax, bx), max(ay, by))
+        if best is None or (r[2] - r[0]) * (r[3] - r[1]) > (best[2] - best[0]) * (best[3] - best[1]):
+            best = r
+    return best

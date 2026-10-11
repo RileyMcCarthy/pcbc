@@ -42,7 +42,7 @@ Every part is `locked=True` at an absolute position: the guard's geometry is the
 placer that moved a part would move the measurement with it.
 """
 
-from pcbc import Board, Capacitor, Ground, Guard, Net, NetReq, Place, Power, Resistor, SchPlace
+from pcbc import Board, Capacitor, Ground, Guard, Net, NetReq, Power, Resistor, SchPlace
 
 V33 = Power("3V3")
 GND = Ground("GND")
@@ -77,35 +77,35 @@ Resistor("R9", "10k", p1=AIN, p2=GND, **r)
 Resistor("R5", "10k", p1=AIN, p2=GND, **r)  # AIN's third pad: three pads is never a hop
 Capacitor("C5", "100nF", p1=V33, p2=GND, **c805)
 
-Board(width=40, height=30, layers=2, stackup="jlcpcb_2l_1oz")
-NetReq("3V3", "GND", kind="power", volts=3.3, amps=0.1)
+Board(layers=2, stackup="jlcpcb_2l_1oz")
+NetReq("3V3", kind="power", volts=3.3); NetReq("GND", kind="power")
 NetReq("AIN", kind="analog", max_mm=30)
 Guard("SIG", stitch_mm=2.5)
 Guard("SIG2", stitch_mm=2.5)
 Guard("AIN", stitch_mm=2.5)
 
-Place("R1", position="absolute", left=5, top=8.4, locked=True, reason="the guarded run starts here")
-Place("R2", position="absolute", left=23, top=8.4, locked=True, reason="16 mm of straight SIG")
-Place("C1", position="absolute", left=12, top=7.9, locked=True, reason="in the north flank's way")
-Place("C2", position="absolute", left=14.3, top=7.9, locked=True, reason="in the north flank's way, 3V3 pad east")
-Place("R3", position="absolute", left=5, top=17, locked=True, reason="the Z hop, west end")
-Place("R4", position="absolute", left=11, top=20, locked=True, reason="the Z hop, east end and 3 mm south")
-Place("R6", position="absolute", left=5, top=10.38, locked=True, reason="BUS runs 1.5 mm south of SIG")
-Place("R7", position="absolute", left=23, top=10.38, locked=True, reason="BUS runs 1.5 mm south of SIG")
-Place("R8", position="absolute", left=5, top=25, locked=True, reason="KRT's net, west end")
-Place("R5", position="absolute", left=14, top=25, locked=True, reason="AIN's third pad")
-Place("R9", position="absolute", left=23, top=25, locked=True, reason="KRT's net, east end")
-Place("C5", position="absolute", left=13, top=3.5, locked=True, reason="3V3 decoupling, north of the guard corridor and not across it")
 
-SchPlace("R1", left=20, top=20)
-SchPlace("R2", left=60, top=20)
-SchPlace("C1", left=100, top=20)
-SchPlace("C2", left=140, top=60)
-SchPlace("R3", left=20, top=60)
-SchPlace("R4", left=60, top=60)
-SchPlace("R6", left=20, top=100)
-SchPlace("R7", left=60, top=100)
-SchPlace("R8", left=20, top=140)
-SchPlace("R5", left=60, top=140)
-SchPlace("R9", left=100, top=140)
-SchPlace("C5", left=140, top=20)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

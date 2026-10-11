@@ -1,4 +1,4 @@
-"""R-X4's **V** half: does a declared `Chain()`'s order survive in the copper KRT finished?
+"""R-X4's **V** half: does a declared `Path()`'s order survive in the copper KRT finished?
 
 `docs/router-plan.md` line 202 tags R-X4 "**P** (chain), **V**" — a pattern *and* a verification —
 and until S6's review only the P existed. The chain pattern refused a link it could not write, and
@@ -24,10 +24,11 @@ from pcbc.compile import compile_design
 from pcbc.language import load_board
 from pcbc.route_geom import hull_dist2
 from pcbc.route_verify import chain_order
+from conftest import ds2_dir, vehicle_examples
 
 ROOT = Path(__file__).resolve().parent.parent
-EXAMPLES = ROOT / "examples"
-DS2 = Path.home() / "Documents" / "MaD" / "Hardware" / "DS2Addon" / "pcbc"
+EXAMPLES = vehicle_examples()  # buck is the pre-migration board here: conftest.vehicle_examples
+DS2 = ds2_dir()
 HAS_DS2 = (DS2 / "ds2_addon.py").exists()
 
 
@@ -90,19 +91,19 @@ def _ds2_with_krt_vdda() -> str:
 
 @pytest.mark.skipif(not HAS_DS2, reason="the DS2 Addon is not checked out here")
 def test_ds2s_declared_chain_is_fed_in_its_order_on_the_native_board():
-    """N0: the native router links `Chain("VDDA", "J2.1", "C4.1", "U1.12")` station to station
+    """N0: the native router links `Path("VDDA", "J2.1", "C4.1", "U1.12")` station to station
     (`route_native.net_links`), so the declared order is the order it routes. Measured 2026-09-25 on a
     board this test builds: **held**, at every tolerance swept (see below)."""
     got = {r.net: r for r in _ask("ds2")}
     assert set(got) == {"VDDA"}, got
     r = got["VDDA"]
-    assert (r.verdict, r.owner, r.where) == ("held", "chain", "Chain line 97"), r
+    assert (r.verdict, r.owner, r.where) == ("held", "chain", "Path line 97"), r
     assert r.stations == ("J2.1", "C4.1", "U1.12") and (r.detail, r.move) == ("", ""), r
 
 
 @pytest.mark.skipif(not HAS_DS2, reason="the DS2 Addon is not checked out here")
 def test_ds2s_declared_chain_is_fed_in_its_order_by_the_router_that_actually_routed_it():
-    """`Chain("VDDA", "J2.1", "C4.1", "U1.12")`, read off the copper the old router finished (the
+    """`Path("VDDA", "J2.1", "C4.1", "U1.12")`, read off the copper the old router finished (the
     fixture spliced into the native board): **held**.
 
     This is the whole of why `chain`'s refusal is soft now. The pattern cannot write link 2 — the
@@ -110,13 +111,13 @@ def test_ds2s_declared_chain_is_fed_in_its_order_by_the_router_that_actually_rou
     express it — and the slice escalated that inability to a build-aborting refusal on the claim that
     KRT would connect the same three pads by branching, which is exactly what the order forbids. The
     board says otherwise: the feed leaves `J2.1`, runs **through** `C4.1`'s pad copper and carries on
-    to `U1.12`, which is the sentence the `Chain()` wrote.
+    to `U1.12`, which is the sentence the `Path()` wrote.
     """
     got = {r.net: r for r in _ask("ds2", _ds2_with_krt_vdda())}
     assert set(got) == {"VDDA"}, got
     r = got["VDDA"]
-    assert (r.verdict, r.owner, r.where) == ("held", "chain", "Chain line 97"), r
-    assert r.stations == ("J2.1", "C4.1", "U1.12"), "the Chain()'s own order, resolved to pads"
+    assert (r.verdict, r.owner, r.where) == ("held", "chain", "Path line 97"), r
+    assert r.stations == ("J2.1", "C4.1", "U1.12"), "the Path()'s own order, resolved to pads"
     assert (r.detail, r.move) == ("", ""), "a chain that held has nothing to say"
 
 
@@ -215,12 +216,8 @@ def test_a_cap_teed_off_the_run_by_millimetres_fails_and_names_the_edit():
         text = text.replace(old, new)
     r = {x.net: x for x in _ask("ds2", text)}["VDDA"]
     assert (r.verdict, r.owner) == ("spur", "chain"), r
-    assert r.detail == "the copper joins J2.1 to U1.12 without crossing C4.1's pad, so C4.1 hangs off the feed instead of sitting in it", r.detail
-    assert r.move == (
-        'Place("C4", toward="down") moves it into the corridor between J2.1 and U1.12; '
-        'or Chain("VDDA", "J2.1", "C4.1", "U1.12") is asking for an order this copper does not take '
-        "— drop C4 from the chain and feed it locally instead."
-    ), r.move
+    assert r.detail == "the copper joins J2.1 to U1.12 without crossing C4.1's pad, so C4.1 hangs off the feed, not in it", r.detail
+    assert r.move == "", "docs/direction.md §7b: the verdict states the fact and proposes no edit"
 
 
 @pytest.mark.skipif(not HAS_DS2, reason="the DS2 Addon is not checked out here")
@@ -240,14 +237,11 @@ def test_the_build_gate_can_fail_and_does_not_on_the_board_as_routed():
     stopped = _chain_gate(bad, design)
     assert stopped["checked"] == {"VDDA": "spur"} and stopped["notes"] == [], stopped
     assert stopped["fails"] == [
-        "VDDA chain J2.1 -> C4.1 -> U1.12 (Chain line 97): the copper joins J2.1 to U1.12 without crossing "
-        "C4.1's pad, so C4.1 hangs off the feed instead of sitting in it (R-X4). "
-        'Place("C4", toward="down") moves it into the corridor between J2.1 and U1.12; or '
-        'Chain("VDDA", "J2.1", "C4.1", "U1.12") is asking for an order this copper does not take — drop C4 '
-        "from the chain and feed it locally instead."
+        "VDDA path J2.1 -> C4.1 -> U1.12 (Path line 97): the copper joins J2.1 to U1.12 without crossing "
+        "C4.1's pad, so C4.1 hangs off the feed, not in it (R-X4)"
     ], stopped["fails"]
     # And the line the build would print, which is what an AI reads.
-    assert ("a declared chain is not fed in its order: " + "; ".join(stopped["fails"])).endswith("feed it locally instead."), stopped
+    assert ("a declared path is not fed in its order: " + "; ".join(stopped["fails"])).endswith("hangs off the feed, not in it (R-X4)"), stopped
 
 
 # --- the four chains R2 hands to R4, and what they measure -----------------------------------------
@@ -260,13 +254,20 @@ def test_the_pair_chains_are_the_routers_now_and_a_violated_one_is_fatal():
     one object each); c3_usb's `USB_DN` holds and its `USB_DP` is a **spur** — the J1 -> U3 link did
     not fit as a pair (U3's DP and DN pins sit either side of its GND pin), and the single-net join
     reaches U3.1 off the feed. So c3_usb's gate fails, naming the edit."""
-    for name, want in (("c3_usb", {"USB_DP": "spur", "USB_DN": "held"}), ("node", {"USB_DP": "held", "USB_DN": "held"})):
+    # (2026-10-01 only: decision 4's corridor, run to the board edge, moved U3 and USB_DP held; undone 2026-10-02.)
+    # Re-measured 2026-10-02 (docs/physics-subjects.md PR 3, PR 8): the currents are Paths now. c3_usb's VBUS and node's
+    # VBUS are unfinished (`open`: the build stops on `unrouted:` first), c3_usb's 3V3 and node's LOAD hold, and node's
+    # 3V3 Path is on its pour (`poured`, a note and no verdict).
+    for name, want in (
+        ("c3_usb", {"VBUS": "open", "3V3": "held", "USB_DP": "spur", "USB_DN": "held"}),
+        ("node", {"VBUS": "open", "LOAD": "held", "USB_DP": "held", "USB_DN": "held", "3V3": "poured"}),
+    ):
         got = {r.net: r for r in _ask(name)}
         assert {n: r.verdict for n, r in got.items()} == want, (name, got)
         gate = _chain_gate(_routed(name).read_text(), load_board(_board(name)))
-        spurs = sorted(n for n, v in want.items() if v == "spur")
-        assert sorted(f.split(" chain ")[0] for f in gate["fails"]) == spurs, gate["fails"]
-        assert gate["notes"] == [] and gate["checked"] == want, (name, gate)
+        bad = sorted(n for n, v in want.items() if v in ("spur", "open"))
+        assert sorted(f.split(" path ")[0] for f in gate["fails"]) == bad, gate["fails"]
+        assert len(gate["notes"]) == sum(1 for v in want.values() if v == "poured") and gate["checked"] == want, (name, gate)
 
 
 def test_a_board_with_no_declared_chain_says_nothing():
@@ -310,7 +311,7 @@ def test_the_tolerance_decides_nothing_on_any_board_in_this_repo():
     for name, net, below, above in (("c3_usb", "USB_DP", 0.4774, 0.4776),):
         assert {r.net: r.verdict for r in _ask(name, floor=below)}[net] == "spur", (name, net, below, "still a spur a tenth of a micron below")
         assert {r.net: r.verdict for r in _ask(name, floor=above)}[net] == "held", (name, net, above, "the dilated pad has swallowed the spur")
-    assert {r.net: r.verdict for r in _ask("node", floor=6.0)} == {"USB_DP": "held", "USB_DN": "held"}, "node's held chains have no flip to find"
+    assert {r.net: r.verdict for r in _ask("node", floor=6.0)} == {"VBUS": "open", "LOAD": "held", "USB_DP": "held", "USB_DN": "held", "3V3": "poured"}, "node's held chains have no flip to find"
 
 
 # --- the two things the copper cannot answer -------------------------------------------------------
@@ -325,7 +326,7 @@ class _Chain:
 
 @dataclass(frozen=True)
 class _Design:
-    chains: tuple
+    paths: tuple
     instances: tuple = ()
 
 
@@ -334,16 +335,16 @@ def test_a_poured_net_and_a_member_that_names_no_pad_both_say_so_rather_than_pas
     """Two verdicts that are neither held nor violated, because the copper cannot answer.
 
     A net with a filled zone joins every pad of itself through the plane, so "the order" is not a
-    question the graph can be asked — it is reported and skipped, never failed. And a `Chain()`
+    question the graph can be asked — it is reported and skipped, never failed. And a `Path()`
     member naming no pad of that net is `unresolved`: `pcbc check` refuses it before the board is
     drawn, and a gate that silently skipped it would be a gate that passes a typo.
     """
     job = compile_design(load_board(_board("ds2")))
     text = _routed("ds2").read_text()
-    poured = chain_order(text, _Design(chains=(_Chain("GND", ("U1.4", "C5.2", "J1.2"), 1),)), job.constraints)
+    poured = chain_order(text, _Design(paths=(_Chain("GND", ("U1.4", "C5.2", "J1.2"), 1),)), job.constraints)
     assert [(r.net, r.verdict) for r in poured] == [("GND", "poured")], poured
     assert poured[0].detail.startswith("GND carries a filled zone"), poured[0].detail
-    typo = chain_order(text, _Design(chains=(_Chain("VDDA", ("J2.1", "C4.9", "U1.12"), 97),)), job.constraints)
+    typo = chain_order(text, _Design(paths=(_Chain("VDDA", ("J2.1", "C4.9", "U1.12"), 97),)), job.constraints)
     assert [(r.net, r.verdict, r.detail) for r in typo] == [("VDDA", "unresolved", "C4.9 names no pad of VDDA on this board")], typo
 
 

@@ -6,17 +6,13 @@ Pin kwargs are the names on each part's .kicad_sym (3V3, I/O1, …).
 from pcbc import (
     Board,
     Capacitor,
-    Chain,
+    Path,
     Ground,
-    Keepout,
     Led,
     Net,
-    NetReq,
-    Place,
+    NetReq, Pair,
     Power,
     Resistor,
-    SchPlace,
-    SchRegion,
     Thermal,
     load,
 )
@@ -204,69 +200,19 @@ Led(
     k=GND,
 )
 
-Board(width=40, height=30, layers=2, stackup="jlcpcb_2l_1oz")
+Board(layers=2, stackup="jlcpcb_2l_1oz")
 
-# Copper: two anchors say where the board's shape is decided (the connector on its
-# edge, the module with its antenna at the west edge); everything else says what it
-# belongs to and the tool puts it there. `pcbc pcb c3_usb.py` lists what to move.
-Place("J1", edge="bottom", reason="USB-C at south edge")
-Place("U1", position="absolute", left=1, top=1, rotate=90, reason="ESP32-C3-MINI antenna at west")
-Keepout("ANTENNA", position="absolute", left=0, top=0, width=4, height=15)
-Place("U2", position="absolute", right=4, top=10, reason="LDO")
-Place("U3", to="J1.DP1", reason="USB ESD at the connector")
-Place("R_CC1", to="J1.CC1")
-Place("R_CC2", to="J1.CC2")
-Place("C_VBUS_HF", to="U2.VIN")  # the small cap first: the first Place() on a pin sits nearest
-Place("C_VBUS", to="U2.VIN")
-Place("C_3V3_HF", to="U2.VOUT")
-Place("C_3V3", to="U2.VOUT")
-Place("C_MCU_HF", to="U1.3V3")  # decoupling before the switches: the first Place() written sits nearest
-Place("C_MCU", to="U1.3V3")
-Place("R_EN", to="U1.EN")
-Place("C_EN", to="U1.EN")
-Place("SW_RST", to="U1.EN")
-Place("R_BOOT", to="U1.IO9")
-Place("SW_BOOT", to="U1.IO9")
-Place("R_LED", to="U1.IO10")
-Place("D1", to="R_LED.2")
-
-# Schematic. CSS parks the multi-pin symbols; everything else hangs off a pin:
-# to="U1.EN" puts the pin that shares that net in line with it, along= stacks
-# beside a sibling, side= says which way. The tool picks the distance (room
-# for the net's label) and draws wires, labels and power symbols from the
-# netlist - nothing here can change what connects.
-SchRegion("usb", title="USB", left=12, top=10, width=180, height=115)
-SchPlace("J1", parent="usb", left=90, top=12)
-SchPlace("R_CC1", to="J1.CC1")
-SchPlace("R_CC2", to="J1.CC2")
-SchPlace("U3", to="J1.DP1", side="bottom", gap=15.24)
-
-SchRegion("pwr", title="3.3 V", left=210, top=10, width=155, height=115)
-SchPlace("U2", parent="pwr", left=55, top=28)
-SchPlace("C_VBUS", to="U2.VIN")
-SchPlace("C_VBUS_HF", along="C_VBUS.1", side="bottom")
-SchPlace("C_3V3", to="U2.VOUT")
-SchPlace("C_3V3_HF", along="C_3V3.1", side="bottom")
-
-SchRegion("mcu", title="MCU", left=12, top=140, width=380, height=145)
-SchPlace("U1", parent="mcu", left=185, top=10)
-SchPlace("C_MCU", to="U1.3V3")
-SchPlace("C_MCU_HF", along="C_MCU.1", side="bottom")  # under the 3V3 node: no extra symbol
-SchPlace("R_EN", to="U1.EN")
-SchPlace("C_EN", along="R_EN.2", side="bottom")
-SchPlace("SW_RST", along="C_EN.1", side="left")
-SchPlace("R_BOOT", to="U1.IO9")
-SchPlace("SW_BOOT", along="R_BOOT.2", side="bottom")
-SchPlace("R_LED", to="U1.IO10")
-SchPlace("D1", to="R_LED.2")
-
-NetReq("USB_DP", "USB_DN", kind="usb_hs", z_diff_ohm=90, pair=True)
-NetReq("VBUS", "3V3", "GND", kind="power", volts=3.3, amps=0.5)
+Pair("USB_DP", "USB_DN", kind="usb_hs", z_diff_ohm=90)
+NetReq("VBUS", kind="power", volts=5)
+NetReq("3V3", kind="power", volts=3.3)
+NetReq("GND", kind="power")
+Path("VBUS", "J1.VBUS", "U2.VIN", amps=0.5)
+Path("3V3", "U2.VOUT", "U1.3V3", amps=0.5)
 NetReq("EN", "BOOT", "LED", "LED_A", "CC1", "CC2", kind="digital")
 # The pair's feed order: connector, ESD, module. Three pads on a high-speed net need the order
 # said, else the third is a stub (`pcbc pcb` asks for these lines).
-Chain("USB_DP", "J1.A6", "U3.1", "U1.27")
-Chain("USB_DN", "J1.A7", "U3.3", "U1.26")
+Path("USB_DP", "J1.A6", "U3.1", "U1.27")
+Path("USB_DN", "J1.A7", "U3.3", "U1.26")
 # The module's exposed pad is nine `pad_prop_heatsink` blocks on GND. Two layers and one pour, so
 # there is no foreign plane to consent to and the pitch is the fab's hole-to-hole alone.
 Thermal("U1.49", watts=0.35)

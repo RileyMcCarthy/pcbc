@@ -11,7 +11,6 @@ from .fab import fab_job
 from .language import load_board
 from .netcheck import KicadMissing, check_copper, check_erc, check_schematic, kicad_drc
 from .project import layout_dir
-from .sch_emit import emit_schematic_file
 from .trace import drift as trace_drift
 from .trace import sha as _trace_sha
 from .trace import tracing
@@ -85,7 +84,7 @@ def tap_stubs(routed_text: str, doc, design) -> list[str]:
 
 
 def _chain_gate(routed_text: str, design) -> dict:
-    """R-X4's verify half, run in the product: every declared `Chain()`'s order, read off the copper.
+    """R-X4's verify half, run in the product: every declared `Path()`'s order, read off the copper.
 
     The gate the chain pattern's hard refusal was standing in for. Until this function the pattern
     refused a link it could not write and **nothing** read the finished board to ask whether the
@@ -109,8 +108,8 @@ def _chain_gate(routed_text: str, design) -> dict:
         "checked": {r.net: r.verdict for r in rows},
         # Fatal for every declared chain: the native router links a chain station to station
         # (`route_native.net_links`), pair nets included, so every copper a chain names is pcbc's.
-        "fails": [f"{r.net} chain {' -> '.join(r.stations)} ({r.where}): {r.detail} (R-X4). {r.move}" for r in bad],
-        "notes": [f"{r.net} chain ({r.where}): {r.detail}" for r in rows if r.verdict in ("poured", "unresolved")],
+        "fails": [f"{r.net} path {' -> '.join(r.stations)} ({r.where}): {r.detail} (R-X4)" + (f". {r.move}" if r.move else "") for r in bad],
+        "notes": [f"{r.net} path ({r.where}): {r.detail}" for r in rows if r.verdict in ("poured", "unresolved")],
     }
 
 
@@ -129,7 +128,7 @@ def _pair_gate(routed_text: str, design) -> dict:
         "pairs": {f"{r.a}/{r.b}": {"len": [r.len_a, r.len_b], "coupled": [r.coupled_a, r.coupled_b], "uncoupled": r.uncoupled, "skew": r.skew} for r in rows},
         "lines": [r.line() for r in rows],
         "fails": [
-            f"{r.line()}. Give the pair a lane both halves fit in (move what sits between its chain stations in board.py), or lock its copper in layout.core.py"
+            f"{r.line()}"
             for r in rows
             if not r.ok
         ],
@@ -220,7 +219,7 @@ def _bridge_gate(routed_text: str, design) -> dict:
     return {
         "ties": [r.to_dict() for r in rows],
         "verdicts": {f"{r.a}|{r.b}": r.verdict for r in rows},
-        "fails": [f"{r.a} and {r.b} are tied at more than one point: {r.why}. {r.move}" for r in rows if r.verdict == "multi"],
+        "fails": [f"{r.a} and {r.b} are tied at more than one point: {r.why}" + (f". {r.move}" if r.move else "") for r in rows if r.verdict == "multi"],
         "notes": [r.line() for r in rows if r.verdict != "tied"],
         "lines": bridge_lines(rows),
     }
@@ -277,7 +276,7 @@ def _barrel_gate(routed_text: str, doc, design) -> dict:
     # net with copper here and no refusal is one where every spec was served.
     refused = {r.get("net") for r in (doc.refusals if doc is not None else []) if r.get("pattern") == "stitch"}
     served = {r.net for r in rungs} - refused
-    fails = [f"pcbc wrote a parallel via that is not parallel: {r.line()}. Drop the rung or join it: this is a pcbc bug, not a board move" for r in rungs if not r.ok]
+    fails = [f"pcbc wrote a parallel via that is not parallel: {r.line()} (a pcbc defect: pcbc wrote this copper)" for r in rungs if not r.ok]
     stalled = []
     if job.constraints is not None and served:
         from .ampacity import CURVE_EPS, power_bottlenecks
@@ -341,8 +340,7 @@ def _guard_gate(routed_text: str, doc) -> dict:
             pieces.append(seg_piece(i["net"], i["reason"], key[1], tuple(key[2]), tuple(key[3]), float(i.get("w") or 0.0), owner=i.get("owner", "")))
     rows = guard_cover(routed_text, pieces)
     fails = [
-        f"pcbc wrote a guard that is not ground: {r.line()}. Drop the stretch or stitch it: this is a "
-        f"pcbc bug, not a board move"
+        f"pcbc wrote a guard that is not ground: {r.line()} (a pcbc defect: pcbc wrote this copper)"
         for r in rows
         if not r.ok
     ]
@@ -396,8 +394,7 @@ def _stitch_gate(routed_text: str, doc) -> dict:
         pieces.append(via_piece(i["net"], i["reason"], tuple(key[1]), float(i.get("w") or 0.0), float(i.get("drill") or 0.0), owner=i.get("owner", "")))
     rows = plane_stitch(routed_text, pieces)
     fails = [
-        f"pcbc wrote a plane stitch that stitches one plane: {r.line()}. Drop the lattice or pour both "
-        f"layers: this is a pcbc bug, not a board move"
+        f"pcbc wrote a plane stitch that stitches one plane: {r.line()} (a pcbc defect: pcbc wrote this copper)"
         for r in rows
         if not r.ok
     ]
@@ -657,7 +654,10 @@ def _inputs(board: Path, design=None) -> dict:
     modules = {m: _sha(root / m) for m in (getattr(design, "modules", None) or ())}
     # M2: every file loading `board.py` was seen to open (`language.load_board` traces it), by content.
     reads = dict(sorted((getattr(design, "reads", None) or {}).items()))
-    return {"board": _sha(board), "core": _sha(board.parent / "layout.core.py"), "parts": dict(sorted(parts.items())), "modules": dict(sorted(modules.items())), "reads": reads}
+    # The same for `layout.core.py`'s own load (docs/board-outline.md A.2): the place and route stamps carry
+    # it, the schematic's does not, so a core edit is stale from place and never from sch.
+    core_reads = dict(sorted((getattr(design, "core_reads", None) or {}).items()))
+    return {"board": _sha(board), "core": _sha(board.parent / "layout.core.py"), "parts": dict(sorted(parts.items())), "modules": dict(sorted(modules.items())), "reads": reads, "core_reads": core_reads}
 
 
 def _write_stamp(path: Path, doc: dict) -> None:
@@ -697,7 +697,52 @@ def _stamp_sch(layout: Path, board: Path, design, traced: dict | None = None) ->
     was on disk — so `pcbc pcb` (check, seed, place, no sch stage) then `pcbc build` vouched for a
     schematic that did not exist, or for yesterday's that contradicted the BOM, and the build said ok."""
     now = _inputs(board, design)
-    _write_stamp(layout / SCH_INPUTS, {"board": now["board"], "parts": now["parts"], "modules": now["modules"], "reads": now["reads"], "sch": _sha(layout / "schematic.kicad_sch"), "traced": traced})
+    _write_stamp(
+        layout / SCH_INPUTS,
+        {
+            "board": now["board"],
+            "parts": now["parts"],
+            "modules": now["modules"],
+            "reads": now["reads"],
+            "sch_core": _sch_core_record(board, design),
+            "sch": _sha(layout / "schematic.kicad_sch"),
+            "gen": _sha(layout / "schematic.gen.py"),
+            "traced": traced,
+        },
+    )
+
+
+SCH_CORE = "schematic.core.py"
+
+
+def _sch_core_record(board: Path, design) -> dict:
+    """`schematic.core.py`'s sha (None when there is none) and what its load opened (`design.sch_core`): the
+    schematic stamp's own record of it. No other stamp holds it (docs/schematic-layout.md §1.1)."""
+    rec = getattr(design, "sch_core", None) or {}
+    return {"sha": _sha(Path(board).parent / SCH_CORE), "reads": dict(sorted((rec.get("reads") or {}).items()))}
+
+
+def sch_reason(layout: Path, board: Path, design=None) -> str | None:
+    """Why the sheet must be drawn again when nothing on the board side changed, or None: the sch stage is a side
+    branch of the ladder (docs/schematic-layout.md §1.1). `schematic.core.py` edited, added or deleted, a file its
+    load opened changed, or `schematic.kicad_sch` not the bytes the sch stage wrote: the sch stage reruns and the
+    placed, routed and fab outputs stay as they are."""
+    sch = _read_stamp(layout / SCH_INPUTS)
+    if sch is None:
+        return "the schematic has no record of what it was drawn from (the sch stage has not run on this board, or its last run was refused)"
+    was = sch.get("sch_core")
+    if not isinstance(was, dict):
+        return "the schematic has no record of schematic.core.py: it was drawn by an older pcbc"
+    if was.get("sha") != _sha(Path(board).parent / SCH_CORE):
+        return f"{SCH_CORE} changed since the schematic was drawn ({'deleted' if was.get('sha') and not (Path(board).parent / SCH_CORE).exists() else 'added' if not was.get('sha') else 'edited'})"
+    why = _load_drift({"reads": was.get("reads") or {}}, board, "schematic was drawn", what=SCH_CORE)
+    if why:
+        return why
+    if sch.get("sch") != _sha(layout / "schematic.kicad_sch"):
+        return f"schematic.kicad_sch is not the file the sch stage wrote (edited or deleted): {NEVER_EDITED}"
+    if sch.get("gen") != _sha(layout / "schematic.gen.py"):
+        return f"schematic.gen.py is not the file the sch stage wrote (edited or deleted): {NEVER_EDITED}"
+    return None
 
 
 def _unstamp_sch(layout: Path) -> None:
@@ -722,18 +767,52 @@ def sch_stage(design, board: Path, layout: Path, *, name: str) -> tuple[dict, st
             stray.unlink()
     report: dict = {}
     with tracing("sch", Path(board).parent) as seen:
+        from .sch_emit import emit_from_design
+        from .sch_gen import GEN_FILE, gen_text
+        from .sch_prims import decompile, gen_lines, load_gen, sheet_text
+        from .sch_score import invariant_errors, kicad_vector, line as vector_line
+
         try:
-            emit_schematic_file(design, sch, title=name, report=report)
+            emit_from_design(design, title=name, report=report)
         except ValueError as exc:
             return {"stage": "sch", "error": str(exc)}, f"schematic: {exc}"
+        # The sheet is emitted from gen objects (docs/schematic-layout.md PR 6): gen is written, its primitive lines are
+        # loaded back from the file, and `sheet_text`, the one writer, draws the sheet from what was loaded.
+        gen = layout / GEN_FILE
+        sch.parent.mkdir(parents=True, exist_ok=True)
+        gen.write_text(gen_text(design, report, name))
+        loaded = load_gen(gen.read_text())
+        sch.write_text(sheet_text(report["_header"], loaded))
+        # Lossless both ways: the emitted sheet decompiles to the very lines gen holds.
+        back = gen_lines(decompile(sch.read_text())[1])
+        held = gen_lines(loaded)
+        if back != held:
+            i = next((k for k, (a, b) in enumerate(zip(back, held)) if a != b), min(len(back), len(held)))
+            return {"stage": "sch", "error": "sheet round trip"}, (
+                f"schematic generator bug: schematic.kicad_sch does not decompile to schematic.gen.py's primitives "
+                f"(primitive {i + 1}: gen {held[i] if i < len(held) else 'nothing'!r}, sheet {back[i] if i < len(back) else 'nothing'!r})"
+            )
         step: dict = {"stage": "sch", "sch": str(sch), "readability": report.get("issues", []), "notes": report.get("notes", [])}
+
+        # The two numbers the generator makes 0 by construction (docs/schematic-layout.md §2.6): a failure is a
+        # generator bug, stated as the facts it is.
+        broken = invariant_errors(report["_sheet"], report["_parts"])
+        if broken:
+            return step, "schematic generator invariant broken: " + "; ".join(broken[:6])
+        step["vector"] = {k: v for k, v in report["readability"].items() if k != "detail" and not k.startswith("_")}
         try:
             fails = check_schematic(design, sch)
             step["netlist"] = "verified" if not fails else fails
             erc = check_erc(sch)
             step["erc"] = "clean" if not erc["errors"] else erc["errors"]
             step["erc_warnings"] = erc["warnings"]
+            # The scored text collisions come from KiCad's own drawing of the sheet (§2.6), once per build.
+            vec = kicad_vector(sch, report)
+            step["vector"] = {k: v for k, v in vec.items() if k != "detail" and not k.startswith("_")}
+            step["vector_detail"] = vec.get("detail", {})
         except KicadMissing as exc:
+            vec = report["readability"]
+            step["vector_detail"] = vec.get("detail", {})
             fails = []
             erc = {"errors": []}
             step["netlist"] = step["erc"] = f"unchecked: {exc}"
@@ -741,12 +820,86 @@ def sch_stage(design, board: Path, layout: Path, *, name: str) -> tuple[dict, st
             # KiCad could not read the sheet pcbc drew (a net name it cannot hold got past the load
             # check): a refusal naming what KiCad said, never a traceback out of the build.
             return step, f"KiCad could not read the schematic pcbc drew: {str(exc)[-400:]}"
+        _name_locked_off_paper(step, report)
+        # Every resolved object, as schematic.core.py lines (docs/schematic-layout.md §4): written whether or not the sheet
+        # passes, so a failing sheet's objects can be locked; stamped only with a sheet that passes.
+        # The header now carries KiCad's vector; the primitive lines are the ones the sheet was emitted from.
+        gen.write_text(gen_text(design, report, name, vector_line(step["vector"])))
+        step["gen"] = str(gen)
         if fails:
             return step, "schematic netlist differs from board.py: " + "; ".join(fails)
         if erc["errors"]:
             return step, "schematic fails KiCad ERC: " + "; ".join(erc["errors"])
+        if step["vector"].get("hard"):
+            # §2.6 / PR 5: a hard readability number above 0 is a build error, on every sheet, stated as facts.
+            facts = [f"{k}: {m}" for k, ms in (step.get("vector_detail") or {}).items() for m in ms]
+            return step, f"schematic is not readable ({step['vector']['hard']} hard finding{'s' if step['vector']['hard'] != 1 else ''}): " + "; ".join(facts) + _applied_locks_fact(report)
     _stamp_sch(layout, board, design, traced=seen.record())
     return step, None
+
+
+def _applied_locks_fact(report: dict) -> str:
+    """The locks of schematic.core.py the sheet applies (those that differ from the sheet laid out without them), and
+    the hard count of that sheet: a finding a real move raises names the move even when it names another part
+    (refute:lock 2026-10-09: buck's L1 locked near C_BOOT failed on `wire FB runs through 5V symbol at C_OUT2`)."""
+    from .sch_core import SCH_CORE_FILE
+
+    applied = report.get("_applied_locks") or []
+    if not applied:
+        return ""
+    lines = ", ".join(f"{SCH_CORE_FILE}:{n} ({label})" for n, label in applied)
+    n = int(report.get("_relaxed_hard") or 0)
+    return f"; this sheet applies the locks at {lines}, which differ from the sheet laid out without them; laid out without them it has {n} hard finding{'s' if n != 1 else ''} (pcbc's text boxes)"
+
+
+def _name_locked_off_paper(step: dict, report: dict) -> None:
+    """A part posed by a `schematic.core.py` line that lands off the paper is that line's fact (docs/schematic-layout.md
+    §5: the line, the paper and the distance outside); the score names the part, the paper and the distance."""
+    from .sch_core import SCH_CORE_FILE
+
+    lines = (step.get("vector_detail") or {}).get("parts_off_paper")
+    posed = report.get("_applied_poses") or {}
+    if lines:
+        out = []
+        for m in lines:
+            ref = m.split("'s body", 1)[0]
+            if ref in posed:
+                m = f"{SCH_CORE_FILE}:{posed[ref]}: the at= of {ref}'s SchPlace puts it there: {m}"
+            out.append(m)
+        step["vector_detail"]["parts_off_paper"] = out
+    layout = report.get("_layout")
+    region_of = {m: r.name for r in layout.regions for m in r.members} if layout is not None else {}
+    _name_applied_poses(step, posed, region_of)
+
+
+def _name_applied_poses(step: dict, posed: dict, region_of: dict | None = None) -> None:
+    """Every other hard finding and readability line that names a part posed by an applied `schematic.core.py` lock
+    (one that differs from the layout without it: `sch_emit._settle`) names that line too (refute:split 2026-10-08: U1's
+    gen pose copied over its anchor put U1 on R_EN and R_BOOT, and none of the 17 overlap facts named the line)."""
+    import re
+
+    from .sch_core import SCH_CORE_FILE
+
+    if not posed:
+        return
+
+    region_of = region_of or {}
+
+    def named(m: str) -> str:
+        refs = [r for r in sorted(posed) if re.search(rf"(?<![\w.]){re.escape(r)}(?![\w])", m)]
+        # A region's frame is drawn round its members: a finding that names the region names its posed members.
+        regs = sorted({region_of[r] for r in posed if r in region_of and re.search(rf"\bregion {re.escape(region_of[r])}\b", m)})
+        if m.startswith(f"{SCH_CORE_FILE}:") or not (refs or regs):
+            return m
+        facts = [f"{r} is posed by {SCH_CORE_FILE}:{posed[r]}" for r in refs]
+        facts += [f"region {g} holds {r}, posed by {SCH_CORE_FILE}:{posed[r]}" for g in regs for r in sorted(posed) if region_of.get(r) == g and r not in refs]
+        return m + " (" + "; ".join(facts) + ")"
+
+    detail = step.get("vector_detail") or {}
+    for k, ms in detail.items():
+        detail[k] = [named(m) for m in ms]
+    if isinstance(step.get("readability"), list):
+        step["readability"] = [named(m) for m in step["readability"]]
 
 
 def _stamp_place(layout: Path, board: Path, design, traced: dict | None = None) -> None:
@@ -764,6 +917,8 @@ def _stamp_place(layout: Path, board: Path, design, traced: dict | None = None) 
             "parts": now["parts"],
             "modules": now["modules"],
             "reads": now["reads"],
+            "core": now["core"],
+            "core_reads": now["core_reads"],
             "placed": _sha(placed),
             "gen": _sha(layout / "placed" / "layout.gen.py"),
             "sidecars": _sidecars(placed),
@@ -772,7 +927,7 @@ def _stamp_place(layout: Path, board: Path, design, traced: dict | None = None) 
     )
 
 
-def _stamp(layout: Path, board: Path, design=None, traced: dict | None = None) -> None:
+def _stamp(layout: Path, board: Path, design=None, traced: dict | None = None, outline: dict | None = None) -> None:
     """`layout/<name>/inputs.json`: what the route stage consumed (`board.py`, `layout.core.py`, the
     part files, the local modules) and what it wrote (`layout.gen.py`, the emitted board after the
     copper gate's save and uuid pinning, and the sidecars beside it), by content, and what it was
@@ -784,6 +939,9 @@ def _stamp(layout: Path, board: Path, design=None, traced: dict | None = None) -
     now["routed"] = _sha(routed / "layout.kicad_pcb")
     now["sidecars"] = _sidecars(routed / "layout.kicad_pcb")
     now["traced"] = traced
+    if outline:
+        # The outline the route stage drew (O on a derived board): later stages read it here and on Edge.Cuts (B.4).
+        now["outline"] = {"source": outline.get("source"), "rect": outline.get("rect")}
     _write_stamp(layout / INPUTS, now)
 
 
@@ -832,20 +990,25 @@ def _unstamp_fab(layout: Path) -> None:
 NEVER_EDITED = "it is build output, never edited"
 
 
-def _load_drift(stamp: dict, board: Path, since: str) -> str | None:
+def _load_drift(stamp: dict, board: Path, since: str, key: str = "reads", what: str = "board.py") -> str | None:
     """The first file loading `board.py` was seen to open (M2: `design.reads`) whose bytes are not the
     ones a stage's stamp recorded, as a stale reason; a stamp with no such record is an older pcbc's.
     Recorded files are re-hashed; the set is not compared, because a module Python has cached is not
-    opened twice in one process, and a new input can only come from an edit to a recorded one."""
-    reads = stamp.get("reads")
+    opened twice in one process, and a new input can only come from an edit to a recorded one. With
+    `key="core_reads"`, the same for `layout.core.py`'s load."""
+    reads = stamp.get(key)
     if not isinstance(reads, dict):
-        return f"the {since} has no record of the files loading board.py read: it was made by an older pcbc"
+        return f"the {since} has no record of the files loading {what} read: it was made by an older pcbc"
     root = Path(board).resolve().parent
-    for key, was in sorted(reads.items()):
-        path = Path(key) if Path(key).is_absolute() else root / key
+    for name, was in sorted(reads.items()):
+        path = Path(name) if Path(name).is_absolute() else root / name
         if _trace_sha(str(path)) != was:
-            return f"{key} changed since the {since} (a file loading board.py opened; {'deleted' if not path.exists() else 'edited'})"
+            return f"{name} changed since the {since} (a file loading {what} opened; {'deleted' if not path.exists() else 'edited'})"
     return None
+
+
+def _core_drift(stamp: dict, board: Path, since: str) -> str | None:
+    return _load_drift(stamp, board, since, key="core_reads", what="layout.core.py")
 
 
 def _changed(was: dict | None, now: dict) -> list[str]:
@@ -885,15 +1048,19 @@ def stale_reason(layout: Path, board: Path, design=None) -> tuple[str | None, st
     now = _inputs(board, design)
     root = Path(board).resolve().parent
     sch = _read_stamp(layout / SCH_INPUTS)
+    # The sch stage is a side branch (docs/schematic-layout.md §1.1): what only the sheet reads (schematic.core.py,
+    # the sheet's own bytes) is `sch_reason`'s and redraws the sheet alone. What the board side reads too —
+    # board.py, its modules, its part files, pcbc's own code — is stale from check, as it always was.
     if sch is None:
-        return None, "the schematic has no record of the board.py it was drawn from (the sch stage has not run on this board, or its last run was refused; `pcbc pcb` places without drawing it)"
-    if sch.get("board") != now["board"] or sch.get("parts") != now["parts"] or (sch.get("modules") or {}) != now["modules"]:
-        return None, "board.py, a module it imports or a part file changed since the schematic was drawn"
-    if sch.get("sch") != _sha(layout / "schematic.kicad_sch"):
-        return None, f"schematic.kicad_sch is not the file the sch stage wrote (edited or deleted): {NEVER_EDITED}"
-    why = _load_drift(sch, board, "schematic was drawn") or trace_drift(sch.get("traced"), root, "sch")
-    if why:
-        return None, why
+        other = _read_stamp(layout / INPUTS) or _read_stamp(layout / "placed" / INPUTS)
+        if current == "sch" or other is None or other.get("board") != now["board"] or other.get("parts") != now["parts"] or (other.get("modules") or {}) != now["modules"]:
+            return None, "the schematic has no record of the board.py it was drawn from (the sch stage has not run on this board, or its last run was refused; `pcbc pcb` places without drawing it)"
+    else:
+        if sch.get("board") != now["board"] or sch.get("parts") != now["parts"] or (sch.get("modules") or {}) != now["modules"]:
+            return None, "board.py, a module it imports or a part file changed since the schematic was drawn"
+        why = _load_drift(sch, board, "schematic was drawn") or trace_drift(sch.get("traced"), root, "sch")
+        if why:
+            return None, why
     if current == "sch":
         return current, None
     if current == "place":
@@ -903,6 +1070,8 @@ def stale_reason(layout: Path, board: Path, design=None) -> tuple[str | None, st
             return "sch", "the placed board has no record of the board.py it was placed from"
         if placed.get("board") != now["board"]:
             return "sch", "board.py changed since the board was placed"
+        if placed.get("core") != now["core"]:
+            return "sch", "layout.core.py changed since the board was placed"
         if placed.get("parts") != now["parts"]:
             return "sch", f"a part file changed since the board was placed ({', '.join(_changed(placed.get('parts'), now['parts'])[:3])})"
         if (placed.get("modules") or {}) != now["modules"]:
@@ -914,7 +1083,7 @@ def stale_reason(layout: Path, board: Path, design=None) -> tuple[str | None, st
         drift = _sidecar_drift(placed_pcb, placed.get("sidecars"))
         if drift:
             return "sch", f"placed/{drift} is not the file the place stage wrote (edited or deleted): {NEVER_EDITED}"
-        why = _load_drift(placed, board, "board was placed") or trace_drift(placed.get("traced"), root, "place")
+        why = _load_drift(placed, board, "board was placed") or _core_drift(placed, board, "board was placed") or trace_drift(placed.get("traced"), root, "place")
         if why:
             return "sch", why
         return current, None
@@ -938,7 +1107,7 @@ def stale_reason(layout: Path, board: Path, design=None) -> tuple[str | None, st
         if drift:
             why = f"routed/{drift} is not the file the route stage wrote (edited or deleted): {NEVER_EDITED}"
         else:
-            why = _load_drift(stamp, board, "route") or trace_drift(stamp.get("traced"), root, "route")
+            why = _load_drift(stamp, board, "route") or _core_drift(stamp, board, "route") or trace_drift(stamp.get("traced"), root, "route")
     if why:
         return "place", why
     if current == "fab":
@@ -990,7 +1159,20 @@ def _core_pour_blame(objs, fails: list[str]) -> str:
             hits.append(f"{c.where or c.id} (Pour {c.net!r} on {', '.join(lays)})")
     if not hits:
         return ""
-    return f" — this is the plane {', '.join(hits)} locks: the gate judges the locked pour as written; give it the outline and fields the build draws (copy its line from layout.gen.py), or unlock it (delete the line)"
+    return f" — this is the plane {', '.join(hits)} locks: the gate judges the locked pour as written, and its outline or fields are not the ones the build draws"
+
+
+def _place_outline(placement) -> dict | None:
+    """The place stage's outline record (B.4): the declared one, or the placement-only fit of a derived board."""
+    from .outline import line
+
+    job = placement.job
+    if placement.error or job.outline is None:
+        return None
+    if job.derived is None:
+        return {"source": "declared", "rect": list(job.outline), "line": line(None, job.outline, {}, source="declared", decl_line=job.outline_line)}
+    d = job.derived
+    return {"source": "derived", "rect": list(d.fit), "R": list(d.R), "sides": d.sides, "line": line(d, d.fit, d.sides, placement_only=True), "A": d.A, "m": d.m}
 
 
 def place_stage(design, board: Path, layout: Path, *, name: str, emit: bool) -> tuple[dict, object, str | None]:
@@ -1013,6 +1195,7 @@ def place_stage(design, board: Path, layout: Path, *, name: str, emit: bool) -> 
     placement = place(design, name=name, base=layout / "routed")
     step: dict = {
         "stage": "place",
+        "outline": _place_outline(placement),
         "layout": placement.report,
         "notes": placement.notes,
         "poses": {p.ref: {"at": list(p.at), "rot": p.rot} for p in placement.poses},
@@ -1037,9 +1220,11 @@ def place_stage(design, board: Path, layout: Path, *, name: str, emit: bool) -> 
             shutil.rmtree(placed_dir)
         placed_dir.mkdir(parents=True)
         copper = stamp(design, placement.copper)
-        graphics = list(placement.graphics)
+        graphics = [*placement.graphics, *placement.marks]
         assign_ids(copper, set(), graphics)
-        write_gen(placed_dir / "layout.gen.py", placement.poses, copper, board=name, graphics=graphics)
+        from .gen import outline_header
+
+        write_gen(placed_dir / "layout.gen.py", placement.poses, copper, board=name, graphics=graphics, outline=outline_header(placement.job.outline_source, placement.job.outline_line))
         pcb = placed_dir / "layout.kicad_pcb"
         from .layout_emit import emit_board
 
@@ -1048,6 +1233,11 @@ def place_stage(design, board: Path, layout: Path, *, name: str, emit: bool) -> 
         pcb.write_text(emit_board(placement.text, placement.poses, copper, graphics, design=design, board=name))
         step["pcb"] = str(pcb)
         step["gen"] = str(placed_dir / "layout.gen.py")
+    if placement.orient_error:
+        # docs/direction.md §4c: a part whose orientation matters with no mark the fab can read. The place-only board is
+        # still written (`--upto place`, `pcbc pcb`: the facts name what is on it), never stamped.
+        step["error"] = placement.orient_error
+        return step, placement, step["error"]
     return step, placement, None
 
 
@@ -1080,6 +1270,7 @@ def pcb_job(board: Path) -> dict:
     result["layout_notes"] = step.get("notes", [])
     result["poses"] = step.get("poses", {})
     result["applied"] = step.get("applied")
+    result["outline"] = step.get("outline")
     if err:
         result["error"] = err
     return result
@@ -1102,31 +1293,45 @@ def _dangling_core_move(text_: str, kind: str, lines, ends) -> str:
     if "dropped" in states:
         nets = sorted({e["net"] for e in mine if e["state"] == "dropped"})
         at = "; ".join(e["owner"] for e in mine if e["state"] == "dropped")
-        return f"{text_} — this {what}'s free end ({at}) was joined by a link that was dropped with the unfinished net {', '.join(nets)}: the moves for {', '.join(nets)} above finish it, and the line is not at fault"
+        return f"{text_} — this {what}'s free end ({at}) was joined by a link that was dropped with the unfinished net {', '.join(nets)} (the errors above); the line is not at fault"
     if "unfinished" in states:
         nets = sorted({e["net"] for e in mine if e["state"] == "unfinished"})
         at = "; ".join(e["owner"] for e in mine if e["state"] == "unfinished")
-        return f"{text_} — this {what}'s free end ({at}) is one of the links the unfinished net {', '.join(nets)} still misses: the moves for {', '.join(nets)} above name it, and the line is not at fault"
+        return f"{text_} — this {what}'s free end ({at}) is one of the links the unfinished net {', '.join(nets)} still misses (the errors above); the line is not at fault"
     if "failed" in states:
         said = "; ".join(e["why"] for e in mine if e["state"] == "failed")
-        return f"{text_} — the router could not join this {what}'s free end ({said}); move that end onto the copper it should join, or unlock the line (delete it)"
+        return f"{text_} — the router could not join this {what}'s free end ({said})"
     if "nothing" in states:
         spur = [e for e in mine if e["state"] == "nothing"]
         at = "; ".join(f"({e['at'][0]:g},{e['at'][1]:g})" for e in spur)
         net = spur[0]["net"]
         return (
             f"{text_} — a spur: this {what}'s free end at {at} has nothing left to join (every {net} pad and via it could reach "
-            f"is already joined by the lock's own copper), and KiCad calls an open end dangling: end the line on the copper it joins, or delete it"
+            f"is already joined by the lock's own copper), and KiCad calls an open end dangling"
         )
     if "lost" in states:
-        return f"{text_} — the route stage joined this {what}'s free end and a later step (relax or prune) left it open: this is a pcbc bug, not a board move"
+        return f"{text_} — the route stage joined this {what}'s free end and a later step (relax or prune) left it open (a pcbc defect)"
     if mine:
-        return f"{text_} — the route stage records this {what}'s free end joined and KiCad finds it open: this is a pcbc bug, not a board move"
-    return f"{text_} — the route stage found no free end on this {what} (every end touched copper of its net) and KiCad finds one open: this is a pcbc bug, not a board move"
+        return f"{text_} — the route stage records this {what}'s free end joined and KiCad finds it open (a pcbc defect)"
+    return f"{text_} — the route stage found no free end on this {what} (every end touched copper of its net) and KiCad finds one open (a pcbc defect)"
 
 
 def _unconnected_nets(gate: dict) -> list[str]:
     return list(gate.get("unconnected_nets") or [])
+
+
+def _clear_built(layout: Path) -> None:
+    """The place, route and fab outputs and their stamps: what a refused source must not leave standing."""
+    import shutil
+
+    _unstamp(layout)
+    for sub in ("placed", "fab"):
+        if (layout / sub).exists():
+            shutil.rmtree(layout / sub)
+    routed = layout / "routed"
+    for f in ("layout.kicad_pcb", "layout.gen.py"):
+        if (routed / f).exists():
+            (routed / f).unlink()
 
 
 def build_job(
@@ -1143,12 +1348,35 @@ def build_job(
     except ValueError as exc:
         # A board.py line refused at load (a net name KiCad cannot hold, ...): a refusal, returned with
         # its line like every other, never a traceback out of the build.
-        return {"board": str(board), "layout": str(layout_dir(board)), "plan": [], "steps": [{"stage": "check", "fails": [str(exc)]}], "error": str(exc)}
+        from .language import _at_board_line
+
+        msg = _at_board_line(exc, Path(board).resolve())
+        if "layout.core.py" in msg:
+            # A refused layout.core.py leaves nothing of the last build standing where a plain build would call it done
+            # (fourth review, finding 9): the core file now runs with board.py (docs/board-outline.md A.2), so its
+            # refusal comes here, before the route stage that used to clear these.
+            _clear_built(layout_dir(board))
+        return {"board": str(board), "layout": str(layout_dir(board)), "plan": [], "steps": [{"stage": "check", "fails": [msg]}], "error": msg}
+    except TypeError as exc:
+        # A keyword a constructor does not take (`NetReq(amps=)`, docs/physics-subjects.md E1): the same
+        # statement `pcbc check` prints, with its line.
+        from .language import _explain_type_error
+
+        msg = _explain_type_error(exc, Path(board).resolve())
+        if msg is None:
+            raise
+        return {"board": str(board), "layout": str(layout_dir(board)), "plan": [], "steps": [{"stage": "check", "fails": [msg]}], "error": msg}
     layout = layout_dir(board)
     name = board.stem
     root = board.parent
     current, why = (None, None) if force else stale_reason(layout, board, design)
     plan = planned(current, upto=upto, force=force)
+    # The sch stage is a side branch (docs/schematic-layout.md §1.1): a sheet-only change redraws the sheet and
+    # leaves the placed, routed and fab outputs as they are.
+    sch_why = None if force or "sch" in plan or upto == "check" else sch_reason(layout, board, design)
+    if sch_why:
+        plan = ["sch", *plan]
+        why = "; ".join(w for w in (sch_why, why) if w)
     result: dict = {
         "board": str(board),
         "layout": str(layout),
@@ -1164,13 +1392,22 @@ def build_job(
         return result
 
     if "check" in plan:
+        from .pcb_place import validate
+
         check_notes: list[str] = []
-        fails = check_design(design, notes=check_notes)
+        # `validate`: a Place(to=) naming a part or pin the board does not have is a check failure with its line,
+        # before placement turns it into an unrelated pad-gap error (refuter round, 2026-10-02).
+        fails = check_design(design, notes=check_notes) + validate(design)
         # Findings that are moves and not failures (`check_design`'s `notes`): today, two `Ground()`
         # nets with nothing tying them. Printed with an exit code of 0 — see `check_design`.
         step = {"stage": "check", "fails": fails, "notes": check_notes}
         if not fails:
-            step["constraints"] = constraint_lines(compile_design(design))
+            try:
+                step["constraints"] = constraint_lines(compile_design(design))
+            except ValueError as exc:
+                # A line `compile_design` refuses (a Region whose size nothing determines): a check failure with
+                # its facts, never a traceback out of the build (refuter round, 2026-10-02).
+                fails.append(str(exc))
         result["steps"].append(step)
         if fails:
             result["error"] = "; ".join(fails)
@@ -1191,6 +1428,8 @@ def build_job(
         with tracing("place", root) as place_seen:
             step, placement, err = place_stage(design, board, layout, name=name, emit=upto == "place")
         result["steps"].append(step)
+        if step.get("outline") and upto == "place":
+            result["outline"] = step["outline"]
         if err:
             result["error"] = err
             return result
@@ -1224,6 +1463,9 @@ def build_job(
             placed_text = step.pop("placed_text", None)
             entry = {"stage": "route", **step}
             entry.pop("copper_uuids", None)
+            if step.get("outline"):
+                # docs/board-outline.md B.4: the outline, what set each side, in Outline()'s terms.
+                result["outline"] = step["outline"]
             if step.get("gen"):
                 result["gen"] = step["gen"]  # `layout.gen.py`, in the build directory beside the routed board
             if step.get("error"):
@@ -1340,9 +1582,9 @@ def build_job(
                     # or to: name it first (the refuters: a stranded lock was blamed on the router alone).
                     held = sorted({o.where for o in (objs or {}).get("copper", ()) if o.source == "core" and o.where and o.net in surprise})
                     if held:
-                        fails.append(f"KiCad reports {', '.join(surprise)} unconnected and the router reported them routed; the core lines on them ({', '.join(held)}) are the first suspects: check each one's ends sit on the copper they should join, or delete it. If none of them is at fault, this is a pcbc router bug")
+                        fails.append(f"KiCad reports {', '.join(surprise)} unconnected and the router reported them routed; core lines on them: {', '.join(held)}")
                     else:
-                        fails.append(f"KiCad reports {', '.join(surprise)} unconnected and the router reported them routed: this is a pcbc router bug, not a board move")
+                        fails.append(f"KiCad reports {', '.join(surprise)} unconnected and the router reported them routed, with no core line on them (a pcbc router defect)")
                 # ... and count for count: the router's own open links per net on the copper it handed
                 # on (`route_native.open_links`, per pad block, as KiCad's ratsnest counts), against
                 # KiCad's unconnected items per net. Equal on every net, routed or not, or the router's
@@ -1401,14 +1643,56 @@ def build_job(
             entry["guards"] = _guard_gate(final_text, doc)
             entry["planes_stitched"] = _stitch_gate(final_text, doc)
             entry["bridges"] = _bridge_gate(final_text, design)
+            # docs/net-path-physics.md §3.2/§4.6: the junction rules measured on the emitted board, at
+            # the net's clearance, on pcbc's copper and on copper no role group owns (a core line's).
+            # Fatal since refutation round 2: a sense tap a core line joins to the rail mid-trace built ok.
+            from .route_verify import path_junctions
+
+            entry["junctions"] = path_junctions(final_text, design, cs_) if cs_ is not None else []
+            from .route_verify import junction_lines, switch_copper, switch_copper_lines
+
+            # Decision 2: a switch node's copper area, measured on the emitted board and reported (never a gate).
+            entry["switch_copper"] = switch_copper_lines(switch_copper(final_text, cs_)) if cs_ is not None else []
+            # Decision 1: every pad neck on the emitted board, listed; a narrow link piece that is not one is
+            # listed here and fails the fab ampacity gate (`copper.power_ampacity_failures`).
+            from .route_verify import gate_roles, neck_lines, neck_refusal_lines, pad_necks
+
+            if cs_ is not None:
+                _nk, _bad = pad_necks(final_text, cs_, gate_roles(final_text, cs_))
+                entry["necks"] = neck_lines(_nk)
+                entry["neck_refusals"] = neck_refusal_lines(_bad)
+            # docs/physics-subjects.md PR 5: a Path's length budget, against the copper its links own.
+            from .route_verify import path_length_lines, path_lengths
+
+            entry["path_lengths"] = path_lengths(final_text, cs_)
+            # docs/physics-subjects.md PR 8: each station's joint to its pour, against the station's draw.
+            from .route_verify import pour_joint_lines, pour_joints
+
+            entry["pour_joints"] = pour_joints(final_text, cs_)
+            # docs/direction.md §4c: every part whose orientation matters carries one good mark, measured on the
+            # emitted board (its footprints' silk and the board's own drawings), and no mark names another pin.
+            from .orient import check_text as orient_check
+            from .stackup import get_stackup, silk_limits
+
+            entry["orientation"] = orient_check(final_text, design, silk_limits(get_stackup(compile_design(design).stackup)))
+
             gate_fails = [
-                ("a declared chain is not fed in its order: ", entry["chains"]["fails"]),
+                ("a path's copper meets its net outside its stations: ", junction_lines(entry["junctions"])),
+                # Postfix B7: an unrouted net's copper is withheld from the emitted board, so R-X4 on it would blame a
+                # link the router did lay ("no copper joins J_IN.1 to C_IN1.1") rather than the one that failed; the
+                # unrouted error states that net's failure.
+                ("a declared path is not fed in its order: ", [f for f in entry["chains"]["fails"] if f.split(" ", 1)[0] not in unrouted]),
                 ("a differential pair is not coupled: ", entry["pairs"]["fails"]),
                 ("two grounds are tied at more than one point: ", entry["bridges"]["fails"]),
                 ("a parallel via is not parallel: ", entry["parallel"]["fails"]),
                 ("a thermal land is not served: ", entry["thermal"]["fails"]),
                 ("a guard is not welded to its pour: ", entry["guards"]["fails"]),
                 ("a plane stitch does not tie both planes: ", entry["planes_stitched"]["fails"]),
+                ("a path is longer than its length_mm: ", path_length_lines(entry["path_lengths"])),
+                ("a joint to a pour carries less than its station draws: ", pour_joint_lines(entry["pour_joints"])),
+                ("a part's orientation is not marked on the silkscreen: ", entry["orientation"]["fails"]),
+                # KiCad's DRC flags silk on a mask opening only where they overlap; the fab's clearance is measured here.
+                ("the silkscreen is nearer a pad's mask opening than the fab prints: ", entry["orientation"]["silk_mask"]),
             ]
             if not unrouted:
                 for head, fl in gate_fails:
@@ -1422,13 +1706,15 @@ def build_job(
                 # stamp and no fab. The gates that would have failed are reported beside the moves.
                 also = [head + "; ".join(fl) for head, fl in gate_fails if fl] + [f for f in gate.get("fails") or []]
                 result["unrouted"] = unrouted
-                result["moves"] = step.get("moves") or []
+                # `errors` is the name (docs/direction.md §7b); `moves` is kept, the same list, for the
+                # tools and tests that read the older key.
+                result["errors"] = result["moves"] = step.get("moves") or []
                 result["error"] = "unrouted: " + "; ".join(unrouted) + "\n" + "\n".join(step.get("moves") or []) + ("".join(f"\n  also: {a}" for a in also) if also else "")
                 return result
             if not gate["ok"]:
                 result["error"] = "copper is not board.py's netlist, or fails KiCad DRC: " + "; ".join(gate["fails"])
                 return result
-            _stamp(layout, board, design, traced=route_seen.record())
+            _stamp(layout, board, design, traced=route_seen.record(), outline=step.get("outline"))
 
     if "fab" in plan:
         if not routed.exists():

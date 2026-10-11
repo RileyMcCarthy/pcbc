@@ -15,16 +15,17 @@ from pcbc.layout_job import layout_job
 from pcbc.layout import footprints_by_ref
 from pcbc.seed import emit_pcb
 from pcbc.sexp import footprint_at, stable_uuid
+from conftest import put_core, write_split
+from conftest import copy_board_file
 
 BLINKY = Path(__file__).resolve().parent.parent / "examples" / "blinky" / "blinky.py"
 
 
 def _core(tmp_path: Path, body: str):
     board = tmp_path / "blinky.py"
-    board.write_text(BLINKY.read_text())
-    design = load_board(board)
-    (tmp_path / "layout.core.py").write_text(body)
-    load_layout(tmp_path / "layout.core.py", design, source="core")
+    copy_board_file(board, BLINKY)
+    put_core(tmp_path / "layout.core.py", body)
+    design = load_board(board)  # the core file runs with board.py (docs/board-outline.md A.2)
     return design, render(design, design.copper, board="blinky")
 
 
@@ -87,7 +88,7 @@ def test_seg_via_arc_pour_are_the_kicad_objects(tmp_path: Path):
 
 def test_css_place_is_the_kicad_footprint_at(tmp_path: Path):
     board = tmp_path / "blinky.py"
-    board.write_text(BLINKY.read_text())
+    copy_board_file(board, BLINKY)
     result = pcb_job(board)
     assert result.get("error") is None, result
     text = Path(result["placed"]).read_text()
@@ -156,10 +157,8 @@ def test_gen_is_the_python_the_stage_wrote_and_core_copper_still_emits(tmp_path:
     native route stage wrote (placer and router), and the job places and routes in memory. The core
     line still emits, once, and is never written into gen."""
     board = tmp_path / "blinky.py"
-    board.write_text(BLINKY.read_text())
-    (tmp_path / "layout.core.py").write_text(
-        'Seg("LED", (1, 2), (3, 2), layer="F.Cu", width=0.25, id="led")\n'
-    )
+    copy_board_file(board, BLINKY)
+    put_core(tmp_path / "layout.core.py", 'Seg("LED", (1, 2), (3, 2), layer="F.Cu", width=0.25, id="led")\n')
     out = tmp_path / "routed" / "layout.kicad_pcb"
     design = load_board(board)
     result = layout_job(design, out=out, board=board)
@@ -187,10 +186,8 @@ def test_kicad_loads_the_board_primitives(tmp_path: Path):
     """kicad-cli accepts every primitive. A string match is not the same thing."""
     png = base64.b64encode(_png_1x1()).decode()
     board = tmp_path / "gfx.py"
-    board.write_text("Board((30, 20))\n")
-    design = load_board(board)
-    (tmp_path / "layout.core.py").write_text(
-        "\n".join(
+    write_split(board, "Board((30, 20))\n")
+    put_core(tmp_path / "layout.core.py", "\n".join(
             [
                 'Seg("GND", (2, 2), (8, 2), layer="F.Cu", width=0.25, id="gnd-seg")',
                 'Arc("GND", (2, 4), (4, 6), (6, 4), layer="F.Cu", width=0.25, id="gnd-arc")',
@@ -216,9 +213,8 @@ def test_kicad_loads_the_board_primitives(tmp_path: Path):
                 'Generated("tuning_pattern", "tune", ["gnd-seg"], id="tune")',
                 "",
             ]
-        )
-    )
-    load_layout(tmp_path / "layout.core.py", design, source="core")
+        ))
+    design = load_board(board)
     block = render(design, design.copper, board="gfx") + render_graphics(design.graphics, board="gfx")
     pcb = tmp_path / "gfx.kicad_pcb"
     pcb.write_text(splice(emit_pcb(design, name="gfx"), block))

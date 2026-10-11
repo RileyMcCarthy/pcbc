@@ -1,8 +1,8 @@
 # Sensor node: USB-C in, 3.3 V LDO, ESP32-C3, BME280 on I2C, a thermistor
 # buffered by an op-amp into an ADC pin, and a MOSFET switching a load.
-# 33 parts, six groups - the hardest sheet so far. The AI writes the netlist
-# and one SchPlace() per part; the tool draws everything else.
-from pcbc import Board, Capacitor, Chain, Ground, Keepout, Led, Net, NetReq, Place, Power, Resistor, SchPlace, SchRegion, Thermal, load
+# 33 parts - the hardest sheet so far. The AI writes the netlist; the tool
+# draws the sheet (schematic.core.py locks what it should not move).
+from pcbc import Board, Capacitor, Path, Ground, Led, Net, NetReq, Pair, Power, Resistor, Thermal, load
 
 VBUS, V33, GND = Power("VBUS"), Power("3V3"), Ground("GND")
 USB_DP, USB_DN, CC1, CC2 = Net("USB_DP"), Net("USB_DN"), Net("CC1"), Net("CC2")
@@ -55,99 +55,25 @@ Capacitor("C_MCU_HF", "100nF", mpn="CL05B104KO5NNNC", lcsc="C1525", p1=V33, p2=G
 Capacitor("C_EN", "1uF", mpn="CL05A105KA5NQNC", lcsc="C52923", p1=EN, p2=GND, **c)
 Capacitor("C_BME", "100nF", mpn="CL05B104KO5NNNC", lcsc="C1525", p1=V33, p2=GND, **c)
 Capacitor("C_OPA", "100nF", mpn="CL05B104KO5NNNC", lcsc="C1525", p1=V33, p2=GND, **c)
-Led("D1", "red", package="0603", mpn="KT-0603R", lcsc="C72043", manufacturer="Kento", a=LED_A, k=GND)
+Led("D1", "red", package="0603", mpn="KT-0603R", lcsc="C2286", manufacturer="Kento", a=LED_A, k=GND)
 
-# Copper, 60 x 45 mm, 4 layers. Anchors decide the shape: the USB-C on the south edge,
-# the module with its antenna at the west edge, the load connector on the east edge, the
-# sensor in the north-east corner away from the regulator. Everything else says what it
-# belongs to; `pcbc pcb node.py` puts it there and lists what to move.
-Place("J1", edge="bottom", reason="USB-C at south edge")
-Place("U1", position="absolute", left=1, top=1, rotate=90, reason="ESP32-C3-MINI antenna at west")
-Keepout("ANTENNA", position="absolute", left=0, top=0, width=4, height=15)
-Place("U2", position="absolute", left=26, bottom=12, reason="LDO between the USB-C and the module")
-Place("U4", position="absolute", right=4, top=4, reason="BME280 in the corner, away from the regulator")
-Place("J_LOAD", edge="right", reason="load connector at east edge")
-Place("U3", to="J1.DP1", reason="USB ESD at the connector")
-Place("R_CC1", to="J1.CC1")
-Place("R_CC2", to="J1.CC2")
-Place("C_VBUS_HF", to="U2.VIN")
-Place("C_VBUS", to="U2.VIN")
-Place("C_3V3_HF", to="U2.VOUT")
-Place("C_3V3", to="U2.VOUT")
-Place("C_MCU_HF", to="U1.3V3")  # decoupling before the switches: the first Place() written sits nearest
-Place("C_MCU", to="U1.3V3")
-Place("R_EN", to="U1.EN")
-Place("C_EN", to="U1.EN")
-Place("SW_RST", to="U1.EN")
-Place("R_BOOT", to="U1.IO9")
-Place("SW_BOOT", to="U1.IO9")
-Place("R_LED", to="U1.IO10")
-Place("D1", to="R_LED.2")
-Place("C_BME", to="U4.VDD")
-Place("R_SDA", to="U4.SDI")
-Place("R_SCL", to="U4.SCK")
-Place("U5", to="U1.IO0", reason="thermistor buffer feeds the ADC pin")
-Place("C_OPA", to="U5.V+")
-Place("R_NTC", to="U5.+")
-Place("R_TDIV", to="U5.+")
-Place("Q1", to="J_LOAD.2", reason="low-side switch at the load connector")
-Place("R_G", to="Q1.G")
-Place("R_PD", to="Q1.G")
-Board(width=60, height=45, layers=4, stackup="jlcpcb_4l_1oz", planes=[("GND", "In1.Cu"), ("3V3", "In2.Cu")])
+Board(layers=4, stackup="jlcpcb_4l_1oz", planes=[("GND", "In1.Cu"), ("3V3", "In2.Cu")])
 
-# Schematic: six groups, one SchPlace() per part. Attached parts pose themselves.
-SchRegion("usb", title="USB", left=12, top=12, width=170, height=110)
-SchPlace("J1", parent="usb", left=90, top=12)
-SchPlace("R_CC1", to="J1.CC1")
-SchPlace("R_CC2", to="J1.CC2")
-SchPlace("U3", to="J1.DP1", side="bottom", gap=15.24)
-
-SchRegion("pwr", title="3.3 V", left=200, top=12, width=170, height=60)
-SchPlace("U2", parent="pwr", left=60, top=20)
-SchPlace("C_VBUS", to="U2.VIN")
-SchPlace("C_VBUS_HF", along="C_VBUS.1", side="bottom")
-SchPlace("C_3V3", to="U2.VOUT")
-SchPlace("C_3V3_HF", along="C_3V3.1", side="bottom")
-
-SchRegion("mcu", title="MCU", left=200, top=90, width=190, height=150)
-SchPlace("U1", parent="mcu", left=90, top=10)
-SchPlace("C_MCU", to="U1.3V3")
-SchPlace("C_MCU_HF", along="C_MCU.1", side="bottom")
-SchPlace("R_EN", to="U1.EN")
-SchPlace("C_EN", along="R_EN.2", side="bottom")
-SchPlace("SW_RST", along="C_EN.1", side="left")
-SchPlace("R_BOOT", to="U1.IO9")
-SchPlace("SW_BOOT", along="R_BOOT.2", side="bottom")
-SchPlace("R_LED", to="U1.IO10")
-SchPlace("D1", to="R_LED.2")
-
-SchRegion("sensor", title="Sensor", left=12, top=140, width=170, height=60)
-SchPlace("U4", parent="sensor", left=70, top=10)
-# Four pins on the left need three symbols and this cap: hangers sit out at 15.24 so the symbols have room.
-SchPlace("C_BME", to="U4.VDD", gap=15.24)
-SchPlace("R_SDA", to="U4.SDI", gap=15.24)
-SchPlace("R_SCL", to="U4.SCK", gap=15.24)
-
-SchRegion("analog", title="Analog", left=12, top=215, width=170, height=70)
-SchPlace("U5", parent="analog", left=70, top=15)
-SchPlace("C_OPA", to="U5.V+")
-SchPlace("R_NTC", to="U5.+")
-SchPlace("R_TDIV", along="R_NTC.2", side="bottom")
-
-SchRegion("load", title="Load", left=200, top=250, width=190, height=45)
-SchPlace("R_G", parent="load", left=20, top=15, rotate=90)  # the group's anchor, lying left to right
-SchPlace("R_PD", along="R_G.2", side="bottom")
-SchPlace("Q1", to="R_G.2")
-SchPlace("J_LOAD", to="Q1.D")
-
-NetReq("USB_DP", "USB_DN", kind="usb_hs", z_diff_ohm=90, pair=True)
-NetReq("VBUS", "3V3", "GND", kind="power", volts=5, amps=1)
+Pair("USB_DP", "USB_DN", kind="usb_hs", z_diff_ohm=90)
+NetReq("VBUS", kind="power", volts=5)
+NetReq("3V3", kind="power", volts=3.3)
+NetReq("GND", kind="power")
+Path("VBUS", "J1.VBUS", "U2.VIN", amps=1)
 NetReq("T_DIV", "T_OUT", kind="analog")
-NetReq("LOAD", kind="power", volts=3.3, amps=1)
-Chain("USB_DP", "J1.B6", "U3.6", "U1.27")  # the pair's feed order: connector, ESD, module; a third pad off the line is a stub
-Chain("USB_DN", "J1.A7", "U3.4", "U1.26")
+NetReq("LOAD", volts=3.3)
+Path("LOAD", "J_LOAD.2", "Q1.D", amps=1)
+Path("USB_DP", "J1.B6", "U3.6", "U1.27")  # the pair's feed order: connector, ESD, module; a third pad off the line is a stub
+Path("USB_DN", "J1.A7", "U3.4", "U1.26")
 # The module's exposed pad is nine `pad_prop_heatsink` blocks on GND; 0.35 W is the C3's own
 # figure for a Wi-Fi duty cycle this board runs. `across_planes=True` consents to the twelve
 # antipads a through array cuts in the 3V3 plane on In2.Cu, which the derived pitch keeps a
 # web between: see `patterns.stitch.thermal_pitch`.
 Thermal("U1.49", watts=0.35, across_planes=True)
+# The load's 1 A on the 3V3 pour (In2.Cu): the pour is the copper between the stations, and each station's joint
+# to it (the LDO's tap vias, the connector's own barrel) is sized for its draw (physics-subjects PR 8).
+Path("3V3", "U2.VOUT", "J_LOAD.1", amps=1)

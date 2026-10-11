@@ -1,8 +1,5 @@
 {
- "board_size_mm": [
-  60.0,
-  45.0
- ],
+ "board_size_mm": null,
  "classes": [
   {
    "clearance_mm": 0.18,
@@ -264,13 +261,16 @@
    "width": null
   },
   {
-   "at": null,
-   "bottom": 12,
+   "at": [
+    28.05,
+    31.3
+   ],
+   "bottom": null,
    "edge": null,
-   "from_box": "courtyard",
+   "from_box": "origin",
    "gap": null,
    "height": null,
-   "left": 26,
+   "left": 28.05,
    "locked": true,
    "margin_bottom": 0,
    "margin_left": 0,
@@ -286,20 +286,23 @@
    "rot_set": false,
    "side": "F",
    "to": null,
-   "top": null,
+   "top": 31.3,
    "toward": null,
    "translate_x": null,
    "translate_y": null,
    "width": null
   },
   {
-   "at": null,
+   "at": [
+    54.75,
+    5.25
+   ],
    "bottom": null,
    "edge": null,
-   "from_box": "courtyard",
+   "from_box": "origin",
    "gap": null,
    "height": null,
-   "left": null,
+   "left": 54.75,
    "locked": true,
    "margin_bottom": 0,
    "margin_left": 0,
@@ -310,12 +313,12 @@
    "position": "absolute",
    "reason": "BME280 in the corner, away from the regulator",
    "ref": "U4",
-   "right": 4,
+   "right": null,
    "rot": 0.0,
    "rot_set": false,
    "side": "F",
    "to": null,
-   "top": 4,
+   "top": 5.25,
    "toward": null,
    "translate_x": null,
    "translate_y": null,

@@ -370,12 +370,27 @@ def zone_rules(text: str):
     return tuple(out)
 
 
+def with_outline(design, job):
+    """`job` with the outline its board is placed and routed in: a freshly compiled job of a board with no `Outline()`
+    has none until the place stage sets R (docs/board-outline.md B.3), so it is taken from `place_native.place`, with
+    the isolation corridors drawn to it. A declared board's job is returned as it is."""
+    if job.outline is None:
+        from pcbc.place_native import place
+
+        pl = place(design, name=__import__("pathlib").Path(design.source or "board.py").stem)
+        assert pl.error is None, pl.error
+        job.outline, job.derived = pl.job.outline, pl.job.derived
+        job.constraints = pl.job.constraints
+    return job
+
+
 def scene_from_text(design, job, cs, text: str):
     """`route_scene.build_scene` over a board text read back into the model (`feet_of_text`, its copper
     and its pours' numbers)."""
     from pcbc.route_scene import build_scene
     from pcbc.stackup import get_stackup
 
+    with_outline(design, job)
     return build_scene(design, job, cs, feet_of_text(design, text), extra=copper_items(text, get_stackup(job.stackup)), zones=zone_rules(text))
 
 
@@ -396,7 +411,8 @@ def plant_errors(design, job, text: str) -> tuple[str, list[str]]:
 
     scene = scene_from_text(design, job, job.constraints, text)
     stack = scene.stack
-    w_mm, h_mm = job.board_size_mm
+    ox0, oy0, ox1, oy1 = job.outline
+    w_mm, h_mm = ox1, oy1  # the far edges: the planted errors are searched from the frame's origin
     signals = sorted({it.net for it in scene.items if it.kind == "pad" and it.net and it.net != "GND"})
     n1, n2 = signals[0], signals[1]
     solid = [s for it in scene.items if it.kind in ("pad", "hole", "track", "via", "keepout") for s in (it.copper, it.hole) if s is not None]

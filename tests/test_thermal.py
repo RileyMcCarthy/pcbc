@@ -16,7 +16,8 @@ from pathlib import Path
 
 import pytest
 
-from conftest import placed_board
+from conftest import placed_board, put_core
+from conftest import edit_board
 from pcbc.compile import compile_design
 from pcbc.constraints import compile_constraints
 from pcbc.fab import via_in_pad, via_in_pad_blockers
@@ -52,11 +53,12 @@ def _ctx(name: str) -> PatternCtx:
 
 def _variant(tmp_path: Path, name: str, *edits: tuple[str, str]) -> Path:
     """A copy of one example with its `Thermal()` line rewritten — for the refusals no board reaches."""
-    src = _board(name).read_text()
-    for old, new in edits:
-        assert old in src, old
-        src = src.replace(old, new)
-    (tmp_path / f"{name}.py").write_text(src)
+    (tmp_path / f"{name}.py").write_text(_board(name).read_text())
+    for cname in ("layout.core.py", "schematic.core.py"):
+        core = _board(name).parent / cname
+        if core.exists():
+            (tmp_path / cname).write_text(core.read_text())
+    edit_board(tmp_path / f"{name}.py", edits, every=True)
     if (_board(name).parent / "components").exists() and not (tmp_path / "components").exists():
         shutil.copytree(_board(name).parent / "components", tmp_path / "components")
     return tmp_path / f"{name}.py"
@@ -172,7 +174,7 @@ def test_a_passive_is_refused_and_via_in_pad_blockers_is_not_asked_to_change(tmp
     board = _variant(tmp_path, "c3_usb", ('Thermal("U1.49", watts=0.35)', 'Thermal("C_MCU.1", watts=0.35)'))
     (refusal,) = compile_constraints(load_board(board)).refusals
     assert "C_MCU is a two-terminal passive" in refusal, refusal
-    assert "wicks the joint whatever the fab fills it with" in refusal and "Drop the line" in refusal, refusal
+    assert "wicks the joint whatever the fab fills it with" in refusal and "Drop the line" not in refusal, refusal
     assert "fab.via_in_pad_blockers" in refusal, "the refusal names the gate it is agreeing with"
 
 
@@ -187,7 +189,7 @@ def test_a_net_with_no_pour_is_refused_and_the_move_is_the_one_that_writes_the_p
     (refusal,) = compile_constraints(load_board(board)).refusals
     assert "3V3 has no plane or pour to reach" in refusal, refusal
     # Re-worded 2026-09-25 for the native router: the pour rule is `route_scene.plane_targets`, not a router flag.
-    assert 'NetReq("3V3", kind="power") is what gives it the back pour (route_scene.plane_targets)' in refusal, refusal
+    assert refusal.endswith("(a two-layer board pours B.Cu only when GND is a power net, route_scene.plane_targets)"), refusal
 
 
 def test_a_foreign_plane_needs_consent_and_the_refusal_carries_the_arithmetic(tmp_path: Path):
@@ -241,12 +243,43 @@ def test_two_thermals_on_one_land_are_refused(tmp_path: Path):
     assert "already has a Thermal()" in refusal and "one land, one array" in refusal, refusal
 
 
+@pytest.mark.parametrize(
+    "first, second",
+    [('Thermal("U2.GND", watts=0.2)', 'Thermal("U2.2", watts=0.3)'), ('Thermal("U2.2", watts=0.3)', 'Thermal("U2.GND", watts=0.2)')],
+)
+def test_two_spellings_of_one_land_are_one_land(tmp_path: Path, first: str, second: str):
+    """Postfix A1 (refutation one-home r2): a pin name and its pad number name the same copper. The duplicate is
+    found on the pads a line resolves to, not on the string it wrote. A1's own fixture was "U1.GND" and "U1.49";
+    round 3 refuses "U1.GND" on its own (22 pads are not one land), so the pin here is U2.GND, which is pad 2."""
+    board = _variant(tmp_path, "c3_usb", ('Thermal("U1.49", watts=0.35)', f'Thermal("U1.49", watts=0.35)\n{first}\n{second}'))
+    (refusal,) = compile_constraints(load_board(board)).refusals
+    assert refusal.startswith(second.split(",")[0]), refusal
+    assert "U2.2 is already the land of" in refusal and "one land, one array" in refusal and "line 219" in refusal, refusal
+
+
+@pytest.mark.parametrize("order", ["alone", "after", "before"])
+def test_a_pin_of_many_pads_is_not_one_land(tmp_path: Path, order: str):
+    """Round 3 (refute-onehome, bt_gnd035/bt_gnd1w): `Thermal("U1.GND", watts=0.35)` compiled as "9 x 0.5/0.3 via on
+    GND" for "one land", but U1.GND is 22 pads, 21 of them separate module-edge lands. The build laid barrels in edge
+    pads and in no pad and its gate called that a pcbc bug. The statement is refused at compile, in either order
+    with the real land's own line, which still compiles."""
+    lines = {"alone": 'Thermal("U1.GND", watts=0.35)', "after": 'Thermal("U1.49", watts=0.35)\nThermal("U1.GND", watts=0.35)',
+             "before": 'Thermal("U1.GND", watts=0.35)\nThermal("U1.49", watts=0.35)'}[order]
+    cs = compile_constraints(load_board(_variant(tmp_path, "c3_usb", ('Thermal("U1.49", watts=0.35)', lines))))
+    (refusal,) = cs.refusals
+    line = 219 if order == "after" else 218
+    assert refusal == (
+        f'Thermal("U1.GND") line {line}: U1.GND is 22 pads of U1 (1, 2, 11, 14, 36, 37, ...); a thermal array is under one land, and a land is one pad'
+    ), refusal
+    assert [t.pad for t in cs.thermals] == ([] if order == "alone" else ["U1.49"])
+
+
 def test_the_language_refuses_a_bad_number_before_the_compiler_sees_it():
     """`watts <= 0` and a `pad` with no dot are wrong in the statement itself, not on this board."""
     from pcbc.language import Thermal, reset
 
     reset()
-    with pytest.raises(ValueError, match="write REF.PAD or REF.PIN"):
+    with pytest.raises(ValueError, match="is not REF.PAD or REF.PIN"):
         Thermal("U1", watts=0.35)
     with pytest.raises(ValueError, match="watts"):
         Thermal("U1.49", watts=0)
@@ -272,7 +305,7 @@ def test_a_pad_that_is_not_a_land_is_the_patterns_refusal_and_it_names_the_land_
     assert res.pieces == () and res.refusal is not None
     assert res.refusal.rule == "not_a_land" and res.refusal.pattern == "thermal", res.refusal
     assert "none of them carries pad_prop_heatsink" in res.refusal.move, res.refusal.move
-    assert 'did you mean Thermal("U1.49")?' in res.refusal.move, res.refusal.move
+    assert res.refusal.move.endswith("U1's pad_prop_heatsink pad is U1.49."), res.refusal.move
     assert "U1.3 draws 1 primitive(s), the widest 0.4 x 0.8 mm" in res.refusal.move, res.refusal.move
     assert "0.4 mm across will not hold two 0.5 mm rings at the 0.800101 mm this board's antipads allow, which needs 1.3001 mm" in res.refusal.move, res.refusal.move
     # And the land itself is not refused, which is the other half of the `and`.

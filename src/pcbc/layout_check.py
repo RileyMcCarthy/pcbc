@@ -243,8 +243,11 @@ def check_layout(design: Design, pads: list[PadGeom], *, layers: tuple[str, ...]
         con = cs.by_net(c.net) if cs is not None and c.net else None
         if con is None:
             continue
-        if c.kind in ("seg", "arc") and c.width is not None and c.width + 1e-6 < con.width_mm.value:
-            say(c, f"width {c.width:g} mm is under the {con.width_mm.value:g} mm {c.net} targets (a soft rule: KiCad warns)", fatal=False)
+        # The narrowest copper the net may carry (a sense path's 0.2 mm on a power net, §4.4): a core
+        # line is under its net only below that.
+        floor = cs.narrowest(c.net) if hasattr(cs, "narrowest") else con.width_mm.value
+        if c.kind in ("seg", "arc") and c.width is not None and c.width + 1e-6 < floor:
+            say(c, f"width {c.width:g} mm is under the {floor:g} mm {c.net} targets (a soft rule: KiCad warns)", fatal=False)
         if c.kind == "via" and c.size is not None and c.drill is not None and (c.size + 1e-6 < con.via.diameter_mm or c.drill + 1e-6 < con.via.drill_mm):
             say(c, f"via {c.size:g}/{c.drill:g} mm is under the {con.via.diameter_mm:g}/{con.via.drill_mm:g} mm netclass via {c.net} targets", fatal=False)
 

@@ -84,18 +84,35 @@ def rules(cs: ConstraintSet) -> list[DruRule]:
         if cls.track_width_mm > stack.track_min and any("track_width" in c.soft for c in cons):
             out.append(DruRule(f"width_{slug(cls.name)}", f"(constraint track_width (min {_mm(cls.track_width_mm)}))", f"A.hasNetclass('{cls.name}')", "warning"))
 
+    # A net whose one Path names every pad (`docs/physics-subjects.md` KD 12): that Path is the whole node,
+    # so a rule selected by net is true of it, at the narrowest copper its links may carry. Any other
+    # path's width is pcbc's to check (KiCad cannot select the copper between two pads; O3), and the
+    # report says which. KiCad takes the last matching rule, so this follows the class rule.
+    for c in cs.constraints:
+        whole = c.whole_node_path() if hasattr(c, "whole_node_path") else None
+        if whole is None:
+            continue
+        nw = min((lk.narrowest() for lk in whole.links), default=0.0)
+        if nw > stack.track_min + 1e-9:
+            out.append(DruRule(f"width_net_{slug(c.net)}", f"(constraint track_width (min {_mm(nw)}))", f"A.NetName == '{c.net}'", "warning"))
+
     # E.4: keep-aways, one per (class, other net); the exemption keeps an IC's own FB/SW pins out.
     for cls in cs.classes:
         aways: dict[str, float] = {}
-        for c in by_class.get(cls.name, []):
+        members = by_class.get(cls.name, [])
+        for c in members:
             for k in c.keep_away:
                 aways.setdefault(k.other, k.mm)
         for other in sorted(aways):
+            # A keep-away is the NetReq's that wrote it (net to net, docs/physics-subjects.md PR 7). When some net of
+            # the class did not write it (two analog NetReqs share class Analog), the rule names the nets that did.
+            said = [c.net for c in members if any(k.other == other for k in c.keep_away)]
+            who = f"A.hasNetclass('{cls.name}')" if len(said) == len(members) else "(" + " || ".join(f"A.NetName == '{n}'" for n in sorted(said)) + ")"
             out.append(
                 DruRule(
                     f"{slug(cls.name)}_away_from_{slug(other)}",
                     f"(constraint clearance (min {_mm(aways[other])}))",
-                    f"A.hasNetclass('{cls.name}') && B.NetName == '{other}' && {NOT_OWN_PADS}",
+                    f"{who} && B.NetName == '{other}' && {NOT_OWN_PADS}",
                 )
             )
 
@@ -115,6 +132,16 @@ def rules(cs: ConstraintSet) -> list[DruRule]:
                     f"A.hasNetclass('{cls.name}') && !B.hasNetclass('{cls.name}') && B.NetName != ''",
                 )
             )
+            # F1 (docs/physics-subjects.md §3.9, PR 4): between two nets of the class as well; the rule above
+            # skips them, and two 400 V nets of one NetReq may be 800 V apart.
+            if len({c.net for c in by_class.get(cls.name, [])}) > 1:
+                out.append(
+                    DruRule(
+                        f"creepage_{slug(cls.name)}_within",
+                        f"(constraint creepage (min {_mm(max(creep))}))",
+                        f"A.hasNetclass('{cls.name}') && B.hasNetclass('{cls.name}') && A.NetName != B.NetName",
+                    )
+                )
 
     # E.13, E.14: isolation clearance and creepage between the two sides' nets (C.8 numbers).
     for spec in cs.isolation_specs:
@@ -141,17 +168,33 @@ def rules(cs: ConstraintSet) -> list[DruRule]:
                     )
                 )
 
-    # E.7: routed length, one rule per net (from length_mm=, i2c, or Bus(length_mm=)); never from max_mm.
+    # E.7: routed length, one rule per net: i2c's derived budget and Bus(length_mm=) bound all of a node's copper;
+    # a Path's length_mm= reaches KiCad only when that Path names every pad (docs/physics-subjects.md KD 12),
+    # because a KiCad length rule sums every stub of the net. Never from max_mm.
     for c in cs.constraints:
-        if c.length_max_mm is not None:
-            out.append(DruRule(f"length_{slug(c.net)}", f"(constraint length (max {_mm(c.length_max_mm.value)}))", f"A.NetName == '{c.net}'"))
-    # E.9: no vias (per net: the verified form); E.10: the via budget, soft.
+        whole = c.whole_node_path() if hasattr(c, "whole_node_path") else None
+        if whole is None and len(c.paths) == 1 and not c.off_path:
+            # Round 3: a group's budget (Pair or Bus length_mm=) on a member Path that names every pad and writes no
+            # field of its own: the path is the whole node, so the per-net rule is exact.
+            whole = c.paths[0]
+        length = c.length_max_mm.value if c.length_max_mm is not None else (whole.length_mm if whole is not None else None)
+        if length is not None:
+            out.append(DruRule(f"length_{slug(c.net)}", f"(constraint length (max {_mm(length)}))", f"A.NetName == '{c.net}'"))
+    # E.9: no vias (per net: the verified form); E.10: the via budget, soft. A net writes neither since PR 5: a
+    # whole-node Path's own (KD 12), and a pair's preset budget.
     for c in cs.constraints:
-        if not c.via.allowed:
+        whole = c.whole_node_path() if hasattr(c, "whole_node_path") else None
+        steps = [lk for lk in whole.links if not lk.join] if whole is not None else []
+        if not c.via.allowed or (steps and all(not lk.via.allowed for lk in steps)):
             out.append(DruRule(f"novia_{slug(c.net)}", "(constraint via_count (max 0))", f"A.NetName == '{c.net}'"))
     for c in cs.constraints:
-        if c.via.allowed and c.via.count_max is not None:
-            out.append(DruRule(f"vias_{slug(c.net)}", f"(constraint via_count (max {c.via.count_max}))", f"A.NetName == '{c.net}'", "warning"))
+        whole = c.whole_node_path() if hasattr(c, "whole_node_path") else None
+        steps = [lk for lk in whole.links if not lk.join] if whole is not None else []
+        budget = c.via.count_max if c.via.allowed else None
+        if steps and all(lk.via.allowed for lk in steps) and steps[0].via.count_max is not None:
+            budget = steps[0].via.count_max
+        if c.via.allowed and budget is not None and not (steps and all(not lk.via.allowed for lk in steps)):
+            out.append(DruRule(f"vias_{slug(c.net)}", f"(constraint via_count (max {budget}))", f"A.NetName == '{c.net}'", "warning"))
 
     # E.8: skew, one per pair and per bus (members sorted; a pair and a bus over the same nets share
     # the tighter budget), soft.

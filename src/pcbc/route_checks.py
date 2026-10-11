@@ -59,6 +59,9 @@ def build_ctx(design: Design, job: CompiledJob, posed) -> Ctx:
     route checks need. No board text is read (`docs/direction.md` §1)."""
     from .pcb_place import posed_feet_of
 
+    if getattr(job, "outline", None) is None:
+        # A derived board's outline is set by placement (R) and the fit (O): with none the escape grid would span the frame.
+        raise ValueError("the board has no Outline() and this job was not placed: a derived outline is set by the place stage (docs/board-outline.md B.3)")
     board = _board_of(job)
     content = content_rect(board)
     regions = resolve_regions(board, job.regions)
@@ -100,6 +103,7 @@ def route_aware_report(design: Design, job: CompiledJob, posed) -> tuple[list[st
     moves += check_airwires(ctx)
     moves += check_chains(ctx)
     moves += check_corridors(ctx)
+    moves += check_station_escapes(ctx)
     m, n = check_loops(ctx)
     moves += m
     notes += n
@@ -330,24 +334,6 @@ def _side_of_pin(f: Foot, p: Pad) -> str:
     return _quantise(px - cx, py - cy)
 
 
-def _place_line(ctx: Ctx, ref: str, avoid_net: str, toward: str | None = None) -> str:
-    """`Place("R_EN", to="U1.EN", toward="up")`: the part attached to the IC pin on one of its other
-    nets; `move R_EN` when it has none."""
-    f = ctx.feet.get(ref)
-    if f is not None:
-        for p in f.pads:
-            if not p.net or p.net == avoid_net:
-                continue
-            ic = _ic_pad_on(ctx, p.net, exclude=ref)
-            if ic is None:
-                continue
-            iref, ipin = ic
-            side = toward
-            if side is None:
-                ipad = next(q for q in ctx.feet[iref].pads if q.net == p.net and q.num)
-                side = _side_of_pin(ctx.feet[iref], ipad)
-            return f'Place("{ref}", to="{iref}.{ipin}", toward="{side}")'
-    return f"move {ref}"
 
 
 # ---------------------------------------------------------------- F.1 airwires
@@ -356,6 +342,13 @@ def _place_line(ctx: Ctx, ref: str, avoid_net: str, toward: str | None = None) -
 def _airwire_src(ctx: Ctx, c: Constraint) -> str:
     if c.req_index >= 0 and ctx.design.netreqs[c.req_index].max_mm is not None:
         return f"NetReq line {c.line}"
+    if c.pair is not None:
+        # A NetReq naming a Pair's two nets gives them its max_mm= (refutation one-home r1, defect 1).
+        import fnmatch
+
+        r = next((r for r in ctx.design.netreqs if r.max_mm is not None and any(fnmatch.fnmatchcase(c.net, x) for x in r.nets)), None)
+        if r is not None:
+            return f"NetReq line {r.line}"
     return f"preset {c.kind}"
 
 
@@ -386,8 +379,10 @@ def _airwire_budget(ctx: Ctx, c: Constraint) -> tuple[float, str] | None:
     return None
 
 
-FAST_KINDS = ("usb_hs", "clock", "spi", "i2c")
-"""The kinds named after a signalling standard. Every one of them carries `PRESETS[kind].airwire_mm
+FAST_KINDS = ("clock", "i2c")
+"""The net kinds named after a signalling standard; a Pair or Bus member is fast too (`_unbudgeted_fast`).
+
+The kinds named after a signalling standard. Every one of them carries `PRESETS[kind].airwire_mm
 is None`, and that is not fixed here.
 
 Measured 2026-09-22, `PRESETS`: `switch_node` 8.0, `feedback` 15.0, `analog` 25.0, `sense` 25.0 —
@@ -443,7 +438,8 @@ def _unbudgeted_fast(ctx: Ctx) -> list[str]:
 
     It is deliberately not a `Place()` move. The defect a missing budget names is a missing
     declaration, and pcbc cannot know how long an ESP32-C3's USB run may be without being told what
-    drives it — the edit is on the `NetReq` line, not on a part.
+    drives it. The line names the subjects that may carry a length (`docs/physics-subjects.md` E21: a
+    Path's `length_mm=`), as facts.
 
     Measured 2026-09-22 on fresh placements: it fires on **four nets of two boards** — c3_usb's
     `USB_DP`/`USB_DN` (20.747 / 20.645 mm) and node's (39.124 / 38.971 mm). blinky, buck and ds2
@@ -451,18 +447,24 @@ def _unbudgeted_fast(ctx: Ctx) -> list[str]:
     """
     out: list[str] = []
     for c in ctx.cs.constraints:
-        if c.kind not in FAST_KINDS or c.airwire_max_mm is not None or c.length_max_mm is not None:
+        group = c.group if c.group is not None and c.group.kind == "bus" else None
+        if (c.kind not in FAST_KINDS and c.pair is None and group is None) or c.airwire_max_mm is not None or c.length_max_mm is not None:
+            continue
+        if any(p.length_mm is not None for p in c.paths):
             continue
         sites = ctx.pads_on.get(c.net, [])
         if len(sites) < 2:
             continue
         mst = _edge_mst_mm([_box_of(s) for s in sites])
-        where = f"NetReq line {c.line}" if c.line else f"kind {c.kind}"
-        out.append(
-            f"{c.net}: {mst:.1f} mm of airwire (MST of {len(sites)} pads, edge to edge) and no budget checks it; "
-            f"preset {c.kind} sets no max_mm and pcbc will not invent one for a signalling standard it was not told "
-            f'({where}); the route is longer still: give NetReq("{c.net}", ..., max_mm=) or length_mm='
-        )
+        lines = [f"Path line {p.line}" for p in c.paths]
+        # docs/physics-subjects.md PR 6: a pair's length may also be written once on its Pair line.
+        if c.pair is not None and c.pair.line:
+            lines.append(f"Pair line {c.pair.line}")
+        if lines:
+            where = f"no length_mm= on {' or '.join(lines)}"
+        else:
+            where = f"no Path of {c.net} writes length_mm="
+        out.append(f"{c.net}: {mst:.1f} mm of airwire (MST of {len(sites)} pads, edge to edge) and no budget checks it: {where}")
     return out
 
 
@@ -503,7 +505,7 @@ def check_airwires(ctx: Ctx) -> list[str]:
             target = f"{ic[0]}.{ic[1]}"
         out.append(
             f"{c.net}: {mst:.1f} mm of airwire (MST of {len(sites)} pads, edge to edge) over max_mm={_g(limit)} ({limit_src}); "
-            f'the route is longer still: Place("{ref}", to="{target}") or raise max_mm'
+            f"the route is longer still; {ref} is the pad farthest from the rest" + (f" ({_attached(ctx, ref)})" if ref in ctx.feet else "") + (f"; {target} is the nearest IC pin on {c.net}" if ic is not None else "")
         )
     out += _unbudgeted_fast(ctx)
     # pairs and buses: member MSTs must agree within the skew budget
@@ -542,39 +544,57 @@ def check_airwires(ctx: Ctx) -> list[str]:
         if spread <= budget + 1e-9:
             continue
         out.append(
-            f"{longest}/{shortest}: airwires {msts[longest]:.1f} and {msts[shortest]:.1f} mm differ by {spread:.1f} mm; "
-            f"skew budget {_g(budget)} mm ({source}): {_even_move(ctx, longest, shortest)} evens them, "
-            f"or the router adds {max(spread - budget, 0.05):.2f} mm of serpentine"
+            f"{longest}/{shortest}: airwires {msts[longest]:.1f} and {msts[shortest]:.1f} mm differ by {spread:.1f} mm, "
+            f"over the skew budget {_g(budget)} mm ({source})"
         )
+    out += _path_airwires(ctx)
     return out
 
 
-def _even_move(ctx: Ctx, a: str, b: str) -> str:
-    """The part whose pads on both members throw the spread the most, put back at the nearest
-    other part's pad on the long member: `Place("U3", to="J1.A6")`."""
-    sites_a = ctx.pads_on.get(a, [])
-    sites_b = ctx.pads_on.get(b, [])
-    refs = sorted({s[0] for s in sites_a} & {s[0] for s in sites_b})
-    if len(refs) < 2:
-        return "move the pair's parts together"
-    base = abs(_mst_mm([(s[2], s[3]) for s in sites_a]) - _mst_mm([(s[2], s[3]) for s in sites_b]))
-    best = None
-    for ref in refs:
-        pa = [(s[2], s[3]) for s in sites_a if s[0] != ref]
-        pb = [(s[2], s[3]) for s in sites_b if s[0] != ref]
-        if len(pa) < 2 or len(pb) < 2:
-            continue
-        gain = base - abs(_mst_mm(pa) - _mst_mm(pb))
-        if best is None or gain > best[0] + 1e-9:
-            best = (gain, ref)
-    if best is None:
-        return "move the pair's parts together"
-    ref = best[1]
-    f = ctx.feet[ref]
-    cx, cy = f.center()
-    others = sorted((math.hypot(s[2] - cx, s[3] - cy), s[0], s[1]) for s in sites_a if s[0] != ref)
-    _d, tref, tnum = others[0]
-    return f'Place("{ref}", to="{tref}.{tnum}")'
+def _station_xy(ctx: Ctx, net: str, station: tuple[str, ...]) -> tuple[float, float] | None:
+    for pid in station:
+        ref, _, num = pid.partition(".")
+        for r, n, x, y, _w, _h in ctx.pads_on.get(net, []):
+            if r == ref and n == num:
+                return (x, y)
+    return None
+
+
+def _path_airwires(ctx: Ctx) -> list[str]:
+    """F.1 for paths (`docs/net-path-physics.md` §4.5): each path's station-to-station airwire against its
+    `Path(length_mm=)` or its kind's preset (the airwire is a lower bound on the routed length, so a placement
+    already over it cannot be routed inside it). A warning stating the facts, never a pose."""
+    out: list[str] = []
+    for c in ctx.cs.constraints:
+        for p in c.paths:
+            if p.length_mm is None:
+                continue
+            pts = [_station_xy(ctx, c.net, st) for st in p.stations]
+            if any(pt is None for pt in pts):
+                continue
+            hops = [math.dist(pts[i], pts[i + 1]) for i in range(len(pts) - 1)]  # type: ignore[arg-type]
+            total = sum(hops)
+            if total <= p.length_mm + 1e-9:
+                continue
+            far = max(range(len(hops)), key=lambda i: (hops[i], -i)) + 1
+            who = p.written[far]
+            ref = who.split(".", 1)[0]
+            lk = p.links[0]
+            lay = lk.layers[0] if lk.layers else "F.Cu"
+            req = next((q for q in ctx.design.paths if q.net == c.net and q.line == p.line), None)
+            if req is not None and req.length_mm is not None:
+                src = f"length_mm={_g(p.length_mm)} on that line"
+            elif c.pair is not None and c.pair.length_mm is not None:
+                src = f"length_mm={_g(p.length_mm)} on Pair line {c.pair.line}"
+            else:
+                src = f"kind {p.kind}'s {_g(p.length_mm)} mm"
+            out.append(
+                f"{c.net} path {' -> '.join(p.written)} (Path line {p.line}): {total:.1f} mm between stations, over {src}; "
+                f"{_g(lk.width_on(lay))} mm wide on {lay}, clearance {_g(c.clearance_mm.value)} mm; {who} is the farthest station ({_attached(ctx, ref)})"
+            )
+    return out
+
+
 
 
 # ---------------------------------------------------------------- F.2 chains
@@ -611,13 +631,13 @@ def _corridor_hits(ctx: Ctx, net: str, half: float, a: tuple[str, Pad], b: tuple
 
 
 def check_chains(ctx: Ctx) -> list[str]:
-    """F.2: a `Chain`'s pads project in order along the feed and no other net's pad sits in the
-    corridor between consecutive pads; a usb_hs or sense net with 3+ pads and no Chain must have its
-    pads on one line, else the message says the Chain line to type."""
+    """F.2: a `Path`'s pads project in order along the feed and no other net's pad sits in the
+    corridor between consecutive pads; a usb_hs or sense net with 3+ pads and no Path must have its
+    pads on one line, else the message says to write one."""
     out: list[str] = []
     cs = ctx.cs
-    chained = {ch.net for ch in ctx.design.chains}
-    for ch in ctx.design.chains:
+    chained = {ch.net for ch in ctx.design.paths}
+    for ch in ctx.design.paths:
         c = cs.by_net(ch.net)
         if c is None:
             continue
@@ -632,31 +652,32 @@ def check_chains(ctx: Ctx) -> list[str]:
             continue
         dx, dy = (xn - x0) / length, (yn - y0) / length
         ts = [round((px - x0) * dx + (py - y0) * dy, 4) + 0.0 for px, py in pts]
-        label = f"{ch.net} chain {' -> '.join(ch.pads)}"
         ordered = True
         for i in range(len(ts) - 1):
             if ts[i] >= ts[i + 1] - 1e-9:
                 ordered = False
-                ref_i = pads[i][0]  # type: ignore[index]
-                ref_j, pad_j = pads[i + 1]  # type: ignore[misc]
-                what = "the cap" if ref_i.startswith("C") else ref_i
-                toward = _quantise(-dx, -dy)
+                # docs/net-path-physics.md §4.5: a statement and the line to edit, never a pose.
+                ref_i, ref_j = pads[i][0], pads[i + 1][0]  # type: ignore[index]
+                placed = "; ".join(dict.fromkeys(_attached(ctx, r) for r in (ref_i, ref_j)))
                 out.append(
-                    f"{label}: {ch.pads[i]} projects after {ch.pads[i + 1]} along the feed (t = {ts[i]:.1f} vs {ts[i + 1]:.1f} mm); "
-                    f'{what} must come first: Place("{ref_i}", to="{ref_j}.{_pin(ctx, ref_j, pad_j.num)}", toward="{toward}")'
+                    f"Path line {ch.line}: {ch.pads[i]} projects after {ch.pads[i + 1]} along the feed (t = {ts[i]:.1f} vs {ts[i + 1]:.1f} mm), "
+                    f"and the stations are fed in the order Path line {ch.line} writes them ({placed})"
                 )
                 break
         if not ordered:
             continue
-        half = _corridor_half(c)
         for i in range(len(pads) - 1):
             if math.hypot(pts[i + 1][0] - pts[i][0], pts[i + 1][1] - pts[i][1]) > CHAIN_HOP_MM + 1e-9:
                 continue  # a hop across the board: the router detours; only a placed hop must be straight
+            # The corridor at the link's own width (§4.5), else the net's.
+            lk = cs.link(ch.net, f"{pads[i][0]}.{pads[i][1].num}", f"{pads[i + 1][0]}.{pads[i + 1][1].num}") if hasattr(cs, "link") else None  # type: ignore[index]
+            half = (lk.widest() / 2.0 + c.clearance_mm.value) if lk is not None else _corridor_half(c)
             for _t, who, net in _corridor_hits(ctx, ch.net, half, pads[i], pads[i + 1]):  # type: ignore[arg-type]
-                out.append(f"{ch.net} chain: {who} ({net or 'no net'}) lies in the corridor between {ch.pads[i]} and {ch.pads[i + 1]}; move {who.split('.', 1)[0]}")
+                ref = who.split(".", 1)[0]
+                out.append(f"{ch.net} path (Path line {ch.line}): {who} ({net or 'no net'}) lies in the corridor between {ch.pads[i]} and {ch.pads[i + 1]} ({_attached(ctx, ref)})")
     # implicit chains: one pad per part, on a line
     for c in cs.constraints:
-        if c.kind not in ("usb_hs", "sense") or c.net in chained:
+        if c.kind != "sense" or c.net in chained:  # a pair member names its Path or is refused (E13, PR 6)
             continue
         sites = ctx.pads_on.get(c.net, [])
         first: dict[str, tuple[str, str, float, float]] = {}
@@ -671,9 +692,37 @@ def check_chains(ctx: Ctx) -> list[str]:
         if not stub:
             continue
         names = ", ".join(f"{r}.{n}" for r, n, _x, _y in pads)
-        chain = ", ".join(f'"{r}.{n}"' for r, n, _x, _y in pads)
-        out.append(f'{c.net} has {len(pads)} pads ({names}): a third pad off the line is a stub; say the order: Chain("{c.net}", {chain})')
+        # No order chosen for the author (§4.5): the order the placement suggests is a pose.
+        out.append(f"{c.net} has {len(pads)} pads ({names}): a third pad off the line is a stub, and no Path gives their feed order")
     return out
+
+
+def _place_spec(ctx: Ctx, ref: str):
+    return next((p for p in ctx.design.places if p.ref == ref), None)
+
+
+def _place_ref(ctx: Ctx, ref: str) -> str:
+    """` (layout.core.py:79)`: where the part the message names is placed, when board.py says."""
+    spec = _place_spec(ctx, ref)
+    line = getattr(spec, "line", 0) if spec is not None else 0
+    return f" (layout.core.py:{line})" if line else ""
+
+
+def _attached(ctx: Ctx, ref: str) -> str:
+    """Where `ref`'s position comes from, as the line that wrote it: `layout.core.py:75 attaches C_OUT1 to
+    L1.2`, `layout.core.py:70 puts J_IN on the left edge`, `layout.core.py:66 places U1`, or `C9 has no Place()
+    (the generator placed it)`. Refutation round 2: this said `no Place() attaches U1` of an anchor the
+    author placed absolutely, instead of naming the line that did."""
+    spec = _place_spec(ctx, ref)
+    if spec is None:
+        return f"{ref} has no Place() (the generator placed it)"
+    line = getattr(spec, "line", 0)
+    who = f"layout.core.py:{line}" if line else "its Place()"
+    if getattr(spec, "to", None):
+        return f"{who} attaches {ref} to {spec.to}"
+    if getattr(spec, "edge", None):
+        return f"{who} puts {ref} on the {spec.edge} edge"
+    return f"{who} places {ref}"
 
 
 def _implicit_chain(ctx: Ctx, net: str, refs: list[str]) -> list[tuple[str, str, float, float]]:
@@ -835,81 +884,120 @@ def check_corridors(ctx: Ctx) -> list[str]:
     """F.3: a net whose class is 0.4 mm or wider needs a channel of width + 2 clearances between
     every MST-adjacent pair of its pads on at least one allowed outer layer. Rasterised: other-net
     pads (through holes on both layers), keepouts, closed rows' fanout lanes and the edge band,
-    each dilated by the channel's half width; the net's own pads are always passable."""
+    each dilated by the channel's half width; the net's own pads are always passable.
+
+    On a net whose paths carry a field or a kind (`docs/net-path-physics.md` §4.5) the declared links
+    are checked first, each at its own width on its own layers, then an MST over the off-path pads and
+    the paths' stations at the net's width (never between two stations of one path: that is a link)."""
     out: list[str] = []
     cs = ctx.cs
     stack = cs.stackup
     outer = [lay for lay in stack.copper_layers() if is_outer(lay)]
     for c in cs.constraints:
-        w = c.width_mm.value
-        if w < WIDE_MM:
-            continue
-        layers = [lay for lay in c.layers if is_outer(lay)]
-        if not layers:
-            continue
         sites = ctx.pads_on.get(c.net, [])
         if len(sites) < 2:
             continue
-        clr = c.clearance_mm.value
-        half = w / 2.0 + clr
-        grid = CORRIDOR_COARSE_MM if w > CORRIDOR_COARSE_OVER_MM else CORRIDOR_GRID_MM
-        dil = math.ceil(round(half / grid, 6))
-        edge_band = math.ceil(round(stack.edge_clearance / grid, 6)) + dil
-        grids: dict[str, _Grid] = {}
-        obstacles: dict[str, list[tuple[str, tuple[float, float, float, float]]]] = {}
-        for lay in layers:
-            g = _Grid(ctx.content, grid)
-            obs: list[tuple[str, tuple[float, float, float, float]]] = []
-            band = bytes([1]) * g.w
-            for j in range(g.h):
-                if j < edge_band or j >= g.h - edge_band:
-                    g.rows[j][:] = band
-                else:
-                    g.rows[j][:edge_band] = b"\x01" * edge_band
-                    g.rows[j][g.w - edge_band :] = b"\x01" * edge_band
-            for ref in sorted(ctx.feet):
-                f = ctx.feet[ref]
-                pl = ctx.pad_layers.get(ref, [])
-                for k, p in enumerate(f.pads):
-                    if p.net == c.net:
+        by_id = {f"{s[0]}.{s[1]}": s for s in sites}
+        jobs: list[tuple[float, list[str], list[tuple], str]] = []  # (width, layers, [(site a, site b)], head)
+        fielded = c.fielded() if hasattr(c, "fielded") else False
+        if fielded:
+            same: set[frozenset] = set()
+            for p in c.paths:
+                st = [x for s_ in p.stations for x in s_]
+                same |= {frozenset((x, y)) for x in st for y in st if x != y}
+                for lk in p.links:
+                    if lk.join:
                         continue
-                    on = pl[k] if k < len(pl) else frozenset({"F.Cu"})
-                    if lay not in on:
+                    a = next((by_id[x] for x in lk.a if x in by_id), None)
+                    b = next((by_id[x] for x in lk.b if x in by_id), None)
+                    lays = [lay for lay in lk.layers if is_outer(lay)]
+                    if a is None or b is None or not lays or lk.widest() < WIDE_MM:
                         continue
-                    box = _pad_box(f, p)
-                    g.fill(box, 1, dil)
-                    obs.append((f"{ref}.{_pin(ctx, ref, p.num)}" if p.num else f"{ref}'s hole", box))
-                for side, strip in _lane_strips(f).items():
-                    if any(p.net == c.net and f.escape.get(p.num) == side for p in f.pads):
-                        continue  # the net's own escape via sits in this lane
-                    g.fill(strip, 1, dil)
-                    obs.append((f"{ref}'s fanout lane", strip))
-            for name, box, _no in ctx.keepout_boxes:
-                g.fill(box, 1, dil)
-                obs.append((f"Keepout {name}", box))
-            e, r = stack.edge_clearance, ctx.content
-            for band in ((r.x0, r.y0, r.x1, r.y0 + e), (r.x0, r.y1 - e, r.x1, r.y1), (r.x0, r.y0, r.x0 + e, r.y1), (r.x1 - e, r.y0, r.x1, r.y1)):
-                obs.append(("the board edge", band))
-            for s in sites:
-                g.fill(_box_of(s), 0)
-            grids[lay] = g
-            obstacles[lay] = obs
-        pts = [(x, y) for _r, _n, x, y, _w, _h in sites]
-        for ia, ib in _mst_edges(pts):
-            a, b = sites[ia], sites[ib]
-            box_a, box_b = _box_of(a), _box_of(b)
-            reached = False
-            for lay in layers:
-                g = grids[lay]
-                label = g.label_in(box_a)
-                if label == 0:
-                    label = g.flood_from(box_a)
-                if label > 0 and g.has(box_b, label):
-                    reached = True
-                    break
-            if reached:
+                    jobs.append((lk.widest(), lays, [(a, b)], f"{c.net} path {lk.written[0]} -> {lk.written[1]} ({lk.source}): "))
+            if c.width_mm.value >= WIDE_MM:
+                lays = [lay for lay in c.layers if is_outer(lay)]
+                pts = [(x, y) for _r, _n, x, y, _w, _h in sites]
+                edges = [(sites[ia], sites[ib]) for ia, ib in _mst_edges(pts) if frozenset((f"{sites[ia][0]}.{sites[ia][1]}", f"{sites[ib][0]}.{sites[ib][1]}")) not in same]
+                if lays and edges:
+                    jobs.append((c.width_mm.value, lays, edges, ""))
+        else:
+            w = c.width_mm.value
+            layers = [lay for lay in c.layers if is_outer(lay)]
+            if w < WIDE_MM or not layers:
                 continue
-            out.append(_corridor_message(ctx, c, a, b, layers, outer, obstacles, half))
+            pts = [(x, y) for _r, _n, x, y, _w, _h in sites]
+            jobs.append((w, layers, [(sites[ia], sites[ib]) for ia, ib in _mst_edges(pts)], ""))
+        for w, layers, edges, head in jobs:
+            out += _corridor_job(ctx, c, w, layers, edges, sites, outer, head)
+    return out
+
+
+def _corridor_job(ctx: Ctx, c: Constraint, w: float, layers: list[str], edges, sites, outer, head: str) -> list[str]:
+    """F.3's raster for one width on some layers, asked of the given pad pairs."""
+    out: list[str] = []
+    stack = ctx.cs.stackup
+    clr = c.clearance_mm.value
+    half = w / 2.0 + clr
+    grid = CORRIDOR_COARSE_MM if w > CORRIDOR_COARSE_OVER_MM else CORRIDOR_GRID_MM
+    dil = math.ceil(round(half / grid, 6))
+    edge_band = math.ceil(round(stack.edge_clearance / grid, 6)) + dil
+    grids: dict[str, _Grid] = {}
+    obstacles: dict[str, list[tuple[str, tuple[float, float, float, float]]]] = {}
+    for lay in layers:
+        g = _Grid(ctx.content, grid)
+        obs: list[tuple[str, tuple[float, float, float, float]]] = []
+        band = bytes([1]) * g.w
+        for j in range(g.h):
+            if j < edge_band or j >= g.h - edge_band:
+                g.rows[j][:] = band
+            else:
+                g.rows[j][:edge_band] = b"\x01" * edge_band
+                g.rows[j][g.w - edge_band :] = b"\x01" * edge_band
+        for ref in sorted(ctx.feet):
+            f = ctx.feet[ref]
+            pl = ctx.pad_layers.get(ref, [])
+            for k, p in enumerate(f.pads):
+                if p.net == c.net:
+                    continue
+                on = pl[k] if k < len(pl) else frozenset({"F.Cu"})
+                if lay not in on:
+                    continue
+                box = _pad_box(f, p)
+                g.fill(box, 1, dil)
+                obs.append((f"{ref}.{_pin(ctx, ref, p.num)}" if p.num else f"{ref}'s hole", box))
+            for side, strip in _lane_strips(f).items():
+                if any(p.net == c.net and f.escape.get(p.num) == side for p in f.pads):
+                    continue  # the net's own escape via sits in this lane
+                g.fill(strip, 1, dil)
+                obs.append((f"{ref}'s fanout lane", strip))
+        for name, box, _no in ctx.keepout_boxes:
+            g.fill(box, 1, dil)
+            obs.append((f"Keepout {name}", box))
+        e, r = stack.edge_clearance, ctx.content
+        for band in ((r.x0, r.y0, r.x1, r.y0 + e), (r.x0, r.y1 - e, r.x1, r.y1), (r.x0, r.y0, r.x0 + e, r.y1), (r.x1 - e, r.y0, r.x1, r.y1)):
+            obs.append(("the board edge", band))
+        for s_ in sites:
+            g.fill(_box_of(s_), 0)
+        grids[lay] = g
+        obstacles[lay] = obs
+    for a, b in edges:
+        box_a, box_b = _box_of(a), _box_of(b)
+        reached = False
+        for lay in layers:
+            g = grids[lay]
+            label = g.label_in(box_a)
+            if label == 0:
+                label = g.flood_from(box_a)
+            if label > 0 and g.has(box_b, label):
+                reached = True
+                break
+        if reached:
+            continue
+        msg = _corridor_message(ctx, c, a, b, layers, outer, obstacles, half, w, pose=not head)
+        if head:
+            # A path's link: its own line heads the message; the layers edit is the Path's, not a NetReq's.
+            msg = head + msg[len(c.net) + 2 :].split("; or NetReq(")[0]
+        out.append(msg)
     return out
 
 
@@ -919,8 +1007,8 @@ def _side(a, b, box) -> int:
     return 1 if _orient(a, b, (cx, cy)) >= 0 else -1
 
 
-def _corridor_message(ctx: Ctx, c: Constraint, a, b, layers, outer, obstacles, half: float) -> str:
-    w, clr = c.width_mm.value, c.clearance_mm.value
+def _corridor_message(ctx: Ctx, c: Constraint, a, b, layers, outer, obstacles, half: float, w: float | None = None, pose: bool = True) -> str:
+    w, clr = (c.width_mm.value if w is None else w), c.clearance_mm.value
     pa, pb = (a[2], a[3]), (b[2], b[3])
     near: dict[str, tuple[float, tuple[float, float, float, float]]] = {}
     for lay in layers:
@@ -946,22 +1034,150 @@ def _corridor_message(ctx: Ctx, c: Constraint, a, b, layers, outer, obstacles, h
     else:
         n1, b1 = "", (0.0, 0.0, 0.0, 0.0)
         pinch = "the board edge boxes it"
-    if n1 == "the board edge":
-        fix = f"move {a[0] if _seg_rect_dist(pa, pa, b1) <= _seg_rect_dist(pb, pb, b1) else b[0]} in"
-    elif n1.endswith("'s fanout lane"):
-        fix = f"move {n1[: -len(chr(39) + 's fanout lane')]}"
-    elif n1.startswith("Keepout "):
-        fix = f"move {n1}"
-    elif n1:
-        fix = _place_line(ctx, n1.split(".", 1)[0], c.net)
-    else:
-        fix = f"move {a[0]}"
+    # Facts only (docs/direction.md §7b): what pinches the channel and the lines that placed it.
+    placed = []
+    for name in (n1, *( [n2] if len(ranked) >= 2 else [])):
+        ref = name.split(".", 1)[0] if name and "." in name and not name.startswith(("Keepout ", "the board edge")) else ""
+        if ref and ref in ctx.feet:
+            placed.append(_attached(ctx, ref))
     missing = [lay for lay in outer if lay not in c.layers]
-    alt = f'; or NetReq("{c.net}", layers={list(missing)!r})'.replace("'", '"') if missing else ""
+    lays = f"; {c.net} may use {', '.join(c.layers)} only ({_layers_src(ctx, c)})" if missing else ""
     return (
         f"{c.net}: no {w:.2f} mm channel from {a[0]}.{_pin(ctx, a[0], a[1])} to {b[0]}.{_pin(ctx, b[0], b[1])} on {' or '.join(layers)} "
-        f"({_g(w)} width + 2 x {_g(clr)} clearance = {2 * half:.2f} mm): {pinch}; {fix}{alt}"
+        f"({_g(w)} width + 2 x {_g(clr)} clearance = {2 * half:.2f} mm): {pinch}" + (f" ({'; '.join(dict.fromkeys(placed))})" if placed else "") + lays
     )
+
+
+def _layers_src(ctx: Ctx, c: Constraint) -> str:
+    req = ctx.design.netreqs[c.req_index] if c.req_index >= 0 else None
+    return f"NetReq line {c.line}" if req is not None and req.layers is not None else f"preset {c.kind}"
+
+
+# ---------------------------------------------------------------- F.3b a path's station escape
+
+ESCAPE_DIRS = 16  # directions a track may leave a station pad in, tried at the link's width
+
+
+def _ray_to_edge(w: float, h: float, ux: float, uy: float) -> float:
+    """From an AABB's centre along unit (ux, uy), the distance to its edge."""
+    tx = (w / 2.0) / abs(ux) if abs(ux) > 1e-12 else math.inf
+    ty = (h / 2.0) / abs(uy) if abs(uy) > 1e-12 else math.inf
+    return min(tx, ty)
+
+
+def check_station_escapes(ctx: Ctx) -> list[str]:
+    """Can a track of the link's width leave each station pad at all? (Refutation round 1, defect 6:
+    the route found "no free cell next to one of the pads" with nothing said before copper.) For each
+    link and each of its two stations, on each of the link's layers the pad is on, a stub is tried in
+    `ESCAPE_DIRS` directions: from the pad's centre to `width/2 + clearance` past its edge, `width` wide,
+    against every other-net pad on that layer at what this net owes it (`ClearanceTable.between`: the
+    clearance, or a keep-away) and the board edge. A station none of whose pads has one free direction
+    is a warning that names the pads in the way, the rule, and the line to edit; never a pose."""
+    from .constraints import clearance_table
+
+    out: list[str] = []
+    table = clearance_table(ctx.cs)
+    edge = ctx.cs.stackup.edge_clearance
+    b = ctx.content
+    inner = (b.x0 + edge, b.y0 + edge, b.x1 - edge, b.y1 - edge)
+    by_layer: dict[str, list[tuple[str, str, str, tuple[float, float, float, float]]]] = {}
+    for ref in sorted(ctx.feet):
+        f = ctx.feet[ref]
+        pl = ctx.pad_layers.get(ref, [])
+        for k, p in enumerate(f.pads):
+            on = pl[k] if k < len(pl) else frozenset({"F.Cu"})
+            for lay in on:
+                by_layer.setdefault(lay, []).append((ref, p.num, p.net or "", _pad_box(f, p)))
+    seen: set[tuple[str, str]] = set()
+    for c in ctx.cs.constraints:
+        for p in c.paths:
+            for lk in p.links:
+                if lk.join:
+                    continue
+                for st, written in ((lk.a, lk.written[0]), (lk.b, lk.written[1])):
+                    if (lk.key, written) in seen:
+                        continue
+                    seen.add((lk.key, written))
+                    tried = []
+                    free = False
+                    for pid in st:
+                        ref, _, num = pid.partition(".")
+                        f = ctx.feet.get(ref)
+                        if f is None:
+                            continue
+                        idx = next((k for k, q in enumerate(f.pads) if q.num == num), None)
+                        if idx is None:
+                            continue
+                        pl = ctx.pad_layers.get(ref, [])
+                        on = pl[idx] if idx < len(pl) else frozenset({"F.Cu"})
+                        box = _pad_box(f, f.pads[idx])
+                        cx, cy = (box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0
+                        for lay in [x for x in lk.layers if x in on]:
+                            w = lk.width_on(lay)
+                            clr = c.clearance_mm.value
+                            hits: dict[tuple[str, str], tuple[float, float, str, str]] = {}
+                            for d in range(ESCAPE_DIRS):
+                                th = 2.0 * math.pi * d / ESCAPE_DIRS
+                                ux, uy = math.cos(th), math.sin(th)
+                                reach = _ray_to_edge(box[2] - box[0], box[3] - box[1], ux, uy) + w / 2.0 + clr
+                                tip = (cx + ux * reach, cy + uy * reach)
+                                ok = inner[0] + w / 2.0 <= tip[0] <= inner[2] - w / 2.0 and inner[1] + w / 2.0 <= tip[1] <= inner[3] - w / 2.0
+                                if not ok:
+                                    hits.setdefault(("the board edge", ""), (0.0, edge, "edge clearance", ""))
+                                for oref, onum, onet, obox in by_layer.get(lay, []):
+                                    if onet == c.net or not onet:
+                                        continue
+                                    need, why = table.between(c.net, onet)
+                                    gap = _seg_rect_dist((cx, cy), tip, obox) - w / 2.0
+                                    if gap < need - 1e-9:
+                                        ok = False
+                                        key = (oref, onum)
+                                        if key not in hits:
+                                            hits[key] = (_gap(box, obox), need, why, onet)
+                                if ok:
+                                    free = True
+                                    break
+                            if free:
+                                break
+                            tried.append((pid, lay, w, hits))
+                        if free:
+                            break
+                    if free or not tried:
+                        continue
+                    pid, lay, w, hits = tried[0]
+                    ref = pid.split(".")[0]
+                    ranked = sorted(hits.items(), key=lambda kv: (kv[1][0] - kv[1][1], kv[0]))
+                    # What is close enough to matter: inside the rule plus one track and its clearance.
+                    close = [kv for kv in ranked if kv[1][0] - kv[1][1] < w + c.clearance_mm.value]
+                    ranked = close or ranked[:1]
+                    named = []
+                    movers = []
+                    both = []
+                    for (oref, onum), (gap, need, why, onet) in ranked[:3]:
+                        if oref == "the board edge":
+                            named.append(f"the board edge ({_g(need)} mm)")
+                            continue
+                        src = why
+                        if "keep-away" in why:
+                            for a_, b_ in ((onet, c.net), (c.net, onet)):
+                                cc = ctx.cs.by_net(a_)
+                                kk = next((k for k in (cc.keep_away if cc is not None else ()) if k.other == b_), None)
+                                if kk is not None and cc.line:
+                                    src = f"keep_clear_of {b_} on NetReq line {cc.line}"
+                                    if oref == ref:
+                                        both.append((oref, onet, cc.line, kk.mm))
+                                    break
+                        named.append(f"{oref}.{_pin(ctx, oref, onum)} ({onet}) is {gap:.2f} mm from it and needs {_g(need)} mm ({src})")
+                        if oref != ref:
+                            movers.append(oref)
+                    head = f"{c.net} path {lk.written[0]} -> {lk.written[1]} ({lk.source}): no {_g(w)} mm track can leave {pid} ({written}) on {lay}"
+                    # Facts only (refutation round 2: when the pads in the way were the station's own
+                    # part's, this named that part as the thing to move). Who is in the way, how far,
+                    # by what rule; a pad of the station's own part is said to be one.
+                    own = [f"{oref} carries both {c.net} and {onet}" for oref, onet, _line, _mm in dict.fromkeys(both)]
+                    placed = [_attached(ctx, m) for m in dict.fromkeys(movers)]
+                    out.append(f"{head}: {'; '.join(named + own + placed)}")
+    return out
 
 
 # ---------------------------------------------------------------- F.4 loops
@@ -1041,10 +1257,45 @@ def check_loops(ctx: Ctx) -> tuple[list[str], list[str]]:
     cs = ctx.cs
     power, ground = _net_kinds(ctx)
     ics = _ics(ctx)
+    # Declared loops first (docs/net-path-physics.md §6): the area the named pads enclose, in the order
+    # written. A lower bound (pad centres, no vertical leg): over budget is definite, under is not proof.
+    named: set[str] = set()
+    for lp in getattr(cs, "loops", ()):
+        named.update(lp.parts)
+        pts = []
+        for pid in lp.pads:
+            ref, num = pid.split(".", 1)
+            f = ctx.feet.get(ref)
+            pad = next((q for q in f.pads if q.num == num), None) if f is not None else None
+            if pad is None:
+                break
+            pts.append(f.pad_world(pad))
+        if len(pts) != len(lp.pads):
+            continue
+        area = _loop_area(pts)
+        budget = lp.budget.value
+        src = f"Loop line {lp.line}" if lp.budget.source.formula == "Loop" else f"pcbc default; {lp.budget.source.note}"
+        head = f"loop {' -> '.join(lp.written)} (Loop line {lp.line})"
+        if area <= budget + 1e-9:
+            notes.append(f"{head}: pads enclose at least {area:.1f} mm2 of {_g(budget)} (shoelace of pad centres; no vertical leg)")
+            continue
+        # The station farthest from its neighbours in the loop, and the attachment already written.
+        n = len(pts)
+        far = max(range(n), key=lambda i: (math.dist(pts[i], pts[(i - 1) % n]) + math.dist(pts[i], pts[(i + 1) % n]), -i))
+        nb = (far + 1) % n if math.dist(pts[far], pts[(far + 1) % n]) >= math.dist(pts[far], pts[(far - 1) % n]) else (far - 1) % n
+        ref = lp.written[far].split(".", 1)[0]
+        ref_nb = lp.written[nb].split(".", 1)[0]
+        placed = "; ".join(dict.fromkeys(_attached(ctx, r) for r in (ref, ref_nb)))
+        moves.append(
+            f"{head} encloses {area:.1f} mm2 over the {_g(budget)} mm2 budget ({src}); {lp.written[far]} is {math.dist(pts[far], pts[nb]):.1f} mm "
+            f"from {lp.written[nb]} ({placed})"
+        )
     for ref in sorted(ctx.feet):
         f = ctx.feet[ref]
         if not ref.startswith("C") or len(f.pads) != 2:
             continue
+        if ref in named:
+            continue  # a declared loop names this cap: the guess does not second-guess it
         nets = {p.net for p in f.pads}
         pnet = next((n for n in sorted(nets) if n in power), None)
         gnet = next((n for n in sorted(nets) if n in ground), None)
@@ -1075,8 +1326,7 @@ def check_loops(ctx: Ctx) -> tuple[list[str], list[str]]:
         if area > budget + 1e-9:
             notes.append(
                 f"{pnet}: decap loop {ic}.{_pin(ctx, ic, ip.num)} -> {ref}.{cp.num} -> {ref}.{cg.num} -> {ic}.{_pin(ctx, ic, ig.num)} "
-                f"encloses {area:.1f} mm2 over the {_g(budget)} mm2 budget ({_loop_src(c, 'power')}): "
-                f'Place("{ref}", to="{ic}.{_pin(ctx, ic, ip.num)}") closes it'
+                f"encloses {area:.1f} mm2 over the {_g(budget)} mm2 budget ({_loop_src(c, 'power')}); {_attached(ctx, ref)}"
             )
     for c in cs.constraints:
         if c.kind != "switch_node":
@@ -1113,6 +1363,8 @@ def check_loops(ctx: Ctx) -> tuple[list[str], list[str]]:
         if best is None:
             continue
         _d, rail, cin = best
+        if cin in named and ic in named:
+            continue  # a declared loop names this hot loop's parts: it replaces the guess
         fcin = ctx.feet[cin]
         gnet = next(n for n in sorted({p.net for p in fcin.pads}) if n in ground)
         cin_rail, cin_gnd = _pad_on(fcin, rail), _pad_on(fcin, gnet)
@@ -1152,15 +1404,22 @@ def check_loops(ctx: Ctx) -> tuple[list[str], list[str]]:
             dc = math.hypot(fcin.center()[0] - icc[0], fcin.center()[1] - icc[1])
             dl = math.hypot(ctx.feet[low].center()[0] - icc[0], ctx.feet[low].center()[1] - icc[1])
             far = low if dl > dc else cin
-        far_pin = _pin(ctx, ic, (ic_rail if far == cin else ic_sw).num)
-        suggested = math.ceil(area / 5.0) * 5
-        # The NetReq that already names this net, so the AI edits that line instead of writing a
-        # second one (two NetReqs on one net is itself a refusal).
-        sw_where = f"NetReq line {c.line}" if c.line else f'NetReq("{sw}", kind="switch_node")'
+        ic_pin_pad = ic_rail if far == cin else ic_sw
+        far_pin = _pin(ctx, ic, ic_pin_pad.num)
         path = " -> ".join(f"{r}.{_pin(ctx, r, p.num)}" for r, p in chain)
+        # docs/net-path-physics.md §6: no budget fitted to the placement being judged and no pose; the
+        # far part, its distance, and the attachment board.py already writes for it.
+        ffar = ctx.feet[far]
+        far_pad = cin_rail if far == cin else _pad_on(ffar, sw)
+        d = math.dist(ffar.pad_world(far_pad), fic.pad_world(ic_pin_pad)) if far_pad is not None else 0.0
+        spec = _place_spec(ctx, far)
+        if spec is not None and getattr(spec, "to", None) == f"{ic}.{far_pin}":
+            att = f"layout.core.py:{getattr(spec, 'line', 0)} attaches {far} there"
+        else:
+            att = "; ".join(dict.fromkeys(_attached(ctx, r) for r in (far, ic)))
         moves.append(
-            f"{sw}: hot loop {path} encloses {area:.1f} mm2 over the {_g(budget)} mm2 budget ({_loop_src(c, 'switch_node')}): "
-            f'Place("{far}", to="{ic}.{far_pin}") closes it, or loop_mm2={suggested} on {sw_where} records it as intent'
+            f"{sw}: hot loop {path} encloses {area:.1f} mm2 over the {_g(budget)} mm2 budget ({_loop_src(c, 'switch_node')}); "
+            f"{far}.{far_pad.num if far_pad is not None else '?'} is {d:.1f} mm from {ic}.{far_pin} ({att})"
         )
     return moves, notes
 
@@ -1170,7 +1429,8 @@ def check_loops(ctx: Ctx) -> tuple[list[str], list[str]]:
 
 def check_keep_away(ctx: Ctx) -> list[str]:
     """F.5: the edge-to-edge distance between a net's pads and the other net's pads, and the
-    courtyards of the parts carrying it. A part carrying both nets is its rating, not layout."""
+    courtyards of the parts carrying it. A part carrying both nets is its rating, not layout. A keep-away is
+    net to net (`docs/physics-subjects.md` PR 7, E8): a Path has none of its own."""
     out: list[str] = []
     for c in ctx.cs.constraints:
         for ka in c.keep_away:
@@ -1213,14 +1473,13 @@ def check_keep_away(ctx: Ctx) -> list[str]:
             else:
                 ox, oy = ctx.feet[oref].center()
             toward = _quantise(a[2] - ox, a[3] - oy)
-            ic = _ic_pad_on(ctx, c.net, exclude=a[0])
-            fix = f'Place("{a[0]}", to="{ic[0]}.{ic[1]}", toward="{toward}")' if ic else f"move {a[0]} {toward}"
-            relax = math.floor(d * 2.0) / 2.0
-            out.append(
-                f"{c.net}: {a[0]}.{_pin(ctx, a[0], a[1])} is {d:.2f} mm from {what}; keep_clear_mm={_g(ka.mm)} ({src}): "
-                f"{fix}, or keep_clear_mm={_g(relax)} if {oref} must sit there"
-            )
+            del toward
+            placed = "; ".join(dict.fromkeys(_attached(ctx, r) for r in (a[0], oref)))
+            out.append(f"{c.net}: {a[0]}.{_pin(ctx, a[0], a[1])} is {d:.2f} mm from {what}, under keep_clear_mm={_g(ka.mm)} ({src}) ({placed})")
     return out
+
+
+_TAN8 = math.tan(math.pi / 8.0)
 
 
 # ---------------------------------------------------------------- F.6 reference plane
@@ -1239,12 +1498,15 @@ def check_reference(ctx: Ctx) -> tuple[list[str], list[str]]:
     inner = Rect(ctx.content.x0 + edge, ctx.content.y0 + edge, ctx.content.x1 - edge, ctx.content.y1 - edge)
     copper_kos = [(name, box) for name, box, no in ctx.keepout_boxes if "copper" in no]
     for c in cs.constraints:
-        if c.reference is None:
+        # A pair's reference is its net's; a single-ended impedance is a Path's link's (docs/physics-subjects.md PR 5).
+        zlink = next((lk for lk in cs.links_of(c.net) if lk.z_se and lk.reference), None)
+        reference = c.reference if c.reference is not None else (zlink.reference[0][1] if zlink is not None else None)
+        if reference is None:
             continue
         if c.pair is not None:
             controlled = c.pair.controlled
             what = "the pair"
-        elif c.z_se is not None:
+        elif zlink is not None:
             controlled = True
             what = "the track"
         else:
@@ -1253,8 +1515,8 @@ def check_reference(ctx: Ctx) -> tuple[list[str], list[str]]:
             continue
         sites = ctx.pads_on.get(c.net, [])
         if stack.layers > 2:
-            plane_net = next((n for n, lay in ctx.job.planes if lay == c.reference), None)
-            plane = f"{c.reference} {plane_net}" if plane_net else c.reference
+            plane_net = next((n for n, lay in ctx.job.planes if lay == reference), None)
+            plane = f"{reference} {plane_net}" if plane_net else reference
             named: set[str] = set()  # one line per part: its first pad off the plane says it
             for ref, num, x, y, w, h in sites:
                 if ref in named:
@@ -1263,16 +1525,14 @@ def check_reference(ctx: Ctx) -> tuple[list[str], list[str]]:
                 if not (box[0] >= inner.x0 - 1e-6 and box[1] >= inner.y0 - 1e-6 and box[2] <= inner.x1 + 1e-6 and box[3] <= inner.y1 + 1e-6):
                     named.add(ref)
                     moves.append(
-                        f"{c.net}: {ref}.{num} sits within {_g(edge)} mm of the board edge: no {plane} under it, {what} has no reference there; "
-                        f"move {ref} in"
+                        f"{c.net}: {ref}.{num} sits within {_g(edge)} mm of the board edge: no {plane} under it, {what} has no reference there ({_attached(ctx, ref)})"
                     )
                     continue
                 for name, ko in copper_kos:
                     if _overlap(box, ko):
                         named.add(ref)
                         moves.append(
-                            f"{c.net}: {ref}.{num} sits in Keepout {name}: no {plane} under it, {what} has no reference there; "
-                            f"move the keepout or {_keepout_escape(ctx, ref, ko)}"
+                            f"{c.net}: {ref}.{num} sits in Keepout {name}: no {plane} under it, {what} has no reference there ({_attached(ctx, ref)})"
                         )
                         break
         else:
@@ -1288,25 +1548,6 @@ def check_reference(ctx: Ctx) -> tuple[list[str], list[str]]:
     return moves, notes
 
 
-def _keepout_escape(ctx: Ctx, ref: str, ko: tuple[float, float, float, float]) -> str:
-    """The Place() line that takes `ref` out of a keepout: along its edge for an edge-placed part,
-    away from the box for a relation, `move` otherwise."""
-    spec = next((p for p in ctx.job.places if p.ref == ref), None)
-    f = ctx.feet[ref]
-    cx, cy = f.center()
-    kx, ky = (ko[0] + ko[2]) / 2.0, (ko[1] + ko[3]) / 2.0
-    away = _quantise(cx - kx, cy - ky)
-    if spec is not None and spec.edge:
-        if spec.edge in ("top", "bottom"):
-            if away == "right":
-                return f'Place("{ref}", edge="{spec.edge}", left={round(ko[2] + GAP - ctx.content.x0, 1):g})'
-            return f'Place("{ref}", edge="{spec.edge}", right={round(ctx.content.x1 - (ko[0] - GAP), 1):g})'
-        if away == "down":
-            return f'Place("{ref}", edge="{spec.edge}", top={round(ko[3] + GAP - ctx.content.y0, 1):g})'
-        return f'Place("{ref}", edge="{spec.edge}", bottom={round(ctx.content.y1 - (ko[1] - GAP), 1):g})'
-    if spec is not None and spec.to:
-        return f'Place("{ref}", to="{spec.to}", toward="{away}")'
-    return f"move {ref} {away}"
 
 
 # ---------------------------------------------------------------- F.7 isolation
@@ -1380,10 +1621,8 @@ def check_isolation(ctx: Ctx) -> list[str]:
                 need = f"{_g(spec.clearance_mm.value)} mm clearance ({spec.clearance_mm.source.ref})"
             else:
                 need = f"{_g(spec.gap_min_mm)} mm gap (slot=True: {_g(spec.clearance_mm.value)} mm clearance, at least 1 mm for the slot)"
-            out.append(
-                f"{tag} ({_g(iso.volts)} V): Regions are {gap:.1f} mm apart; needs {need}: "
-                f'Region("{far_name}", {shift}={spec.gap_min_mm - gap:+.1f})'
-            )
+            del far_name, shift
+            out.append(f"{tag} ({_g(iso.volts)} V): Regions are {gap:.1f} mm apart, {spec.gap_min_mm - gap:.1f} mm short of the {need}")
         sides = _part_sides(ctx, (iso.a, iso.b))
         across = set(iso.across)
         for ref in sorted(ctx.feet):
@@ -1397,7 +1636,8 @@ def check_isolation(ctx: Ctx) -> list[str]:
                         edge = "right" if side == (iso.a if low is ra else iso.b) else "left"
                     else:
                         edge = "bottom" if side == (iso.a if low is ra else iso.b) else "top"
-                    out.append(f'{tag}: {ref} is in across= but does not span the gap; Place("{ref}", parent="{side}", {edge}={-gap:.1f})')
+                    del edge
+                    out.append(f"{tag}: {ref} is in across= but does not span the {gap:.1f} mm gap ({_attached(ctx, ref)})")
                     continue
                 for p in f.pads:
                     if not p.num:
@@ -1406,7 +1646,7 @@ def check_isolation(ctx: Ctx) -> list[str]:
                     inside = low.x1 < box[0] and box[2] < high.x0 if axis == "x" else low.y1 < box[1] and box[3] < high.y0
                     if inside:
                         lo, hi = (corridor[0], corridor[2]) if axis == "x" else (corridor[1], corridor[3])
-                        out.append(f"{tag}: {ref}.{p.num} is in across= but lies in the gap ({lo:.1f}..{hi:.1f} mm): copper in the corridor is copper across the barrier; move {ref}")
+                        out.append(f"{tag}: {ref}.{p.num} is in across= but lies in the gap ({lo:.1f}..{hi:.1f} mm): copper in the corridor is copper across the barrier ({_attached(ctx, ref)})")
                         break
                 continue
             side = sides.get(ref)
@@ -1416,9 +1656,9 @@ def check_isolation(ctx: Ctx) -> list[str]:
             if crt[0] >= rect.x0 - 1e-6 and crt[1] >= rect.y0 - 1e-6 and crt[2] <= rect.x1 + 1e-6 and crt[3] <= rect.y1 + 1e-6:
                 continue
             if _overlap(crt, corridor):
-                out.append(f"{tag}: {ref} ({side}) crosses the corridor: move {ref}")
+                out.append(f"{tag}: {ref} ({side}) crosses the corridor ({_attached(ctx, ref)})")
             else:
-                out.append(f"{tag}: {ref} ({side}) lies outside Region {side}: move {ref}")
+                out.append(f"{tag}: {ref} ({side}) lies outside Region {side} ({_attached(ctx, ref)})")
         area = next((a for a in ctx.cs.rule_areas if a.name == f"ISO_{iso.a}_{iso.b}"), None)
         if area is not None:
             placed = (round(low.x1, 4), round(high.x0, 4)) if axis == "x" else (round(low.y1, 4), round(high.y0, 4))
@@ -1554,8 +1794,7 @@ def check_bridge(ctx: Ctx) -> list[str]:
                 where = f"{near[1]} and {near[2]} come closest, {near[0]:.4f} mm apart" if near else "no two pads of them share a layer"
                 out.append(
                     f"{a}/{b}: no axis separates the two grounds — {'; '.join(spans)}. "
-                    f"So there is no moat to cut and no RuleArea to write: {where}, which is where a tie belongs. "
-                    f'Resistor("R11", "0R", p1={a}, p2={b}) with Place("R11", to="{near[1] if near else a}") and Bridge("{a}", "{b}", at="R11").'
+                    f"No straight line separates them, and no Bridge() names a part that ties them: {where}."
                 )
                 continue
             skip = frozenset({spec.tie_ref})
@@ -1566,8 +1805,7 @@ def check_bridge(ctx: Ctx) -> list[str]:
                 out.append(
                     f"{a}/{b}: {spec.tie_ref} ties them at {own}, but {net} comes closest to {other} at {got[1]} — "
                     f"{got[0]:.4f} mm from {got[2]}, with {spec.tie_ref} itself left out of the measurement on both sides. "
-                    f"Every return current goes round to {spec.tie_ref} to get home while the two grounds touch at {got[1]}. "
-                    f'Place("{spec.tie_ref}", to="{got[1]}").'
+                    f"Every return current goes round to {spec.tie_ref} to get home while the two grounds touch at {got[1]} ({_attached(ctx, spec.tie_ref)})."
                 )
     return out
 

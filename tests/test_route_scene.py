@@ -45,10 +45,11 @@ from pcbc.route_scene import (
 from pcbc.sexp import board_footprint_spans, footprint_at, footprint_reference
 from pcbc.stackup import fanout_stagger
 from boardtext import scene_from_text
+from conftest import declared_examples, ds2_dir, write_split
 
 ROOT = Path(__file__).resolve().parent.parent
-EXAMPLES = ROOT / "examples"
-DS2 = Path.home() / "Documents" / "MaD" / "Hardware" / "DS2Addon" / "pcbc"
+EXAMPLES = declared_examples()  # the examples as shipped with a declared outline (vehicles): conftest.declared_examples
+DS2 = ds2_dir()
 NAMES = ("blinky", "buck", "c3_usb", "node")
 
 
@@ -212,18 +213,16 @@ def test_clearance_table_covers_every_written_rule(name: str):
     assert checked >= 0
 
 
-def test_a_synthetic_board_with_every_kind_exercises_creepage_and_isolation():
+def test_a_synthetic_board_with_every_kind_exercises_creepage_and_isolation(tmp_path: Path):
     """The five real boards write no `creepage` and no `Isolation` rule, so the coverage test above
     would pass vacuously on exactly the two rows most likely to be wrong. `test_dru.py`'s own
-    every-kind board is the one that writes them."""
+    every-kind board is the one that writes them. Written in a temporary directory: in tests/ it
+    left write_split's schematic.core.py behind."""
     from test_dru import EVERY_KIND, HEAD, TAIL, TWO
 
-    src = ROOT / "tests" / "_every_kind_tmp.py"
-    src.write_text(HEAD + TWO + EVERY_KIND + TAIL)
-    try:
-        cs = compile_design(load_board(src)).constraints
-    finally:
-        src.unlink()
+    src = tmp_path / "_every_kind_tmp.py"
+    write_split(src, HEAD + TWO + EVERY_KIND + TAIL)
+    cs = compile_design(load_board(src)).constraints
     table = clearance_table(cs)
     cons = sorted(cs.constraints, key=lambda c: c.net)
     kinds = set()
@@ -238,7 +237,7 @@ def test_a_synthetic_board_with_every_kind_exercises_creepage_and_isolation():
                 kinds.add(rule.name.split("_")[0])
                 got, why = table.between(a.net, b.net)
                 assert got + 1e-9 >= want, f"rule {rule.name} asks {want} for {a.net}/{b.net}, table says {got} ({why})"
-    assert {"creepage", "feedback", "analog"} <= kinds, f"the creepage and keep-away rows really ran: {sorted(kinds)}"
+    assert {"creepage", "analog"} <= kinds, f"the creepage and keep-away rows really ran: {sorted(kinds)}"  # PR 7: feedback is a Path kind
     hv = next(c for c in cons if c.voltage is not None and c.voltage.creepage_mm is not None)
     other = next(c for c in cons if c.class_name != hv.class_name)
     assert table.between(hv.net, other.net)[0] >= hv.voltage.creepage_mm.value, (
@@ -334,8 +333,9 @@ def test_the_outline_is_the_content_rect_inset_by_edge_clearance_with_no_stroke_
     `stack.edge_clearance` exactly (docs/r2-design.md A.4 rule 5)."""
     scene, design, _j, _t = _scene("node")
     from pcbc.layout import content_rect
+    from pcbc.pcb_place import _board_of
 
-    c = content_rect(design.board)
+    c = content_rect(_board_of(_j))  # the job's outline (docs/board-outline.md PR 2)
     e = scene.stack.edge_clearance
     assert scene.outline == (c.x0 + e, c.y0 + e, c.x1 - e, c.y1 - e) == (0.3, 0.3, 59.7, 44.7)
     assert e == 0.3 and "0.025" not in repr(scene.outline), "no half-stroke term anywhere in it"

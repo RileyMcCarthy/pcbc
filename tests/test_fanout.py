@@ -14,6 +14,8 @@ from boardtext import fanout_copper
 from pcbc.language import load_board
 from pcbc.stackup import get_stackup
 
+from conftest import write_split
+
 EXAMPLES = Path(__file__).resolve().parent.parent / "examples"
 
 

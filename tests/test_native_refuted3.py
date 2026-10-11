@@ -27,11 +27,13 @@ import pytest
 
 from pcbc.build import build_job
 from pcbc.language import load_board
+from conftest import ds2_dir, put_core, vehicle_examples, write_split
+from conftest import copy_board_file
 
 ROOT = Path(__file__).resolve().parent.parent
-EXAMPLES = ROOT / "examples"
+EXAMPLES = vehicle_examples()  # buck is the pre-migration board here: conftest.vehicle_examples
 FIXTURES = ROOT / "tests" / "fixtures"
-DS2 = Path.home() / "Documents/MaD/Hardware/DS2Addon/pcbc"
+DS2 = ds2_dir()
 
 
 def _route(result: dict) -> dict:
@@ -41,9 +43,9 @@ def _route(result: dict) -> dict:
 def _buck(tmp_path: Path, core: str) -> Path:
     src = EXAMPLES / "buck"
     board = tmp_path / "buck.py"
-    board.write_text((src / "buck.py").read_text())
+    copy_board_file(board, src / "buck.py")
     shutil.copytree(src / "components", tmp_path / "components")
-    (tmp_path / "layout.core.py").write_text(core)
+    put_core(tmp_path / "layout.core.py", core)
     return board
 
 
@@ -55,10 +57,10 @@ def _thermal(tmp_path: Path, watts: float | None, core: str = "") -> Path:
     else:
         text = text.replace('Thermal("U1.49", watts=1.0)', f'Thermal("U1.49", watts={watts})')
     board = tmp_path / "thermal.py"
-    board.write_text(text)
+    write_split(board, text)
     shutil.copytree(EXAMPLES / "c3_usb" / "components" / "Espressif", tmp_path / "components" / "Espressif")
     if core:
-        (tmp_path / "layout.core.py").write_text(core)
+        put_core(tmp_path / "layout.core.py", core)
     return board
 
 
@@ -77,7 +79,7 @@ def test_a_spur_with_nothing_left_to_join_is_named_a_spur(tmp_path: Path):
     err = result["error"] or ""
     route = _route(result)
     assert "layout.core.py:2: track_dangling" in err and "a spur: this core track's free end at (13.5,7) has nothing left to join" in err, err
-    assert "end the line on the copper it joins, or delete it" in err and "pcbc bug" not in err, err
+    assert err.endswith("and KiCad calls an open end dangling") and "delete" not in err and "pcbc bug" not in err, err
     assert any(n.startswith("BOOT: layout.core.py:2's free end at (13.5,7) has nothing to join") for n in route["notes"]), route["notes"]
     states = [(e["line"], e["kind"], tuple(e["at"]), e["state"]) for e in route["route_stats"]["core_ends"]]
     assert states == [("layout.core.py:2", "track", (13.5, 7.0), "nothing")], states
@@ -119,7 +121,14 @@ def test_a_lock_no_pad_reaches_is_the_locks_finding_not_an_unfinished_net(tmp_pa
     so `5V` is routed and keeps its copper; the lock is the finding — the build quotes the router's note
     and names the moves. (Counted as a failed link of the net, it made `5V` unfinished and dropped all
     of its generated copper for one via.)"""
-    board = _buck(tmp_path, 'Via("5V", (2.5, 22.5), size=0.5, drill=0.3)\n')
+    # Re-measured 2026-10-02 (docs/physics-subjects.md O2 (b)): the vehicle's routing changed and the router now finds an
+    # F.Cu way past FID3, so a core keepout (no tracks on F.Cu round the via, line 2) keeps the lock unreachable.
+    ko = '{"tracks": "not_allowed", "vias": "allowed", "pads": "allowed", "copperpour": "allowed", "footprints": "allowed"}'
+    board = _buck(
+        tmp_path,
+        'Via("5V", (2.5, 22.5), size=0.5, drill=0.3)\n'
+        f'Pour(None, layer="F.Cu", layers=None, name="moat", keepout={ko}, points=[(1.3, 21.3), (3.7, 21.3), (3.7, 23.7), (1.3, 23.7)], id="moat")\n',
+    )
     result = build_job(board, upto="fab", force=True)
     err = result["error"] or ""
     route = _route(result)
@@ -137,9 +146,9 @@ def test_a_lock_on_an_unfinished_net_is_not_blamed(tmp_path: Path):
     third refutation round, locks major 2)."""
     src = EXAMPLES / "c3_usb"
     board = tmp_path / "c3_usb.py"
-    board.write_text((src / "c3_usb.py").read_text())
+    copy_board_file(board, src / "c3_usb.py")
     shutil.copytree(src / "components", tmp_path / "components")
-    (tmp_path / "layout.core.py").write_text('Seg("VBUS", (30.618, 10.25), (30.618, 7.5), width=0.4, layer="F.Cu")\n')
+    put_core(tmp_path / "layout.core.py", 'Seg("VBUS", (30.618, 10.25), (30.618, 7.5), width=0.4, layer="F.Cu")\n')
     result = build_job(board, upto="fab", force=True)
     err = result["error"] or ""
     assert result.get("unrouted") == ["VBUS"], result.get("unrouted")
@@ -192,7 +201,7 @@ def test_the_build_holds_the_routers_count_to_kicads(tmp_path: Path, monkeypatch
 
     src = EXAMPLES / "blinky"
     board = tmp_path / "blinky.py"
-    board.write_text((src / "blinky.py").read_text())
+    copy_board_file(board, src / "blinky.py")
     real = pcbc.netcheck._unconnected_by_net
     monkeypatch.setattr(pcbc.netcheck, "_unconnected_by_net", lambda u: {**real(u), "GND": 1})
     result = build_job(board, upto="route", force=True)
@@ -226,7 +235,7 @@ def test_a_bare_thermal_pad_is_refused_with_its_blocker(tmp_path: Path):
     err = result["error"] or ""
     assert err.startswith("a thermal land is not served: thermal U1.49: 9 of 9 barrel(s)"), err
     assert "8 of its 9 pads with one" in err and "1 of its 9 pads carry no barrel ((10.825,15.225))" in err, err
-    assert "worst blocker layout.core.py:1 [3V3]" in err and "Moves: move layout.core.py:1 off the land or delete it" in err, err
+    assert "worst blocker layout.core.py:1 [3V3]" in err and "Moves:" not in err, err
     (row,) = _route(result)["thermal"]["arrays"]
     assert row["verdict"] == "bare" and row["bare"] == [[10.825, 15.225]], row
 
@@ -301,14 +310,17 @@ def test_place_and_the_core_read_no_board_text(monkeypatch, tmp_path: Path, name
     from pcbc.layout_job import load_core
     from pcbc.place_native import place
 
-    src = EXAMPLES / name
-    design = load_board(src / f"{name}.py")
+    import shutil
+
+    shutil.copytree(EXAMPLES / name, tmp_path / name, ignore=shutil.ignore_patterns("layout"))
+    board = tmp_path / name / f"{name}.py"
+    put_core(board, 'Seg("GND", (1.0, 1.0), (2.0, 1.0), width=0.3, layer="F.Cu")\n')
+    design = load_board(board)  # the core file runs with board.py (docs/board-outline.md A.2)
     hits: list[str] = []
     _trap_text_readers(monkeypatch, hits)
     pl = place(design, name=name)
     assert pl.error is None and pl.poses and pl.feet, pl.error
-    (tmp_path / "layout.core.py").write_text('Seg("GND", (1.0, 1.0), (2.0, 1.0), width=0.3, layer="F.Cu")\n')
-    cu, _gr = load_core(design, tmp_path / f"{name}.py", pl, name=name)
+    cu, _gr = load_core(design, board, pl, name=name)
     assert len(cu) == 1 and hits == [], hits
 
 
@@ -385,7 +397,9 @@ def test_prune_keeps_a_track_end_in_its_own_nets_pour():
     scene = build_scene(design, pl.job, pl.job.constraints, pl.feet)
     pad = next(it for it in scene.items if it.kind == "pad" and it.net == "GND" and it.layers == frozenset({"F.Cu"}))
     x, y = pad.at()
-    far = (round(x, 4), round(y - 3.0, 4))
+    # Downward (2026-10-02): the upward stub ran 3 mm onto U1.1, a second GND pad; a track that joins two items is now
+    # cut back to them, not removed (`route_native._trim_overhang`), and this test is about a stub that joins one.
+    far = (round(x, 4), round(y + 3.0, 4))
     stub = seg_piece("GND", "route", "F.Cu", (x, y), far, 0.3, owner="GND")
     kept, removed = prune_dangling(design, pl.job, pl.feet, [stub])
     assert kept == [] and [r["why"] for r in removed] == [f"its end at ({far[0]:g},{far[1]:g}) touches nothing"], removed

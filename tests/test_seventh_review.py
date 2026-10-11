@@ -19,12 +19,12 @@ from pathlib import Path
 
 import pytest
 
-from conftest import routed_board
+from conftest import put_core, routed_board, vehicle_examples, write_split
 from pcbc.language import load_board, load_layout
 from pcbc.model import BoardSpec, Copper, Design
 
 ROOT = Path(__file__).resolve().parent.parent
-EXAMPLES = ROOT / "examples"
+EXAMPLES = vehicle_examples()  # buck is the pre-migration board here: conftest.vehicle_examples
 FIX = Path(__file__).resolve().parent / "fixtures" / "kicad10"
 PROBE_BASE = FIX / "kicad10_primitives3.kicad_pcb"
 
@@ -49,9 +49,9 @@ def _core(tmp_path: Path, text: str, layers: int = 4) -> tuple[Design, list, lis
 # solid pour, a group that holds itself), cannot parse it (a list of the wrong length), or the emitter
 # cannot write it (a required yes/no left None). Not one of these has an explicit rule of its own.
 M1_CASES = [
-    ('Via("GND", (10.0, 10.0), size=0.6, drill=0.3, layers=("F.Cu", "In1.Cu"), kind="through")', r"layers \(written \('F.Cu', 'In1.Cu'\), KiCad's load of the line has \('F.Cu', 'B.Cu'\): write that\)"),
+    ('Via("GND", (10.0, 10.0), size=0.6, drill=0.3, layers=("F.Cu", "In1.Cu"), kind="through")', r"layers \(written \('F.Cu', 'In1.Cu'\), KiCad's load of the line has \('F.Cu', 'B.Cu'\)\)"),
     ('Line((1.0, 1.0), (5.0, 1.0), layer="F.SilkS", width=0.1, stroke_color=(0.5, 0.5, 0.5, 0.5))', r"stroke_color \(written \(0.5, 0.5, 0.5, 0.5\), KiCad's load of the line has \(0.0, 0.0, 0.0, 0.5\)"),
-    ('Line((1.0, 1.0), (5.0, 1.0), layer="F.SilkS", width=0.0)', r"width \(written 0.0, KiCad's load of the line has 0.1: write that\)"),
+    ('Line((1.0, 1.0), (5.0, 1.0), layer="F.SilkS", width=0.0)', r"width \(written 0.0, KiCad's load of the line has 0.1\)"),
     ('Pour("GND", layer="F.Cu", points=[(1.0, 1.0), (5.0, 1.0), (5.0, 5.0), (1.0, 5.0)], island_removal_mode=2, island_area_min=1.23456789)', r"island_area_min \(written 1.23456789, KiCad's load of the line has 1.234568"),
     ('Pour(None, layer="F.Cu", points=[(1.0, 1.0), (5.0, 1.0), (5.0, 5.0), (1.0, 5.0)], keepout={"tracks": "not_allowed"})', r"keepout.pads \(written None, KiCad's load of the line has 'allowed'"),
     ('Pour("GND", layer="F.Cu", points=[(1.0, 1.0), (5.0, 1.0), (5.0, 5.0), (1.0, 5.0)], hatch_gap=0.4)', r"hatch_gap \(written 0.4, KiCad's load of the line has None"),
@@ -107,7 +107,7 @@ def test_every_gen_line_passes_kicad_s_reading_in_one_call(name: str, tmp_path: 
     lines = [ln for ln in (final.parent / "layout.gen.py").read_text().splitlines() if re.match(r"[A-Z][A-Za-z]*\(", ln) and not ln.startswith("Place(") and 'Group("pcbc:' not in ln and 'layer="Edge.Cuts"' not in ln]
     shutil.copytree(EXAMPLES / name, tmp_path / name, ignore=shutil.ignore_patterns("layout"))
     board = tmp_path / name / f"{name}.py"
-    (board.parent / "layout.core.py").write_text("\n".join(lines) + "\n")
+    put_core(board.parent / "layout.core.py", "\n".join(lines) + "\n")
     from pcbc.place_native import place
 
     design = load_board(board)
@@ -126,7 +126,7 @@ def test_the_route_stage_refuses_a_line_kicad_rewrites_before_it_routes(tmp_path
 
     shutil.copytree(EXAMPLES / "blinky", tmp_path / "blinky", ignore=shutil.ignore_patterns("layout"))
     board = tmp_path / "blinky" / "blinky.py"
-    (board.parent / "layout.core.py").write_text('Line((15.0, 3.0), (20.0, 3.0), layer="F.SilkS", width=0.1, stroke_color=(0.5, 0.5, 0.5, 0.5))\n')
+    put_core(board.parent / "layout.core.py", 'Line((15.0, 3.0), (20.0, 3.0), layer="F.SilkS", width=0.1, stroke_color=(0.5, 0.5, 0.5, 0.5))\n')
     result = build_job(board, upto="route", force=True)
     route = next(s for s in result["steps"] if s["stage"] == "route")
     assert result["error"].startswith("a core line is refused: layout.core.py:1: KiCad's load of the line differs in stroke_color"), result["error"]
@@ -144,7 +144,7 @@ def test_a_stage_stamps_what_it_was_seen_to_read_and_nothing_it_wrote(tmp_path: 
     `drift` names the first that changed, a file that appeared beside a tool's input included."""
     from pcbc.trace import drift, tracing
 
-    (tmp_path / "helper_mod_m2.py").write_text("X = 5\n")
+    write_split(tmp_path / "helper_mod_m2.py", "X = 5\n")
     (tmp_path / "data.json").write_text('{"x": 1}\n')
     tool_dir = tmp_path / "handed"
     tool_dir.mkdir()
@@ -168,9 +168,9 @@ def test_a_stage_stamps_what_it_was_seen_to_read_and_nothing_it_wrote(tmp_path: 
     assert rec["dirs"] == {"handed": {"inputs": {"input.txt": rec["dirs"]["handed"]["inputs"]["input.txt"]}, "outputs": ["written.txt"]}}, rec["dirs"]
     assert rec["argv"] == [["/bin/cat", "./handed/input.txt"]], rec["argv"]
     assert drift(rec, tmp_path, "route") is None
-    (tmp_path / "helper_mod_m2.py").write_text("X = 7\n")
+    write_split(tmp_path / "helper_mod_m2.py", "X = 7\n")
     assert drift(rec, tmp_path, "route") == "helper_mod_m2.py changed since the route stage read it (a file the route stage opened; edited)"
-    (tmp_path / "helper_mod_m2.py").write_text("X = 5\n")
+    write_split(tmp_path / "helper_mod_m2.py", "X = 5\n")
     (tool_dir / "input.kicad_pro").write_text("{}")
     assert drift(rec, tmp_path, "route").startswith("handed/input.kicad_pro is beside a file a route-stage tool was handed and was not there")
     (tool_dir / "input.kicad_pro").unlink()
@@ -188,14 +188,14 @@ def test_a_net_name_kicad_cannot_hold_is_refused_at_load_naming_the_line(tmp_pat
         board = tmp_path / bad.encode().hex() / "blinky.py"
         board.parent.mkdir()
         text = (EXAMPLES / "blinky" / "blinky.py").read_text()
-        board.write_text(text.replace('"LED"', repr(bad)))
+        write_split(board, text.replace('"LED"', repr(bad)))
         with pytest.raises(ValueError, match=r"board.py line 5: the net name .* " + re.escape(says)):
             load_board(board)
         result = build_job(board, upto="fab", force=True)
         assert result["error"].startswith("board.py line 5: the net name") and says in result["error"], result["error"]
     ok = tmp_path / "tab" / "blinky.py"
     ok.parent.mkdir()
-    ok.write_text((EXAMPLES / "blinky" / "blinky.py").read_text().replace('"LED"', repr("LED\tX")))
+    write_split(ok, (EXAMPLES / "blinky" / "blinky.py").read_text().replace('"LED"', repr("LED\tX")))
     assert "LED\tX" in load_board(ok).nets
 
 
@@ -213,21 +213,20 @@ def test_an_input_outside_board_py_and_core_is_stale_from_the_stage_that_read_it
     board = tmp_path / "blinky" / "blinky.py"
     (board.parent / "corehelp_m2.py").write_text("X = 5.0\n")
     (board.parent / "corehelp.json").write_text('{"Y": 2.0}\n')
-    (board.parent / "layout.core.py").write_text(
-        "import json, os, sys\nsys.path.insert(0, os.path.dirname(__file__))\nfrom corehelp_m2 import X\n"
+    put_core(board.parent / "layout.core.py", "import json, os, sys\nsys.path.insert(0, os.path.dirname(__file__))\nfrom corehelp_m2 import X\n"
         "Y = json.load(open(os.path.join(os.path.dirname(__file__), 'corehelp.json')))['Y']\n"
-        'Line((2.0, Y), (X, Y), width=0.15, layer="F.SilkS")\n'
-    )
+        'Line((2.0, Y), (X, Y), width=0.15, layer="F.SilkS")\n')
     assert build_job(board, upto="fab", force=True).get("ok")
     layout = board.parent / "layout" / "blinky"
     assert stale_reason(layout, board) == ("fab", None)
     assert "corehelp_m2" not in sys.modules and str(board.parent) not in sys.path  # the core's import and path went with its load
 
     (board.parent / "corehelp_m2.py").write_text("X = 7.0\n")
-    assert stale_reason(layout, board) == ("place", "corehelp_m2.py changed since the route stage read it (a file the route stage opened; edited)")
+    # docs/board-outline.md A.2: the core file is loaded with board.py under its own trace, and the stamp names that load
+    assert stale_reason(layout, board) == ("place", "corehelp_m2.py changed since the route (a file loading layout.core.py opened; edited)")
     (board.parent / "corehelp_m2.py").write_text("X = 5.0\n")
     (board.parent / "corehelp.json").write_text('{"Y": 3.0}\n')
-    assert stale_reason(layout, board) == ("place", "corehelp.json changed since the route stage read it (a file the route stage opened; edited)")
+    assert stale_reason(layout, board) == ("place", "corehelp.json changed since the route (a file loading layout.core.py opened; edited)")
     (board.parent / "corehelp.json").write_text('{"Y": 2.0}\n')
     assert stale_reason(layout, board) == ("fab", None)
 
@@ -243,10 +242,12 @@ def test_an_input_outside_board_py_and_core_is_stale_from_the_stage_that_read_it
     result = build_job(board, upto="fab")
     assert result.get("ok") and result["plan"][0] == "check" and not (layout / "schematic.kicad_pro").exists(), result.get("error")
     assert stale_reason(layout, board) == ("fab", None)
-    stamp = json.loads((layout / "inputs.json").read_text())["traced"]
+    whole = json.loads((layout / "inputs.json").read_text())
+    stamp = whole["traced"]
     from pcbc.trace import code_sha
 
-    assert set(stamp["reads"]) >= {"corehelp_m2.py", "corehelp.json"} and stamp["tools"]["pcbc"] == code_sha() and "krt" not in stamp["tools"]
+    # what layout.core.py's load read is the stamp's `core_reads` (docs/board-outline.md A.2)
+    assert set(whole["core_reads"]) >= {"corehelp_m2.py", "corehelp.json"} and stamp["tools"]["pcbc"] == code_sha() and "krt" not in stamp["tools"]
     assert stamp["tools"]["kicad-cli"]["version"] and all(not a.startswith(str(tmp_path)) for argv in stamp["argv"] for a in argv)
 
 

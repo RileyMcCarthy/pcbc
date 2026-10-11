@@ -16,7 +16,7 @@ is `fab._fiducial_sexp`, read by the same parser.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from .pads import PadGeom, PadSpec, geoms_of, pad_specs
@@ -32,9 +32,10 @@ class LibFoot:
     the third refutation round, native major):
 
     - `boxes`: the CSS border boxes `geom.footprint_box_local` gives (`courtyard`, `fab`, `pads`);
-    - `silk_crtyd`, `silk_silk`: the `F.CrtYd` and `F.SilkS` extents the silkscreen pass keeps its
-      references off (`silk._bbox_on_layer`'s reading);
-    - `silk_pads`: every pad as the silkscreen pass reads it, `(x, y, library angle, w, h)`;
+    - `silk_crtyd`: the `F.CrtYd` box the silkscreen pass keeps other parts' references off
+      (`silk._bbox_on_layer`: polygons, circles' radii and arcs' sweeps included);
+    - `silk_shapes`: every `F.SilkS` drawing (`silk.drawings`), which the silkscreen pass keeps
+      references clear of and trims to the board and the pads;
     - `locked`: the footprint's own `(locked yes)`.
     """
 
@@ -42,11 +43,11 @@ class LibFoot:
     courtyard: tuple[float, float, float, float] | None
     boxes: tuple[tuple[str, tuple[float, float, float, float]], ...] = ()
     silk_crtyd: tuple[float, float, float, float] | None = None
-    silk_silk: tuple[float, float, float, float] | None = None
-    silk_pads: tuple[tuple[float, float, float, float, float], ...] = ()
+    silk_shapes: tuple = field(default=(), compare=False, hash=False)  # dicts (`silk.drawings`)
     locked: bool = False
     uuids: tuple[str, ...] = ()  # every `(uuid ...)` of the part's drawing the board copy keeps (`seed.instantiate`)
     props: frozenset[str] = frozenset()  # the `(property "...")` names the `.kicad_mod` already carries
+    body: tuple[float, float, float, float] | None = None  # `orient.body_box`: F.Fab's box, else F.CrtYd's
 
     def box(self, kind: str) -> tuple[float, float, float, float]:
         """`geom.footprint_box_local(block, kind)` of this footprint."""
@@ -83,15 +84,14 @@ def lib_foot_text(mod: str) -> LibFoot:
     from .geom import _graphics_bbox, footprint_box_local
     from .seed import drop_degenerate_lines
     from .sexp import matching_paren
-    from .silk import _PAD_RE, _bbox_on_layer
+    from .silk import _bbox_on_layer, drawings
 
     j = mod.find("(footprint ")
     body = mod[j : matching_paren(mod, j) + 1] if j >= 0 else mod
     body = drop_degenerate_lines(body)
     boxes = tuple((k, footprint_box_local(body, k)) for k in ("courtyard", "fab", "pads"))
-    crtyd = _bbox_on_layer(body, "F.CrtYd", ("fp_line", "fp_rect", "fp_poly", "fp_circle"))
-    silk = _bbox_on_layer(body, "F.SilkS", ("fp_line", "fp_rect", "fp_poly", "fp_circle", "fp_arc"))
-    spads = tuple((float(m.group(1)), float(m.group(2)), float(m.group(3) or 0), float(m.group(4)), float(m.group(5))) for m in _PAD_RE.finditer(body))
+    crtyd = _bbox_on_layer(body, "F.CrtYd")
+    shapes = tuple(drawings(body, "F.SilkS"))
     # The footprint's own lock, as `place_native` reads a pose's (a line of the footprint's head).
     head = body[: body.find("(pad ")] if "(pad " in body else body
     locked = re.search(r"\n\s*\(locked yes\)", head) is not None
@@ -101,7 +101,9 @@ def lib_foot_text(mod: str) -> LibFoot:
     kept = body[k + 1 :] if k >= 0 else body
     uuids = tuple(re.findall(r'\(uuid\s+"([^"]+)"\)', kept))
     props = frozenset(re.findall(r'\(property\s+"([^"]+)"', body))
-    return LibFoot(pad_specs(body), _graphics_bbox(body, "CrtYd"), boxes, crtyd, silk, spads, locked, uuids, props)
+    from .orient import body_box
+
+    return LibFoot(pad_specs(body), _graphics_bbox(body, "CrtYd"), boxes, crtyd, shapes, locked, uuids, props, body_box(body))
 
 
 _CACHE: dict[tuple[str, int, int], LibFoot] = {}
@@ -185,7 +187,7 @@ def foot_of(pf: PosedFoot):
             w, h = max(w, sp.custom[0]), max(h, sp.custom[1])
         if round(sp.angle) % 180 == 90:
             w, h = h, w
-        pads.append(Pad(sp.num, sp.x, sp.y, w, h, nets.get(sp.num, sp.net)))
+        pads.append(Pad(sp.num, sp.x, sp.y, w, h, nets.get(sp.num, sp.net), through=sp.kind in ("thru_hole", "np_thru_hole")))
         x0, y0, x1, y1 = rotate_local_bounds(-sp.w / 2.0, -sp.h / 2.0, sp.w / 2.0, sp.h / 2.0, sp.angle)
         xs += [sp.x + x0, sp.x + x1]
         ys += [sp.y + y0, sp.y + y1]

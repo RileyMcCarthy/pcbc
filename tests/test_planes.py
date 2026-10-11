@@ -38,7 +38,7 @@ from pcbc.constraints import COMMON_KWARGS, return_rules
 from pcbc.copper_bar import REDUNDANT
 from pcbc.fanout import fanout_pieces
 from pcbc.language import load_board
-from pcbc.patterns import PatternCtx, merge_plans, pattern_copper
+from pcbc.patterns import PatternCtx, pattern_copper
 from pcbc.route_native import plane_pours
 from pcbc.route_emit import REASONS, via_piece
 from boardtext import WithText, with_text, write_pieces
@@ -48,11 +48,13 @@ from pcbc.route_verify import BRANCH_REASONS, plane_stitch, plane_stitch_lines
 from pcbc.stackup import C_MM_PER_NS, get_stackup
 import pcbc.patterns.stitch as st
 from boardtext import scene_from_text
+from conftest import copy_board, declared_examples, ds2_dir, write_split
+from conftest import copy_board_file
 
 ROOT = Path(__file__).resolve().parent.parent
-EXAMPLES = ROOT / "examples"
+EXAMPLES = declared_examples()  # the examples as shipped with a declared outline (vehicles): conftest.declared_examples
 FIXTURE = ROOT / "tests" / "fixtures" / "planes" / "planes.py"
-DS2 = Path.home() / "Documents" / "MaD" / "Hardware" / "DS2Addon" / "pcbc" / "ds2_addon.py"
+DS2 = ds2_dir() / "ds2_addon.py"
 HAS_DS2 = DS2.exists()
 
 EXAMPLE_BOARDS = ("blinky", "buck", "c3_usb", "node")
@@ -82,8 +84,8 @@ def _final_ctx(name: str):
     pre = pattern_copper(design, job, job.constraints, board, stage="pre", scene=scene_from_text(design, job, job.constraints, base))
     fan, _n = fanout_pieces(design, job, board, scene=pre.scene, claimed=pre.claimed)
     pre.scene.add(pre.scene.item_of(p) for p in fan)
-    mid = pattern_copper(design, job, job.constraints, board, stage="mid", scene=pre.scene)
-    merged = WithText(merge_plans(pre, mid), write_pieces(base, list(pre.pieces) + list(fan) + list(mid.pieces)))
+    # No mid stage since the spine pattern was deleted (docs/physics-subjects.md PR 3, KD 14).
+    merged = WithText(pre, write_pieces(base, list(pre.pieces) + list(fan)))
     scene = scene_from_text(design, job, job.constraints, merged.text)
     ctx = PatternCtx(scene=scene, design=design, job=job, cs=job.constraints, board=board, stage="final", owned=tuple(merged.pieces) + tuple(fan))
     return ctx, merged
@@ -113,13 +115,13 @@ def test_a_declared_plane_is_the_boards_answer_on_every_stackup_and_the_implicit
         'VCC = Power("VCC"); GND = Ground("GND")\n'
         'Resistor("R1", "1k", package="0603", mpn="X", lcsc="C1", p1=VCC, p2=GND)\n'
         'Board(width=40, height=25, layers=2, stackup="jlcpcb_2l_1oz"{planes})\n'
-        'NetReq("VCC", "GND", kind="power", volts=5, amps=0.1)\n'
+        'NetReq("VCC", kind="power", volts=5); NetReq("GND", kind="power")\n'
         'Place("R1", at=(5, 5)); SchPlace("R1", left=20, top=20)\n'
     )
 
     def targets(planes: str) -> tuple:
         b = tmp_path / f"b{abs(hash(planes))}.py"
-        b.write_text(head.format(planes=planes))
+        write_split(b, head.format(planes=planes))
         assert not [f for f in check_board(b, pcb=False) if "planes" in f], check_board(b, pcb=False)
         return plane_targets(compile_design(load_board(b)))
 
@@ -146,10 +148,10 @@ def test_the_board_line_no_longer_refuses_a_two_layer_plane_and_still_refuses_a_
         'Place("R1", at=(5, 5)); SchPlace("R1", left=20, top=20)\n'
     )
     ok = tmp_path / "ok.py"
-    ok.write_text(head.format(planes='[("GND", "F.Cu"), ("GND", "B.Cu")]'))
+    write_split(ok, head.format(planes='[("GND", "F.Cu"), ("GND", "B.Cu")]'))
     assert not [f for f in check_board(ok, pcb=False) if "planes" in f]
     ghost = tmp_path / "ghost.py"
-    ghost.write_text(head.format(planes='[("GND", "In1.Cu")]'))
+    write_split(ghost, head.format(planes='[("GND", "In1.Cu")]'))
     assert check_board(ghost, pcb=False)[:1] == [
         "line 4: Board(planes=[('GND', 'In1.Cu')]): jlcpcb_2l_1oz has no copper layer In1.Cu; it has B.Cu, F.Cu"
     ], check_board(ghost, pcb=False)[:1]
@@ -281,8 +283,7 @@ def test_the_refusal_names_the_missing_keyword_and_is_a_move_a_board_can_act_on(
     Exercised on the fixture with its one `rise_ps=` taken out, so the refusal is measured on a board
     that otherwise gets a lattice rather than on a board that could never have had one.
     """
-    work = tmp_path / "noedge.py"
-    work.write_text(FIXTURE.read_text().replace(', rise_ps=500', ''))
+    work = copy_board(FIXTURE, tmp_path, [(', rise_ps=500', '')], name="noedge.py")
     from conftest import placed_board
 
     design = load_board(work)
@@ -298,7 +299,7 @@ def test_the_refusal_names_the_missing_keyword_and_is_a_move_a_board_can_act_on(
     assert res.refusal.rule == "no_edge_rate" and res.refusal.hard is False and res.refusal.pattern == "plane"
     assert "no net declares NetReq(rise_ps=)" in res.refusal.move
     assert "will not invent" in res.refusal.move
-    assert 'add rise_ps= to NetReq("CLK", ..., rise_ps=...)' in res.refusal.move, "it names the fastest-kind net it can see"
+    assert "no NetReq on this board gives rise_ps=, and pcbc has no default edge rate (nets of a fast kind: CLK)" in res.refusal.move, "it names the fastest-kind net it can see"
 
 
 def test_the_process_floor_is_under_the_pitch_and_it_binds_only_below_an_impossible_edge():
@@ -546,8 +547,7 @@ def test_node_with_gnd_on_both_inner_planes_flips_its_return_verdict_and_pays_fo
     exp = compile_design(load_board(_board("node"))).constraints
     assert {r.net: r.verdict for r in return_rules(exp)} == {"USB_DN": "net_change", "USB_DP": "net_change"}
     line = next(r.line() for r in return_rules(exp) if r.net == "USB_DP")
-    assert 'Board(planes=[("GND", "In1.Cu"), ("GND", "In2.Cu")]) puts one net under both layers' in line
-    assert "at the cost of 3V3's plane" in line, "the move names its own cost, and the cost is what settled it"
+    assert line.endswith("(net_change).") and "Board(planes" not in line, line
     # The prediction, made the way S5 makes it: from board.py alone, no PCB file.
     from dataclasses import replace
 
@@ -581,13 +581,13 @@ def test_the_fixture_builds_to_fab_with_the_plane_gate_verified(tmp_path: Path):
     from pcbc.build import build_job
 
     work = tmp_path / "planes.py"
-    work.write_text(FIXTURE.read_text())
+    copy_board_file(work, FIXTURE)
     result = build_job(work, upto="fab", force=True)
     assert result["error"] is None, result["error"]
     route = next(s for s in result["steps"] if s.get("stage") == "route")
     assert route["planes_stitched"]["fails"] == [], route["planes_stitched"]["lines"]
     assert route["planes_stitched"]["lines"] == [
-        "plane GND: 43 lattice via(s), all landing in B.Cu + F.Cu; 2210.61 mm2 of pour across 2 layer(s), 1 island(s) on the worst of them",
+        "plane GND: 43 lattice via(s), all landing in B.Cu + F.Cu; 2215.64 mm2 of pour across 2 layer(s), 1 island(s) on the worst of them",
         "planes: 1 of 1 lattice(s) landing in every pour they tie",
     ], route["planes_stitched"]["lines"]
     assert route["planes"]["islands"] == {"GND B.Cu": 1, "GND F.Cu": 1}, route["planes"]["islands"]
@@ -595,7 +595,9 @@ def test_the_fixture_builds_to_fab_with_the_plane_gate_verified(tmp_path: Path):
     # 1139.54/1071.07 mm2. The lattice takes what the route leaves (R-S2), and the native router
     # leaves more of the board free than the old one did (its copper is shorter), so two more of the
     # 50 candidate sites clear and both pours keep more copper; still one island per plane.
-    assert route["planes"]["area_mm2"] == {"GND B.Cu": 1139.54, "GND F.Cu": 1071.07}, route["planes"]["area_mm2"]
+    # Re-measured 2026-10-02 (docs/physics-subjects.md PR 3-5: the fixture's nets carry no current, so their copper
+    # is the class floor): F.Cu 1071.07 -> 1076.1 mm2, the sum 2210.61 -> 2215.64; still 43 vias, one island each.
+    assert route["planes"]["area_mm2"] == {"GND B.Cu": 1139.54, "GND F.Cu": 1076.1}, route["planes"]["area_mm2"]
     assert route["copper_bar"]["totals"]["vias_pattern"] == {"plane": 43, "tap": 5}
     assert route["refusals"] == [], "a board that declares an edge rate has nothing to refuse"
     assert any(n.startswith("style: stitch GND plane: 43 of 50 placed, 0.5 GHz of 1 GHz") for n in route["notes"]), route["notes"]

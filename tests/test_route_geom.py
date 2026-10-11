@@ -54,6 +54,7 @@ from pcbc.route_geom import (
     turn_ok,
     via_shape,
 )
+from conftest import ds2_dir, placed_board
 
 SEED = 20260920  # the day the design was written; fixed so CI is deterministic
 CASES = 2000  # D.3's number, and the size of the golden-vector fixture R3 replays
@@ -1082,9 +1083,13 @@ def test_kicad_measures_the_same_air_around_a_real_pad_as_the_shape_model_does()
 
     Method: one footprint lifted from a placed board, a ring of short probe tracks around one pad on
     a net of their own, and a single clearance rule far wider than the gap, so KiCad prints its own
-    measured `actual` for every probe. The claim is one-sided, because that is what soundness means
-    here: **KiCad's air is never less than pcbc's**, so the model is the true copper or a superset
-    of it and never a subset. Where the model is exact the two agree to the last digit KiCad prints.
+    measured `actual` for every probe. The placed board is generated from `board.py`
+    (`conftest.placed_board`). `examples/**/layout/` is gitignored build output, and the DS2 copy
+    has no `placed/` board in it, so reading either made this a `FileNotFoundError` on a machine
+    that had not already placed that board. The claim is one-sided, because that is what soundness
+    means here: **KiCad's air is never less than pcbc's**, so the model is the true copper or a
+    superset of it and never a subset. Where the model is exact the two agree to the last digit
+    KiCad prints.
     """
     import json
     import re
@@ -1097,9 +1102,13 @@ def test_kicad_measures_the_same_air_around_a_real_pad_as_the_shape_model_does()
     from pcbc.sexp import board_footprint_spans, footprint_at, footprint_reference
 
     root = Path(__file__).resolve().parent.parent
-    ds2 = Path.home() / "Documents" / "MaD" / "Hardware" / "DS2Addon" / "pcbc"
-    if not ds2.exists():
+    ds2 = ds2_dir()
+    if not (ds2 / "ds2_addon.py").exists():
         pytest.skip("the DS2 Addon is not checked out here; its header is one of the four rows")
+    placed = {
+        "c3_usb": placed_board("c3_usb", root / "examples" / "c3_usb" / "c3_usb.py"),
+        "ds2": placed_board("ds2", ds2 / "ds2_addon.py"),
+    }
     pro = {
         "board": {"design_settings": {"defaults": {}, "rules": {"min_clearance": 0.05, "min_track_width": 0.05}, "rule_severities": {}}},
         "meta": {"filename": "layout.kicad_pcb", "version": 1},
@@ -1109,8 +1118,7 @@ def test_kicad_measures_the_same_air_around_a_real_pad_as_the_shape_model_does()
     actual = re.compile(r"actual ([0-9.]+) mm")
     agreed = 0
     for board, ref, num, what in PROBE_PADS:
-        pcb = (ds2 / "layout" / "ds2_addon" / "placed" / "layout.kicad_pcb") if board == "ds2" else (root / "examples" / board / "layout" / board / "placed" / "layout.kicad_pcb")
-        text = pcb.read_text()
+        text = placed[board].read_text()
         block = next(text[s:e] for s, e in board_footprint_spans(text) if footprint_reference(text[s:e]) == ref)
         geoms = pad_geoms(block, footprint_at(block), ref=ref)
         target = next(g for g in geoms if g.num == num)

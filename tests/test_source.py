@@ -5,9 +5,11 @@ from __future__ import annotations
 import io
 import json
 import os
+import re
 import stat
 from pathlib import Path
 
+import pytest
 
 from pcbc.cli import main
 from pcbc.seed import _absolute_models
@@ -21,6 +23,7 @@ from pcbc.source import (
     search_lcsc,
     slug,
 )
+from conftest import write_split
 
 
 def _pin(num: str, name: str, x: float, y: float, rot: int, *, kind: str = "passive", length: float = 2.54) -> str:
@@ -73,7 +76,7 @@ def _write_part(tmp: Path, sym: str, mod: str, part_py: str | None = None) -> Pa
     (tmp / "PART.kicad_sym").write_text(sym)
     (tmp / "PART.kicad_mod").write_text(mod)
     if part_py is not None:
-        (tmp / "part.py").write_text(part_py)
+        write_split(tmp / "part.py", part_py)
     return tmp
 
 
@@ -218,7 +221,7 @@ def test_fetch_splits_upgrades_and_writes_part_py(tmp_path: Path):
     part_py = (d / "part.py").read_text()
     assert 'lcsc="C191884"' in part_py and 'manufacturer="Acme"' in part_py and "# Pins: VIN(1) GND(2) EN(3) SW(4)" in part_py
     # A hand-edited part.py is kept unless --force.
-    (d / "part.py").write_text("# mine\n" + part_py)
+    write_split(d / "part.py", "# mine\n" + part_py)
     r2 = fetch_lcsc("C191884", into, easyeda2kicad=str(fake))
     assert not r2["wrote_part_py"] and (d / "part.py").read_text().startswith("# mine")
     r3 = fetch_lcsc("C191884", into, easyeda2kicad=str(fake), force=True)
@@ -264,17 +267,90 @@ def test_check_refuses_a_fail_grade_part(tmp_path: Path):
     from pcbc.language import check_board
 
     bad = _write_part(tmp_path / "components" / "Acme" / "PART", _symbol(GOOD_PINS), _footprint(["1", "2", "3"]))
-    (bad / "part.py").write_text('from pcbc import Component\npart = Component(name="PART", prefix="U", lcsc="C1")\n')
+    write_split(bad / "part.py", 'from pcbc import Component\npart = Component(name="PART", prefix="U", lcsc="C1")\n')
     good = _write_part(tmp_path / "components" / "Acme" / "OK", _symbol(GOOD_PINS), _footprint(["1", "2", "3", "4"]))
-    (good / "part.py").write_text('from pcbc import Component\npart = Component(name="OK", prefix="U", lcsc="C2")\n')
+    write_split(good / "part.py", 'from pcbc import Component\npart = Component(name="OK", prefix="U", lcsc="C2")\n')
     board = tmp_path / "b.py"
-    board.write_text(
-        "from pcbc import *\n"
+    write_split(board, "from pcbc import *\n"
         'VIN = Power("VIN"); GND = Ground("GND"); EN = Net("EN"); SW = Net("SW")\n'
         'U1 = load("components/Acme/PART"); U1("U1", VIN=VIN, GND=GND, EN=EN, SW=SW)\n'
         'U2 = load("components/Acme/OK"); U2("U2", VIN=VIN, GND=GND, EN=EN, SW=SW)\n'
         'SchPlace("U1", left=20, top=20); SchPlace("U2", left=80, top=20)\n'
-        'Board(width=20, height=20, layers=2, stackup="jlcpcb_2l_1oz")\n'
-    )
+        'Board(width=20, height=20, layers=2, stackup="jlcpcb_2l_1oz")\n')
     fails = check_board(board, pcb=False)
     assert fails == ["U1: library symbol pins with no pad in the footprint: 4; the netlist would drop them"], fails
+
+
+def _vrml_box(path: Path, lo: tuple[float, float, float], hi: tuple[float, float, float]) -> None:
+    """A VRML box from `lo` to `hi` (mm), in KiCad's VRML unit (2.54 mm), as easyeda2kicad writes its `.wrl`."""
+    u = [v / 2.54 for v in lo]
+    w = [v / 2.54 for v in hi]
+    pts = [(x, y, z) for x in (u[0], w[0]) for y in (u[1], w[1]) for z in (u[2], w[2])]
+    faces = "0,1,3,2,-1,4,6,7,5,-1,0,4,5,1,-1,2,3,7,6,-1,0,2,6,4,-1,1,5,7,3,-1"
+    path.write_text(
+        "#VRML V2.0 utf8\nShape { appearance Appearance { material Material { diffuseColor 0.5 0.5 0.5 } }\n"
+        " geometry IndexedFaceSet { coord Coordinate { point [ "
+        + ", ".join(f"{a:.4f} {b:.4f} {c:.4f}" for a, b, c in pts)
+        + " ] }\n coordIndex [ " + faces + " ] } }\n"
+    )
+
+
+XH_STEP = Path(__file__).resolve().parent.parent / "examples" / "buck" / "components" / "JST" / "B2B-XH-A" / "CONN-TH_B2B-XH-A-LF-SN.step"
+
+
+@pytest.mark.kicad
+def test_the_model_offset_is_easyedas_placement_measured_by_kicad(tmp_path: Path):
+    """easyeda2kicad writes `(offset (xyz 0 0 0))` and copies the STEP as EasyEDA serves it; the JST XH
+    STEP's own box is centred at (1.25, 2.2505) with its pin tips at z -4.3, and EasyEDA places that
+    centre at T = (0, 0.475) and the bottom at -2.5 (its `.wrl` bake). offset = T - R*c, measured with
+    KiCad's own loader at the part's rotation: (1.25, 2.726, 1.8) at 180, the investigation's measured
+    pin shift on buck J_OUT/J_IN and node J_LOAD. At 90 KiCad turns the model by -90 in its y-up frame,
+    so R*c = (2.2505, -1.25) and the offset is (-2.25, 1.725, 1.8): pins the sign."""
+    from pcbc.model3d import model_offset
+    from pcbc.source import _kicad_cli
+
+    cli = _kicad_cli()
+    assert cli is not None
+    placed = tmp_path / "placed.wrl"
+    _vrml_box(placed, (-3.75, 0.475 - 2.85, -2.5), (3.75, 0.475 + 2.85, 7.0))
+    assert model_offset(XH_STEP, placed, (0, 0, 180), cli) == ((1.25, 2.726, 1.8), "")
+    assert model_offset(XH_STEP, placed, (0, 0, 90), cli) == ((-2.25, 1.725, 1.8), "")
+    assert model_offset(XH_STEP, placed, (0, 0, 0), cli) == ((-1.25, -1.775, 1.8), "")
+    # A .wrl kept alone (no STEP) was baked before KiCad's turn: offset = T - R*T, 0 at rotation 0.
+    assert model_offset(placed, placed, (0, 0, 180), cli) == ((0.0, 0.95, 0.0), "")
+    assert model_offset(placed, placed, (0, 0, 0), cli) == ((0.0, 0.0, 0.0), "")
+    # A file KiCad cannot load is a fact, not a zero.
+    bad = tmp_path / "bad.step"
+    bad.write_text("ISO-10303-21;")
+    off, why = model_offset(bad, placed, (0, 0, 0), cli)
+    assert off is None and "bad.step" in why
+
+
+@pytest.mark.kicad
+def test_fetch_writes_the_measured_model_offset(tmp_path: Path):
+    """`pcbc fetch` keeps the STEP and writes the offset KiCad measured against easyeda2kicad's `.wrl`,
+    not easyeda2kicad's (0 0 0)."""
+    script = tmp_path / "easyeda2kicad"
+    sym = _symbol(GOOD_PINS, name="TPS1").replace("(version 20251024)", "(version 20211014)")
+    mod = _footprint(["1", "2", "3", "4"], legacy=True, model=True).replace(
+        '(model "part.step" (offset (xyz 0 0 0)) (scale (xyz 1 1 1)) (rotate (xyz 0 0 0)))',
+        '(model "/somewhere/e.3dshapes/XH.wrl" (offset (xyz 0 0 0)) (scale (xyz 1 1 1)) (rotate (xyz 0 0 180)))',
+    )
+    placed = tmp_path / "XH.wrl"
+    _vrml_box(placed, (-3.75, 0.475 - 2.85, -2.5), (3.75, 0.475 + 2.85, 7.0))
+    script.write_text(
+        "#!/usr/bin/env python3\nimport sys, pathlib, shutil\n"
+        "out = pathlib.Path(sys.argv[sys.argv.index('--output') + 1])\n"
+        f"out.write_text({sym!r})\n"
+        "pretty = out.with_name(out.stem + '.pretty'); pretty.mkdir()\n"
+        f"(pretty / 'XH.kicad_mod').write_text({mod!r})\n"
+        "shapes = out.with_name(out.stem + '.3dshapes'); shapes.mkdir()\n"
+        f"shutil.copyfile({str(XH_STEP)!r}, shapes / 'XH.step')\n"
+        f"shutil.copyfile({str(placed)!r}, shapes / 'XH.wrl')\n"
+    )
+    script.chmod(script.stat().st_mode | stat.S_IEXEC)
+    r = fetch_lcsc("C158012", tmp_path / "components", easyeda2kicad=str(script))
+    text = (Path(r["dir"]) / "XH.kicad_mod").read_text()
+    assert r["model"] == "XH.step"
+    assert re.search(r'\(model "XH\.step"\s*\(offset\s*\(xyz 1\.25 2\.726 1\.8\)', text), text[text.find("(model"):]
+    assert not any("3D model offset" in m for _s, m in r["score"]["findings"]), r["score"]["findings"]

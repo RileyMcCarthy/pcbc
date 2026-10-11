@@ -12,6 +12,7 @@ from pcbc.compile import compile_design
 from pcbc.language import check_board, load_board
 from pcbc.pcb_place import Foot, Pad, _face, _farads, _rot_for_face, resolve_places
 from pcbc.place_native import seed_feet
+from conftest import write_split
 
 EXAMPLES = Path(__file__).resolve().parent.parent / "examples"
 C3_USB = EXAMPLES / "c3_usb" / "c3_usb.py"
@@ -19,20 +20,18 @@ BLINKY = EXAMPLES / "blinky" / "blinky.py"
 
 
 def _c3(tmp_path: Path, place_block: str) -> Path:
-    """c3_usb with its Place() lines replaced."""
-    src = C3_USB.read_text()
-    head = src[: src.index('Place("J1"')]
-    tail = src[src.index('Place("D1"') :]
-    tail = tail[tail.index("\n") + 1 :]
+    """c3_usb with its Place() lines (its layout.core.py, outline kept) replaced by `place_block`."""
     tmp_path.mkdir(parents=True, exist_ok=True)
     board = tmp_path / "c3_usb.py"
-    board.write_text(head + place_block + tail)
+    board.write_text(C3_USB.read_text())
+    (tmp_path / "layout.core.py").write_text("Outline(width=40, height=30)\n" + place_block)
+    (tmp_path / "schematic.core.py").write_text((C3_USB.parent / "schematic.core.py").read_text())
     shutil.copytree(C3_USB.parent / "components", tmp_path / "components")
     return board
 
 
 ANCHORS = '''Place("J1", edge="bottom")
-Place("U1", position="absolute", left=1, top=1, rotate=90)
+Place("U1", position="absolute", left=1, top=1, rot=90)
 Keepout("ANTENNA", position="absolute", left=0, top=0, width=4, height=15)
 Place("U2", position="absolute", right=4, top=10)
 '''
@@ -59,9 +58,15 @@ def _relations(report: list[str]) -> list[str]:
     return [m for m in report if "no budget checks it" not in m]
 
 
-def _placed(board: Path) -> tuple[dict, dict]:
+def _placed(board: Path, *, orientation: str | None = None) -> tuple[dict, dict]:
+    """`pcbc pcb` on `board`: no error, or (`orientation`) the orientation refusal naming that part, with the
+    place-only board written all the same (docs/direction.md §4c)."""
     result = pcb_job(board)
-    assert result.get("error") is None, result
+    if orientation is not None and result.get("error"):
+        assert result["error"].startswith(f"orientation: {orientation}: no orientation mark"), result["error"]
+        assert Path(result["placed"]).exists()
+    else:
+        assert result.get("error") is None, result
     return result, result["poses"]
 
 
@@ -127,7 +132,8 @@ def test_two_parts_on_one_pin_share_it_in_file_order(tmp_path: Path):
     assert _relations(result["layout_report"]) == [], result["layout_report"]
     assert _pad_to_pin(result, "C_MCU_HF", "U1", "3V3") < _pad_to_pin(result, "C_MCU", "U1", "3V3")
     swapped = _c3(tmp_path / "swapped", ANCHORS + REST.replace('Place("C_MCU_HF", to="U1.3V3")\nPlace("C_MCU", to="U1.3V3")\n', 'Place("C_MCU", to="U1.3V3")\nPlace("C_MCU_HF", to="U1.3V3")\n'))
-    r2, _p2 = _placed(swapped)
+    # C_MCU, the bigger cap, now hugs the ESP32's pin-1 corner: no visible spot is left for its pin-1 mark.
+    r2, _p2 = _placed(swapped, orientation="U1")
     assert _pad_to_pin(r2, "C_MCU", "U1", "3V3") < _pad_to_pin(r2, "C_MCU_HF", "U1", "3V3")
 
 
@@ -256,13 +262,24 @@ def test_the_same_board_places_the_same(tmp_path: Path):
     assert Path(ra["placed"]).read_text() == Path(rb["placed"]).read_text().replace(str(tmp_path / "b"), str(tmp_path / "a"))
 
 
-def test_c3_usb_layout_bar():
-    result = pcb_job(C3_USB)
+def _copy_example(src: Path, tmp_path: Path) -> Path:
+    """examples/<name> copied without its build output: a test never places into examples/."""
+    dst = tmp_path / src.parent.name
+    shutil.copytree(src.parent, dst, ignore=shutil.ignore_patterns("layout"))
+    return dst / src.name
+
+
+def test_c3_usb_layout_bar(tmp_path: Path):
+    result = pcb_job(_copy_example(C3_USB, tmp_path))
     assert result.get("error") is None, result
+    # docs/board-outline.md PR 4: c3_usb declares no Outline(). B.2 step 3 limits a relation rooted at an anchor to I0,
+    # the anchors' box. Re-recorded 2026-10-07: a spot in I0 farther than DECAP_NEXT_MM from its pin no longer wins over
+    # one nearer by more than DECAP_MM outside it (`pcb_place._relate`), so U1.3V3's caps stand below U1 again (1.61 and
+    # 2.39 mm, as on the declared board) where I0 had put them 8.9 and 9.5 mm away; 2 moves -> 0, as before PR 4.
     assert _relations(result["layout_report"]) == [], result["layout_report"]
 
 
-def test_cli_pcb(capsys):
-    assert main(["pcb", str(BLINKY)]) == 0
+def test_cli_pcb(capsys, tmp_path: Path):
+    assert main(["pcb", str(_copy_example(BLINKY, tmp_path))]) == 0
     out = capsys.readouterr().out
-    assert "layout: nothing to move" in out
+    assert "layout: no warnings" in out

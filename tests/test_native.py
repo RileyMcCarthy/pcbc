@@ -23,10 +23,11 @@ import pytest
 
 from pcbc import trace
 from pcbc.build import build_job
+from conftest import ds2_dir, put_core, vehicle_examples
 
 ROOT = Path(__file__).resolve().parent.parent
-EXAMPLES = ROOT / "examples"
-DS2 = Path.home() / "Documents" / "MaD" / "Hardware" / "DS2Addon" / "pcbc"
+EXAMPLES = vehicle_examples()  # buck is the pre-migration board here: conftest.vehicle_examples
+DS2 = ds2_dir()
 BOARDS = ["blinky", "buck", "c3_usb", "node"] + (["ds2"] if (DS2 / "ds2_addon.py").exists() else [])
 
 
@@ -75,7 +76,7 @@ def test_the_core_probe_is_the_one_board_before_emit_and_it_is_named_by_its_modu
     """The exemption P1 makes is the M1 probe's own module, and it is used: with a core line, the probe
     writes and KiCad saves one probe board before the emit, and those events are `core_probe`'s."""
     board = _copy("blinky", tmp_path)
-    (board.parent / "layout.core.py").write_text('Line((2.0, 2.0), (6.0, 2.0), width=0.15, layer="F.SilkS")\n')
+    put_core(board.parent / "layout.core.py", 'Line((2.0, 2.0), (6.0, 2.0), width=0.15, layer="F.SilkS")\n')
     result, events = _traced_build(board, upto="route")
     assert result.get("error") is None, result.get("error")
     before, _emit = _before_emit(events)
